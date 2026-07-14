@@ -149,6 +149,7 @@ async fn main() {
         .route("/api/webhook/telegram",            post(routes::webhook_handler))
         .route("/api/logs/stream",                  get(routes::sse_logs_handler))
         .route("/api/portfolio",                    get(routes::portfolio_handler))
+        .route("/api/health",                       get(routes::health_handler))
         .route("/api/positions",                    get(routes::positions_handler))
         .route("/api/prices",                       get(routes::prices_handler))
         .route("/api/scrip/search",                 get(routes::scrip_search_handler))
