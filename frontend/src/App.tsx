@@ -3,6 +3,8 @@ import {
   Activity,
   ChevronDown,
   ChevronUp,
+  Cpu,
+  HardDrive,
   IndianRupee,
   Info,
   KeyRound,
@@ -50,6 +52,40 @@ interface Portfolio {
   trades: PaperTrade[];
 }
 
+interface HealthSnapshot {
+  generated_at_ist: string;
+  hostname: string | null;
+  os_name: string | null;
+  os_version: string | null;
+  kernel_version: string | null;
+  uptime_secs: number;
+  cpu_cores: number;
+  cpu_usage_pct: number;
+  load_average: {
+    one: number;
+    five: number;
+    fifteen: number;
+  };
+  memory: {
+    total_mib: number;
+    used_mib: number;
+    free_mib: number;
+  };
+  swap: {
+    total_mib: number;
+    used_mib: number;
+    free_mib: number;
+  };
+  current_process: {
+    pid: string;
+    name: string;
+    cpu_usage_pct: number;
+    memory_mib: number;
+    virtual_memory_mib: number;
+    run_time_secs: number;
+  } | null;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -64,6 +100,19 @@ function fmt(n: number) {
 function totalCharges(t: PaperTrade) {
   return t.brokerage + t.stt_charge + t.sebi_fee +
     t.stamp_duty + t.transaction_charge + t.gst;
+}
+
+function fmtPct(n: number) {
+  return `${n.toFixed(1)}%`;
+}
+
+function fmtUptime(totalSecs: number) {
+  const days = Math.floor(totalSecs / 86_400);
+  const hours = Math.floor((totalSecs % 86_400) / 3_600);
+  const mins = Math.floor((totalSecs % 3_600) / 60);
+  if (days > 0) return `${days}d ${hours}h ${mins}m`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
 }
 
 const SERVER_BASE_STORAGE_KEY = 'server_base';
@@ -114,6 +163,134 @@ function apiUrl(serverBase: string, path: string) {
 
 function apiFetch(serverBase: string, path: string, init?: RequestInit) {
   return fetch(apiUrl(serverBase, path), init);
+}
+
+function HeaderNav({ currentPath }: { currentPath: string }) {
+  const linkClass = (active: boolean) => `px-2 py-1 rounded text-xs transition-colors ${active ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`;
+
+  return (
+    <nav className="ml-auto flex items-center gap-2">
+      <a href="/" className={linkClass(currentPath === '/')}>Dashboard</a>
+      <a href="/health" className={linkClass(currentPath === '/health')}>Health</a>
+    </nav>
+  );
+}
+
+function HealthPage({ serverBase }: { serverBase: string }) {
+  const [snapshot, setSnapshot] = useState<HealthSnapshot | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function loadHealth() {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await apiFetch(serverBase, '/api/health');
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data?.error ?? 'Failed to load health snapshot');
+        return;
+      }
+      setSnapshot(data);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-900">
+      <div className="flex items-center justify-between gap-4 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3">
+        <div>
+          <div className="text-sm font-semibold text-white">On-demand instance health</div>
+          <div className="text-xs text-gray-400">Fetches CPU, memory, swap, uptime, load average, and current server-process stats only when requested.</div>
+        </div>
+        <button
+          onClick={loadHealth}
+          disabled={loading}
+          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm rounded transition-colors"
+        >
+          {loading ? 'Refreshing…' : 'Fetch Health'}
+        </button>
+      </div>
+
+      {!serverBase && (
+        <div className="bg-amber-950/40 border border-amber-800 text-amber-300 rounded-lg px-4 py-3 text-sm">
+          Set the backend server URL in the Kotak panel first if this frontend is running on a different origin than the backend.
+        </div>
+      )}
+
+      {error && (
+        <div className="bg-red-950/40 border border-red-800 text-red-300 rounded-lg px-4 py-3 text-sm">
+          {error}
+        </div>
+      )}
+
+      {!snapshot && !error && !loading && (
+        <div className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-6 text-sm text-gray-400">
+          No snapshot loaded yet.
+        </div>
+      )}
+
+      {snapshot && (
+        <>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <Stat icon={<Cpu size={16} className="text-blue-400" />} label="CPU Usage">
+              {fmtPct(snapshot.cpu_usage_pct)}
+            </Stat>
+            <Stat icon={<Activity size={16} className="text-emerald-400" />} label="Load Average">
+              {snapshot.load_average.one.toFixed(2)} / {snapshot.load_average.five.toFixed(2)} / {snapshot.load_average.fifteen.toFixed(2)}
+            </Stat>
+            <Stat icon={<HardDrive size={16} className="text-yellow-400" />} label="Memory Used">
+              {snapshot.memory.used_mib} / {snapshot.memory.total_mib} MiB
+            </Stat>
+            <Stat icon={<HardDrive size={16} className="text-orange-400" />} label="Swap Used">
+              {snapshot.swap.used_mib} / {snapshot.swap.total_mib} MiB
+            </Stat>
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-[1.2fr_1fr]">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
+              <div className="px-4 py-2 border-b border-gray-700 text-xs text-gray-400 uppercase tracking-wide">
+                Instance Overview
+              </div>
+              <div className="p-4 grid gap-3 sm:grid-cols-2 text-sm">
+                <div><span className="text-gray-500">Generated (IST):</span> <span className="text-white">{snapshot.generated_at_ist}</span></div>
+                <div><span className="text-gray-500">Hostname:</span> <span className="text-white">{snapshot.hostname ?? '—'}</span></div>
+                <div><span className="text-gray-500">OS:</span> <span className="text-white">{[snapshot.os_name, snapshot.os_version].filter(Boolean).join(' ') || '—'}</span></div>
+                <div><span className="text-gray-500">Kernel:</span> <span className="text-white">{snapshot.kernel_version ?? '—'}</span></div>
+                <div><span className="text-gray-500">Uptime:</span> <span className="text-white">{fmtUptime(snapshot.uptime_secs)}</span></div>
+                <div><span className="text-gray-500">CPU Cores:</span> <span className="text-white">{snapshot.cpu_cores}</span></div>
+                <div><span className="text-gray-500">Free Memory:</span> <span className="text-white">{snapshot.memory.free_mib} MiB</span></div>
+                <div><span className="text-gray-500">Free Swap:</span> <span className="text-white">{snapshot.swap.free_mib} MiB</span></div>
+              </div>
+            </div>
+
+            <div className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
+              <div className="px-4 py-2 border-b border-gray-700 text-xs text-gray-400 uppercase tracking-wide">
+                Current Server Process
+              </div>
+              <div className="p-4 text-sm space-y-2">
+                {snapshot.current_process ? (
+                  <>
+                    <div><span className="text-gray-500">PID:</span> <span className="text-white">{snapshot.current_process.pid}</span></div>
+                    <div><span className="text-gray-500">Name:</span> <span className="text-white">{snapshot.current_process.name}</span></div>
+                    <div><span className="text-gray-500">CPU:</span> <span className="text-white">{fmtPct(snapshot.current_process.cpu_usage_pct)}</span></div>
+                    <div><span className="text-gray-500">Resident Memory:</span> <span className="text-white">{snapshot.current_process.memory_mib} MiB</span></div>
+                    <div><span className="text-gray-500">Virtual Memory:</span> <span className="text-white">{snapshot.current_process.virtual_memory_mib} MiB</span></div>
+                    <div><span className="text-gray-500">Run Time:</span> <span className="text-white">{fmtUptime(snapshot.current_process.run_time_secs)}</span></div>
+                  </>
+                ) : (
+                  <div className="text-gray-400">Current process stats unavailable.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,6 +1339,8 @@ function ConnectionPanel({ serverBase, onServerBaseChange }: {
 export default function App() {
   const [logHeight, setLogHeight] = useState(220);
   const [serverBase, setServerBase] = useState(() => getStoredServerBase());
+  const currentPath = typeof window === 'undefined' ? '/' : window.location.pathname;
+  const isHealthPage = currentPath === '/health';
 
   function handleServerBaseChange(value: string) {
     setServerBase(persistServerBase(value));
@@ -1175,33 +1354,42 @@ export default function App() {
           <h1 className="text-sm font-semibold tracking-wide">
             Auto Trader <span className="text-gray-500 font-normal">— Options OMS</span>
           </h1>
+          <HeaderNav currentPath={currentPath} />
         </header>
-        <div className="shrink-0"><SettingsBar serverBase={serverBase} /></div>
-        <div className="shrink-0"><ConnectionPanel serverBase={serverBase} onServerBaseChange={handleServerBaseChange} /></div>
-        <UpcomingTrades serverBase={serverBase} />
-        <PortfolioSection serverBase={serverBase} />
+        {isHealthPage ? (
+          <HealthPage serverBase={serverBase} />
+        ) : (
+          <>
+            <div className="shrink-0"><SettingsBar serverBase={serverBase} /></div>
+            <div className="shrink-0"><ConnectionPanel serverBase={serverBase} onServerBaseChange={handleServerBaseChange} /></div>
+            <UpcomingTrades serverBase={serverBase} />
+            <PortfolioSection serverBase={serverBase} />
+          </>
+        )}
       </div>
-      <div className="shrink-0 relative group">
-        <div 
-          className="absolute top-0 left-0 right-0 h-1 cursor-ns-resize hover:bg-blue-500/50 z-10 transition-colors"
-          onMouseDown={(e) => {
-            e.preventDefault();
-            const startY = e.clientY;
-            const startH = logHeight;
-            const onMove = (ev: MouseEvent) => {
-              const diff = startY - ev.clientY;
-              setLogHeight(Math.max(100, Math.min(window.innerHeight - 100, startH + diff)));
-            };
-            const onUp = () => {
-              window.removeEventListener('mousemove', onMove);
-              window.removeEventListener('mouseup', onUp);
-            };
-            window.addEventListener('mousemove', onMove);
-            window.addEventListener('mouseup', onUp);
-          }}
-        />
-        <LogTerminal serverBase={serverBase} height={logHeight} />
-      </div>
+      {!isHealthPage && (
+        <div className="shrink-0 relative group">
+          <div 
+            className="absolute top-0 left-0 right-0 h-1 cursor-ns-resize hover:bg-blue-500/50 z-10 transition-colors"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              const startY = e.clientY;
+              const startH = logHeight;
+              const onMove = (ev: MouseEvent) => {
+                const diff = startY - ev.clientY;
+                setLogHeight(Math.max(100, Math.min(window.innerHeight - 100, startH + diff)));
+              };
+              const onUp = () => {
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+              };
+              window.addEventListener('mousemove', onMove);
+              window.addEventListener('mouseup', onUp);
+            }}
+          />
+          <LogTerminal serverBase={serverBase} height={logHeight} />
+        </div>
+      )}
     </div>
   );
 }

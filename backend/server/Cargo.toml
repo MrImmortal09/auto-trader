@@ -24,3 +24,4 @@ futures            = "0.3"
 tokio-stream       = { version = "0.1", features = ["sync"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo            = "0.37"
