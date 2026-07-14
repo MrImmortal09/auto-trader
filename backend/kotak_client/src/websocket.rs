@@ -1,7 +1,22 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info, warn};
+
+fn resolve_bridge_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("kotak-bridge"));
+        candidates.push(current_dir.join("../kotak-bridge"));
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(manifest_dir.join("../../kotak-bridge"));
+
+    candidates.into_iter().find(|path| path.is_dir())
+}
 
 pub async fn start_market_data_stream(
     auth_token: String,
@@ -13,10 +28,15 @@ pub async fn start_market_data_stream(
 ) {
     info!("Starting Node.js bridge for Kotak WebSocket with scrips: {}", scrips);
 
+    let Some(bridge_dir) = resolve_bridge_dir() else {
+        error!("Failed to locate kotak-bridge directory from the current runtime paths.");
+        return;
+    };
+
     let mut child = match Command::new("bash")
         .arg("-lc")
         .arg("node index.js")
-        .current_dir("../kotak-bridge")
+        .current_dir(&bridge_dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()

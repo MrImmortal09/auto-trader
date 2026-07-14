@@ -101,14 +101,20 @@ async fn main() {
     let ws_scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
     let scrip_store = Arc::new(RwLock::new(None));
     let raw_scrip_csv = Arc::new(RwLock::new(None));
-    
-    let (ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
-    
-    let ws_handle = tokio::spawn(kotak_client::start_market_data_stream(
-        ws_auth, ws_sid, ws_scrips, 1, Arc::clone(&prices), ws_rx,
-    ));
-    let ws_task = Arc::new(tokio::sync::Mutex::new(Some(ws_handle)));
-    let ws_tx = Arc::new(tokio::sync::Mutex::new(Some(ws_tx)));
+
+    let ws_task = Arc::new(tokio::sync::Mutex::new(None));
+    let ws_tx = Arc::new(tokio::sync::Mutex::new(None));
+
+    if !ws_auth.is_empty() && !ws_sid.is_empty() {
+        let (initial_ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
+        let ws_handle = tokio::spawn(kotak_client::start_market_data_stream(
+            ws_auth, ws_sid, ws_scrips, 1, Arc::clone(&prices), ws_rx,
+        ));
+        *ws_task.lock().await = Some(ws_handle);
+        *ws_tx.lock().await = Some(initial_ws_tx);
+    } else {
+        tracing::info!("KOTAK_AUTH_TOKEN or KOTAK_SID missing — bridge startup deferred until login");
+    }
 
     // 8. Position Monitor
     tracing::info!(mode = %trading_cfg.read().await.mode, "Starting position monitor");
