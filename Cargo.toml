@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "backend/shared_domain",
+    "backend/kotak_client",
+    "backend/trading_engine",
+    "backend/server",
+    "backend/telegram_ingester",
+]
+resolver = "2"

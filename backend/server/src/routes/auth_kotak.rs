@@ -1,0 +1,120 @@
+use std::sync::Arc;
+
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use serde::Deserialize;
+
+use crate::AppState;
+
+#[derive(Deserialize)]
+pub struct KotakLoginReq {
+    pub access_token: String,
+    pub mobile_number: String,
+    pub ucc: String,
+    pub totp: String,
+    pub mpin: String,
+}
+
+/// `POST /api/auth/kotak` — log in and restart the HSM WebSocket.
+pub async fn kotak_login_handler(
+    State(state): State<AppState>,
+    Json(req): Json<KotakLoginReq>,
+) -> impl IntoResponse {
+    let mut client = match kotak_client::KotakClient::new(&req.access_token) {
+        Ok(c) => c,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ).into_response(),
+    };
+
+    let creds = kotak_client::KotakCredentials {
+        access_token: req.access_token.clone(),
+        mobile_number: req.mobile_number,
+        ucc: req.ucc,
+        totp: req.totp,
+        mpin: req.mpin,
+    };
+
+    if let Err(e) = client.login(creds).await {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+    }
+
+    // (Re)start the HSM WebSocket with fresh tokens.
+    if let Some((auth, sid)) = client.session_credentials() {
+        let scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
+        
+        // Abort the previous WebSocket task to prevent dual connections
+        let mut ws_guard = state.ws_task.lock().await;
+        if let Some(old_task) = ws_guard.take() {
+            old_task.abort();
+            tracing::info!("Aborted previous Kotak WebSocket task.");
+        }
+
+        let (ws_tx, ws_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let new_handle = tokio::spawn(kotak_client::start_market_data_stream(
+            auth.to_owned(), sid.to_owned(), scrips, 1,
+            Arc::clone(&state.prices),
+            ws_rx,
+        ));
+        *ws_guard = Some(new_handle);
+        
+        let mut tx_guard = state.ws_tx.lock().await;
+        *tx_guard = Some(ws_tx);
+    }
+
+    // Fetch and parse Scrip Master
+    let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH","message":"Fetching Kotak Scrip Master..."}"#.into());
+    match client.get_scrip_master_csv("nse_fo").await {
+        Ok(csv) => {
+            let store = trading_engine::ScripStore::parse_csv(&csv);
+            *state.scrip_store.write().await = Some(store);
+            *state.raw_scrip_csv.write().await = Some(csv);
+            let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Scrip Master loaded successfully"}"#.into());
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch Scrip Master: {}", e);
+            let _ = state.log_tx.send(format!(r#"{{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch Scrip Master: {}"}}"#, e));
+        }
+    }
+
+    let _ = state.log_tx.send(r#"{"event":"KOTAK_CONNECTED","status":"ok"}"#.into());
+    *state.kotak.lock().await = Some(client);
+    let kotak = state.kotak.lock().await;
+    match *kotak {
+        Some(_) => (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response(),
+        None => (StatusCode::OK, Json(serde_json::json!({"status": "disconnected"}))).into_response(),
+    }
+}
+
+/// `GET /api/auth/kotak/scrip-master/raw` — download raw CSV.
+pub async fn kotak_scrip_raw_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let raw = state.raw_scrip_csv.read().await;
+    match raw.as_ref() {
+        Some(csv) => {
+            let headers = [
+                (axum::http::header::CONTENT_TYPE, "text/csv"),
+                (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"scrip_master.csv\""),
+            ];
+            (StatusCode::OK, headers, csv.clone()).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Scrip Master not loaded yet".to_string()).into_response(),
+    }
+}
+
+/// `GET /api/auth/kotak/scrip-master/json` — return parsed JSON of Scrip Store.
+pub async fn kotak_scrip_json_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let store = state.scrip_store.read().await;
+    match store.as_ref() {
+        Some(s) => (StatusCode::OK, Json(s)).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Scrip Master not loaded yet"}))).into_response(),
+    }
+}
+
+/// `GET /api/auth/kotak` — return connection status.
+pub async fn kotak_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"connected": state.kotak.lock().await.is_some()}))
+}

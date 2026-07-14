@@ -1,0 +1,39 @@
+{
+  "home_dc": 5,
+  "dc_options": {
+    "1": {
+      "id": 1,
+      "ipv4": "149.154.175.53:443",
+      "ipv6": "[2001:b28:f23d:f001::a]:443"
+    },
+    "4": {
+      "id": 4,
+      "ipv4": "149.154.167.92:443",
+      "ipv6": "[2001:67c:4e8:f004::a]:443"
+    },
+    "2": {
+      "id": 2,
+      "ipv4": "149.154.167.41:443",
+      "ipv6": "[2001:67c:4e8:f002::a]:443",
+      "auth_key_hex": "9f06502be09f3e08ea6b4990422218380112c9bc1320670016c03db2df91002c504d7ceb86ba584161c86f28eca56a458984e3d912e47173acc891603a4d1d793d919467b5ac5e6b44fd9333453c70eef266cf58e4dbdb3e6ee669cd6d440b3bca02bdf2a0d6a83fafd56bc34e22d26e6373628c7e3f7ef9480ff7ec770fb3dc4cba64e091f147f88d79bf840de3c0eb5069039a677b81b574bfefb6b702469ef2b0e406d3028c590c25cab0e750bb21c526a43da298a8894773f82fce29d2a333937e15776e8c9dacc4b677020cfdc1baa68d2a44c930578cbc7cc964bb6530160cefba23ce0bc04597a062acff0b0b767bac659a6ad4015a01f2daa603315b"
+    },
+    "5": {
+      "id": 5,
+      "ipv4": "91.108.56.104:443",
+      "ipv6": "[2001:b28:f23f:f005::a]:443",
+      "auth_key_hex": "494649bee643d9bc91ccbf3bbbfa70448a8f75212d7a64c00318fe7c4b8ebb18c73dc7fdfdb22a71f3f1f1eb72e6ce8c99347db6273b042b3cd6fa61bc97af514b2b1a116a10679ede17f1123f71f06ab5798f55c2f863cdd66e2aa7bc20bf658dd47cab99d1b51a3d7f7cc1a5b03524c00ed55b3b371a34b00dd6ee030edd3b35a18510e12f471c4472bf9174eadd5fe54d0811f53b3d142eac731686552cf6a1fbe93d60af25aec8a138237c8dec80a992afe172d25340ce4279a2d8ed2f5c69413c68ba9d9b842b9c95aeff430c129110c0b2a846d4f281dda5a486808247c2d0ae14ac9acb6ac989a695f7e873d15d8626e5886429c29cedda9c7fd8d9c3"
+    },
+    "3": {
+      "id": 3,
+      "ipv4": "149.154.175.100:443",
+      "ipv6": "[2001:b28:f23d:f003::a]:443"
+    }
+  },
+  "updates_state": {
+    "pts": 12730,
+    "qts": 0,
+    "date": 1784014623,
+    "seq": 1,
+    "channels": []
+  }
+}

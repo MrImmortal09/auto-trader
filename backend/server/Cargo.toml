@@ -1,0 +1,26 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+shared_domain      = { path = "../shared_domain" }
+trading_engine     = { path = "../trading_engine" }
+kotak_client       = { path = "../kotak_client" }
+telegram_ingester  = { path = "../telegram_ingester" }
+
+tokio              = { version = "1", features = ["full"] }
+axum               = { version = "0.7", features = ["macros"] }
+tower-http         = { version = "0.5", features = ["cors", "fs"] }
+sqlx               = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+dashmap            = "6"
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+futures            = "0.3"
+tokio-stream       = { version = "0.1", features = ["sync"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

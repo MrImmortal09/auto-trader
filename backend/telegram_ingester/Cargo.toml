@@ -1,0 +1,25 @@
+[package]
+name = "telegram_ingester"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared_domain = { path = "../shared_domain" }
+
+# grammers — MTProto user-account ("userbot") client.
+# Pulled from git because the crate authors do not publish stable releases to
+# crates.io; using the git source is their official recommendation.
+grammers-client  = { git = "https://codeberg.org/Lonami/grammers.git" }
+# Disable default `sqlite-storage` feature to avoid pulling in `libsql`,
+# which panics when `sqlx` (used by the server crate) has already initialised
+# SQLite with a different threading mode.  We use `MemorySession` + JSON file
+# persistence instead.
+grammers-session = { git = "https://codeberg.org/Lonami/grammers.git", default-features = false, features = ["serde"] }
+
+tokio   = { version = "1", features = ["sync", "io-util", "fs"] }
+regex   = "1"
+tracing = "0.1"
+serde   = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4.45", features = ["std"] }
