@@ -1,0 +1,778 @@
+{
+	"info": {
+		"_postman_id": "5178e12e-7e25-416e-a048-0587e91b45e1",
+		"name": "Client APIs",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Login APIs",
+			"item": [
+				{
+					"name": "TOTP_Validate",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"id": "6ea7c39e-70a9-4778-bb03-cc0eb7878794",
+								"exec": [
+									"var viewtokenResponse=JSON.parse(responseBody);\r",
+									"pm.environment.set(\"viewtoken\", viewtokenResponse.data.token);\r",
+									"pm.environment.set(\"sidView\", viewtokenResponse.data.sid);"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "neo-fin-key",
+								"value": "neotradeapi",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "{{consumerKey}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"mobileNumber\": \"+918097236708\",\n    \"ucc\": \"Y4HAU\",  \n    \"totp\": \"124579\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "https://mis.kotaksecurities.com/login/1.0/tradeApiLogin",
+							"protocol": "https",
+							"host": [
+								"mis",
+								"kotaksecurities",
+								"com"
+							],
+							"path": [
+								"login",
+								"1.0",
+								"tradeApiLogin"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "MPIN_Validate",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"id": "87966787-c8f6-4952-8350-20ab96b6ccd0",
+								"exec": [
+									"var sessiontokenResponse=JSON.parse(responseBody);\r",
+									"pm.environment.set(\"sessiontoken\", sessiontokenResponse.data.token);\r",
+									"pm.environment.set(\"sidSession\", sessiontokenResponse.data.sid);\r",
+									"pm.environment.set(\"baseUrl\", sessiontokenResponse.data.baseUrl);"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "{{consumerKey}}",
+								"type": "text"
+							},
+							{
+								"key": "neo-fin-key",
+								"value": "neotradeapi",
+								"type": "text"
+							},
+							{
+								"key": "sid",
+								"value": "{{sidView}}",
+								"type": "text"
+							},
+							{
+								"key": "Auth",
+								"value": "{{viewtoken}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"mpin\": \"123456\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "https://mis.kotaksecurities.com/login/1.0/tradeApiValidate",
+							"protocol": "https",
+							"host": [
+								"mis",
+								"kotaksecurities",
+								"com"
+							],
+							"path": [
+								"login",
+								"1.0",
+								"tradeApiValidate"
+							]
+						}
+					},
+					"response": []
+				}
+			],
+			"protocolProfileBehavior": {}
+		},
+		{
+			"name": "Order APIs",
+			"item": [
+				{
+					"name": "Place order",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"id": "d5f99b39-1d54-45c7-a806-c6a040cfdf2e",
+								"exec": [
+									"var PlaceOrderResponse=JSON.parse(responseBody);\r",
+									"pm.environment.set(\"orderNo\", PlaceOrderResponse.nOrdNo);"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}"
+							},
+							{
+								"key": "X-Forwarded-For",
+								"value": "10.250.20.148",
+								"disabled": true
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded"
+							}
+						],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "jData",
+									"value": "{\n  \"am\": \"NO\",\n  \"dq\": \"0\",\n  \"es\": \"nse_cm\",\n  \"mp\": \"0\",\n  \"pc\": \"CNC\",\n  \"pf\": \"N\",\n  \"pr\": \"3150\",\n  \"pt\": \"L\",\n  \"qt\": \"1\",\n  \"rt\": \"DAY\",\n  \"tp\": \"0\",\n  \"ts\": \"TCS-EQ\",\n  \"tt\": \"B\"\n}",
+									"type": "text"
+								}
+							],
+							"options": {}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/quick/order/rule/ms/place",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"order",
+								"rule",
+								"ms",
+								"place"
+							]
+						},
+						"description": "Generated from cURL: curl --location 'https://d-mis.kotaksecurities.com/quick/order/rule/ms/place' \\\r\n--header 'Sid:c1ef9d59-f938-4a59-9b28-d13fc413aaad' \\\r\n--header 'X-Forwarded-For: 127.0.0.210' \\\r\n--header 'Auth: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yaXNhdGlvbiI6IiIsImV4cCI6MTc1MjY5MDU5OSwiZmV0Y2hjYWNoaW5ncnVsZSI6MCwiaWF0IjoxNzE0NDY3NTM0LCJpc3MiOiJsb2dpbi1zZXJ2aWNlIiwianRpIjoiMTY4OWZmNjctYWI5MS00MjhlLTk1MTYtMjlkNTBhYzI4YmFjIiwibmFwIjoiIiwic2NvcGUiOlsiVHJhZGUiXSwic3ViIjoiZGM3YWMzMGMtYmRlNC00MjViLWFjNzMtZGJkZjdjN2NmN2Y4IiwidWNjIjoiQUJDWFlaOTgiLCJ5Y2UiOiJlWVxcNiVcdTAwM2UjKDZxXHUwMDAxXHRcdTAwMDZ3XHUwMDAwXHUwMDEwYiJ9.qZceMLrPT3jUxNRHU0rhjv2o5WP-rErBA5aIHwf8XBSF_7sDtGgtKuTObs3MMUje5BDrfiz6Bex1NDTH4cekCX65FV9kW4yXSF1rc06wEJMantBnrTvk-mGTzHGTS-1guzlCdZG7HQ7rA1-V45huR2aDt7xCI3S1oMDKlZgpHCpxcA0vABR57Fg_1JdOEiugRodw3bWPe-a3wIQdyEYRaQI2NHb_mr9_LQGH16a0Wemhet8sCfImmXuSsGlqjZTRqZ9kEz3z8H0EWlU_IOSYHG4L16Wc52_lnyEknsCUgW4nzenNEroNf7mYeDkhe7X-hOQd20yNE1AJKboZX9MObA' \\\r\n--header 'Content-Type: application/x-www-form-urlencoded' \\\r\n--data-urlencode 'jData={ \"am\":\"NO\",\"dq\":\"0\",\"bc\":\"1\",\"es\":\"nse_cm\",\"mp\":\"0\",\"pc\":\"NRML\",\"pf\":\"N\",\"pr\":\"0\",\"pt\":\"L\",\"qt\":\"1\",\"rt\":\"DAY\",\"tp\":\"0\",\"ts\":\"ACC-EQ\",\"tt\":\"B\",\"nc\":\"00\",\"cl\":\"3\",\"si\":\"2\",\"sy\":\"1234\",\"sn\":\"1\",\"cf\":\"C\"}'\r\n"
+					},
+					"response": []
+				},
+				{
+					"name": "Modify order",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}"
+							},
+							{
+								"key": "X-Forwarded-For",
+								"value": "101.70.80.44",
+								"disabled": true
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded"
+							}
+						],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "jData",
+									"value": "{\n  \"am\": \"NO\",\n  \"dq\": \"0\",\n  \"es\": \"nse_cm\",\n  \"mp\": \"0\",\n  \"pc\": \"CNC\",\n  \"pf\": \"N\",\n  \"pr\": \"245\",\n  \"pt\": \"L\",\n  \"qt\": \"2\",\n  \"vd\": \"DAY\",\n  \"tp\": \"0\",\n  \"ts\": \"WIPRO-EQ\",\n  \"tt\": \"B\",\n  \"no\":\"{{orderNo}}\"\n}",
+									"type": "text"
+								}
+							],
+							"options": {}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/quick/order/vr/modify",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"order",
+								"vr",
+								"modify"
+							]
+						},
+						"description": "Generated from cURL: curl --location 'https://d-mis.kotaksecurities.com/quick/order/rule/ms/place' \\\r\n--header 'Sid:c1ef9d59-f938-4a59-9b28-d13fc413aaad' \\\r\n--header 'X-Forwarded-For: 127.0.0.210' \\\r\n--header 'Auth: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yaXNhdGlvbiI6IiIsImV4cCI6MTc1MjY5MDU5OSwiZmV0Y2hjYWNoaW5ncnVsZSI6MCwiaWF0IjoxNzE0NDY3NTM0LCJpc3MiOiJsb2dpbi1zZXJ2aWNlIiwianRpIjoiMTY4OWZmNjctYWI5MS00MjhlLTk1MTYtMjlkNTBhYzI4YmFjIiwibmFwIjoiIiwic2NvcGUiOlsiVHJhZGUiXSwic3ViIjoiZGM3YWMzMGMtYmRlNC00MjViLWFjNzMtZGJkZjdjN2NmN2Y4IiwidWNjIjoiQUJDWFlaOTgiLCJ5Y2UiOiJlWVxcNiVcdTAwM2UjKDZxXHUwMDAxXHRcdTAwMDZ3XHUwMDAwXHUwMDEwYiJ9.qZceMLrPT3jUxNRHU0rhjv2o5WP-rErBA5aIHwf8XBSF_7sDtGgtKuTObs3MMUje5BDrfiz6Bex1NDTH4cekCX65FV9kW4yXSF1rc06wEJMantBnrTvk-mGTzHGTS-1guzlCdZG7HQ7rA1-V45huR2aDt7xCI3S1oMDKlZgpHCpxcA0vABR57Fg_1JdOEiugRodw3bWPe-a3wIQdyEYRaQI2NHb_mr9_LQGH16a0Wemhet8sCfImmXuSsGlqjZTRqZ9kEz3z8H0EWlU_IOSYHG4L16Wc52_lnyEknsCUgW4nzenNEroNf7mYeDkhe7X-hOQd20yNE1AJKboZX9MObA' \\\r\n--header 'Content-Type: application/x-www-form-urlencoded' \\\r\n--data-urlencode 'jData={ \"am\":\"NO\",\"dq\":\"0\",\"bc\":\"1\",\"es\":\"nse_cm\",\"mp\":\"0\",\"pc\":\"NRML\",\"pf\":\"N\",\"pr\":\"0\",\"pt\":\"L\",\"qt\":\"1\",\"rt\":\"DAY\",\"tp\":\"0\",\"ts\":\"ACC-EQ\",\"tt\":\"B\",\"nc\":\"00\",\"cl\":\"3\",\"si\":\"2\",\"sy\":\"1234\",\"sn\":\"1\",\"cf\":\"C\"}'\r\n"
+					},
+					"response": []
+				},
+				{
+					"name": "Cancel order",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}"
+							},
+							{
+								"key": "X-Forwarded-For",
+								"value": "127.0.0.210",
+								"disabled": true
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded"
+							}
+						],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "jData",
+									"value": "{\"on\":\"{{orderNo}}\", \"am\":\"NO\"}",
+									"type": "text"
+								}
+							],
+							"options": {}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/quick/order/cancel",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"order",
+								"cancel"
+							]
+						},
+						"description": "Generated from cURL: curl --location 'https://d-mis.kotaksecurities.com/quick/order/rule/ms/place' \\\r\n--header 'Sid:c1ef9d59-f938-4a59-9b28-d13fc413aaad' \\\r\n--header 'X-Forwarded-For: 127.0.0.210' \\\r\n--header 'Auth: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yaXNhdGlvbiI6IiIsImV4cCI6MTc1MjY5MDU5OSwiZmV0Y2hjYWNoaW5ncnVsZSI6MCwiaWF0IjoxNzE0NDY3NTM0LCJpc3MiOiJsb2dpbi1zZXJ2aWNlIiwianRpIjoiMTY4OWZmNjctYWI5MS00MjhlLTk1MTYtMjlkNTBhYzI4YmFjIiwibmFwIjoiIiwic2NvcGUiOlsiVHJhZGUiXSwic3ViIjoiZGM3YWMzMGMtYmRlNC00MjViLWFjNzMtZGJkZjdjN2NmN2Y4IiwidWNjIjoiQUJDWFlaOTgiLCJ5Y2UiOiJlWVxcNiVcdTAwM2UjKDZxXHUwMDAxXHRcdTAwMDZ3XHUwMDAwXHUwMDEwYiJ9.qZceMLrPT3jUxNRHU0rhjv2o5WP-rErBA5aIHwf8XBSF_7sDtGgtKuTObs3MMUje5BDrfiz6Bex1NDTH4cekCX65FV9kW4yXSF1rc06wEJMantBnrTvk-mGTzHGTS-1guzlCdZG7HQ7rA1-V45huR2aDt7xCI3S1oMDKlZgpHCpxcA0vABR57Fg_1JdOEiugRodw3bWPe-a3wIQdyEYRaQI2NHb_mr9_LQGH16a0Wemhet8sCfImmXuSsGlqjZTRqZ9kEz3z8H0EWlU_IOSYHG4L16Wc52_lnyEknsCUgW4nzenNEroNf7mYeDkhe7X-hOQd20yNE1AJKboZX9MObA' \\\r\n--header 'Content-Type: application/x-www-form-urlencoded' \\\r\n--data-urlencode 'jData={ \"am\":\"NO\",\"dq\":\"0\",\"bc\":\"1\",\"es\":\"nse_cm\",\"mp\":\"0\",\"pc\":\"NRML\",\"pf\":\"N\",\"pr\":\"0\",\"pt\":\"L\",\"qt\":\"1\",\"rt\":\"DAY\",\"tp\":\"0\",\"ts\":\"ACC-EQ\",\"tt\":\"B\",\"nc\":\"00\",\"cl\":\"3\",\"si\":\"2\",\"sy\":\"1234\",\"sn\":\"1\",\"cf\":\"C\"}'\r\n"
+					},
+					"response": []
+				},
+				{
+					"name": "Exit Cover order",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}"
+							},
+							{
+								"key": "X-Forwarded-For",
+								"value": "127.0.0.210",
+								"disabled": true
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded"
+							}
+						],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "jData",
+									"value": "{\"on\":\"{{orderNo}}\", \"am\":\"NO\"}",
+									"type": "text"
+								}
+							],
+							"options": {}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/quick/order/co/exit",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"order",
+								"co",
+								"exit"
+							]
+						},
+						"description": "Generated from cURL: curl --location 'https://d-mis.kotaksecurities.com/quick/order/rule/ms/place' \\\r\n--header 'Sid:c1ef9d59-f938-4a59-9b28-d13fc413aaad' \\\r\n--header 'X-Forwarded-For: 127.0.0.210' \\\r\n--header 'Auth: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yaXNhdGlvbiI6IiIsImV4cCI6MTc1MjY5MDU5OSwiZmV0Y2hjYWNoaW5ncnVsZSI6MCwiaWF0IjoxNzE0NDY3NTM0LCJpc3MiOiJsb2dpbi1zZXJ2aWNlIiwianRpIjoiMTY4OWZmNjctYWI5MS00MjhlLTk1MTYtMjlkNTBhYzI4YmFjIiwibmFwIjoiIiwic2NvcGUiOlsiVHJhZGUiXSwic3ViIjoiZGM3YWMzMGMtYmRlNC00MjViLWFjNzMtZGJkZjdjN2NmN2Y4IiwidWNjIjoiQUJDWFlaOTgiLCJ5Y2UiOiJlWVxcNiVcdTAwM2UjKDZxXHUwMDAxXHRcdTAwMDZ3XHUwMDAwXHUwMDEwYiJ9.qZceMLrPT3jUxNRHU0rhjv2o5WP-rErBA5aIHwf8XBSF_7sDtGgtKuTObs3MMUje5BDrfiz6Bex1NDTH4cekCX65FV9kW4yXSF1rc06wEJMantBnrTvk-mGTzHGTS-1guzlCdZG7HQ7rA1-V45huR2aDt7xCI3S1oMDKlZgpHCpxcA0vABR57Fg_1JdOEiugRodw3bWPe-a3wIQdyEYRaQI2NHb_mr9_LQGH16a0Wemhet8sCfImmXuSsGlqjZTRqZ9kEz3z8H0EWlU_IOSYHG4L16Wc52_lnyEknsCUgW4nzenNEroNf7mYeDkhe7X-hOQd20yNE1AJKboZX9MObA' \\\r\n--header 'Content-Type: application/x-www-form-urlencoded' \\\r\n--data-urlencode 'jData={ \"am\":\"NO\",\"dq\":\"0\",\"bc\":\"1\",\"es\":\"nse_cm\",\"mp\":\"0\",\"pc\":\"NRML\",\"pf\":\"N\",\"pr\":\"0\",\"pt\":\"L\",\"qt\":\"1\",\"rt\":\"DAY\",\"tp\":\"0\",\"ts\":\"ACC-EQ\",\"tt\":\"B\",\"nc\":\"00\",\"cl\":\"3\",\"si\":\"2\",\"sy\":\"1234\",\"sn\":\"1\",\"cf\":\"C\"}'\r\n"
+					},
+					"response": []
+				},
+				{
+					"name": "Exit Bracket order",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}"
+							},
+							{
+								"key": "X-Forwarded-For",
+								"value": "127.0.0.210",
+								"disabled": true
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded"
+							}
+						],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "jData",
+									"value": "{\"on\":\"{{orderNo}}\", \"am\":\"NO\"}",
+									"type": "text"
+								}
+							],
+							"options": {}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/quick/order/bo/exit",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"order",
+								"bo",
+								"exit"
+							]
+						},
+						"description": "Generated from cURL: curl --location 'https://d-mis.kotaksecurities.com/quick/order/rule/ms/place' \\\r\n--header 'Sid:c1ef9d59-f938-4a59-9b28-d13fc413aaad' \\\r\n--header 'X-Forwarded-For: 127.0.0.210' \\\r\n--header 'Auth: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yaXNhdGlvbiI6IiIsImV4cCI6MTc1MjY5MDU5OSwiZmV0Y2hjYWNoaW5ncnVsZSI6MCwiaWF0IjoxNzE0NDY3NTM0LCJpc3MiOiJsb2dpbi1zZXJ2aWNlIiwianRpIjoiMTY4OWZmNjctYWI5MS00MjhlLTk1MTYtMjlkNTBhYzI4YmFjIiwibmFwIjoiIiwic2NvcGUiOlsiVHJhZGUiXSwic3ViIjoiZGM3YWMzMGMtYmRlNC00MjViLWFjNzMtZGJkZjdjN2NmN2Y4IiwidWNjIjoiQUJDWFlaOTgiLCJ5Y2UiOiJlWVxcNiVcdTAwM2UjKDZxXHUwMDAxXHRcdTAwMDZ3XHUwMDAwXHUwMDEwYiJ9.qZceMLrPT3jUxNRHU0rhjv2o5WP-rErBA5aIHwf8XBSF_7sDtGgtKuTObs3MMUje5BDrfiz6Bex1NDTH4cekCX65FV9kW4yXSF1rc06wEJMantBnrTvk-mGTzHGTS-1guzlCdZG7HQ7rA1-V45huR2aDt7xCI3S1oMDKlZgpHCpxcA0vABR57Fg_1JdOEiugRodw3bWPe-a3wIQdyEYRaQI2NHb_mr9_LQGH16a0Wemhet8sCfImmXuSsGlqjZTRqZ9kEz3z8H0EWlU_IOSYHG4L16Wc52_lnyEknsCUgW4nzenNEroNf7mYeDkhe7X-hOQd20yNE1AJKboZX9MObA' \\\r\n--header 'Content-Type: application/x-www-form-urlencoded' \\\r\n--data-urlencode 'jData={ \"am\":\"NO\",\"dq\":\"0\",\"bc\":\"1\",\"es\":\"nse_cm\",\"mp\":\"0\",\"pc\":\"NRML\",\"pf\":\"N\",\"pr\":\"0\",\"pt\":\"L\",\"qt\":\"1\",\"rt\":\"DAY\",\"tp\":\"0\",\"ts\":\"ACC-EQ\",\"tt\":\"B\",\"nc\":\"00\",\"cl\":\"3\",\"si\":\"2\",\"sy\":\"1234\",\"sn\":\"1\",\"cf\":\"C\"}'\r\n"
+					},
+					"response": []
+				}
+			],
+			"protocolProfileBehavior": {}
+		},
+		{
+			"name": "Report APIs",
+			"item": [
+				{
+					"name": "Order history",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}"
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded"
+							}
+						],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "jData",
+									"value": "{\"nOrdNo\": \"{{orderNo}}\"}",
+									"type": "text"
+								}
+							],
+							"options": {}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/quick/order/history",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"order",
+								"history"
+							]
+						},
+						"description": "Generated from cURL: curl --location 'https://d-mis.kotaksecurities.com/quick/order/history' \\\r\n--header 'Sid: 99c1c22b-1eeb-410a-9012-9a285fdfc422' \\\r\n--header 'Auth: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yaXNhdGlvbiI6IiIsImV4cCI6MTc1MzIwODk5OSwiZmV0Y2hjYWNoaW5ncnVsZSI6MCwiaWF0IjoxNzE0NDY3NTM0LCJpc3MiOiJsb2dpbi1zZXJ2aWNlIiwianRpIjoiMTY4OWZmNjctYWI5MS00MjhlLTk1MTYtMjlkNTBhYzI4YmFjIiwibmFwIjoiIiwic2NvcGUiOlsiVHJhZGUiXSwic3ViIjoiZGM3YWMzMGMtYmRlNC00MjViLWFjNzMtZGJkZjdjN2NmN2Y4IiwidWNjIjoiQUJDWFlaMDciLCJ5Y2UiOiJlWVxcNiVcdTAwM2UjKDZxXHUwMDAxXHRcdTAwMDZ3XHUwMDAwXHUwMDEwYiJ9.gaZ8aiSlOylcGxHzbVkFG-hgym53eEjO2uubsEoy8tEDc4laPQ7CCJ5GtYurDQvQUTuyKeUcasx_n6VO0HoUGtKxc_iYzTAokjt6UqTAe9TF-M1KFI1eodBQU81b3n06lttWge5krKozUYcjYsAb9elLa4TkaDSR76HN9t0pRT0XL3eq8hlBZyQVkmnKqDxeceOAn_4C17UjLFwEDxck8-l_L8mRNaPrvW6_zW3ZdLooTajo4yuplEdWpRZDfP7lo-UEoIsQ-gqeLcXFbY1-6j2PGH1hCwYbozNuYlx2rqL67VJbJwWo6ZAV-FZ1iitRcAN5d4ZZq7hUhwHJ7FbcSw' \\\r\n--header 'Content-Type: application/x-www-form-urlencoded' \\\r\n--data-urlencode 'jData={\"nOrdNo\": \"240611000000675\"}'"
+					},
+					"response": []
+				},
+				{
+					"name": "Order book",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}"
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/quick/user/orders",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"user",
+								"orders"
+							]
+						},
+						"description": "Generated from cURL: curl --location 'https://d-mis.kotaksecurities.com/quick/order/history' \\\r\n--header 'Sid: 99c1c22b-1eeb-410a-9012-9a285fdfc422' \\\r\n--header 'Auth: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJjYXRlZ29yaXNhdGlvbiI6IiIsImV4cCI6MTc1MzIwODk5OSwiZmV0Y2hjYWNoaW5ncnVsZSI6MCwiaWF0IjoxNzE0NDY3NTM0LCJpc3MiOiJsb2dpbi1zZXJ2aWNlIiwianRpIjoiMTY4OWZmNjctYWI5MS00MjhlLTk1MTYtMjlkNTBhYzI4YmFjIiwibmFwIjoiIiwic2NvcGUiOlsiVHJhZGUiXSwic3ViIjoiZGM3YWMzMGMtYmRlNC00MjViLWFjNzMtZGJkZjdjN2NmN2Y4IiwidWNjIjoiQUJDWFlaMDciLCJ5Y2UiOiJlWVxcNiVcdTAwM2UjKDZxXHUwMDAxXHRcdTAwMDZ3XHUwMDAwXHUwMDEwYiJ9.gaZ8aiSlOylcGxHzbVkFG-hgym53eEjO2uubsEoy8tEDc4laPQ7CCJ5GtYurDQvQUTuyKeUcasx_n6VO0HoUGtKxc_iYzTAokjt6UqTAe9TF-M1KFI1eodBQU81b3n06lttWge5krKozUYcjYsAb9elLa4TkaDSR76HN9t0pRT0XL3eq8hlBZyQVkmnKqDxeceOAn_4C17UjLFwEDxck8-l_L8mRNaPrvW6_zW3ZdLooTajo4yuplEdWpRZDfP7lo-UEoIsQ-gqeLcXFbY1-6j2PGH1hCwYbozNuYlx2rqL67VJbJwWo6ZAV-FZ1iitRcAN5d4ZZq7hUhwHJ7FbcSw' \\\r\n--header 'Content-Type: application/x-www-form-urlencoded' \\\r\n--data-urlencode 'jData={\"nOrdNo\": \"240611000000675\"}'"
+					},
+					"response": []
+				},
+				{
+					"name": "Trade book",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}",
+								"type": "text"
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/quick/user/trades",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"user",
+								"trades"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Positions book",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}",
+								"type": "text"
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/quick/user/positions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"user",
+								"positions"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Portfolio holdings",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}",
+								"type": "text"
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/portfolio/v1/holdings",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"portfolio",
+								"v1",
+								"holdings"
+							]
+						}
+					},
+					"response": []
+				}
+			],
+			"protocolProfileBehavior": {}
+		},
+		{
+			"name": "Other APIs",
+			"item": [
+				{
+					"name": "Check margin",
+					"request": {
+						"auth": {
+							"type": "noauth"
+						},
+						"method": "POST",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}",
+								"type": "text"
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "jData",
+									"value": "{\"brkName\":\"KOTAK\", \"brnchId\":\"ONLINE\", \"exSeg\":\"nse_cm\", \"prc\":\"12500\", \"prcTp\":\"L\", \"prod\":\"CNC\", \"qty\":\"1\", \"tok\":\"11536\", \"trnsTp\":\"B\"}",
+									"type": "text"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{baseUrl}}/quick/user/check-margin",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"user",
+								"check-margin"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Limits",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Sid",
+								"value": "{{sidSession}}",
+								"type": "text"
+							},
+							{
+								"key": "Auth",
+								"value": "{{sessiontoken}}",
+								"type": "text"
+							},
+							{
+								"warning": "This is a duplicate header and will be overridden by the Content-Type header generated by Postman.",
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "jData",
+									"value": "{\"exch\": \"ALL\",\"seg\": \"ALL\",\"prod\": \"ALL\"}",
+									"type": "text"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{baseUrl}}/quick/user/limits",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quick",
+								"user",
+								"limits"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Quotes",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"disabled": true
+							},
+							{
+								"key": "Authorization",
+								"value": "{{consumerKey}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/x-www-form-urlencoded",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/script-details/1.0/quotes/neosymbol/nse_cm|22/all",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"script-details",
+								"1.0",
+								"quotes",
+								"neosymbol",
+								"nse_cm|22",
+								"all"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Scrip master files",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}"
+							},
+							{
+								"key": "Authorization",
+								"value": "92782a39-04b9-4075-9a7c-6c7d68a10b8a",
+								"type": "text"
+							},
+							{
+								"key": "Auth",
+								"value": "",
+								"type": "text",
+								"disabled": true
+							}
+						],
+						"url": {
+							"raw": "https://d-mis.kotaksecurities.com/script-details/1.0/masterscrip/file-paths",
+							"protocol": "https",
+							"host": [
+								"d-mis",
+								"kotaksecurities",
+								"com"
+							],
+							"path": [
+								"script-details",
+								"1.0",
+								"masterscrip",
+								"file-paths"
+							]
+						}
+					},
+					"response": []
+				}
+			],
+			"protocolProfileBehavior": {}
+		}
+	],
+	"protocolProfileBehavior": {}
+}

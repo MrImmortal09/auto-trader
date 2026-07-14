@@ -1,0 +1,15 @@
+[package]
+name = "trading_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared_domain = { path = "../shared_domain" }
+kotak_client  = { path = "../kotak_client" }   # for live order routing (future)
+tokio   = { version = "1", features = ["sync", "time"] }
+uuid = { version = "1.1", features = ["v4"] }
+dashmap = "6"
+tracing = "0.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.150"

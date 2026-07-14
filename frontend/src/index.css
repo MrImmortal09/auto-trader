@@ -1,0 +1,13 @@
+/* Tailwind v4 — single import, no config file needed */
+@import "tailwindcss";
+
+/* Shared micro-component utilities used in App.tsx */
+@layer utilities {
+  .input-sm {
+    @apply bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs text-white
+           placeholder-gray-500 focus:outline-none focus:border-blue-500;
+  }
+  .btn-sm {
+    @apply px-3 py-1 rounded text-xs text-white transition-colors;
+  }
+}
