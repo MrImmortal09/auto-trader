@@ -66,11 +66,61 @@ function totalCharges(t: PaperTrade) {
     t.stamp_duty + t.transaction_charge + t.gst;
 }
 
+const SERVER_BASE_STORAGE_KEY = 'server_base';
+const SERVER_BASE_COOKIE = 'server_base';
+
+function readCookie(name: string) {
+  if (typeof document === 'undefined') return '';
+  const prefix = `${name}=`;
+  const entry = document.cookie.split('; ').find((item) => item.startsWith(prefix));
+  return entry ? decodeURIComponent(entry.slice(prefix.length)) : '';
+}
+
+function normalizeServerBase(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  return withProtocol.replace(/\/+$/, '');
+}
+
+function getStoredServerBase() {
+  if (typeof window === 'undefined') return '';
+  const saved = window.localStorage.getItem(SERVER_BASE_STORAGE_KEY) ?? '';
+  const cookie = readCookie(SERVER_BASE_COOKIE);
+  return normalizeServerBase(saved || cookie || (import.meta.env.VITE_API_BASE_URL ?? ''));
+}
+
+function persistServerBase(value: string) {
+  const normalized = normalizeServerBase(value);
+
+  if (typeof window !== 'undefined') {
+    if (normalized) window.localStorage.setItem(SERVER_BASE_STORAGE_KEY, normalized);
+    else window.localStorage.removeItem(SERVER_BASE_STORAGE_KEY);
+  }
+
+  if (typeof document !== 'undefined') {
+    document.cookie = normalized
+      ? `${SERVER_BASE_COOKIE}=${encodeURIComponent(normalized)}; path=/; max-age=31536000; SameSite=Lax`
+      : `${SERVER_BASE_COOKIE}=; path=/; max-age=0; SameSite=Lax`;
+  }
+
+  return normalized;
+}
+
+function apiUrl(serverBase: string, path: string) {
+  const normalized = normalizeServerBase(serverBase);
+  return normalized ? `${normalized}${path}` : path;
+}
+
+function apiFetch(serverBase: string, path: string, init?: RequestInit) {
+  return fetch(apiUrl(serverBase, path), init);
+}
+
 // ---------------------------------------------------------------------------
 // Top Bar — Settings
 // ---------------------------------------------------------------------------
 
-function SettingsBar() {
+function SettingsBar({ serverBase }: { serverBase: string }) {
   const [cfg, setCfg] = useState<TradingConfig | null>(null);
   const [virtualBalance, setVirtualBalance] = useState<number>(0);
   const [saving, setSaving] = useState(false);
@@ -78,27 +128,27 @@ function SettingsBar() {
 
   useEffect(() => {
     Promise.all([
-      fetch('/api/settings').then((r) => r.json()),
-      fetch('/api/wallet/balance').then((r) => r.json()),
+      apiFetch(serverBase, '/api/settings').then((r) => r.json()),
+      apiFetch(serverBase, '/api/wallet/balance').then((r) => r.json()),
     ])
       .then(([cfgData, walletData]) => {
         setCfg(cfgData);
         setVirtualBalance(typeof walletData?.balance === 'number' ? walletData.balance : 0);
       })
       .catch(console.error);
-  }, []);
+  }, [serverBase]);
 
   async function handleSave() {
     if (!cfg) return;
     setSaving(true);
     try {
       await Promise.all([
-        fetch('/api/settings', {
+        apiFetch(serverBase, '/api/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(cfg),
         }),
-        fetch('/api/wallet/balance', {
+        apiFetch(serverBase, '/api/wallet/balance', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ balance: virtualBalance }),
@@ -184,7 +234,7 @@ function SettingsBar() {
 // Portfolio section
 // ---------------------------------------------------------------------------
 
-function PortfolioSection() {
+function PortfolioSection({ serverBase }: { serverBase: string }) {
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [positions, setPositions] = useState<MonitoredPosition[]>([]);
   const [openTradeInfo, setOpenTradeInfo] = useState<number | null>(null);
@@ -193,8 +243,8 @@ function PortfolioSection() {
     async function load() {
       try {
         const [portfolioRes, positionsRes] = await Promise.all([
-          fetch('/api/portfolio'),
-          fetch('/api/positions'),
+          apiFetch(serverBase, '/api/portfolio'),
+          apiFetch(serverBase, '/api/positions'),
         ]);
         const [portfolioJson, positionsJson] = await Promise.all([
           portfolioRes.json(),
@@ -209,7 +259,7 @@ function PortfolioSection() {
     load();
     const id = setInterval(load, 5_000);
     return () => clearInterval(id);
-  }, []);
+  }, [serverBase]);
 
   if (!portfolio) {
     return (
@@ -365,7 +415,7 @@ function Stat({ icon, label, children }: {
 // Live Log Terminal
 // ---------------------------------------------------------------------------
 
-function LogTerminal({ height = 220 }: { height?: number }) {
+function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?: number }) {
   const [logs, setLogs] = useState<{ id: number, text: string, time: string, isError: boolean }[]>([]);
   const [filter, setFilter] = useState<'ALL' | 'ERROR'>('ALL');
   const [connected, setConnected] = useState(false);
@@ -379,7 +429,7 @@ function LogTerminal({ height = 220 }: { height?: number }) {
 
   // SSE connection
   useEffect(() => {
-    const es = new EventSource('/api/logs/stream');
+    const es = new EventSource(apiUrl(serverBase, '/api/logs/stream'));
     es.onopen = () => setConnected(true);
     es.onmessage = (e: MessageEvent<string>) => {
       const now = new Date();
@@ -396,7 +446,7 @@ function LogTerminal({ height = 220 }: { height?: number }) {
     };
     es.onerror = () => setConnected(false);
     return () => es.close();
-  }, []);
+  }, [serverBase]);
 
   return (
     <div className="flex flex-col border-t border-gray-700 bg-gray-950 transition-all duration-300" style={{ height: isOpen ? height : 37 }}>
@@ -537,14 +587,14 @@ function QtyInput({ initialQty, id, defaultQty, onUpdate }: { initialQty: number
   );
 }
 
-function UpcomingTrades() {
+function UpcomingTrades({ serverBase }: { serverBase: string }) {
   const [positions, setPositions] = useState<MonitoredPosition[]>([]);
   const [openTooltip, setOpenTooltip] = useState<string | null>(null);
   const [closingId, setClosingId] = useState<string | null>(null);
 
   useEffect(() => {
     function load() {
-      fetch('/api/positions')
+      apiFetch(serverBase, '/api/positions')
         .then(r => r.json())
         .then(setPositions)
         .catch(console.error);
@@ -552,11 +602,11 @@ function UpcomingTrades() {
     load();
     const id = setInterval(load, 3000);
     return () => clearInterval(id);
-  }, []);
+  }, [serverBase]);
 
   async function cancelTrade(id: string) {
     try {
-      await fetch(`/api/positions/${id}`, { method: 'DELETE' });
+      await apiFetch(serverBase, `/api/positions/${id}`, { method: 'DELETE' });
       setPositions(prev => prev.filter(p => p.id !== id));
     } catch (e) {
       console.error(e);
@@ -565,7 +615,7 @@ function UpcomingTrades() {
 
   async function updateQty(id: string, qty: number | null) {
     try {
-      await fetch(`/api/positions/${id}`, {
+      await apiFetch(serverBase, `/api/positions/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ override_qty: qty }),
@@ -579,7 +629,7 @@ function UpcomingTrades() {
   async function closeOngoingTrade(id: string) {
     try {
       setClosingId(id);
-      const res = await fetch(`/api/positions/${id}/close`, { method: 'POST' });
+      const res = await apiFetch(serverBase, `/api/positions/${id}/close`, { method: 'POST' });
       if (!res.ok) {
         const err = await res.json().catch(() => null);
         console.error(err?.error ?? 'Failed to close position');
@@ -791,6 +841,7 @@ function UpcomingTrades() {
 // ── Kotak ────────────────────────────────────────────────────────────────── //
 
 interface KotakForm {
+  server_base: string;
   access_token: string;
   mobile_number: string;
   ucc: string;
@@ -798,26 +849,47 @@ interface KotakForm {
   mpin: string;
 }
 
-function KotakLoginPanel() {
+function KotakLoginPanel({ serverBase, onServerBaseChange }: {
+  serverBase: string;
+  onServerBaseChange: (value: string) => void;
+}) {
   const [form, setForm] = useState<KotakForm>(() => {
     try {
       const saved = localStorage.getItem('kotak_creds');
-      if (saved) return { ...JSON.parse(saved), totp: '' } as KotakForm;
+      if (saved) {
+        return {
+          server_base: getStoredServerBase(),
+          ...JSON.parse(saved),
+          totp: '',
+        } as KotakForm;
+      }
     } catch {}
-    return { access_token: '', mobile_number: '', ucc: '', totp: '', mpin: '' };
+    return {
+      server_base: getStoredServerBase(),
+      access_token: '',
+      mobile_number: '',
+      ucc: '',
+      totp: '',
+      mpin: '',
+    };
   });
   const [status, setStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
   const [msg, setMsg] = useState('');
 
   useEffect(() => {
-    const { totp, ...rest } = form;
+    setForm((current) => current.server_base === serverBase ? current : { ...current, server_base: serverBase });
+  }, [serverBase]);
+
+  useEffect(() => {
+    const { totp, server_base, ...rest } = form;
     localStorage.setItem('kotak_creds', JSON.stringify(rest));
+    onServerBaseChange(server_base);
   }, [form]);
 
   async function handleLogin() {
     setStatus('loading');
     try {
-      const res = await fetch('/api/auth/kotak', {
+      const res = await apiFetch(form.server_base, '/api/auth/kotak', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(form),
@@ -832,6 +904,7 @@ function KotakLoginPanel() {
   }
 
   const fields: { key: keyof typeof form; label: string; type?: string }[] = [
+    { key: 'server_base',   label: 'Server URL or IP:PORT' },
     { key: 'access_token',  label: 'API Access Token' },
     { key: 'mobile_number', label: 'Mobile (+91…)' },
     { key: 'ucc',           label: 'UCC (Client Code)' },
@@ -870,8 +943,8 @@ function KotakLoginPanel() {
         )}
         {status === 'ok' && (
           <div className="flex gap-2 ml-auto">
-            <a href="/api/auth/kotak/scrip-master/raw" download="scrip_master.csv" className="text-[10px] text-blue-400 hover:text-blue-300 underline self-center">Download CSV</a>
-            <a href="/api/auth/kotak/scrip-master/json" target="_blank" rel="noreferrer" className="text-[10px] text-blue-400 hover:text-blue-300 underline self-center">View JSON</a>
+            <a href={apiUrl(form.server_base, '/api/auth/kotak/scrip-master/raw')} download="scrip_master.csv" className="text-[10px] text-blue-400 hover:text-blue-300 underline self-center">Download CSV</a>
+            <a href={apiUrl(form.server_base, '/api/auth/kotak/scrip-master/json')} target="_blank" rel="noreferrer" className="text-[10px] text-blue-400 hover:text-blue-300 underline self-center">View JSON</a>
           </div>
         )}
       </div>
@@ -885,7 +958,7 @@ type TgStep = 'idle' | 'code' | 'twofa' | 'chats' | 'running';
 
 interface TelegramChat { id: number; name: string; kind: string }
 
-function TelegramLoginPanel() {
+function TelegramLoginPanel({ serverBase }: { serverBase: string }) {
   const [step, setStep] = useState<TgStep>('idle');
   const [apiId, setApiId]     = useState(() => localStorage.getItem('tg_api_id') || '');
   const [apiHash, setApiHash] = useState(() => localStorage.getItem('tg_api_hash') || '');
@@ -902,7 +975,7 @@ function TelegramLoginPanel() {
   useEffect(() => { localStorage.setItem('tg_twofa', twofa); }, [twofa]);
 
   async function post(url: string, body: object) {
-    const res = await fetch(url, {
+    const res = await apiFetch(serverBase, url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -939,7 +1012,7 @@ function TelegramLoginPanel() {
   }
 
   async function loadChats() {
-    const data: TelegramChat[] | { error: string } = await fetch('/api/auth/telegram/chats').then(r => r.json());
+    const data: TelegramChat[] | { error: string } = await apiFetch(serverBase, '/api/auth/telegram/chats').then(r => r.json());
     if ('error' in data) { setErr(data.error); return; }
     setChats(data);
     setStep('chats');
@@ -1070,11 +1143,14 @@ function TelegramLoginPanel() {
 
 // ── Combined panel ────────────────────────────────────────────────────────── //
 
-function ConnectionPanel() {
+function ConnectionPanel({ serverBase, onServerBaseChange }: {
+  serverBase: string;
+  onServerBaseChange: (value: string) => void;
+}) {
   return (
     <div className="flex flex-col gap-4 bg-gray-900 border-b border-gray-700 px-4 py-3">
-      <KotakLoginPanel />
-      <TelegramLoginPanel />
+      <KotakLoginPanel serverBase={serverBase} onServerBaseChange={onServerBaseChange} />
+      <TelegramLoginPanel serverBase={serverBase} />
     </div>
   );
 }
@@ -1085,6 +1161,11 @@ function ConnectionPanel() {
 
 export default function App() {
   const [logHeight, setLogHeight] = useState(220);
+  const [serverBase, setServerBase] = useState(() => getStoredServerBase());
+
+  function handleServerBaseChange(value: string) {
+    setServerBase(persistServerBase(value));
+  }
 
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white overflow-hidden">
@@ -1095,10 +1176,10 @@ export default function App() {
             Auto Trader <span className="text-gray-500 font-normal">— Options OMS</span>
           </h1>
         </header>
-        <div className="shrink-0"><SettingsBar /></div>
-        <div className="shrink-0"><ConnectionPanel /></div>
-        <UpcomingTrades />
-        <PortfolioSection />
+        <div className="shrink-0"><SettingsBar serverBase={serverBase} /></div>
+        <div className="shrink-0"><ConnectionPanel serverBase={serverBase} onServerBaseChange={handleServerBaseChange} /></div>
+        <UpcomingTrades serverBase={serverBase} />
+        <PortfolioSection serverBase={serverBase} />
       </div>
       <div className="shrink-0 relative group">
         <div 
@@ -1119,7 +1200,7 @@ export default function App() {
             window.addEventListener('mouseup', onUp);
           }}
         />
-        <LogTerminal height={logHeight} />
+        <LogTerminal serverBase={serverBase} height={logHeight} />
       </div>
     </div>
   );
