@@ -101,7 +101,7 @@ pub async fn start_position_monitor(
                             // Check expiry
                             if let Some(ref expiry_str) = signal.expiry {
                                 if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(expiry_str, "%d-%b-%Y") {
-                                    let today = chrono::Local::now().date_naive();
+                                    let today = shared_domain::today_ist();
                                     if exp_date < today {
                                         let msg = format!(
                                             r#"{{"event":"ERROR","message":"Parsed expiry ({}) is in the past","instrument":"{}"}}"#,

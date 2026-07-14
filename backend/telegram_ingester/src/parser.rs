@@ -1,8 +1,8 @@
 use std::sync::LazyLock;
 
+use chrono::{Datelike, NaiveDate, Weekday};
 use regex::Regex;
-use shared_domain::TradeSignal;
-use chrono::{Datelike, Local, NaiveDate, Weekday};
+use shared_domain::{today_ist, TradeSignal};
 
 // ---------------------------------------------------------------------------
 // Compiled regex cache
@@ -97,7 +97,7 @@ fn next_weekday(mut d: NaiveDate, target: Weekday) -> NaiveDate {
 
 fn resolve_expiry_date(day_str: Option<&str>, month_str: &str, instrument: &str) -> Option<String> {
     let parsed_m = parse_month(month_str)?;
-    let now = Local::now().date_naive();
+    let now = today_ist();
     let curr_m = now.month();
     let mut curr_y = now.year();
 

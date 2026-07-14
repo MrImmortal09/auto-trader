@@ -63,11 +63,7 @@ struct KotakOrderResponse {
 }
 
 pub(crate) fn chrono_or_epoch() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".into())
+    shared_domain::current_ist_timestamp_string()
 }
 
 fn find_csv_url(val: &serde_json::Value, segment: &str) -> Option<String> {
