@@ -5,6 +5,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use shared_domain::current_ist_timestamp_string;
 use trading_engine::FeeCalculator;
 
 use crate::AppState;
@@ -186,17 +187,20 @@ pub async fn close_position_handler(
         }
     };
 
+    let timestamp = current_ist_timestamp_string();
+
     if let Err(e) = sqlx::query(
         "INSERT INTO paper_trades
-         (ticker, action, qty, executed_price,
+         (ticker, action, qty, executed_price, timestamp,
           gross_value, brokerage, stt_charge, sebi_fee,
           stamp_duty, transaction_charge, gst, net_value)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&instrument)
     .bind("SELL")
     .bind(qty as i64)
     .bind(exit_price)
+    .bind(&timestamp)
     .bind(fees.gross_value)
     .bind(fees.brokerage)
     .bind(fees.stt_charge)

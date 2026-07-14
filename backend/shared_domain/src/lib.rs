@@ -1,4 +1,23 @@
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+
+pub const IST_OFFSET_SECS: i32 = 5 * 60 * 60 + 30 * 60;
+
+pub fn ist_offset() -> FixedOffset {
+    FixedOffset::east_opt(IST_OFFSET_SECS).expect("valid IST offset")
+}
+
+pub fn now_ist() -> DateTime<FixedOffset> {
+    Utc::now().with_timezone(&ist_offset())
+}
+
+pub fn today_ist() -> NaiveDate {
+    now_ist().date_naive()
+}
+
+pub fn current_ist_timestamp_string() -> String {
+    now_ist().format("%Y-%m-%d %H:%M:%S").to_string()
+}
 
 // ===========================================================================
 // Trading configuration
@@ -260,8 +279,8 @@ pub struct OrderRequest {
 /// Defined here (not in `server`) so both `trading_engine` and `server` can
 /// use it without creating a circular dependency.
 ///
-/// Timestamps are omitted from both variants — SQLite's
-/// `DEFAULT CURRENT_TIMESTAMP` fills them automatically.
+/// Timestamps are omitted from both variants — the DB writer stamps them
+/// explicitly in IST before persisting.
 #[derive(Debug, Clone)]
 pub enum DbWriteMessage {
     Trade {

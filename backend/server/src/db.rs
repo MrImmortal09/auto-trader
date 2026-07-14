@@ -1,4 +1,4 @@
-use shared_domain::DbWriteMessage;
+use shared_domain::{current_ist_timestamp_string, DbWriteMessage};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use shared_domain::TradingConfig;
 use std::str::FromStr;
@@ -31,7 +31,7 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             stt_charge REAL NOT NULL DEFAULT 0.0, sebi_fee REAL NOT NULL DEFAULT 0.0,
             stamp_duty REAL NOT NULL DEFAULT 0.0, transaction_charge REAL NOT NULL DEFAULT 0.0,
             gst REAL NOT NULL DEFAULT 0.0, net_value REAL NOT NULL DEFAULT 0.0,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp DATETIME NOT NULL
         )",
     ).execute(&pool).await.unwrap();
 
@@ -39,7 +39,7 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         "CREATE TABLE IF NOT EXISTS system_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             level TEXT NOT NULL, message TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp DATETIME NOT NULL
         )",
     ).execute(&pool).await.unwrap();
 
@@ -113,6 +113,7 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 gross_value, brokerage, stt_charge, sebi_fee,
                 stamp_duty, transaction_charge, gst, net_value,
             } => {
+                let timestamp = current_ist_timestamp_string();
                 let mut tx = match pool.begin().await {
                     Ok(t) => t,
                     Err(e) => {
@@ -123,12 +124,12 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
 
                 if let Err(e) = sqlx::query(
                     "INSERT INTO paper_trades
-                     (ticker, action, qty, executed_price,
+                     (ticker, action, qty, executed_price, timestamp,
                       gross_value, brokerage, stt_charge, sebi_fee,
                       stamp_duty, transaction_charge, gst, net_value)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 )
-                .bind(&ticker).bind(&action).bind(qty as i64).bind(executed_price)
+                 .bind(&ticker).bind(&action).bind(qty as i64).bind(executed_price).bind(&timestamp)
                 .bind(gross_value).bind(brokerage).bind(stt_charge).bind(sebi_fee)
                 .bind(stamp_duty).bind(transaction_charge).bind(gst).bind(net_value)
                 .execute(&mut *tx).await
@@ -159,10 +160,11 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 }
             }
             DbWriteMessage::Log { level, message } => {
+                let timestamp = current_ist_timestamp_string();
                 if let Err(e) = sqlx::query(
-                    "INSERT INTO system_logs (level, message) VALUES (?, ?)",
+                    "INSERT INTO system_logs (level, message, timestamp) VALUES (?, ?, ?)",
                 )
-                .bind(&level).bind(&message).execute(&pool).await
+                .bind(&level).bind(&message).bind(&timestamp).execute(&pool).await
                 {
                     tracing::error!("DB log insert: {e}");
                 }

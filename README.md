@@ -152,6 +152,10 @@ It does not automatically load a `.env` file, so either:
 - export the variables in your shell before starting the server, or
 - define them in a `systemd` unit with `Environment=` or `EnvironmentFile=`
 
+All backend date-sensitive logic is normalized to Indian Standard Time (IST, `UTC+05:30`).
+That includes expiry-date interpretation, "today" checks, and persisted trade/log timestamps,
+so behavior stays aligned with Indian markets even if the server is running in another timezone.
+
 These are the supported variables:
 
 ```dotenv

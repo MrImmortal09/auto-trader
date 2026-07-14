@@ -140,7 +140,7 @@ impl ScripStore {
             None
         };
 
-        let today = chrono::Local::now().date_naive();
+        let today = shared_domain::today_ist();
         
         if signal.instrument_name == "NIFTY" {
             let sample_strikes: Vec<f64> = options.iter().take(5).map(|o| o.strike_price).collect();
