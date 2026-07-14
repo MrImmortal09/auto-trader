@@ -1,0 +1,65 @@
+name: Release Server Binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-server:
+    runs-on: ubuntu-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+      SERVER_CRATE_MANIFEST: backend/server/Cargo.toml
+      TARGET_TRIPLE: x86_64-unknown-linux-gnu
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET_TRIPLE }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Derive release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_version=$(grep '^version = ' "$SERVER_CRATE_MANIFEST" | head -n1 | sed -E 's/version = "([^"]+)"/\1/')
+          release_version="${base_version}-build.${GITHUB_RUN_NUMBER}"
+          release_tag="server-v${release_version}"
+          asset_name="server-${release_version}-${TARGET_TRIPLE}"
+
+          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
+          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release -p server --target "$TARGET_TRIPLE"
+
+      - name: Package release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/$TARGET_TRIPLE/release/server" "dist/${{ steps.version.outputs.asset_name }}"
+          tar -C dist -czf "dist/${{ steps.version.outputs.asset_name }}.tar.gz" "${{ steps.version.outputs.asset_name }}"
+          sha256sum "dist/${{ steps.version.outputs.asset_name }}.tar.gz" > "dist/${{ steps.version.outputs.asset_name }}.tar.gz.sha256"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.release_tag }}
+          name: Server ${{ steps.version.outputs.release_version }}
+          generate_release_notes: true
+          files: |
+            dist/${{ steps.version.outputs.asset_name }}.tar.gz
+            dist/${{ steps.version.outputs.asset_name }}.tar.gz.sha256
