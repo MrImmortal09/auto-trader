@@ -176,7 +176,7 @@ impl ScripStore {
                 strike_match
             })
             .filter(|o| target_opt_type.is_empty() || o.option_type == target_opt_type)
-            .filter(|o| o.expiry_date >= today)
+            .filter(|o| o.exchange_segment_code == "nse_cm" || o.expiry_date >= today)
             .filter(|o| {
                 // Ignore BSE options unless it's a known BSE index
                 if o.exchange_segment_code == "bse_fo" {

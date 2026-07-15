@@ -116,7 +116,7 @@ async fn main() {
             let mut store = trading_engine::ScripStore::default();
             let mut raw_sections: Vec<(&str, String)> = Vec::new();
             
-            for segment in ["nse_fo", "bse_fo"] {
+            for segment in ["nse_fo", "bse_fo", "nse_cm"] {
                 if let Ok(csv) = client.get_scrip_master_csv(segment).await {
                     store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
                     raw_sections.push((segment, csv));
@@ -215,9 +215,11 @@ async fn main() {
         .route("/api/settings",                     get(routes::get_settings_handler)
                                                    .post(routes::post_settings_handler))
         .route("/api/wallet/balance",               get(routes::get_wallet_balance_handler)
-                               .post(routes::post_wallet_balance_handler))
+                                                   .post(routes::post_wallet_balance_handler))
         .route("/api/auth/kotak",                  post(routes::kotak_login_handler)
                                                    .get(routes::kotak_status_handler))
+        .route("/api/auth/reset",                  axum::routing::delete(routes::reset_creds))
+        .route("/api/status",                      get(routes::system_status))
         .route("/api/auth/kotak/scrip-master/raw",  get(routes::kotak_scrip_raw_handler))
         .route("/api/auth/kotak/scrip-master/json", get(routes::kotak_scrip_json_handler))
         .route("/api/auth/telegram/request-code",  post(routes::telegram_request_code_handler))

@@ -202,6 +202,7 @@ pub async fn start_position_monitor(
                                         resolved_segment_code = Some(record.exchange_segment_code.clone());
                                         let exchange_segment = match record.exchange_segment_code.as_str() {
                                             "bse_fo" => ExchangeSegment::BseFo,
+                                            "nse_cm" => ExchangeSegment::NseCm,
                                             _ => ExchangeSegment::NseFo,
                                         };
                                         resolved_order = Some(OrderRequest {

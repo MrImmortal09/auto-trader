@@ -121,7 +121,7 @@ pub async fn kotak_login_handler(
     let mut store = trading_engine::ScripStore::default();
     let mut raw_sections: Vec<(&str, String)> = Vec::new();
 
-    for segment in ["nse_fo", "bse_fo"] {
+    for segment in ["nse_fo", "bse_fo", "nse_cm"] {
         match client.get_scrip_master_csv(segment).await {
             Ok(csv) => {
                 store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
@@ -182,4 +182,37 @@ pub async fn kotak_scrip_json_handler(
 /// `GET /api/auth/kotak` — return connection status.
 pub async fn kotak_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"connected": state.kotak.lock().await.is_some()}))
+}
+
+// ---------------------------------------------------------------------------
+// Reset Credentials
+// ---------------------------------------------------------------------------
+
+pub async fn reset_creds(State(state): State<AppState>) -> impl IntoResponse {
+    let _ = std::fs::remove_file("session.json");
+    let _ = sqlx::query("DELETE FROM kotak_session").execute(&state.db_pool).await;
+    
+    // Spawn a task to exit after a short delay so the HTTP response goes through
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        std::process::exit(0);
+    });
+    
+    (StatusCode::OK, Json(serde_json::json!({"status": "reset"})))
+}
+
+// ---------------------------------------------------------------------------
+// System Status
+// ---------------------------------------------------------------------------
+
+pub async fn system_status(State(state): State<AppState>) -> impl IntoResponse {
+    let telegram_ok = std::path::Path::new("session.json").exists();
+    let kotak_ok = {
+        let k = state.kotak.lock().await;
+        k.is_some()
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "telegram_connected": telegram_ok,
+        "kotak_connected": kotak_ok
+    })))
 }
