@@ -22,6 +22,7 @@ enum PosAction {
         reason: &'static str,
         new_sl: Option<f64>,
     },
+    Cancel { reason: String },
 }
 
 struct Pending {
@@ -276,21 +277,33 @@ pub async fn start_position_monitor(
                                 _ => false,
                             };
                             triggered.then(|| {
-                                let qty = pos.override_qty.unwrap_or_else(|| {
-                                    let lot_size = pos
-                                        .resolved_order
-                                        .as_ref()
-                                        .and_then(|o| o.quantity.parse::<i32>().ok())
-                                        .filter(|v| *v > 0)
-                                        .unwrap_or(1);
+                                let lot_size = pos
+                                    .resolved_order
+                                    .as_ref()
+                                    .and_then(|o| o.quantity.parse::<i32>().ok())
+                                    .filter(|v| *v > 0)
+                                    .unwrap_or(1);
 
+                                let qty = if let Some(override_lots) = pos.override_qty {
+                                    override_lots * lot_size
+                                } else {
                                     if pos.signal.option_type.is_some() {
                                         cfg.default_option_lots.max(1) * lot_size
                                     } else {
-                                        ((cfg.max_trade_amount_inr / ltp).floor() as i32).max(1)
+                                        let raw_qty = ((cfg.max_trade_amount_inr / ltp).floor() as i32).max(1);
+                                        let mut multiple = (raw_qty / lot_size) * lot_size;
+                                        if multiple == 0 { multiple = lot_size; }
+                                        multiple
                                     }
-                                });
-                                PosAction::EntryBuy { qty }
+                                };
+
+                                if qty <= 0 || qty % lot_size != 0 {
+                                    PosAction::Cancel {
+                                        reason: format!("Invalid quantity {}, must be positive multiple of lot size {}", qty, lot_size)
+                                    }
+                                } else {
+                                    PosAction::EntryBuy { qty }
+                                }
                             })
                         }
 
@@ -388,6 +401,17 @@ pub async fn start_position_monitor(
                                 None => pos.state = TradeState::Closed,
                             }
                             positions_mutated = true;
+                        }
+
+                        PosAction::Cancel { reason } => {
+                            pos.state = TradeState::Closed;
+                            positions_mutated = true;
+                            let msg = format!(
+                                r#"{{"event":"ERROR","instrument":"{}","message":"Trade cancelled: {}"}}"#,
+                                instrument, reason
+                            );
+                            tracing::error!(instrument = %instrument, reason = %reason, "Trade cancelled");
+                            send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                         }
                     }
                 }
