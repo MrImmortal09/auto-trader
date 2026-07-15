@@ -64,6 +64,18 @@ pub async fn kotak_login_handler(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response();
     }
 
+    // Save session to DB
+    if let Some((auth, sid)) = client.session_credentials() {
+        let base_url = client.session.as_ref().map(|s| s.base_url.clone()).unwrap_or_default();
+        crate::db::save_kotak_session(
+            &state.db_pool,
+            &req.access_token,
+            auth,
+            sid,
+            &base_url,
+        ).await;
+    }
+
     // (Re)start the HSM WebSocket with fresh tokens.
     if let Some((auth, sid)) = client.session_credentials() {
         let scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());

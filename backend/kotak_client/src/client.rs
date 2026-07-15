@@ -8,7 +8,7 @@ use crate::{KotakCredentials, KotakError, AUTH_BASE_URL, NEO_FIN_KEY};
 // Internal session state
 // ---------------------------------------------------------------------------
 
-pub(crate) struct Session {
+pub struct Session {
     pub auth_token: String,
     pub sid: String,
     pub base_url: String,
@@ -103,7 +103,7 @@ fn find_csv_url(val: &serde_json::Value, segment: &str) -> Option<String> {
 pub struct KotakClient {
     pub(crate) http: Client,
     pub(crate) access_token: String,
-    pub(crate) session: Option<Session>,
+    pub session: Option<Session>,
     /// Optional IP sent as `X-Forwarded-For` on order calls.
     pub(crate) client_ip: Option<String>,
 }
@@ -124,6 +124,15 @@ impl KotakClient {
     pub fn with_client_ip(mut self, ip: impl Into<String>) -> Self {
         self.client_ip = Some(ip.into());
         self
+    }
+
+    pub fn restore_session(&mut self, auth_token: String, sid: String, base_url: String) {
+        self.session = Some(Session {
+            auth_token,
+            sid,
+            base_url,
+            data_center: None,
+        });
     }
 
     // ── Auth helpers ────────────────────────────────────────────────────── //

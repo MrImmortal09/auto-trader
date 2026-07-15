@@ -97,23 +97,59 @@ async fn main() {
         tracing::info!("TELEGRAM_API_ID not set — ingester disabled (use /api/auth/telegram)");
     }
 
-    // 7. Kotak HSM WebSocket (optional — tokens from env or POST /api/auth/kotak)
-    let ws_auth   = std::env::var("KOTAK_AUTH_TOKEN").unwrap_or_default();
-    let ws_sid    = std::env::var("KOTAK_SID").unwrap_or_default();
+    let kotak_client_opt = Arc::new(tokio::sync::Mutex::new(None));
+    let ws_task = Arc::new(tokio::sync::Mutex::new(None));
+    let ws_tx = Arc::new(tokio::sync::Mutex::new(None));
+    
     let ws_scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
     let scrip_store = Arc::new(RwLock::new(None));
     let raw_scrip_csv = Arc::new(RwLock::new(None));
 
-    let ws_task = Arc::new(tokio::sync::Mutex::new(None));
-    let ws_tx = Arc::new(tokio::sync::Mutex::new(None));
+    // 7. Try to restore Kotak session from DB
+    if let Some(session) = db::load_kotak_session(&pool).await {
+        tracing::info!("Found active Kotak session for today, restoring...");
+        if let Ok(mut client) = kotak_client::KotakClient::new(&session.access_token) {
+            client.restore_session(session.auth_token.clone(), session.sid.clone(), session.base_url.clone());
+            
+            // Fetch Scrip Master before starting WebSocket
+            tracing::info!("Fetching Scrip Master...");
+            let mut store = trading_engine::ScripStore::default();
+            let mut raw_sections: Vec<(&str, String)> = Vec::new();
+            
+            for segment in ["nse_fo", "bse_fo"] {
+                if let Ok(csv) = client.get_scrip_master_csv(segment).await {
+                    store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
+                    raw_sections.push((segment, csv));
+                }
+            }
+            
+            if !raw_sections.is_empty() {
+                *scrip_store.write().await = Some(store);
+                
+                // Combine raw CSVs (simplified for startup)
+                let mut combined = String::new();
+                for (i, (_, csv)) in raw_sections.iter().enumerate() {
+                    let mut lines = csv.lines();
+                    if let Some(header) = lines.next() {
+                        if i == 0 { combined.push_str(header); combined.push('\n'); }
+                        for line in lines {
+                            if !line.trim().is_empty() { combined.push_str(line); combined.push('\n'); }
+                        }
+                    }
+                }
+                *raw_scrip_csv.write().await = Some(combined);
+                tracing::info!("Scrip Master fetched successfully.");
+            }
 
-    if !ws_auth.is_empty() && !ws_sid.is_empty() {
-        let (initial_ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
-        let ws_handle = tokio::spawn(kotak_client::start_market_data_stream(
-            ws_auth, ws_sid, ws_scrips, 1, Arc::clone(&prices), ws_rx,
-        ));
-        *ws_task.lock().await = Some(ws_handle);
-        {
+            *kotak_client_opt.lock().await = Some(client);
+
+            // Start WebSocket
+            let (initial_ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
+            let ws_handle = tokio::spawn(kotak_client::start_market_data_stream(
+                session.auth_token, session.sid, ws_scrips, 1, Arc::clone(&prices), ws_rx,
+            ));
+            *ws_task.lock().await = Some(ws_handle);
+            
             let mut tx_guard = ws_tx.lock().await;
             *tx_guard = Some(initial_ws_tx);
             if let Some(tx) = tx_guard.as_ref() {
@@ -124,17 +160,14 @@ async fn main() {
                     .filter_map(|p| p.ws_scrip_key.clone())
                     .collect();
                 for key in keys {
-                    let payload = serde_json::json!({
-                        "action": "subscribe",
-                        "scrips": key,
-                    });
-                    let _ = tx.send(payload.to_string());
+                    let _ = tx.send(serde_json::json!({"action": "subscribe", "scrips": key}).to_string());
                 }
             }
         }
     } else {
-        tracing::info!("KOTAK_AUTH_TOKEN or KOTAK_SID missing — bridge startup deferred until login");
+        tracing::info!("No valid Kotak session found for today — bridge startup deferred until login");
     }
+
 
     // 8. Position Monitor
     tracing::info!(mode = %trading_cfg.read().await.mode, "Starting position monitor");

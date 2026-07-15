@@ -85,6 +85,17 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     .await
     .unwrap();
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS kotak_session (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            access_token TEXT NOT NULL,
+            auth_token TEXT NOT NULL,
+            sid TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            updated_at DATETIME NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+
     pool
 }
 
@@ -143,6 +154,60 @@ pub async fn load_open_positions(pool: &SqlitePool) -> Vec<MonitoredPosition> {
 
     serde_json::from_str::<Vec<MonitoredPosition>>(&json)
         .unwrap_or_default()
+}
+
+pub struct KotakSessionRow {
+    pub access_token: String,
+    pub auth_token: String,
+    pub sid: String,
+    pub base_url: String,
+    pub updated_at: String,
+}
+
+pub async fn save_kotak_session(pool: &SqlitePool, access: &str, auth: &str, sid: &str, base_url: &str) {
+    sqlx::query(
+        "INSERT INTO kotak_session (id, access_token, auth_token, sid, base_url, updated_at) 
+         VALUES (1, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET 
+         access_token = excluded.access_token,
+         auth_token = excluded.auth_token,
+         sid = excluded.sid,
+         base_url = excluded.base_url,
+         updated_at = excluded.updated_at"
+    )
+    .bind(access)
+    .bind(auth)
+    .bind(sid)
+    .bind(base_url)
+    .bind(shared_domain::current_ist_timestamp_string())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+pub async fn load_kotak_session(pool: &SqlitePool) -> Option<KotakSessionRow> {
+    let row = sqlx::query_as::<_, (String, String, String, String, String)>(
+        "SELECT access_token, auth_token, sid, base_url, updated_at FROM kotak_session WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+
+    let (access_token, auth_token, sid, base_url, updated_at) = row;
+    
+    // Check if the session is from today in IST. If not, it's expired.
+    if !updated_at.starts_with(&shared_domain::now_ist().format("%Y-%m-%d").to_string()) {
+        return None;
+    }
+
+    Some(KotakSessionRow {
+        access_token,
+        auth_token,
+        sid,
+        base_url,
+        updated_at,
+    })
 }
 
 // ---------------------------------------------------------------------------
