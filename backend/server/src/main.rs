@@ -191,7 +191,7 @@ async fn main() {
         db_tx: write_tx.clone(),
         trading_cfg,
         prices,
-        kotak: Arc::new(Mutex::new(None)),
+        kotak: kotak_client_opt,
         telegram: Arc::new(Mutex::new(telegram_ingester::TelegramManager::new())),
         positions,
         scrip_store,

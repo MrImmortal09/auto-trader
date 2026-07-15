@@ -1215,7 +1215,12 @@ function TelegramLoginPanel({ serverBase }: { serverBase: string }) {
         const res = await apiFetch(serverBase, '/api/auth/telegram/status');
         if (res.ok) {
           const data = await res.json();
-          if (data.state === 'running') setStep('running');
+          if (data.state === 'running') {
+            setStep('running');
+            if (Array.isArray(data.chat_ids)) {
+              setSelected(new Set(data.chat_ids));
+            }
+          }
           else if (data.state === 'authenticated') loadChats();
         }
       } catch (e) {}

@@ -58,7 +58,11 @@ pub async fn telegram_submit_2fa_handler(
 
 /// `GET /api/auth/telegram/status`
 pub async fn telegram_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({"state": state.telegram.lock().await.state}))
+    let mgr = state.telegram.lock().await;
+    Json(serde_json::json!({
+        "state": mgr.state,
+        "chat_ids": mgr.monitored_chats
+    }))
 }
 
 /// `GET /api/auth/telegram/chats`
