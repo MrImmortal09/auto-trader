@@ -19,6 +19,31 @@ pub fn current_ist_timestamp_string() -> String {
     now_ist().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+pub fn is_market_open() -> bool {
+    use chrono::Timelike;
+    use chrono::Datelike;
+    let now = now_ist();
+    
+    // Check if it is a weekday
+    let weekday = now.weekday();
+    if weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun {
+        return false;
+    }
+
+    let h = now.hour();
+    let m = now.minute();
+    
+    // Market hours are 09:15 to 15:30 IST
+    if h < 9 || (h == 9 && m < 15) {
+        return false;
+    }
+    if h > 15 || (h == 15 && m > 30) {
+        return false;
+    }
+    
+    true
+}
+
 // ===========================================================================
 // Trading configuration
 // ===========================================================================
