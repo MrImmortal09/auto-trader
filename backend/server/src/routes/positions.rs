@@ -9,7 +9,16 @@ use shared_domain::current_ist_timestamp_string;
 use trading_engine::FeeCalculator;
 
 use crate::AppState;
-use shared_domain::{MonitoredPosition, TradeState};
+use shared_domain::{DbWriteMessage, MonitoredPosition, TradeState};
+
+async fn persist_positions_snapshot(state: &AppState, snapshot: &[MonitoredPosition]) {
+    if let Ok(json) = serde_json::to_string(snapshot) {
+        let _ = state
+            .db_tx
+            .send(DbWriteMessage::PositionsSnapshot { json })
+            .await;
+    }
+}
 
 #[derive(Deserialize)]
 pub struct ScripSearchParams {
@@ -98,6 +107,9 @@ pub async fn delete_position_handler(
     let len_before = positions.len();
     positions.retain(|p| p.id != id);
     if positions.len() < len_before {
+        let snapshot = positions.clone();
+        drop(positions);
+        persist_positions_snapshot(&state, &snapshot).await;
         (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response()
@@ -112,6 +124,9 @@ pub async fn patch_position_handler(
     let mut positions = state.positions.write().await;
     if let Some(pos) = positions.iter_mut().find(|p| p.id == id) {
         pos.override_qty = req.override_qty;
+        let snapshot = positions.clone();
+        drop(positions);
+        persist_positions_snapshot(&state, &snapshot).await;
         (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response()
@@ -247,6 +262,9 @@ pub async fn close_position_handler(
             pos.executed_qty = 0;
             pos.state = TradeState::Closed;
         }
+        let snapshot = positions.clone();
+        drop(positions);
+        persist_positions_snapshot(&state, &snapshot).await;
     }
 
     let pnl = fees.net_value - (avg_buy_price * qty as f64);

@@ -26,6 +26,7 @@ pub(crate) struct AppState {
     pub signal_tx:   broadcast::Sender<TradeSignal>,
     pub log_tx:      broadcast::Sender<String>,
     pub db_pool:     SqlitePool,
+    pub db_tx:       mpsc::Sender<DbWriteMessage>,
     /// Runtime trading config — updated by POST /api/settings.
     pub trading_cfg: Arc<RwLock<TradingConfig>>,
     /// Live price map shared with the position monitor.
@@ -70,7 +71,8 @@ async fn main() {
 
     // 4. Shared state
     let prices: Arc<DashMap<String, f64>> = Arc::new(DashMap::new());
-    let positions = Arc::new(RwLock::new(Vec::<shared_domain::MonitoredPosition>::new()));
+    let restored_positions = db::load_open_positions(&pool).await;
+    let positions = Arc::new(RwLock::new(restored_positions));
     let (signal_tx, signal_rx) = broadcast::channel::<TradeSignal>(100);
     let (log_tx, _)            = broadcast::channel::<String>(1000);
     let (write_tx, write_rx)   = mpsc::channel::<DbWriteMessage>(1000);
@@ -111,16 +113,35 @@ async fn main() {
             ws_auth, ws_sid, ws_scrips, 1, Arc::clone(&prices), ws_rx,
         ));
         *ws_task.lock().await = Some(ws_handle);
-        *ws_tx.lock().await = Some(initial_ws_tx);
+        {
+            let mut tx_guard = ws_tx.lock().await;
+            *tx_guard = Some(initial_ws_tx);
+            if let Some(tx) = tx_guard.as_ref() {
+                let keys: Vec<String> = positions
+                    .read()
+                    .await
+                    .iter()
+                    .filter_map(|p| p.ws_scrip_key.clone())
+                    .collect();
+                for key in keys {
+                    let payload = serde_json::json!({
+                        "action": "subscribe",
+                        "scrips": key,
+                    });
+                    let _ = tx.send(payload.to_string());
+                }
+            }
+        }
     } else {
         tracing::info!("KOTAK_AUTH_TOKEN or KOTAK_SID missing — bridge startup deferred until login");
     }
 
     // 8. Position Monitor
     tracing::info!(mode = %trading_cfg.read().await.mode, "Starting position monitor");
+    let monitor_write_tx = write_tx.clone();
     tokio::spawn(trading_engine::start_position_monitor(
         signal_rx,
-        write_tx,
+        monitor_write_tx,
         Arc::clone(&prices),
         Arc::clone(&trading_cfg),
         Arc::clone(&positions),
@@ -134,6 +155,7 @@ async fn main() {
         signal_tx,
         log_tx,
         db_pool: pool,
+        db_tx: write_tx.clone(),
         trading_cfg,
         prices,
         kotak: Arc::new(Mutex::new(None)),

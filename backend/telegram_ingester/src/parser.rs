@@ -23,7 +23,7 @@ static EQT_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// TARGET / TGT line — captures the value(s) after the separator.
 static TGT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:TGT|TARGET)[^\n:]*:?-?\s*([\d.\s/]+)").expect("TGT_RE")
+    Regex::new(r"(?i)(?:TGT|TARGET)[^0-9\n]*([\d. \t/]+)").expect("TGT_RE")
 });
 
 /// Stop-loss value — handles `SL :- 5`, `S.L. : 5`, `STOP LOSS :- 5.5`.
@@ -31,10 +31,9 @@ static SL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:STOP[-\s]*LOSS|S\.?L\.?)\s*:?-?\s*([\d.]+)").expect("SL_RE")
 });
 
-/// Expiry month: `JULY EXPIRY`, `JUL EXPIRY`, `25 JUL EXPIRY`, `26 JUNE`.
 static EXPIRY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:(\d{1,2})[-\s]+)?(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)(?:\s+EXPIRY)?\b"
+        r"(?i)(?:(\d{1,2})[ \t-]+)?(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)(?:\s+EXPIRY)?\b"
     ).expect("EXPIRY_RE")
 });
 
@@ -82,9 +81,12 @@ fn get_expiry_weekday(instrument: &str) -> Weekday {
     let inst = instrument.to_uppercase();
     if inst.contains("SENSEX") || inst.contains("BANKEX") {
         Weekday::Thu
-    } else {
-        // NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY
+    } else if inst.contains("NIFTY") || inst.contains("BANKNIFTY") || inst.contains("FINNIFTY") || inst.contains("MIDCPNIFTY") {
+        // Keep existing weekly-index behavior.
         Weekday::Tue
+    } else {
+        // Stock options are monthly-only; use Thursday expiry calendar.
+        Weekday::Thu
     }
 }
 
@@ -95,38 +97,78 @@ fn next_weekday(mut d: NaiveDate, target: Weekday) -> NaiveDate {
     adjust_for_holidays(d)
 }
 
-fn resolve_expiry_date(day_str: Option<&str>, month_str: &str, instrument: &str) -> Option<String> {
+fn last_day_of_month(year: i32, month: u32) -> Option<NaiveDate> {
+    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let first_next = NaiveDate::from_ymd_opt(ny, nm, 1)?;
+    first_next.pred_opt()
+}
+
+fn monthly_expiry_date(year: i32, month: u32, instrument: &str) -> Option<NaiveDate> {
+    let target = get_expiry_weekday(instrument);
+    let mut d = last_day_of_month(year, month)?;
+    while d.weekday() != target {
+        d = d.pred_opt()?;
+    }
+    Some(adjust_for_holidays(d))
+}
+
+fn resolve_expiry_date_with_now(
+    day_str: Option<&str>,
+    month_str: &str,
+    instrument: &str,
+    now: NaiveDate,
+) -> Option<String> {
     let parsed_m = parse_month(month_str)?;
-    let now = today_ist();
-    let curr_m = now.month();
-    let mut curr_y = now.year();
+    let target_day = get_expiry_weekday(instrument);
 
-    if curr_m == 12 && parsed_m == 1 {
-        curr_y += 1;
-    } else if curr_m == 1 && parsed_m == 12 {
-        curr_y -= 1;
-    }
+    let resolved = if let Some(d) = day_str {
+        let day = d.parse::<u32>().ok()?;
+        let mut year = now.year();
+        if parsed_m < now.month() {
+            year += 1;
+        }
 
-    let exact_date = if let Some(d) = day_str {
-        if let Ok(day) = d.parse::<u32>() {
-            let mut date = NaiveDate::from_ymd_opt(curr_y, parsed_m, day)?;
-            // If they specified a date, we also ensure it's shifted if it falls on a holiday.
-            date = adjust_for_holidays(date);
-            Some(date)
-        } else { None }
-    } else { None };
+        let mut date = NaiveDate::from_ymd_opt(year, parsed_m, day)?;
+        date = adjust_for_holidays(date);
 
-    if let Some(date) = exact_date {
-        Some(date.format("%d-%b-%Y").to_string().to_uppercase())
-    } else {
-        let start = if curr_y == now.year() && parsed_m == now.month() {
-            now
+        // If this exact-day/month already passed this year, roll to next year.
+        if date < now {
+            let mut rolled = NaiveDate::from_ymd_opt(year + 1, parsed_m, day)?;
+            rolled = adjust_for_holidays(rolled);
+            rolled
         } else {
-            NaiveDate::from_ymd_opt(curr_y, parsed_m, 1).unwrap_or(now)
-        };
-        let target_day = get_expiry_weekday(instrument);
-        Some(next_weekday(start, target_day).format("%d-%b-%Y").to_string().to_uppercase())
-    }
+            date
+        }
+    } else {
+        // Month-only expiry means monthly contract expiry for that instrument.
+        let mut year = now.year();
+        if parsed_m < now.month() {
+            year += 1;
+        }
+
+        let mut date = monthly_expiry_date(year, parsed_m, instrument)?;
+        if date < now {
+            date = monthly_expiry_date(year + 1, parsed_m, instrument)?;
+        }
+
+        // For explicit current-month weekly style wording, keep a sensible fallback.
+        if date.month() != parsed_m {
+            let start = if year == now.year() && parsed_m == now.month() {
+                now
+            } else {
+                NaiveDate::from_ymd_opt(year, parsed_m, 1)?
+            };
+            next_weekday(start, target_day)
+        } else {
+            date
+        }
+    };
+
+    Some(resolved.format("%d-%b-%Y").to_string().to_uppercase())
+}
+
+fn resolve_expiry_date(day_str: Option<&str>, month_str: &str, instrument: &str) -> Option<String> {
+    resolve_expiry_date_with_now(day_str, month_str, instrument, today_ist())
 }
 
 // ---------------------------------------------------------------------------
@@ -210,12 +252,12 @@ mod tests {
 
     #[test]
     fn options_exact_expiry() {
-        let text = "BUY BANKNIFTY 55400 CE ABOVE 690\nTARGET :- 750 / 850\nSL - 600\n26 JUNE EXPIRY";
+        let text = "BUY BANKNIFTY 55400 CE ABOVE 690\nTARGET :- 750 / 850\nSL - 600\n26 NOV EXPIRY";
         let sig = parse_signal(text, "test").unwrap();
         assert_eq!(sig.action, "BUY");
         assert_eq!(sig.instrument_name, "BANKNIFTY");
         let expiry = sig.expiry.unwrap();
-        assert!(expiry.starts_with("26-JUN"));
+        assert!(expiry.starts_with("26-NOV"));
     }
 
     #[test]
@@ -239,5 +281,19 @@ mod tests {
     #[test]
     fn no_match_returns_none() {
         assert!(parse_signal("Hello world!", "test").is_none());
+    }
+
+    #[test]
+    fn stock_month_only_resolves_to_monthly_expiry() {
+        let now = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let expiry = resolve_expiry_date_with_now(None, "JULY", "BHEL", now).unwrap();
+        assert_eq!(expiry, "30-JUL-2026");
+    }
+
+    #[test]
+    fn month_only_uses_next_year_if_current_year_monthly_expiry_passed() {
+        let now = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let expiry = resolve_expiry_date_with_now(None, "JULY", "BHEL", now).unwrap();
+        assert_eq!(expiry, "29-JUL-2027");
     }
 }
