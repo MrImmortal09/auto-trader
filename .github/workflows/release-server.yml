@@ -33,7 +33,8 @@ jobs:
         run: |
           set -euo pipefail
           base_version=$(grep '^version = ' "$SERVER_CRATE_MANIFEST" | head -n1 | sed -E 's/version = "([^"]+)"/\1/')
-          release_version="${base_version}-build.${GITHUB_RUN_NUMBER}"
+          # Convert 0.1.0 -> 0.1.RUN_NUMBER
+          release_version="${base_version%.*}.${GITHUB_RUN_NUMBER}"
           release_tag="server-v${release_version}"
           asset_name="server-${release_version}-${TARGET_TRIPLE}"
 
@@ -59,5 +60,6 @@ jobs:
           tag_name: ${{ steps.version.outputs.release_tag }}
           name: Server ${{ steps.version.outputs.release_version }}
           generate_release_notes: true
+          make_latest: true
           files: |
             dist/${{ steps.version.outputs.asset_name }}
