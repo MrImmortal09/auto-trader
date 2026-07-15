@@ -1,4 +1,4 @@
-use shared_domain::{current_ist_timestamp_string, DbWriteMessage};
+use shared_domain::{current_ist_timestamp_string, DbWriteMessage, MonitoredPosition};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use shared_domain::TradingConfig;
 use std::str::FromStr;
@@ -70,6 +70,21 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         "ALTER TABLE trading_config ADD COLUMN default_option_lots INTEGER NOT NULL DEFAULT 1",
     ).await;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS open_positions (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            json TEXT NOT NULL DEFAULT '[]',
+            updated_at DATETIME NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO open_positions (id, json, updated_at) VALUES (1, '[]', ?)",
+    )
+    .bind(current_ist_timestamp_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
     pool
 }
 
@@ -114,6 +129,20 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         target_1_exit_pct: 50.0,
         target_2_exit_pct: 100.0,
     })
+}
+
+pub async fn load_open_positions(pool: &SqlitePool) -> Vec<MonitoredPosition> {
+    let json = sqlx::query_scalar::<_, String>(
+        "SELECT json FROM open_positions WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "[]".to_string());
+
+    serde_json::from_str::<Vec<MonitoredPosition>>(&json)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +213,19 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 .bind(&level).bind(&message).bind(&timestamp).execute(&pool).await
                 {
                     tracing::error!("DB log insert: {e}");
+                }
+            }
+            DbWriteMessage::PositionsSnapshot { json } => {
+                let timestamp = current_ist_timestamp_string();
+                if let Err(e) = sqlx::query(
+                    "UPDATE open_positions SET json = ?, updated_at = ? WHERE id = 1",
+                )
+                .bind(&json)
+                .bind(&timestamp)
+                .execute(&pool)
+                .await
+                {
+                    tracing::error!("DB positions snapshot update: {e}");
                 }
             }
         }

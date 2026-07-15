@@ -60,6 +60,15 @@ async fn send_log(tx: &mpsc::Sender<DbWriteMessage>, log_tx: &broadcast::Sender<
     let _ = log_tx.send(msg.to_owned());
 }
 
+async fn send_positions_snapshot(
+    tx: &mpsc::Sender<DbWriteMessage>,
+    positions: &[MonitoredPosition],
+) {
+    if let Ok(json) = serde_json::to_string(positions) {
+        let _ = tx.send(DbWriteMessage::PositionsSnapshot { json }).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public position monitor
 // ---------------------------------------------------------------------------
@@ -222,6 +231,9 @@ pub async fn start_position_monitor(
                                     ltp: None,
                                     ws_scrip_key: ws_key,
                                 });
+                                let snapshot = pos_guard.clone();
+                                drop(pos_guard);
+                                send_positions_snapshot(&db_tx, &snapshot).await;
                             }
                         } else {
                             tracing::warn!(
@@ -246,6 +258,7 @@ pub async fn start_position_monitor(
 
                 let cfg = config.read().await;
                 let mut pending: Vec<Pending> = Vec::new();
+                let mut positions_mutated = false;
 
                 // ── Pass 1: read-only scan ────────────────────────── //
                 for (i, pos) in pos_guard.iter().enumerate() {
@@ -339,6 +352,7 @@ pub async fn start_position_monitor(
                             pos.avg_buy_price = pa.ltp;
                             pos.executed_qty   = qty;
                             pos.state          = TradeState::Active;
+                            positions_mutated = true;
 
                             let msg = format!(
                                 r#"{{"event":"ENTRY","instrument":"{instrument}","price":{:.2},"qty":{qty},"net_cost":{:.2}}}"#,
@@ -373,6 +387,7 @@ pub async fn start_position_monitor(
                                 }
                                 None => pos.state = TradeState::Closed,
                             }
+                            positions_mutated = true;
                         }
                     }
                 }
@@ -382,7 +397,14 @@ pub async fn start_position_monitor(
                 pos_guard.retain(|p| !matches!(p.state, TradeState::Closed));
                 let removed = before - pos_guard.len();
                 if removed > 0 {
+                    positions_mutated = true;
                     tracing::debug!("Removed {removed} closed position(s)");
+                }
+
+                if positions_mutated {
+                    let snapshot = pos_guard.clone();
+                    drop(pos_guard);
+                    send_positions_snapshot(&db_tx, &snapshot).await;
                 }
             }
         }

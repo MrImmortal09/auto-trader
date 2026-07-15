@@ -303,4 +303,7 @@ pub enum DbWriteMessage {
         level: String,
         message: String,
     },
+    PositionsSnapshot {
+        json: String,
+    },
 }

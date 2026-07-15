@@ -85,6 +85,23 @@ pub async fn kotak_login_handler(
         
         let mut tx_guard = state.ws_tx.lock().await;
         *tx_guard = Some(ws_tx);
+        if let Some(tx) = tx_guard.as_ref() {
+            let keys: Vec<String> = state
+                .positions
+                .read()
+                .await
+                .iter()
+                .filter_map(|p| p.ws_scrip_key.clone())
+                .collect();
+
+            for key in keys {
+                let payload = serde_json::json!({
+                    "action": "subscribe",
+                    "scrips": key,
+                });
+                let _ = tx.send(payload.to_string());
+            }
+        }
     }
 
     // Fetch and parse Scrip Master
