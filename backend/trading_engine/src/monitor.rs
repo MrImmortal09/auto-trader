@@ -363,10 +363,23 @@ pub async fn start_position_monitor(
                                 })
                             } else if !pos.signal.targets.is_empty() && ltp >= pos.signal.targets[0] {
                                 let has_t2 = pos.signal.targets.len() > 1;
-                                let exit_qty = if has_t2 {
-                                    ((pos.executed_qty as f64 * cfg.target_1_exit_pct / 100.0)
-                                        .floor() as i32).max(1).min(pos.executed_qty)
-                                } else { pos.executed_qty };
+                                let lot_size = pos
+                                    .resolved_order
+                                    .as_ref()
+                                    .and_then(|o| o.quantity.parse::<i32>().ok())
+                                    .filter(|v| *v > 0)
+                                    .unwrap_or(1);
+
+                                let raw_exit_qty = ((pos.executed_qty as f64 * cfg.target_1_exit_pct / 100.0)
+                                    .floor() as i32).max(1).min(pos.executed_qty);
+                                
+                                let mut exit_qty = (raw_exit_qty / lot_size) * lot_size;
+                                if exit_qty == 0 && pos.executed_qty >= lot_size {
+                                    exit_qty = lot_size;
+                                } else if exit_qty == 0 {
+                                    exit_qty = pos.executed_qty;
+                                }
+
                                 let new_sl = has_t2.then(|| {
                                     pos.avg_buy_price
                                 });
