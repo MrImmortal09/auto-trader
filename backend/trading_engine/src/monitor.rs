@@ -319,7 +319,7 @@ pub async fn start_position_monitor(
                                         .floor() as i32).max(1).min(pos.executed_qty)
                                 } else { pos.executed_qty };
                                 let new_sl = has_t2.then(|| {
-                                    (pos.avg_buy_price + pos.signal.targets[1]) / 2.0
+                                    pos.avg_buy_price
                                 });
                                 Some(PosAction::ExitSell {
                                     qty: exit_qty,
@@ -332,7 +332,7 @@ pub async fn start_position_monitor(
                         TradeState::Target1Hit => {
                             if ltp <= pos.current_sl {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: "SL_TRAILED", new_sl: None,
+                                    qty: pos.executed_qty, reason: "TRAIL_SL_HIT", new_sl: None,
                                 })
                             } else if pos.signal.targets.len() > 1 && ltp >= pos.signal.targets[1] {
                                 Some(PosAction::ExitSell {
