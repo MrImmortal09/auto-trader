@@ -138,16 +138,22 @@ pub async fn start_position_monitor(
                                 let scrip_guard = scrip_store.read().await;
                                 let mut resolved_order = None;
                                 let mut resolved_token = None;
+                                let mut resolved_segment_code = None;
                                 if let Some(ref store) = *scrip_guard {
                                     if let Some(record) = store.resolve_signal(&signal) {
                                         // Build OrderRequest
                                         use shared_domain::{OrderRequest, AmoFlag, ExchangeSegment, ProductCode, OrderType, Validity, TransactionType};
                                         let qty = record.lot_size.to_string(); // we use lot size by default
                                         resolved_token = Some(record.instrument_token.clone());
+                                        resolved_segment_code = Some(record.exchange_segment_code.clone());
+                                        let exchange_segment = match record.exchange_segment_code.as_str() {
+                                            "bse_fo" => ExchangeSegment::BseFo,
+                                            _ => ExchangeSegment::NseFo,
+                                        };
                                         resolved_order = Some(OrderRequest {
                                             after_market_order: AmoFlag::No,
                                             disclosed_quantity: "0".to_string(),
-                                            exchange_segment: ExchangeSegment::NseFo, // Assuming nse_fo
+                                            exchange_segment,
                                             market_protection: "0".to_string(),
                                             product_code: ProductCode::Nrml,
                                             portfolio_flag: "N".to_string(),
@@ -187,7 +193,8 @@ pub async fn start_position_monitor(
                                 
                                 let mut ws_key = None;
                                 if let Some(token) = resolved_token {
-                                    let ws_scrip = format!("nse_fo|{}", token);
+                                    let segment_code = resolved_segment_code.unwrap_or_else(|| "nse_fo".to_string());
+                                    let ws_scrip = format!("{}|{}", segment_code, token);
                                     ltp_map.insert(ws_scrip.clone(), 0.0);
                                     tracing::info!("Requested live price stream for {}", ws_scrip);
                                     

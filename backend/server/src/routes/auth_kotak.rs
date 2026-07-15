@@ -5,6 +5,31 @@ use serde::Deserialize;
 
 use crate::AppState;
 
+fn merge_csv_sections(csvs: &[(&str, String)]) -> Option<String> {
+    let mut combined = String::new();
+
+    for (index, (segment, csv)) in csvs.iter().enumerate() {
+        let mut lines = csv.lines();
+        let header = lines.next()?;
+
+        if index == 0 {
+            combined.push_str(header);
+            combined.push('\n');
+        }
+
+        for line in lines {
+            if !line.trim().is_empty() {
+                combined.push_str(line);
+                combined.push('\n');
+            }
+        }
+
+        tracing::info!(segment = %segment, "Merged scrip master segment");
+    }
+
+    Some(combined)
+}
+
 #[derive(Deserialize)]
 pub struct KotakLoginReq {
     pub access_token: String,
@@ -64,17 +89,28 @@ pub async fn kotak_login_handler(
 
     // Fetch and parse Scrip Master
     let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH","message":"Fetching Kotak Scrip Master..."}"#.into());
-    match client.get_scrip_master_csv("nse_fo").await {
-        Ok(csv) => {
-            let store = trading_engine::ScripStore::parse_csv(&csv);
-            *state.scrip_store.write().await = Some(store);
-            *state.raw_scrip_csv.write().await = Some(csv);
-            let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Scrip Master loaded successfully"}"#.into());
+    let mut store = trading_engine::ScripStore::default();
+    let mut raw_sections: Vec<(&str, String)> = Vec::new();
+
+    for segment in ["nse_fo", "bse_fo"] {
+        match client.get_scrip_master_csv(segment).await {
+            Ok(csv) => {
+                store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
+                raw_sections.push((segment, csv));
+            }
+            Err(e) => {
+                tracing::error!(segment = %segment, "Failed to fetch Scrip Master: {}", e);
+                let _ = state.log_tx.send(format!(r#"{{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch {} scrip master: {}"}}"#, segment, e));
+            }
         }
-        Err(e) => {
-            tracing::error!("Failed to fetch Scrip Master: {}", e);
-            let _ = state.log_tx.send(format!(r#"{{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch Scrip Master: {}"}}"#, e));
-        }
+    }
+
+    if raw_sections.is_empty() {
+        let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch all scrip master segments"}"#.into());
+    } else {
+        *state.scrip_store.write().await = Some(store);
+        *state.raw_scrip_csv.write().await = merge_csv_sections(&raw_sections);
+        let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Scrip Master loaded successfully"}"#.into());
     }
 
     let _ = state.log_tx.send(r#"{"event":"KOTAK_CONNECTED","status":"ok"}"#.into());
