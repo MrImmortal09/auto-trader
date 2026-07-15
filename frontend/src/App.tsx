@@ -1170,11 +1170,11 @@ function KotakLoginPanel({ serverBase, onServerBaseChange }: {
         ))}
         <button
           onClick={handleLogin}
-          disabled={status === 'loading'}
+          disabled={status === 'loading' || status === 'ok'}
           className="flex items-center gap-1 px-3 py-1 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 text-white text-xs rounded transition-colors"
         >
           <Plug size={11} />
-          {status === 'loading' ? 'Connecting…' : 'Connect'}
+          {status === 'loading' ? 'Connecting…' : status === 'ok' ? 'Connected' : 'Connect'}
         </button>
         {msg && (
           <span className={`text-xs self-center ${status === 'ok' ? 'text-emerald-400' : 'text-red-400'}`}>
