@@ -141,9 +141,16 @@ impl ScripStore {
         let target_strike = signal.strike.unwrap_or(0.0);
         let target_opt_type = signal.option_type.as_deref().unwrap_or("");
 
-        // Parse signal expiry (which the parser outputs as DD-MMM-YYYY)
+        // Parse signal expiry (which the parser outputs as DD-MMM-YYYY, e.g. 30-JUL-2026)
+        // chrono's %b expects Titlecase (Jul), so we need to fix the casing.
         let target_expiry_date = if let Some(ref exp_str) = signal.expiry {
-            NaiveDate::parse_from_str(exp_str, "%d-%b-%Y").ok()
+            let exp_lower = exp_str.to_lowercase();
+            let mut chars = exp_lower.chars().collect::<Vec<_>>();
+            if chars.len() == 11 && chars[3].is_ascii_lowercase() {
+                chars[3] = chars[3].to_ascii_uppercase();
+            }
+            let exp_title = chars.into_iter().collect::<String>();
+            NaiveDate::parse_from_str(&exp_title, "%d-%b-%Y").ok()
         } else {
             None
         };
