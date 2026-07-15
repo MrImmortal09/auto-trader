@@ -176,14 +176,18 @@ impl ScripStore {
             return None;
         }
 
-        // Sort by expiry date
-        candidates.sort_by_key(|o| o.expiry_date);
+        // Sort by expiry date, prioritizing nse_fo
+        candidates.sort_by_key(|o| {
+            let exch_score = if o.exchange_segment_code == "nse_fo" { 0 } else { 1 };
+            (o.expiry_date, exch_score)
+        });
 
         if let Some(target_date) = target_expiry_date {
             // Find the closest expiry to the requested target_date
             candidates.into_iter().min_by_key(|o| {
                 let diff = (o.expiry_date - target_date).num_days().abs();
-                diff
+                let exch_score = if o.exchange_segment_code == "nse_fo" { 0 } else { 1 };
+                (diff, exch_score)
             }).cloned()
         } else {
             // Pick the earliest upcoming expiry
