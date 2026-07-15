@@ -118,7 +118,7 @@ function fmtUptime(totalSecs: number) {
 
 const SERVER_BASE_STORAGE_KEY = 'server_base';
 const SERVER_BASE_COOKIE = 'server_base';
-const DEFAULT_SERVER_BASE = 'http://34.148.153.83:8080';
+const DEFAULT_SERVER_BASE = 'https://at.axiosiiitl.dev';
 
 function readCookie(name: string) {
   if (typeof document === 'undefined') return '';
