@@ -206,7 +206,10 @@ pub async fn reset_creds(State(state): State<AppState>) -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 pub async fn system_status(State(state): State<AppState>) -> impl IntoResponse {
-    let telegram_ok = std::path::Path::new("session.json").exists();
+    let telegram_ok = {
+        let t = state.telegram.lock().await;
+        t.state == "running"
+    };
     let kotak_ok = {
         let k = state.kotak.lock().await;
         k.is_some()
