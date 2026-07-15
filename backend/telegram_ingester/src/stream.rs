@@ -53,7 +53,11 @@ pub(crate) async fn run_event_loop(
             Err(e) => { tracing::warn!("[telegram] Stream closed: {e}"); break; }
         };
 
-        let Update::NewMessage(msg) = update else { continue };
+        let (msg, is_edit) = match update {
+            Update::NewMessage(m) => (m, false),
+            Update::MessageEdited(m) => (m, true),
+            _ => continue,
+        };
 
         let chat_id: i64 = msg.peer_id().bot_api_dialog_id_unchecked();
         if !target_chat_ids.contains(&chat_id) { continue; }
@@ -63,14 +67,16 @@ pub(crate) async fn run_event_loop(
 
         if let Some(ref ltx) = log_tx {
             let log_msg = serde_json::json!({
-                "event": "TELEGRAM_MESSAGE",
+                "event": if is_edit { "TELEGRAM_MESSAGE_EDITED" } else { "TELEGRAM_MESSAGE" },
                 "chat_id": chat_id,
+                "msg_id": msg.id(),
                 "text": text,
             });
             let _ = ltx.send(log_msg.to_string());
         }
 
-        if let Some(signal) = parse_signal(text, "telegram") {
+        let msg_id_str = msg.id().to_string();
+        if let Some(signal) = parse_signal(text, "telegram", Some(msg_id_str)) {
             tracing::info!(
                 instrument = %signal.instrument_name,
                 action = %signal.action,

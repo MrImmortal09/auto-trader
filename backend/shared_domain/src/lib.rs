@@ -69,6 +69,9 @@ pub struct TradeSignal {
     pub stop_loss: f64,
     /// Signal origin (e.g. `"telegram"`, `"manual"`).
     pub source: String,
+    /// Unique identifier for the signal (e.g. Telegram message ID), used for tracking edits.
+    #[serde(default)]
+    pub signal_id: Option<String>,
 }
 
 // ===========================================================================
@@ -109,6 +112,9 @@ pub struct MonitoredPosition {
     /// WebSocket scrip key for price map lookup (e.g. "nse_fo|51386")
     #[serde(default)]
     pub ws_scrip_key: Option<String>,
+    /// Set this to a string reason to force the position to exit on the next tick
+    #[serde(default)]
+    pub force_exit: Option<String>,
 }
 
 // ===========================================================================

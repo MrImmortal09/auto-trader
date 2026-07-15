@@ -187,7 +187,7 @@ fn resolve_expiry_date(day_str: Option<&str>, month_str: &str, instrument: &str)
 /// SL :- 5
 /// JULY EXPIRY
 /// ```
-pub fn parse_signal(text: &str, source: &str) -> Option<TradeSignal> {
+pub fn parse_signal(text: &str, source: &str, signal_id: Option<String>) -> Option<TradeSignal> {
     let (action, instrument_name, strike, option_type, entry_condition, entry_price) =
         if let Some(caps) = OPTS_RE.captures(text) {
             (
@@ -226,6 +226,7 @@ pub fn parse_signal(text: &str, source: &str) -> Option<TradeSignal> {
         instrument_name, strike, option_type, expiry,
         action, entry_condition, entry_price, targets, stop_loss,
         source: source.to_owned(),
+        signal_id,
     })
 }
 
@@ -240,7 +241,7 @@ mod tests {
     #[test]
     fn options_multi_target() {
         let text = "BUY BHEL 425 CE ABOVE 8.25\nTARGET :- 9.50 / 11.50\nSL :- 5\nJULY EXPIRY";
-        let sig = parse_signal(text, "test").unwrap();
+        let sig = parse_signal(text, "test", None).unwrap();
         assert_eq!(sig.action, "BUY");
         assert_eq!(sig.instrument_name, "BHEL");
         assert_eq!(sig.strike, Some(425.0));
@@ -280,7 +281,7 @@ mod tests {
 
     #[test]
     fn no_match_returns_none() {
-        assert!(parse_signal("Hello world!", "test").is_none());
+        assert!(parse_signal("Hello world!", "test", None).is_none());
     }
 
     #[test]

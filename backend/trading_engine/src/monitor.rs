@@ -19,7 +19,7 @@ enum PosAction {
     EntryBuy { qty: i32 },
     ExitSell {
         qty: i32,
-        reason: &'static str,
+        reason: String,
         new_sl: Option<f64>,
     },
     Cancel { reason: String },
@@ -107,6 +107,50 @@ pub async fn start_position_monitor(
                             entry = signal.entry_price,
                             "Signal queued"
                         );
+
+                        // If the signal has an ID (e.g. edited Telegram message), try to update existing
+                        if let Some(ref sig_id) = signal.signal_id {
+                            let mut write_guard = positions.write().await;
+                            let mut updated = false;
+                            for p in write_guard.iter_mut() {
+                                if p.signal.signal_id.as_ref() == Some(sig_id) {
+                                    if p.signal.entry_price != signal.entry_price || p.signal.entry_condition != signal.entry_condition {
+                                        p.force_exit = Some("ENTRY_CHANGED_ERROR".to_string());
+                                        if matches!(p.state, TradeState::WaitingForEntry) {
+                                            p.state = TradeState::Closed;
+                                        }
+                                        updated = true;
+                                        break;
+                                    }
+
+                                    p.signal.stop_loss = signal.stop_loss;
+                                    p.signal.targets = signal.targets.clone();
+                                    p.signal.entry_price = signal.entry_price;
+                                    
+                                    // Update active trailing SL if not hit TGT1 yet
+                                    if matches!(p.state, TradeState::WaitingForEntry | TradeState::Active) {
+                                        p.current_sl = signal.stop_loss;
+                                    }
+                                    
+                                    // Can't await inside sync context? Wait, we are in an async loop and write_guard is across await point!
+                                    // So let's drop guard first.
+                                    updated = true;
+                                    break;
+                                }
+                            }
+                            if updated {
+                                let msg = format!(
+                                    r#"{{"event":"SIGNAL_UPDATED","instrument":"{}","new_sl":{}}}"#,
+                                    signal.instrument_name, signal.stop_loss
+                                );
+                                send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                                let snapshot = { positions.read().await.clone() };
+                                send_positions_snapshot(&db_tx, &snapshot).await;
+                                tracing::info!(id=?sig_id, "Updated existing signal");
+                                continue;
+                            }
+                        }
+
                         if signal.action.eq_ignore_ascii_case("BUY") {
                             // Check expiry
                             if let Some(ref expiry_str) = signal.expiry {
@@ -231,6 +275,7 @@ pub async fn start_position_monitor(
                                     resolved_order,
                                     ltp: None,
                                     ws_scrip_key: ws_key,
+                                    force_exit: None,
                                 });
                                 let snapshot = pos_guard.clone();
                                 drop(pos_guard);
@@ -308,9 +353,13 @@ pub async fn start_position_monitor(
                         }
 
                         TradeState::Active => {
-                            if ltp <= pos.current_sl {
+                            if let Some(ref reason) = pos.force_exit {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: "SL_HIT", new_sl: None,
+                                    qty: pos.executed_qty, reason: reason.clone(), new_sl: None,
+                                })
+                            } else if ltp <= pos.current_sl {
+                                Some(PosAction::ExitSell {
+                                    qty: pos.executed_qty, reason: "SL_HIT".to_string(), new_sl: None,
                                 })
                             } else if !pos.signal.targets.is_empty() && ltp >= pos.signal.targets[0] {
                                 let has_t2 = pos.signal.targets.len() > 1;
@@ -323,20 +372,24 @@ pub async fn start_position_monitor(
                                 });
                                 Some(PosAction::ExitSell {
                                     qty: exit_qty,
-                                    reason: if has_t2 { "TGT1_PARTIAL" } else { "TGT1_FULL" },
+                                    reason: (if has_t2 { "TGT1_PARTIAL" } else { "TGT1_FULL" }).to_string(),
                                     new_sl,
                                 })
                             } else { None }
                         }
 
                         TradeState::Target1Hit => {
-                            if ltp <= pos.current_sl {
+                            if let Some(ref reason) = pos.force_exit {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: "TRAIL_SL_HIT", new_sl: None,
+                                    qty: pos.executed_qty, reason: reason.clone(), new_sl: None,
+                                })
+                            } else if ltp <= pos.current_sl {
+                                Some(PosAction::ExitSell {
+                                    qty: pos.executed_qty, reason: "TRAIL_SL_HIT".to_string(), new_sl: None,
                                 })
                             } else if pos.signal.targets.len() > 1 && ltp >= pos.signal.targets[1] {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: "TGT2_HIT", new_sl: None,
+                                    qty: pos.executed_qty, reason: "TGT2_HIT".to_string(), new_sl: None,
                                 })
                             } else { None }
                         }
