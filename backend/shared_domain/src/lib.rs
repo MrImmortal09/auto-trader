@@ -28,6 +28,8 @@ pub fn current_ist_timestamp_string() -> String {
 pub struct TradingConfig {
     /// Maximum capital allocated per trade in INR.
     pub max_trade_amount_inr: f64,
+    /// Default number of option lots to buy when no per-trade override is set.
+    pub default_option_lots: i32,
     /// `"LIVE"` or `"PAPER"`.
     pub mode: String,
     /// Flat brokerage charged per order leg (INR).

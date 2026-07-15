@@ -272,8 +272,7 @@ pub async fn start_position_monitor(
                                         .unwrap_or(1);
 
                                     if pos.signal.option_type.is_some() {
-                                        let lots = (cfg.max_trade_amount_inr / (ltp * lot_size as f64)).floor() as i32;
-                                        lots.max(1) * lot_size
+                                        cfg.default_option_lots.max(1) * lot_size
                                     } else {
                                         ((cfg.max_trade_amount_inr / ltp).floor() as i32).max(1)
                                     }
