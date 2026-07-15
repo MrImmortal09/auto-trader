@@ -1370,8 +1370,52 @@ function ConnectionPanel({ serverBase, onServerBaseChange }: {
   serverBase: string;
   onServerBaseChange: (value: string) => void;
 }) {
+  const [sysStatus, setSysStatus] = useState({ telegram_connected: false, kotak_connected: false });
+
+  useEffect(() => {
+    if (!serverBase) return;
+    const fetchStatus = async () => {
+      try {
+        const res = await apiFetch(serverBase, '/api/status');
+        if (res.ok) setSysStatus(await res.json());
+      } catch (e) {}
+    };
+    fetchStatus();
+    const timer = setInterval(fetchStatus, 3000);
+    return () => clearInterval(timer);
+  }, [serverBase]);
+
+  const handleReset = async () => {
+    if (!confirm('Are you sure you want to reset all connections? This will log out Telegram and Kotak and restart the server!')) return;
+    try {
+      await apiFetch(serverBase, '/api/auth/reset', { method: 'DELETE' });
+      alert('Connections reset. The server is restarting...');
+      window.location.reload();
+    } catch (e) {
+      alert('Failed to reset connections');
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4 bg-gray-900 border-b border-gray-700 px-4 py-3">
+      <div className="flex items-center justify-between">
+        <div className="flex gap-4 text-xs font-semibold">
+          <div className="flex items-center gap-1">
+            <div className={`w-2 h-2 rounded-full ${sysStatus.kotak_connected ? 'bg-emerald-500 shadow-[0_0_5px_rgba(16,185,129,0.5)]' : 'bg-red-500'}`} />
+            <span className={sysStatus.kotak_connected ? 'text-gray-200' : 'text-gray-500'}>Kotak</span>
+          </div>
+          <div className="flex items-center gap-1">
+            <div className={`w-2 h-2 rounded-full ${sysStatus.telegram_connected ? 'bg-emerald-500 shadow-[0_0_5px_rgba(16,185,129,0.5)]' : 'bg-red-500'}`} />
+            <span className={sysStatus.telegram_connected ? 'text-gray-200' : 'text-gray-500'}>Telegram</span>
+          </div>
+        </div>
+        <button
+          onClick={handleReset}
+          className="btn-sm bg-red-900/40 hover:bg-red-800/60 text-red-400 border border-red-900/50 hover:text-white transition-colors"
+        >
+          Reset Connections
+        </button>
+      </div>
       <KotakLoginPanel serverBase={serverBase} onServerBaseChange={onServerBaseChange} />
       <TelegramLoginPanel serverBase={serverBase} />
     </div>
