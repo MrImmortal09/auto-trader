@@ -7,6 +7,7 @@ pub struct ScripRecord {
     pub instrument_token: String,
     pub trading_symbol: String,
     pub symbol_name: String,
+    pub exchange_segment_code: String,
     pub strike_price: f64,
     pub option_type: String, // CE or PE
     pub expiry_date: NaiveDate,
@@ -20,7 +21,7 @@ pub struct ScripStore {
 }
 
 impl ScripStore {
-    pub fn parse_csv(csv: &str) -> Self {
+    pub fn parse_csv(csv: &str, exchange_segment_code: &str) -> Self {
         let mut store = ScripStore::default();
         let mut lines = csv.lines();
         
@@ -113,6 +114,7 @@ impl ScripStore {
                 instrument_token: cols[token_idx].to_string(),
                 trading_symbol: cols[trd_symbol_idx].to_string(),
                 symbol_name: sym_name.clone(),
+                exchange_segment_code: exchange_segment_code.to_string(),
                 strike_price,
                 option_type,
                 expiry_date,
@@ -124,6 +126,12 @@ impl ScripStore {
 
         tracing::info!("Loaded {} distinct symbols into ScripStore", store.records.len());
         store
+    }
+
+    pub fn merge(&mut self, other: ScripStore) {
+        for (symbol, mut records) in other.records {
+            self.records.entry(symbol).or_default().append(&mut records);
+        }
     }
 
     pub fn resolve_signal(&self, signal: &TradeSignal) -> Option<ScripRecord> {
