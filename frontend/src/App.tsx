@@ -1103,6 +1103,23 @@ function KotakLoginPanel({ serverBase, onServerBaseChange }: {
   }, [serverBase]);
 
   useEffect(() => {
+    async function checkState() {
+      if (!serverBase) return;
+      try {
+        const res = await apiFetch(serverBase, '/api/auth/kotak');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.connected) {
+            setStatus('ok');
+            setMsg('Connected ✓');
+          }
+        }
+      } catch (e) {}
+    }
+    checkState();
+  }, [serverBase]);
+
+  useEffect(() => {
     const { totp, server_base, ...rest } = form;
     localStorage.setItem('kotak_creds', JSON.stringify(rest));
   }, [form]);
@@ -1191,6 +1208,20 @@ function TelegramLoginPanel({ serverBase }: { serverBase: string }) {
   const [chats, setChats]     = useState<TelegramChat[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [err, setErr]         = useState('');
+
+  useEffect(() => {
+    async function checkState() {
+      try {
+        const res = await apiFetch(serverBase, '/api/auth/telegram/status');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.state === 'running') setStep('running');
+          else if (data.state === 'authenticated') loadChats();
+        }
+      } catch (e) {}
+    }
+    checkState();
+  }, [serverBase]);
 
   useEffect(() => { localStorage.setItem('tg_api_id', apiId); }, [apiId]);
   useEffect(() => { localStorage.setItem('tg_api_hash', apiHash); }, [apiHash]);
