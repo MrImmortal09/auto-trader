@@ -61,9 +61,10 @@ pub struct TelegramManager {
     session:        Option<Arc<MemorySession>>,
     updates_rx:     Option<mpsc::UnboundedReceiver<UpdatesLike>>,
     login_token:    Option<grammers_client::client::LoginToken>,
-    password_token: Option<grammers_client::client::PasswordToken>,
+    pub password_token: Option<grammers_client::client::PasswordToken>,
     /// Human-readable state exposed by `/api/auth/telegram/status`.
     pub state: String,
+    pub monitored_chats: Vec<i64>,
 }
 
 impl Default for TelegramManager {
@@ -76,6 +77,7 @@ impl TelegramManager {
             client: None, session: None, updates_rx: None,
             login_token: None, password_token: None,
             state: "idle".into(),
+            monitored_chats: Vec::new(),
         }
     }
 
@@ -250,6 +252,7 @@ impl TelegramManager {
         let updates_rx = self.updates_rx.take()
             .ok_or_else(|| TelegramAuthError::WrongState(self.state.clone()))?;
 
+        self.monitored_chats = chat_ids.clone();
         tokio::spawn(run_event_loop(client, updates_rx, chat_ids, signal_tx, log_tx));
         self.state = "running".into();
         Ok(())
