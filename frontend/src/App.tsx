@@ -24,6 +24,7 @@ import {
 
 interface TradingConfig {
   max_trade_amount_inr: number;
+  default_option_lots: number;
   mode: string;
   brokerage_per_order: number;
   target_1_exit_pct: number;
@@ -117,6 +118,7 @@ function fmtUptime(totalSecs: number) {
 
 const SERVER_BASE_STORAGE_KEY = 'server_base';
 const SERVER_BASE_COOKIE = 'server_base';
+const DEFAULT_SERVER_BASE = 'http://34.148.153.83:8080';
 
 function readCookie(name: string) {
   if (typeof document === 'undefined') return '';
@@ -128,15 +130,26 @@ function readCookie(name: string) {
 function normalizeServerBase(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return '';
-  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
-  return withProtocol.replace(/\/+$/, '');
+  return trimmed.replace(/\/+$/, '');
+}
+
+function isValidServerBase(value: string) {
+  const normalized = normalizeServerBase(value);
+  if (!normalized) return true;
+
+  try {
+    const parsed = new URL(normalized);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 function getStoredServerBase() {
   if (typeof window === 'undefined') return '';
   const saved = window.localStorage.getItem(SERVER_BASE_STORAGE_KEY) ?? '';
   const cookie = readCookie(SERVER_BASE_COOKIE);
-  return normalizeServerBase(saved || cookie || (import.meta.env.VITE_API_BASE_URL ?? ''));
+  return normalizeServerBase(saved || cookie || (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_SERVER_BASE));
 }
 
 function persistServerBase(value: string) {
@@ -158,6 +171,7 @@ function persistServerBase(value: string) {
 
 function apiUrl(serverBase: string, path: string) {
   const normalized = normalizeServerBase(serverBase);
+  if (normalized && !isValidServerBase(normalized)) return path;
   return normalized ? `${normalized}${path}` : path;
 }
 
@@ -371,6 +385,7 @@ function SettingsBar({ serverBase }: { serverBase: string }) {
       {(
         [
           { key: 'virtual_balance', label: 'Virtual Balance (₹)' },
+          { key: 'default_option_lots', label: 'Default Lots' },
           { key: 'brokerage_per_order', label: 'Brokerage (₹)' },
           { key: 'max_trade_amount_inr', label: 'Max Trade (₹)' },
           { key: 'target_1_exit_pct', label: 'Target 1 Exit %' },
@@ -606,7 +621,14 @@ function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?
 
   // SSE connection
   useEffect(() => {
-    const es = new EventSource(apiUrl(serverBase, '/api/logs/stream'));
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(apiUrl(serverBase, '/api/logs/stream'));
+    } catch (e) {
+      console.error(e);
+      setConnected(false);
+      return () => {};
+    }
     es.onopen = () => setConnected(true);
     es.onmessage = (e: MessageEvent<string>) => {
       const now = new Date();
@@ -622,7 +644,7 @@ function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?
       setLogs((prev) => [...prev.slice(-500), { id: Date.now() + Math.random(), text, time: timeStr, isError }]);
     };
     es.onerror = () => setConnected(false);
-    return () => es.close();
+    return () => es?.close();
   }, [serverBase]);
 
   return (
@@ -1053,6 +1075,29 @@ function KotakLoginPanel({ serverBase, onServerBaseChange }: {
   const [status, setStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
   const [msg, setMsg] = useState('');
 
+  function commitServerBase(rawValue: string) {
+    const normalized = normalizeServerBase(rawValue);
+    if (!normalized) {
+      onServerBaseChange('');
+      setMsg('');
+      if (status !== 'loading') setStatus('idle');
+      return true;
+    }
+
+    if (!isValidServerBase(normalized)) {
+      setStatus('error');
+      setMsg('Enter a full http:// or https:// server URL');
+      return false;
+    }
+
+    onServerBaseChange(normalized);
+    if (status === 'error' && msg === 'Enter a full http:// or https:// server URL') {
+      setStatus('idle');
+      setMsg('');
+    }
+    return true;
+  }
+
   useEffect(() => {
     setForm((current) => current.server_base === serverBase ? current : { ...current, server_base: serverBase });
   }, [serverBase]);
@@ -1060,10 +1105,10 @@ function KotakLoginPanel({ serverBase, onServerBaseChange }: {
   useEffect(() => {
     const { totp, server_base, ...rest } = form;
     localStorage.setItem('kotak_creds', JSON.stringify(rest));
-    onServerBaseChange(server_base);
   }, [form]);
 
   async function handleLogin() {
+    if (!commitServerBase(form.server_base)) return;
     setStatus('loading');
     try {
       const res = await apiFetch(form.server_base, '/api/auth/kotak', {
@@ -1102,6 +1147,7 @@ function KotakLoginPanel({ serverBase, onServerBaseChange }: {
             placeholder={label}
             value={form[key]}
             onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
+            onBlur={key === 'server_base' ? (e) => { void commitServerBase(e.target.value); } : undefined}
             className="w-36 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-orange-500"
           />
         ))}
