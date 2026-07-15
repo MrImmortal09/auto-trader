@@ -170,6 +170,14 @@ impl ScripStore {
             })
             .filter(|o| target_opt_type.is_empty() || o.option_type == target_opt_type)
             .filter(|o| o.expiry_date >= today)
+            .filter(|o| {
+                // Ignore BSE options unless it's a known BSE index
+                if o.exchange_segment_code == "bse_fo" {
+                    o.symbol_name == "SENSEX" || o.symbol_name == "BANKEX"
+                } else {
+                    true
+                }
+            })
             .collect();
 
         if candidates.is_empty() {
