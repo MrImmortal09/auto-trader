@@ -142,7 +142,12 @@ pub struct MonitoredPosition {
     /// Set this to a string reason to force the position to exit on the next tick
     #[serde(default)]
     pub force_exit: Option<String>,
+    /// Minimum price increment for this contract (usually 0.05)
+    #[serde(default = "default_tick_size")]
+    pub tick_size: f64,
 }
+
+fn default_tick_size() -> f64 { 0.05 }
 
 // ===========================================================================
 // Execution result with full statutory charge breakdown

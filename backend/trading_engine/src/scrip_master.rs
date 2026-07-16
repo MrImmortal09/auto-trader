@@ -12,6 +12,7 @@ pub struct ScripRecord {
     pub option_type: String, // CE or PE
     pub expiry_date: NaiveDate,
     pub lot_size: u32,
+    pub tick_size: f64,
 }
 
 #[derive(Default, serde::Serialize)]
@@ -46,6 +47,7 @@ impl ScripStore {
         let opt_type_idx = headers.get("poptiontype").copied();
         let expiry_idx = headers.get("lexpirydate").or(headers.get("pexpirydate")).copied();
         let lot_size_idx = headers.get("llotsize").copied();
+        let tick_size_idx = headers.get("pticksize").or(headers.get("ticksize")).copied();
 
         // If we can't find core headers, fallback to some defaults or return empty.
         // But for safety we just skip lines missing these.
@@ -61,6 +63,7 @@ impl ScripStore {
         let opt_type_idx = opt_type_idx.unwrap_or(usize::MAX);
         let expiry_idx = expiry_idx.unwrap_or(usize::MAX);
         let lot_size_idx = lot_size_idx.unwrap_or(usize::MAX);
+        let tick_size_idx = tick_size_idx.unwrap_or(usize::MAX);
 
         for line in lines {
             let cols: Vec<&str> = line.split(',').map(|s| s.trim().trim_matches('"')).collect();
@@ -84,13 +87,13 @@ impl ScripStore {
                 let date_str = cols[expiry_idx];
                 // Try string formats first
                 if let Ok(d) = NaiveDate::parse_from_str(date_str, "%d-%b-%Y") {
-                    d
+                    Some(d)
                 } else if let Ok(d) = NaiveDate::parse_from_str(date_str, "%d/%m/%Y") {
-                    d
+                    Some(d)
                 } else if let Ok(d) = NaiveDate::parse_from_str(date_str, "%d-%m-%Y") {
-                    d
+                    Some(d)
                 } else if let Ok(d) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                    d
+                    Some(d)
                 } else if let Ok(epoch) = date_str.parse::<i64>() {
                     // It's an epoch. If nse_fo, we must add 315511200 (Kotak custom epoch offset)
                     // The epoch might already be correct if it's BSE, but we'll assume NSE F&O for now.
@@ -98,17 +101,22 @@ impl ScripStore {
                     let adjusted_epoch = if epoch < 1600000000 { epoch + 315511200 + 19800 } else { epoch + 19800 };
                     chrono::DateTime::from_timestamp(adjusted_epoch, 0)
                         .map(|dt| dt.date_naive())
-                        .unwrap_or_default()
                 } else {
-                    NaiveDate::default()
+                    None
                 }
             } else {
-                NaiveDate::default()
+                None
             };
 
+            // Parse lot size
             let lot_size = if lot_size_idx < cols.len() {
                 cols[lot_size_idx].parse::<u32>().unwrap_or(1)
             } else { 1 };
+
+            // Parse tick size
+            let tick_size = if tick_size_idx < cols.len() {
+                cols[tick_size_idx].parse::<f64>().unwrap_or(0.05)
+            } else { 0.05 };
 
             let record = ScripRecord {
                 instrument_token: cols[token_idx].to_string(),
@@ -117,8 +125,9 @@ impl ScripStore {
                 exchange_segment_code: exchange_segment_code.to_string(),
                 strike_price,
                 option_type,
-                expiry_date,
+                expiry_date: expiry_date.unwrap_or(NaiveDate::from_ymd_opt(2099, 12, 31).unwrap()),
                 lot_size,
+                tick_size,
             };
 
             store.records.entry(sym_name).or_default().push(record);
