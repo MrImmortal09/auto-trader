@@ -21,12 +21,13 @@ pub async fn post_settings_handler(
 ) -> impl IntoResponse {
     if let Err(e) = sqlx::query(
         "UPDATE trading_config
-         SET max_trade_amount_inr=?, default_option_lots=?, mode=?, brokerage_per_order=?,
+         SET max_trade_amount_inr=?, index_lots=?, other_lots=?, mode=?, brokerage_per_order=?,
              target_1_exit_pct=?, target_2_exit_pct=?
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
-    .bind(cfg.default_option_lots.max(1))
+    .bind(cfg.index_lots.max(1))
+    .bind(cfg.other_lots.max(1))
     .bind(&cfg.mode)
     .bind(cfg.brokerage_per_order)
     .bind(cfg.target_1_exit_pct)
@@ -41,10 +42,10 @@ pub async fn post_settings_handler(
     *state.trading_cfg.write().await = cfg.clone();
 
     let _ = state.log_tx.send(format!(
-        r#"{{"event":"CONFIG_UPDATED","mode":"{}","max_trade":{:.2},"default_option_lots":{}}}"#,
-        cfg.mode, cfg.max_trade_amount_inr, cfg.default_option_lots.max(1)
+        r#"{{"event":"CONFIG_UPDATED","mode":"{}","max_trade":{:.2},"index_lots":{},"other_lots":{}}}"#,
+        cfg.mode, cfg.max_trade_amount_inr, cfg.index_lots.max(1), cfg.other_lots.max(1)
     ));
-    tracing::info!(mode = %cfg.mode, max_trade = cfg.max_trade_amount_inr, default_option_lots = cfg.default_option_lots.max(1), "Config updated");
+    tracing::info!(mode = %cfg.mode, max_trade = cfg.max_trade_amount_inr, index_lots = cfg.index_lots.max(1), other_lots = cfg.other_lots.max(1), "Config updated");
     StatusCode::OK
 }
 

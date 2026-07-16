@@ -53,8 +53,10 @@ pub fn is_market_open() -> bool {
 pub struct TradingConfig {
     /// Maximum capital allocated per trade in INR.
     pub max_trade_amount_inr: f64,
-    /// Default number of option lots to buy when no per-trade override is set.
-    pub default_option_lots: i32,
+    /// Default number of index option lots to buy when no per-trade override is set.
+    pub index_lots: i32,
+    /// Default number of non-index option (stock option) lots to buy.
+    pub other_lots: i32,
     /// `"LIVE"` or `"PAPER"`.
     pub mode: String,
     /// Flat brokerage charged per order leg (INR).
