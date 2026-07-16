@@ -108,6 +108,32 @@ pub async fn start_position_monitor(
                             "Signal queued"
                         );
 
+                        if signal.action == "UPDATE_SL" {
+                            if let Some(ref sig_id) = signal.signal_id {
+                                let mut write_guard = positions.write().await;
+                                let mut updated = false;
+                                for p in write_guard.iter_mut() {
+                                    if p.signal.signal_id.as_ref() == Some(sig_id) {
+                                        p.current_sl = signal.stop_loss;
+                                        p.signal.stop_loss = signal.stop_loss;
+                                        updated = true;
+                                        break;
+                                    }
+                                }
+                                if updated {
+                                    let msg = format!(
+                                        r#"{{"event":"SIGNAL_UPDATED","instrument":"{}","new_sl":{}}}"#,
+                                        "UPDATE", signal.stop_loss
+                                    );
+                                    send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                                    let snapshot = { positions.read().await.clone() };
+                                    send_positions_snapshot(&db_tx, &snapshot).await;
+                                    tracing::info!(id=?sig_id, "Updated SL via reply");
+                                }
+                            }
+                            continue;
+                        }
+
                         // If the signal has an ID (e.g. edited Telegram message), try to update existing
                         if let Some(ref sig_id) = signal.signal_id {
                             let mut write_guard = positions.write().await;
@@ -334,7 +360,11 @@ pub async fn start_position_monitor(
                                     override_lots * lot_size
                                 } else {
                                     if pos.signal.option_type.is_some() {
-                                        cfg.default_option_lots.max(1) * lot_size
+                                        let inst = pos.signal.instrument_name.to_uppercase();
+                                        const INDEX_NAMES: &[&str] = &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"];
+                                        let is_index = INDEX_NAMES.iter().any(|&idx| inst.contains(idx));
+                                        let lots = if is_index { cfg.index_lots.max(1) } else { cfg.other_lots.max(1) };
+                                        lots * lot_size
                                     } else {
                                         let raw_qty = ((cfg.max_trade_amount_inr / ltp).floor() as i32).max(1);
                                         let mut multiple = (raw_qty / lot_size) * lot_size;

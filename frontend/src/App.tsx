@@ -24,7 +24,8 @@ import {
 
 interface TradingConfig {
   max_trade_amount_inr: number;
-  default_option_lots: number;
+  index_lots: number;
+  other_lots: number;
   mode: string;
   brokerage_per_order: number;
   target_1_exit_pct: number;
@@ -385,7 +386,8 @@ function SettingsBar({ serverBase }: { serverBase: string }) {
       {(
         [
           { key: 'virtual_balance', label: 'Virtual Balance (₹)' },
-          { key: 'default_option_lots', label: 'Default Lots' },
+          { key: 'index_lots', label: 'Index Lots' },
+          { key: 'other_lots', label: 'Other Lots' },
           { key: 'brokerage_per_order', label: 'Brokerage (₹)' },
           { key: 'max_trade_amount_inr', label: 'Max Trade (₹)' },
           { key: 'target_1_exit_pct', label: 'Target 1 Exit %' },

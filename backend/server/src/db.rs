@@ -56,7 +56,8 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         "CREATE TABLE IF NOT EXISTS trading_config (
             id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
             max_trade_amount_inr REAL NOT NULL DEFAULT 10000.0,
-            default_option_lots INTEGER NOT NULL DEFAULT 1,
+            index_lots INTEGER NOT NULL DEFAULT 1,
+            other_lots INTEGER NOT NULL DEFAULT 1,
             mode TEXT NOT NULL DEFAULT 'PAPER',
             brokerage_per_order REAL NOT NULL DEFAULT 20.0,
             target_1_exit_pct REAL NOT NULL DEFAULT 50.0,
@@ -67,7 +68,11 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         .execute(&pool).await.unwrap();
     ensure_column(
         &pool,
-        "ALTER TABLE trading_config ADD COLUMN default_option_lots INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE trading_config ADD COLUMN index_lots INTEGER NOT NULL DEFAULT 1",
+    ).await;
+    ensure_column(
+        &pool,
+        "ALTER TABLE trading_config ADD COLUMN other_lots INTEGER NOT NULL DEFAULT 1",
     ).await;
 
     sqlx::query(
@@ -106,7 +111,8 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
 #[derive(sqlx::FromRow)]
 struct TradingConfigRow {
     max_trade_amount_inr: f64,
-    default_option_lots: i32,
+    index_lots: i32,
+    other_lots: i32,
     mode: String,
     brokerage_per_order: f64,
     target_1_exit_pct: f64,
@@ -116,7 +122,7 @@ struct TradingConfigRow {
 /// Load `TradingConfig` from SQLite, falling back to safe defaults.
 pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
     sqlx::query_as::<_, TradingConfigRow>(
-        "SELECT max_trade_amount_inr, default_option_lots, mode, brokerage_per_order,
+        "SELECT max_trade_amount_inr, index_lots, other_lots, mode, brokerage_per_order,
                 target_1_exit_pct, target_2_exit_pct
          FROM trading_config WHERE id = 1",
     )
@@ -126,7 +132,8 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
     .flatten()
     .map(|r| TradingConfig {
         max_trade_amount_inr: r.max_trade_amount_inr,
-        default_option_lots: r.default_option_lots.max(1),
+        index_lots: r.index_lots.max(1),
+        other_lots: r.other_lots.max(1),
         mode: r.mode,
         brokerage_per_order: r.brokerage_per_order,
         target_1_exit_pct: r.target_1_exit_pct,
@@ -134,7 +141,8 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
     })
     .unwrap_or_else(|| TradingConfig {
         max_trade_amount_inr: 10_000.0,
-        default_option_lots: 1,
+        index_lots: 1,
+        other_lots: 1,
         mode: "PAPER".into(),
         brokerage_per_order: 20.0,
         target_1_exit_pct: 50.0,

@@ -8,7 +8,7 @@ use grammers_session::updates::UpdatesLike;
 use shared_domain::TradeSignal;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::parser::parse_signal;
+use crate::parser::{parse_signal, parse_reply_sl};
 use crate::session_file;
 
 // ---------------------------------------------------------------------------
@@ -76,14 +76,42 @@ pub(crate) async fn run_event_loop(
         }
 
         let msg_id_str = msg.id().to_string();
-        if let Some(signal) = parse_signal(text, "telegram", Some(msg_id_str)) {
-            tracing::info!(
-                instrument = %signal.instrument_name,
-                action = %signal.action,
-                "Signal parsed — broadcasting"
-            );
-            if tx.send(signal).is_err() {
-                tracing::warn!("[telegram] No receivers — signal dropped");
+        
+        let mut emitted = false;
+        
+        if let Some(reply_to_id) = msg.reply_to_message_id() {
+            if let Some(new_sl) = parse_reply_sl(text) {
+                let signal = TradeSignal {
+                    instrument_name: "UPDATE".to_string(),
+                    strike: None,
+                    option_type: None,
+                    expiry: None,
+                    action: "UPDATE_SL".to_string(),
+                    entry_condition: "ABOVE".to_string(),
+                    entry_price: 0.0,
+                    targets: vec![],
+                    stop_loss: new_sl,
+                    source: "telegram_reply".to_string(),
+                    signal_id: Some(reply_to_id.to_string()),
+                };
+                tracing::info!(new_sl, "Reply parsed as SL update — broadcasting");
+                if tx.send(signal).is_err() {
+                    tracing::warn!("[telegram] No receivers — update dropped");
+                }
+                emitted = true;
+            }
+        }
+
+        if !emitted {
+            if let Some(signal) = parse_signal(text, "telegram", Some(msg_id_str)) {
+                tracing::info!(
+                    instrument = %signal.instrument_name,
+                    action = %signal.action,
+                    "Signal parsed — broadcasting"
+                );
+                if tx.send(signal).is_err() {
+                    tracing::warn!("[telegram] No receivers — signal dropped");
+                }
             }
         }
     }

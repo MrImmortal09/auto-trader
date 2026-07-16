@@ -31,6 +31,11 @@ static SL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:STOP[-\s]*LOSS|S\.?L\.?)\s*:?-?\s*([\d.]+)").expect("SL_RE")
 });
 
+/// Update Stop-loss value from replies — handles `Move SL to 4`, `SL to 4`, `SL 4`, `shift sl to 4`.
+static UPDATE_SL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:MOVE|SHIFT)?\s*(?:STOP[-\s]*LOSS|S\.?L\.?)\s*(?:TO|:-|:|->|-)?\s*([\d.]+)").expect("UPDATE_SL_RE")
+});
+
 static EXPIRY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(?:(\d{1,2})[ \t-]+)?(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)(?:\s+EXPIRY)?\b"
@@ -230,6 +235,13 @@ pub fn parse_signal(text: &str, source: &str, signal_id: Option<String>) -> Opti
     })
 }
 
+/// Parse a raw Telegram reply message to extract a stop-loss update.
+/// Returns `Some(new_sl)` if it matches a stop-loss update pattern.
+pub fn parse_reply_sl(text: &str) -> Option<f64> {
+    UPDATE_SL_RE.captures(text)
+        .and_then(|c| c[1].parse().ok())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -254,7 +266,7 @@ mod tests {
     #[test]
     fn options_exact_expiry() {
         let text = "BUY BANKNIFTY 55400 CE ABOVE 690\nTARGET :- 750 / 850\nSL - 600\n26 NOV EXPIRY";
-        let sig = parse_signal(text, "test").unwrap();
+        let sig = parse_signal(text, "test", None).unwrap();
         assert_eq!(sig.action, "BUY");
         assert_eq!(sig.instrument_name, "BANKNIFTY");
         let expiry = sig.expiry.unwrap();
@@ -264,7 +276,7 @@ mod tests {
     #[test]
     fn options_single_target() {
         let text = "SELL NIFTY 18500 PE BELOW 120\nTARGET: 80\nSL: 145\nAUG EXPIRY";
-        let sig = parse_signal(text, "test").unwrap();
+        let sig = parse_signal(text, "test", None).unwrap();
         assert_eq!(sig.action, "SELL");
         assert_eq!(sig.targets, vec![80.0]);
         assert!((sig.stop_loss - 145.0).abs() < f64::EPSILON);
@@ -273,7 +285,7 @@ mod tests {
     #[test]
     fn equity_signal() {
         let text = "BUY RELIANCE ABOVE 2500\nTGT 2600 / 2700\nSL 2420";
-        let sig = parse_signal(text, "test").unwrap();
+        let sig = parse_signal(text, "test", None).unwrap();
         assert_eq!(sig.instrument_name, "RELIANCE");
         assert_eq!(sig.strike, None);
         assert_eq!(sig.targets.len(), 2);
@@ -296,5 +308,16 @@ mod tests {
         let now = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
         let expiry = resolve_expiry_date_with_now(None, "JULY", "BHEL", now).unwrap();
         assert_eq!(expiry, "29-JUL-2027");
+    }
+
+    #[test]
+    fn test_parse_reply_sl() {
+        assert_eq!(parse_reply_sl("Move SL to 4 and hold for the targets"), Some(4.0));
+        assert_eq!(parse_reply_sl("SL to 4.50"), Some(4.5));
+        assert_eq!(parse_reply_sl("Shift sl to 3"), Some(3.0));
+        assert_eq!(parse_reply_sl("S.L. : 5"), Some(5.0));
+        assert_eq!(parse_reply_sl("Stop loss -> 4.2"), Some(4.2));
+        assert_eq!(parse_reply_sl("sl 2"), Some(2.0));
+        assert_eq!(parse_reply_sl("random message"), None);
     }
 }
