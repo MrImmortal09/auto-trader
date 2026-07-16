@@ -219,6 +219,7 @@ pub async fn start_position_monitor(
                                 let mut resolved_order = None;
                                 let mut resolved_token = None;
                                 let mut resolved_segment_code = None;
+                                let mut resolved_tick_size = 0.05;
                                 if let Some(ref store) = *scrip_guard {
                                     if let Some(record) = store.resolve_signal(&signal) {
                                         // Build OrderRequest
@@ -226,6 +227,7 @@ pub async fn start_position_monitor(
                                         let qty = record.lot_size.to_string(); // we use lot size by default
                                         resolved_token = Some(record.instrument_token.clone());
                                         resolved_segment_code = Some(record.exchange_segment_code.clone());
+                                        resolved_tick_size = record.tick_size;
                                         let exchange_segment = match record.exchange_segment_code.as_str() {
                                             "bse_fo" => ExchangeSegment::BseFo,
                                             "nse_cm" => ExchangeSegment::NseCm,
@@ -303,6 +305,7 @@ pub async fn start_position_monitor(
                                     ltp: None,
                                     ws_scrip_key: ws_key,
                                     force_exit: None,
+                                    tick_size: resolved_tick_size,
                                 });
                                 let snapshot = pos_guard.clone();
                                 drop(pos_guard);
@@ -412,7 +415,8 @@ pub async fn start_position_monitor(
                                 }
 
                                 let new_sl = has_t2.then(|| {
-                                    pos.avg_buy_price
+                                    let raw = (pos.avg_buy_price + pos.signal.targets[0]) / 2.0;
+                                    (raw / pos.tick_size).floor() * pos.tick_size
                                 });
                                 Some(PosAction::ExitSell {
                                     qty: exit_qty,
