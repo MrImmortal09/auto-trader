@@ -89,3 +89,39 @@ pub async fn post_wallet_balance_handler(
 
     (StatusCode::OK, Json(serde_json::json!({ "balance": req.balance }))).into_response()
 }
+
+/// `POST /api/settings/clear_database` — clear logs, trades, and positions.
+pub async fn post_clear_database_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let mut tx = match state.db_pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("Failed to begin tx for clear_db: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    
+    let res1 = sqlx::query("DELETE FROM system_logs").execute(&mut *tx).await;
+    let res2 = sqlx::query("DELETE FROM paper_trades").execute(&mut *tx).await;
+    let res3 = sqlx::query("UPDATE open_positions SET json = '[]' WHERE id = 1").execute(&mut *tx).await;
+    
+    if res1.is_err() || res2.is_err() || res3.is_err() {
+        let _ = tx.rollback().await;
+        tracing::error!("Failed to clear database tables");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    
+    if let Err(e) = tx.commit().await {
+        tracing::error!("Failed to commit clear_db tx: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    // Also update in-memory positions
+    *state.positions.write().await = vec![];
+    
+    let _ = state.log_tx.send(r#"{"event":"DATABASE_CLEARED","message":"Database cleared successfully"}"#.to_string());
+    tracing::info!("Database tables cleared");
+    
+    StatusCode::OK
+}

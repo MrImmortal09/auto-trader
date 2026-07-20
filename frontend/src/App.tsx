@@ -643,7 +643,7 @@ function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?
       const text = e.data;
       const isError = text.includes('"level":"ERROR"') || text.includes('"event":"ERROR"');
 
-      setLogs((prev) => [...prev.slice(-500), { id: Date.now() + Math.random(), text, time: timeStr, isError }]);
+      setLogs((prev) => [...prev, { id: Date.now() + Math.random(), text, time: timeStr, isError }]);
     };
     es.onerror = () => setConnected(false);
     return () => es?.close();
@@ -680,7 +680,24 @@ function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?
           onClick={() => setLogs([])}
           className="ml-auto text-xs text-gray-500 hover:text-gray-300 transition-colors"
         >
-          Clear
+          Clear UI Logs
+        </button>
+        <button
+          onClick={async () => {
+            if (confirm('Are you sure you want to clear the entire database (logs, trades, and positions)?')) {
+              try {
+                const res = await fetch(serverBase + '/api/settings/clear_database', { method: 'POST' });
+                if (res.ok) setLogs([]);
+                else alert('Failed to clear database');
+              } catch (e) {
+                console.error(e);
+                alert('Failed to clear database');
+              }
+            }
+          }}
+          className="ml-4 text-xs text-red-500 hover:text-red-400 transition-colors"
+        >
+          Clear DB
         </button>
       </div>
 

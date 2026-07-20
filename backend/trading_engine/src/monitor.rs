@@ -121,6 +121,7 @@ pub async fn start_position_monitor(
                                     }
                                 }
                                 if updated {
+                                    drop(write_guard);
                                     let msg = format!(
                                         r#"{{"event":"SIGNAL_UPDATED","instrument":"{}","new_sl":{}}}"#,
                                         "UPDATE", signal.stop_loss
@@ -165,6 +166,7 @@ pub async fn start_position_monitor(
                                 }
                             }
                             if updated {
+                                drop(write_guard);
                                 let msg = format!(
                                     r#"{{"event":"SIGNAL_UPDATED","instrument":"{}","new_sl":{}}}"#,
                                     signal.instrument_name, signal.stop_loss

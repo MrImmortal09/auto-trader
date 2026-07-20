@@ -214,6 +214,7 @@ async fn main() {
         .route("/api/positions/:id/close",          post(routes::close_position_handler))
         .route("/api/settings",                     get(routes::get_settings_handler)
                                                    .post(routes::post_settings_handler))
+        .route("/api/settings/clear_database",      post(routes::post_clear_database_handler))
         .route("/api/wallet/balance",               get(routes::get_wallet_balance_handler)
                                                    .post(routes::post_wallet_balance_handler))
         .route("/api/auth/kotak",                  post(routes::kotak_login_handler)
