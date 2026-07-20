@@ -621,8 +621,38 @@ function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  // SSE connection
+  // SSE connection & Initial load
   useEffect(() => {
+    // 1. Fetch Historical Logs
+    apiFetch(serverBase, '/api/logs/history')
+      .then(res => res.json())
+      .then((history: any[]) => {
+        if (Array.isArray(history)) {
+          const historicalLogs = history.map((item: any, i: number) => {
+            const rawMsg = item.message;
+            const text = typeof rawMsg === 'string' ? rawMsg : JSON.stringify(rawMsg);
+            const isError = text.includes('"level":"ERROR"') || text.includes('"event":"ERROR"');
+            
+            // Format timestamp from "2026-07-20 06:21:23"
+            let timeStr = 'Hist';
+            if (item.timestamp) {
+              const d = new Date(item.timestamp + 'Z'); // assuming UTC in db
+              if (!isNaN(d.getTime())) {
+                let hours = d.getHours();
+                const ampm = hours >= 12 ? 'PM' : 'AM';
+                hours = hours % 12;
+                hours = hours ? hours : 12;
+                timeStr = `${String(hours).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')} ${ampm}`;
+              }
+            }
+            return { id: `hist-${i}`, text, time: timeStr, isError };
+          });
+          setLogs(historicalLogs);
+        }
+      })
+      .catch(console.error);
+
+    // 2. Connect SSE
     let es: EventSource | null = null;
     try {
       es = new EventSource(apiUrl(serverBase, '/api/logs/stream'));

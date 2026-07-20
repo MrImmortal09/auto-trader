@@ -203,6 +203,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/webhook/telegram",            post(routes::webhook_handler))
         .route("/api/logs/stream",                  get(routes::sse_logs_handler))
+        .route("/api/logs/history",                 get(routes::logs_history_handler))
         .route("/api/portfolio",                    get(routes::portfolio_handler))
         .route("/api/health",                       get(routes::health_handler))
         .route("/api/positions",                    get(routes::positions_handler))

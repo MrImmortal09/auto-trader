@@ -75,10 +75,12 @@ function handleMessage(msg) {
         wsClient.onclose = function () {
             console.log(JSON.stringify({ event: "closed" }));
             if (heartbeatInterval) clearInterval(heartbeatInterval);
+            process.exit(1);
         };
 
         wsClient.onerror = function () {
             console.log(JSON.stringify({ event: "error" }));
+            process.exit(1);
         };
 
         wsClient.onmessage = function (data) {
