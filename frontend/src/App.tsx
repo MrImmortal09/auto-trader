@@ -645,7 +645,7 @@ function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?
                 timeStr = `${String(hours).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')} ${ampm}`;
               }
             }
-            return { id: `hist-${i}`, text, time: timeStr, isError };
+            return { id: Date.now() + i + Math.random(), text, time: timeStr, isError };
           });
           setLogs(historicalLogs);
         }
