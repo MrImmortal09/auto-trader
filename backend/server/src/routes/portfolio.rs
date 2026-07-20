@@ -97,3 +97,24 @@ pub async fn portfolio_handler(
 
     Ok(Json(Portfolio { balance, trades }))
 }
+
+/// `GET /api/logs/history` — Fetch recent logs from DB
+pub async fn logs_history_handler(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT message, timestamp FROM (SELECT id, message, timestamp FROM system_logs ORDER BY id DESC LIMIT 500) ORDER BY id ASC"
+    )
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| { tracing::error!("logs history: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+    let logs = rows.into_iter().filter_map(|(msg, ts)| {
+        let parsed = serde_json::from_str::<serde_json::Value>(&msg).ok()?;
+        Some(serde_json::json!({
+            "message": parsed,
+            "timestamp": ts
+        }))
+    }).collect();
+    Ok(Json(logs))
+}
