@@ -16,11 +16,7 @@ import {
   Wallet,
   Wifi,
   WifiOff,
-  Clock,
-  FileText,
-  CheckCircle2,
-  ChevronRight,
-  XCircle,
+  XCircle
 } from 'lucide-react';
 
 // ---------------------------------------------------------------------------

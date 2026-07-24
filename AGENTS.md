@@ -9,3 +9,4 @@
 
 ### Verification Rule
 - ALWAYS run `cargo build` (or `cargo check`) in the appropriate directory after making ANY changes to Rust code to verify compilation before concluding your turn.
+- ALWAYS run `pnpm run build` in the `frontend` directory after making ANY changes to frontend code to verify there are no type or build errors.
