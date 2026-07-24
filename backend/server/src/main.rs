@@ -160,6 +160,11 @@ async fn main() {
                     .filter_map(|p| p.ws_scrip_key.clone())
                     .collect();
                 for key in keys {
+                    // Seed a 0.0 placeholder so the position monitor doesn't skip
+                    // this position on its first tick (it continues when ltp_map
+                    // returns None). The real price will overwrite this once the
+                    // first live tick arrives from the WebSocket.
+                    prices.insert(key.clone(), 0.0);
                     let _ = tx.send(serde_json::json!({"action": "subscribe", "scrips": key}).to_string());
                 }
             }
