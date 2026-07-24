@@ -341,9 +341,12 @@ pub async fn start_position_monitor(
                 // ── Pass 1: read-only scan ────────────────────────── //
                 for (i, pos) in pos_guard.iter().enumerate() {
                     let lookup_key = pos.ws_scrip_key.as_ref().unwrap_or(&pos.signal.instrument_name);
+                    // Skip if no price available yet OR if the price is the 0.0
+                    // placeholder inserted on startup for carried-over positions.
+                    // A real live tick will overwrite 0.0 before we act on anything.
                     let ltp = match ltp_map.get(lookup_key).map(|r| *r) {
-                        Some(v) => v,
-                        None => continue,
+                        Some(v) if v > 0.0 => v,
+                        _ => continue,
                     };
 
                     let pa = match pos.state {
