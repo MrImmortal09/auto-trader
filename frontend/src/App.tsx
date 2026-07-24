@@ -1456,6 +1456,7 @@ function ConnectionPanel({ serverBase, onServerBaseChange }: {
   onServerBaseChange: (value: string) => void;
 }) {
   const [sysStatus, setSysStatus] = useState({ telegram_connected: false, kotak_connected: false });
+  const [isUpdating, setIsUpdating] = useState(false);
 
   useEffect(() => {
     if (!serverBase) return;
@@ -1495,6 +1496,29 @@ function ConnectionPanel({ serverBase, onServerBaseChange }: {
     }
   };
 
+  const handleUpdate = async () => {
+    if (!confirm('Are you sure you want to update the server? This will download the latest release, disconnect everything, and restart the server.')) return;
+    setIsUpdating(true);
+    try {
+      await apiFetch(serverBase, '/api/update_server', { method: 'POST' });
+      
+      // The server will restart, which means it will temporarily go down.
+      // We will poll /api/health until it comes back, then reload.
+      const pollTimer = setInterval(async () => {
+        try {
+          const res = await apiFetch(serverBase, '/api/health');
+          if (res.ok) {
+            clearInterval(pollTimer);
+            window.location.reload();
+          }
+        } catch (e) {}
+      }, 2000);
+    } catch (e) {
+      alert('Failed to trigger update');
+      setIsUpdating(false);
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4 bg-gray-900 border-b border-gray-700 px-4 py-3">
       <div className="flex items-center justify-between">
@@ -1528,15 +1552,28 @@ function ConnectionPanel({ serverBase, onServerBaseChange }: {
             )}
           </div>
         </div>
-        {/* Hard reset (restarts server) — kept for emergencies */}
-        <button
-          id="btn-reset-all-connections"
-          onClick={handleReset}
-          className="btn-sm bg-red-900/20 hover:bg-red-900/40 text-red-600 hover:text-red-400 border border-red-900/30 transition-colors"
-          title="Full reset — restarts the server process"
-        >
-          Reset All
-        </button>
+        <div className="flex gap-2">
+          {/* Update Server */}
+          <button
+            onClick={handleUpdate}
+            disabled={isUpdating}
+            className={`btn-sm transition-colors ${isUpdating ? 'bg-blue-900/40 text-blue-300 cursor-wait' : 'bg-blue-600 hover:bg-blue-500 text-white'}`}
+            title="Download latest binary and restart"
+          >
+            {isUpdating ? 'Updating...' : 'Update Server'}
+          </button>
+
+          {/* Hard reset (restarts server) — kept for emergencies */}
+          <button
+            id="btn-reset-all-connections"
+            onClick={handleReset}
+            disabled={isUpdating}
+            className="btn-sm bg-red-900/20 hover:bg-red-900/40 text-red-600 hover:text-red-400 border border-red-900/30 transition-colors disabled:opacity-50"
+            title="Full reset — restarts the server process"
+          >
+            Reset All
+          </button>
+        </div>
       </div>
       <KotakLoginPanel serverBase={serverBase} onServerBaseChange={onServerBaseChange} />
       <TelegramLoginPanel serverBase={serverBase} />

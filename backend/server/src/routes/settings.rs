@@ -125,3 +125,40 @@ pub async fn post_clear_database_handler(
     
     StatusCode::OK
 }
+
+/// `POST /api/update_server` — Disconnect websockets and trigger server update script.
+pub async fn post_update_server_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    tracing::info!("Server update requested. Disconnecting services...");
+    
+    // 1. Disconnect Kotak
+    if let Some(task) = state.ws_task.lock().await.take() {
+        task.abort();
+    }
+    *state.ws_tx.lock().await = None;
+    *state.kotak.lock().await = None;
+    let _ = sqlx::query("DELETE FROM kotak_session").execute(&state.db_pool).await;
+
+    // 2. Disconnect Telegram
+    {
+        let mut mgr = state.telegram.lock().await;
+        *mgr = telegram_ingester::TelegramManager::new();
+    }
+    let _ = std::fs::remove_file("session.json");
+
+    // 3. Trigger update.sh detached
+    tracing::info!("Spawning update.sh...");
+    if let Err(e) = std::process::Command::new("nohup")
+        .arg("bash")
+        .arg("./update.sh")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        tracing::error!("Failed to spawn update.sh: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to trigger update"}))).into_response();
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "updating"}))).into_response()
+}
