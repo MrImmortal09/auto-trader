@@ -107,6 +107,9 @@ pub async fn kotak_login_handler(
                 .collect();
 
             for key in keys {
+                // Seed 0.0 so the position monitor doesn't skip these until the
+                // first live tick arrives (same logic as server startup).
+                state.prices.insert(key.clone(), 0.0);
                 let payload = serde_json::json!({
                     "action": "subscribe",
                     "scrips": key,
