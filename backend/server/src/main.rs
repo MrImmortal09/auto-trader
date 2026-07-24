@@ -10,6 +10,7 @@ mod routes;
 use std::sync::Arc;
 
 use axum::{routing::{get, post}, Router};
+use chrono::{Datelike, Duration as ChronoDuration};
 use dashmap::DashMap;
 use shared_domain::{DbWriteMessage, TradeSignal, TradingConfig};
 use sqlx::sqlite::SqlitePool;
@@ -53,8 +54,13 @@ pub(crate) struct AppState {
 
 #[tokio::main]
 async fn main() {
-    // 1. Tracing
+    // 1. Tracing — timestamps in IST (UTC+5:30) so GCP server logs are readable
+    let ist_timer = tracing_subscriber::fmt::time::OffsetTime::new(
+        time::UtcOffset::from_hms(5, 30, 0).expect("valid IST offset"),
+        time::format_description::well_known::Rfc3339,
+    );
     tracing_subscriber::fmt()
+        .with_timer(ist_timer)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -187,6 +193,104 @@ async fn main() {
         Arc::clone(&scrip_store),
         Arc::clone(&ws_tx),
     ));
+
+    // 9. Daily Scrip Master refresh — runs at 09:10 IST every trading day
+    {
+        let kotak_arc   = Arc::clone(&kotak_client_opt);
+        let store_arc   = Arc::clone(&scrip_store);
+        let csv_arc     = Arc::clone(&raw_scrip_csv);
+        let log_tx_scrip = log_tx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                // Compute seconds until next 09:10:00 IST
+                let secs_until = {
+                    let now = shared_domain::now_ist();
+                    let today_910 = now
+                        .date_naive()
+                        .and_hms_opt(9, 10, 0)
+                        .expect("valid time")
+                        .and_local_timezone(shared_domain::ist_offset())
+                        .single()
+                        .expect("IST 09:10 is unambiguous");
+
+                    let diff = today_910.signed_duration_since(now);
+                    if diff.num_seconds() > 0 {
+                        diff.num_seconds() as u64
+                    } else {
+                        // Already past 09:10 today — wait until tomorrow's 09:10
+                        (diff + ChronoDuration::hours(24)).num_seconds().max(1) as u64
+                    }
+                };
+
+                tracing::info!(secs = secs_until, "Daily Scrip Master refresh scheduled");
+                tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
+
+                // Only refresh on weekdays (skip weekends)
+                {
+                    let wd = shared_domain::now_ist().weekday();
+                    if wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun {
+                        tracing::info!("Scrip Master refresh skipped — weekend");
+                        // Sleep 24h and loop to recalculate the next wake time
+                        tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
+                        continue;
+                    }
+                }
+
+                let client_guard = kotak_arc.lock().await;
+                if let Some(ref client) = *client_guard {
+                    tracing::info!("Daily Scrip Master refresh starting...");
+                    let _ = log_tx_scrip.send(
+                        r#"{"event":"SCRIP_FETCH","message":"Daily 09:10 Scrip Master refresh..."}"#.into(),
+                    );
+
+                    let mut new_store = trading_engine::ScripStore::default();
+                    let mut raw_sections: Vec<(&str, String)> = Vec::new();
+
+                    for segment in ["nse_fo", "bse_fo", "nse_cm"] {
+                        match client.get_scrip_master_csv(segment).await {
+                            Ok(csv) => {
+                                new_store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
+                                raw_sections.push((segment, csv));
+                            }
+                            Err(e) => {
+                                tracing::error!(segment, "Scrip Master refresh failed: {e}");
+                                let _ = log_tx_scrip.send(format!(
+                                    r#"{{"event":"SCRIP_FETCH_ERROR","message":"Refresh failed for {segment}: {e}"}}"#
+                                ));
+                            }
+                        }
+                    }
+
+                    if !raw_sections.is_empty() {
+                        // Build combined CSV (header once, then all data rows)
+                        let mut combined = String::new();
+                        for (i, (_, csv)) in raw_sections.iter().enumerate() {
+                            let mut lines = csv.lines();
+                            if let Some(header) = lines.next() {
+                                if i == 0 { combined.push_str(header); combined.push('\n'); }
+                                for line in lines {
+                                    if !line.trim().is_empty() { combined.push_str(line); combined.push('\n'); }
+                                }
+                            }
+                        }
+                        // Replace old scrip store atomically
+                        *store_arc.write().await = Some(new_store);
+                        *csv_arc.write().await   = Some(combined);
+                        tracing::info!("Daily Scrip Master refresh complete.");
+                        let _ = log_tx_scrip.send(
+                            r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Daily Scrip Master refresh complete"}"#.into(),
+                        );
+                    }
+                } else {
+                    tracing::warn!("Daily Scrip Master refresh skipped — Kotak not connected");
+                }
+
+                // Sleep until next day's 09:10 (approximately 24 h)
+                tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
+            }
+        });
+    }
 
     // 9. Router
     let state = AppState {
