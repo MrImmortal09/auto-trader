@@ -120,7 +120,13 @@ pub async fn kotak_login_handler(
     }
 
     // Fetch and parse Scrip Master
-    let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH","message":"Fetching Kotak Scrip Master..."}"#.into());
+    // Log to DB (persisted) AND broadcast to live SSE stream
+    let scrip_start_msg = r#"{"event":"SCRIP_FETCH","message":"Fetching Kotak Scrip Master..."}"#;
+    let _ = state.db_tx.send(shared_domain::DbWriteMessage::Log {
+        level: "INFO".into(), message: scrip_start_msg.into(),
+    }).await;
+    let _ = state.log_tx.send(scrip_start_msg.into());
+
     let mut store = trading_engine::ScripStore::default();
     let mut raw_sections: Vec<(&str, String)> = Vec::new();
 
@@ -132,17 +138,29 @@ pub async fn kotak_login_handler(
             }
             Err(e) => {
                 tracing::error!(segment = %segment, "Failed to fetch Scrip Master: {}", e);
-                let _ = state.log_tx.send(format!(r#"{{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch {} scrip master: {}"}}"#, segment, e));
+                let err_msg = format!(r#"{{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch {segment} scrip master: {e}"}}"#);
+                let _ = state.db_tx.send(shared_domain::DbWriteMessage::Log {
+                    level: "ERROR".into(), message: err_msg.clone(),
+                }).await;
+                let _ = state.log_tx.send(err_msg);
             }
         }
     }
 
     if raw_sections.is_empty() {
-        let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch all scrip master segments"}"#.into());
+        let err_msg = r#"{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch all scrip master segments"}"#;
+        let _ = state.db_tx.send(shared_domain::DbWriteMessage::Log {
+            level: "ERROR".into(), message: err_msg.into(),
+        }).await;
+        let _ = state.log_tx.send(err_msg.into());
     } else {
         *state.scrip_store.write().await = Some(store);
         *state.raw_scrip_csv.write().await = merge_csv_sections(&raw_sections);
-        let _ = state.log_tx.send(r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Scrip Master loaded successfully"}"#.into());
+        let ok_msg = r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Scrip Master loaded successfully"}"#;
+        let _ = state.db_tx.send(shared_domain::DbWriteMessage::Log {
+            level: "INFO".into(), message: ok_msg.into(),
+        }).await;
+        let _ = state.log_tx.send(ok_msg.into());
     }
 
     let _ = state.log_tx.send(r#"{"event":"KOTAK_CONNECTED","status":"ok"}"#.into());

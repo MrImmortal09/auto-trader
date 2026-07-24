@@ -25,6 +25,11 @@ eval(hslibCode);
 let wsClient = null;
 let heartbeatInterval = null;
 
+// Queue for subscribe messages that arrive before wsClient.onopen fires.
+// Drained immediately once the connection is established.
+let wsOpen = false;
+let pendingSubscriptions = [];
+
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -43,10 +48,16 @@ rl.on('line', (line) => {
 
 function handleMessage(msg) {
     if (msg.action === 'connect') {
+        // Reset state for this new connection
+        wsOpen = false;
+        pendingSubscriptions = [];
+
         const url = "wss://mlhsm.kotaksecurities.com";
         wsClient = new HSWebSocket(url);
         
         wsClient.onopen = function () {
+            wsOpen = true;
+
             // Send connection request
             let jObj = {
                 "Authorization": msg.auth,
@@ -70,15 +81,28 @@ function handleMessage(msg) {
                 };
                 wsClient.send(JSON.stringify(subObj));
             }
+
+            // Drain any subscribe messages that arrived before open
+            if (pendingSubscriptions.length > 0) {
+                console.error(`Draining ${pendingSubscriptions.length} queued subscription(s)`);
+                for (const scrips of pendingSubscriptions) {
+                    wsClient.send(JSON.stringify({ type: "mws", scrips, channelnum: 1 }));
+                }
+                pendingSubscriptions = [];
+            }
         };
 
         wsClient.onclose = function () {
+            wsOpen = false;
+            pendingSubscriptions = [];
             console.log(JSON.stringify({ event: "closed" }));
             if (heartbeatInterval) clearInterval(heartbeatInterval);
             process.exit(1);
         };
 
         wsClient.onerror = function () {
+            wsOpen = false;
+            pendingSubscriptions = [];
             console.log(JSON.stringify({ event: "error" }));
             process.exit(1);
         };
@@ -103,10 +127,16 @@ function handleMessage(msg) {
                 "scrips": msg.scrips,
                 "channelnum": 1
             };
-            try {
-                wsClient.send(JSON.stringify(subObj));
-            } catch (e) {
-                console.log(JSON.stringify({ event: "error", message: `subscribe failed: ${e.message}` }));
+            if (wsOpen) {
+                // Connection is live — send immediately
+                try {
+                    wsClient.send(JSON.stringify(subObj));
+                } catch (e) {
+                    console.log(JSON.stringify({ event: "error", message: `subscribe failed: ${e.message}` }));
+                }
+            } else {
+                // Connection not open yet — queue for drain in onopen
+                pendingSubscriptions.push(msg.scrips);
             }
         }
     } else if (msg.action === 'close') {
