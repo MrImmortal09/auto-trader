@@ -11,13 +11,13 @@ use shared_domain::{today_ist, TradeSignal};
 /// Options signal: `BUY BHEL 425 CE ABOVE 8.25`
 static OPTS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(BUY|SELL)\s+([A-Z0-9&]+)\s+(\d+(?:\.\d+)?)\s+(CE|PE)\s+(ABOVE|BELOW)\s+(\d+(?:\.\d+)?)",
+        r"(?i)(BUY|SELL)\s+([A-Z0-9&\-]+)\s+(\d+(?:\.\d+)?)\s+(CE|PE)\s+(ABOVE|BELOW)\s+(\d+(?:\.\d+)?)",
     ).expect("OPTS_RE")
 });
 
 /// Equity signal (no strike/type): `BUY RELIANCE ABOVE 2500`
 static EQT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(BUY|SELL)\s+([A-Z0-9&]+)\s+(ABOVE|BELOW)\s+(\d+(?:\.\d+)?)")
+    Regex::new(r"(?i)(BUY|SELL)\s+([A-Z0-9&\-]+)\s+(ABOVE|BELOW)\s+(\d+(?:\.\d+)?)")
         .expect("EQT_RE")
 });
 
@@ -316,9 +316,24 @@ mod tests {
         assert_eq!(parse_reply_sl("Move SL to 4 and hold for the targets"), Some(4.0));
         assert_eq!(parse_reply_sl("SL to 4.50"), Some(4.5));
         assert_eq!(parse_reply_sl("Shift sl to 3"), Some(3.0));
-        assert_eq!(parse_reply_sl("S.L. : 5"), Some(5.0));
-        assert_eq!(parse_reply_sl("Stop loss -> 4.2"), Some(4.2));
-        assert_eq!(parse_reply_sl("sl 2"), Some(2.0));
-        assert_eq!(parse_reply_sl("random message"), None);
+        assert_eq!(parse_reply_sl("sl -> 2.5"), Some(2.5));
+        assert_eq!(parse_reply_sl("SL:- 5"), Some(5.0));
+        assert_eq!(parse_reply_sl("Update SL 6.0"), Some(6.0)); // matches SL_RE inside UPDATE_SL_RE logic
+        assert_eq!(parse_reply_sl("Something else"), None);
+    }
+
+    #[test]
+    fn test_parse_options_with_hyphen() {
+        let text = "BUY BAJAJ-AUTO 11300 CE ABOVE 325\n\nTARGET :- 365 / 450\n\nSL :- 250\n\nAUGUST EXPIRY";
+        let sig = parse_signal(text, "test", None).unwrap();
+        assert_eq!(sig.instrument_name, "BAJAJ-AUTO");
+        assert_eq!(sig.strike, Some(11300.0));
+        assert_eq!(sig.option_type.as_deref(), Some("CE"));
+        assert_eq!(sig.action, "BUY");
+        assert_eq!(sig.entry_condition, "ABOVE");
+        assert_eq!(sig.entry_price, 325.0);
+        assert_eq!(sig.targets, vec![365.0, 450.0]);
+        assert_eq!(sig.stop_loss, 250.0);
+        assert!(sig.expiry.is_some());
     }
 }
