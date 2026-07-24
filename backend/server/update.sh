@@ -2,28 +2,30 @@
 set -euo pipefail
 
 echo "Starting server update process..."
+git pull
 
 # 1. Fetch latest release info
 echo "Fetching latest release info from GitHub..."
 LATEST_JSON=$(curl -s https://api.github.com/repos/MrImmortal09/auto-trader/releases/latest)
 DOWNLOAD_URL=$(echo "$LATEST_JSON" | grep -o '"browser_download_url": *"[^"]*"' | grep 'x86_64-unknown-linux-gnu' | head -n 1 | cut -d '"' -f 4)
+VERSION_TAG=$(echo "$LATEST_JSON" | grep -o '"tag_name": *"[^"]*"' | head -n 1 | cut -d '"' -f 4)
 
-if [ -z "$DOWNLOAD_URL" ]; then
-    echo "Error: Could not find the download URL for the latest release."
+if [ -z "$DOWNLOAD_URL" ] || [ -z "$VERSION_TAG" ]; then
+    echo "Error: Could not find the download URL or version tag for the latest release."
     exit 1
 fi
 
-echo "Downloading binary from $DOWNLOAD_URL ..."
+echo "Downloading $VERSION_TAG binary from $DOWNLOAD_URL ..."
 TMP_BIN="/tmp/server-latest"
 curl -sL "$DOWNLOAD_URL" -o "$TMP_BIN"
 chmod +x "$TMP_BIN"
 
 TARGET_DIR="$HOME/auto-trader/backend/server"
-TARGET_BIN="$TARGET_DIR/server-bin"
+TARGET_BIN="$TARGET_DIR/$VERSION_TAG"
 
 # 2. Stop existing server
 echo "Stopping existing server..."
-pkill -f "server-bin" || true
+pkill -f "$TARGET_DIR/server-" || true
 tmux send-keys -t 0:0 C-c
 sleep 2
 
@@ -45,6 +47,6 @@ mv "$TMP_BIN" "$TARGET_BIN"
 
 # 4. Restart server in tmux pane 0:0
 echo "Starting new server in tmux..."
-tmux send-keys -t 0:0 "cd $TARGET_DIR && ./server-bin" C-m
+tmux send-keys -t 0:0 "cd $TARGET_DIR && ./$VERSION_TAG" C-m
 
 echo "Update complete!"
