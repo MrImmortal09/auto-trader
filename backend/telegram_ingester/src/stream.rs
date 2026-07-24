@@ -93,6 +93,7 @@ pub(crate) async fn run_event_loop(
                     stop_loss: new_sl,
                     source: "telegram_reply".to_string(),
                     signal_id: Some(reply_to_id.to_string()),
+                    raw_message: Some(text.to_owned()),
                 };
                 tracing::info!(new_sl, "Reply parsed as SL update — broadcasting");
                 if tx.send(signal).is_err() {
