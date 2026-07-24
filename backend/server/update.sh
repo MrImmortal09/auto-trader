@@ -23,8 +23,8 @@ TARGET_BIN="$TARGET_DIR/server"
 
 # 2. Stop existing server
 echo "Stopping existing server..."
-pkill -x server || echo "No existing server process found."
-
+pkill -f "auto-trader/backend/server" || true
+tmux send-keys -t 0:0 C-c
 sleep 2
 
 # build the frontend
