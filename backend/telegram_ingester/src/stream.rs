@@ -75,6 +75,8 @@ pub(crate) async fn run_event_loop(
             let _ = ltx.send(log_msg.to_string());
         }
 
+        tracing::info!(chat_id, msg_id = msg.id(), "[telegram] Received message: {}", text);
+
         let msg_id_str = msg.id().to_string();
         
         let mut emitted = false;
