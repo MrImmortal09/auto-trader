@@ -204,6 +204,26 @@ pub async fn reset_creds(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"status": "reset"})))
 }
 
+/// `DELETE /api/auth/kotak/disconnect` — drop the Kotak session without restarting.
+/// Clears the DB session, kills the WebSocket task, and sets kotak = None in memory.
+/// Does NOT clear any frontend fields.
+pub async fn disconnect_kotak(State(state): State<AppState>) -> impl IntoResponse {
+    // 1. Kill the running WebSocket task
+    if let Some(task) = state.ws_task.lock().await.take() {
+        task.abort();
+        tracing::info!("Kotak WebSocket task aborted on disconnect.");
+    }
+    // 2. Clear the ws_tx sender so no stale messages are sent
+    *state.ws_tx.lock().await = None;
+    // 3. Remove the Kotak client from memory
+    *state.kotak.lock().await = None;
+    // 4. Delete session from DB so it isn't restored on next startup
+    let _ = sqlx::query("DELETE FROM kotak_session").execute(&state.db_pool).await;
+
+    tracing::info!("Kotak disconnected via /api/auth/kotak/disconnect");
+    (StatusCode::OK, Json(serde_json::json!({"status": "disconnected"})))
+}
+
 // ---------------------------------------------------------------------------
 // System Status
 // ---------------------------------------------------------------------------

@@ -87,3 +87,16 @@ pub async fn telegram_start_handler(
         Err(e) => bad_req!(e),
     }
 }
+
+/// `DELETE /api/auth/telegram/disconnect` — stop monitoring and clear the local session.
+/// Resets TelegramManager to idle state and deletes the session JSON file.
+/// Does NOT clear any frontend fields.
+pub async fn disconnect_telegram(State(state): State<AppState>) -> impl IntoResponse {
+    let mut mgr = state.telegram.lock().await;
+    // Drop the client and all auth state by replacing with a fresh manager
+    *mgr = telegram_ingester::TelegramManager::new();
+    // Delete the persisted session file so it isn't re-used on next request-code call
+    let _ = std::fs::remove_file("session.json");
+    tracing::info!("Telegram disconnected via /api/auth/telegram/disconnect");
+    (StatusCode::OK, Json(serde_json::json!({"status": "disconnected"})))
+}
