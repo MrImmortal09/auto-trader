@@ -35,8 +35,9 @@ pub struct PaperTrade {
     pub stamp_duty: f64,
     pub transaction_charge: f64,
     pub gst: f64,
-    pub net_value: f64,
     pub timestamp: String,
+    pub signal_id: Option<String>,
+    pub raw_message: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -88,8 +89,9 @@ pub async fn portfolio_handler(
     let trades: Vec<PaperTrade> = sqlx::query_as(
         "SELECT id, ticker, action, qty, executed_price,
                 gross_value, brokerage, stt_charge, sebi_fee,
-                stamp_duty, transaction_charge, gst, net_value, timestamp
-         FROM paper_trades ORDER BY timestamp DESC LIMIT 100",
+                stamp_duty, transaction_charge, gst, net_value, timestamp,
+                signal_id, raw_message
+         FROM paper_trades ORDER BY timestamp DESC LIMIT 1000",
     )
     .fetch_all(&state.db_pool)
     .await

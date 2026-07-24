@@ -232,6 +232,7 @@ pub fn parse_signal(text: &str, source: &str, signal_id: Option<String>) -> Opti
         action, entry_condition, entry_price, targets, stop_loss,
         source: source.to_owned(),
         signal_id,
+        raw_message: Some(text.to_owned()),
     })
 }
 

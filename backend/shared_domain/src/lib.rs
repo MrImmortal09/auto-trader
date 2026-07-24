@@ -99,6 +99,9 @@ pub struct TradeSignal {
     /// Unique identifier for the signal (e.g. Telegram message ID), used for tracking edits.
     #[serde(default)]
     pub signal_id: Option<String>,
+    /// The exact raw message text received, for displaying in reports.
+    #[serde(default)]
+    pub raw_message: Option<String>,
 }
 
 // ===========================================================================
@@ -336,6 +339,8 @@ pub enum DbWriteMessage {
         transaction_charge: f64,
         gst: f64,
         net_value: f64,
+        signal_id: Option<String>,
+        raw_message: Option<String>,
     },
     Log {
         level: String,

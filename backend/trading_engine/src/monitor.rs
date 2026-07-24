@@ -42,6 +42,8 @@ async fn send_trade(
     qty: i32,
     price: f64,
     c: &ChargeBreakdown,
+    signal_id: Option<String>,
+    raw_message: Option<String>,
 ) {
     let _ = tx.send(DbWriteMessage::Trade {
         ticker: ticker.to_owned(), action: action.to_owned(), qty,
@@ -50,6 +52,7 @@ async fn send_trade(
         stt_charge: c.stt_charge, sebi_fee: c.sebi_fee,
         stamp_duty: c.stamp_duty, transaction_charge: c.transaction_charge,
         gst: c.gst, net_value: c.net_value,
+        signal_id, raw_message,
     }).await;
 }
 
@@ -478,7 +481,7 @@ pub async fn start_position_monitor(
                                 pa.ltp, fees.net_value
                             );
                             tracing::info!(instrument = %instrument, price = pa.ltp, qty, "Entry executed");
-                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees).await;
+                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone()).await;
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
                         }
 
@@ -492,7 +495,7 @@ pub async fn start_position_monitor(
                                 pa.ltp
                             );
                             tracing::info!(instrument = %instrument, reason, pnl, "Exit executed");
-                            send_trade(&db_tx, &instrument, "SELL", qty, pa.ltp, &fees).await;
+                            send_trade(&db_tx, &instrument, "SELL", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone()).await;
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
 
                             pos.executed_qty -= qty;
