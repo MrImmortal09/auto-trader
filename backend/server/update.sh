@@ -18,12 +18,12 @@ TMP_BIN="/tmp/server-latest"
 curl -sL "$DOWNLOAD_URL" -o "$TMP_BIN"
 chmod +x "$TMP_BIN"
 
-TARGET_DIR="$HOME/auto-trader/backend"
-TARGET_BIN="$TARGET_DIR/server"
+TARGET_DIR="$HOME/auto-trader/backend/server"
+TARGET_BIN="$TARGET_DIR/server-bin"
 
 # 2. Stop existing server
 echo "Stopping existing server..."
-pkill -f "auto-trader/backend/server" || true
+pkill -f "server-bin" || true
 tmux send-keys -t 0:0 C-c
 sleep 2
 
@@ -38,8 +38,6 @@ else
     echo "Warning: could not cd to $FRONTEND"
 fi
 
-
-
 # 3. Replace binary
 echo "Replacing binary..."
 mkdir -p "$TARGET_DIR"
@@ -47,6 +45,6 @@ mv "$TMP_BIN" "$TARGET_BIN"
 
 # 4. Restart server in tmux pane 0:0
 echo "Starting new server in tmux..."
-tmux send-keys -t 0:0 "cd $TARGET_DIR && ./server" C-m
+tmux send-keys -t 0:0 "cd $TARGET_DIR && ./server-bin" C-m
 
 echo "Update complete!"
