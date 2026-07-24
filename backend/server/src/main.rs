@@ -329,6 +329,7 @@ async fn main() {
                                                    .post(routes::post_wallet_balance_handler))
         .route("/api/auth/kotak",                  post(routes::kotak_login_handler)
                                                    .get(routes::kotak_status_handler))
+        .route("/api/auth/kotak/disconnect",        axum::routing::delete(routes::disconnect_kotak))
         .route("/api/auth/reset",                  axum::routing::delete(routes::reset_creds))
         .route("/api/status",                      get(routes::system_status))
         .route("/api/auth/kotak/scrip-master/raw",  get(routes::kotak_scrip_raw_handler))
@@ -339,6 +340,7 @@ async fn main() {
         .route("/api/auth/telegram/status",         get(routes::telegram_status_handler))
         .route("/api/auth/telegram/chats",          get(routes::telegram_chats_handler))
         .route("/api/auth/telegram/start",          post(routes::telegram_start_handler))
+        .route("/api/auth/telegram/disconnect",     axum::routing::delete(routes::disconnect_telegram))
         .fallback_service(ServeDir::new("../frontend/dist"))
         .with_state(state)
         .layer(CorsLayer::permissive());

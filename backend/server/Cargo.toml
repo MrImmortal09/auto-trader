@@ -25,4 +25,5 @@ tokio-stream       = { version = "0.1", features = ["sync"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 time               = { version = "0.3", features = ["macros", "formatting"] }
+chrono             = { version = "0.4", features = ["std"] }
 sysinfo            = "0.37"

@@ -1470,6 +1470,20 @@ function ConnectionPanel({ serverBase, onServerBaseChange }: {
     return () => clearInterval(timer);
   }, [serverBase]);
 
+  const handleDisconnectKotak = async () => {
+    if (!confirm('Disconnect Kotak? The WebSocket will stop and the session will be cleared. Your input fields will not be touched.')) return;
+    try {
+      await apiFetch(serverBase, '/api/auth/kotak/disconnect', { method: 'DELETE' });
+    } catch (e) {}
+  };
+
+  const handleDisconnectTelegram = async () => {
+    if (!confirm('Disconnect Telegram? The ingester will stop and the session file will be deleted. Your input fields will not be touched.')) return;
+    try {
+      await apiFetch(serverBase, '/api/auth/telegram/disconnect', { method: 'DELETE' });
+    } catch (e) {}
+  };
+
   const handleReset = async () => {
     if (!confirm('Are you sure you want to reset all connections? This will log out Telegram and Kotak and restart the server!')) return;
     try {
@@ -1485,20 +1499,43 @@ function ConnectionPanel({ serverBase, onServerBaseChange }: {
     <div className="flex flex-col gap-4 bg-gray-900 border-b border-gray-700 px-4 py-3">
       <div className="flex items-center justify-between">
         <div className="flex gap-4 text-xs font-semibold">
-          <div className="flex items-center gap-1">
+          {/* Kotak status + disconnect */}
+          <div className="flex items-center gap-1.5">
             <div className={`w-2 h-2 rounded-full ${sysStatus.kotak_connected ? 'bg-emerald-500 shadow-[0_0_5px_rgba(16,185,129,0.5)]' : 'bg-red-500'}`} />
             <span className={sysStatus.kotak_connected ? 'text-gray-200' : 'text-gray-500'}>Kotak</span>
+            {sysStatus.kotak_connected && (
+              <button
+                id="btn-disconnect-kotak"
+                onClick={handleDisconnectKotak}
+                className="ml-1 px-1.5 py-0.5 text-[10px] rounded bg-red-900/40 hover:bg-red-800/60 text-red-400 hover:text-white border border-red-900/50 transition-colors"
+              >
+                Disconnect
+              </button>
+            )}
           </div>
-          <div className="flex items-center gap-1">
+          {/* Telegram status + disconnect */}
+          <div className="flex items-center gap-1.5">
             <div className={`w-2 h-2 rounded-full ${sysStatus.telegram_connected ? 'bg-emerald-500 shadow-[0_0_5px_rgba(16,185,129,0.5)]' : 'bg-red-500'}`} />
             <span className={sysStatus.telegram_connected ? 'text-gray-200' : 'text-gray-500'}>Telegram</span>
+            {sysStatus.telegram_connected && (
+              <button
+                id="btn-disconnect-telegram"
+                onClick={handleDisconnectTelegram}
+                className="ml-1 px-1.5 py-0.5 text-[10px] rounded bg-red-900/40 hover:bg-red-800/60 text-red-400 hover:text-white border border-red-900/50 transition-colors"
+              >
+                Disconnect
+              </button>
+            )}
           </div>
         </div>
+        {/* Hard reset (restarts server) — kept for emergencies */}
         <button
+          id="btn-reset-all-connections"
           onClick={handleReset}
-          className="btn-sm bg-red-900/40 hover:bg-red-800/60 text-red-400 border border-red-900/50 hover:text-white transition-colors"
+          className="btn-sm bg-red-900/20 hover:bg-red-900/40 text-red-600 hover:text-red-400 border border-red-900/30 transition-colors"
+          title="Full reset — restarts the server process"
         >
-          Reset Connections
+          Reset All
         </button>
       </div>
       <KotakLoginPanel serverBase={serverBase} onServerBaseChange={onServerBaseChange} />
