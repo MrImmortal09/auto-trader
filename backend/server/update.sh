@@ -27,6 +27,19 @@ pkill -x server || echo "No existing server process found."
 
 sleep 2
 
+# build the frontend
+echo "Building frontend..."
+FRONTEND="$HOME/auto-trader/frontend"
+if cd "$FRONTEND"; then
+    git pull || echo "Warning: git pull failed"
+    pnpm install || echo "Warning: npm install failed"
+    pnpm run build || echo "Warning: npm run build failed"
+else
+    echo "Warning: could not cd to $FRONTEND"
+fi
+
+
+
 # 3. Replace binary
 echo "Replacing binary..."
 mkdir -p "$TARGET_DIR"
