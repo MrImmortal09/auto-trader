@@ -327,6 +327,7 @@ async fn main() {
         .route("/api/settings/clear_database",      post(routes::post_clear_database_handler))
         .route("/api/wallet/balance",               get(routes::get_wallet_balance_handler)
                                                    .post(routes::post_wallet_balance_handler))
+        .route("/api/update_server",                post(routes::post_update_server_handler))
         .route("/api/auth/kotak",                  post(routes::kotak_login_handler)
                                                    .get(routes::kotak_status_handler))
         .route("/api/auth/kotak/disconnect",        axum::routing::delete(routes::disconnect_kotak))
