@@ -16,6 +16,11 @@ import {
   Wallet,
   Wifi,
   WifiOff,
+  Clock,
+  FileText,
+  CheckCircle2,
+  ChevronRight,
+  XCircle,
 } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
@@ -186,6 +191,7 @@ function HeaderNav({ currentPath }: { currentPath: string }) {
   return (
     <nav className="ml-auto flex items-center gap-2">
       <a href="/" className={linkClass(currentPath === '/')}>Dashboard</a>
+      <a href="/reports" className={linkClass(currentPath === '/reports')}>Daily Reports</a>
       <a href="/health" className={linkClass(currentPath === '/health')}>Health</a>
     </nav>
   );
@@ -636,13 +642,15 @@ function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?
             // Format timestamp from "2026-07-20 06:21:23"
             let timeStr = 'Hist';
             if (item.timestamp) {
-              const d = new Date(item.timestamp + 'Z'); // assuming UTC in db
-              if (!isNaN(d.getTime())) {
-                let hours = d.getHours();
+              // Backend stores exactly "YYYY-MM-DD HH:MM:SS" in IST. Parse it directly to ignore browser timezone.
+              const timePart = item.timestamp.split(' ')[1];
+              if (timePart) {
+                const [h, m, s] = timePart.split(':');
+                let hours = parseInt(h, 10);
                 const ampm = hours >= 12 ? 'PM' : 'AM';
                 hours = hours % 12;
                 hours = hours ? hours : 12;
-                timeStr = `${String(hours).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')} ${ampm}`;
+                timeStr = `${String(hours).padStart(2, '0')}:${m}:${s} ${ampm}`;
               }
             }
             return { id: Date.now() + i + Math.random(), text, time: timeStr, isError };
@@ -663,12 +671,13 @@ function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?
     }
     es.onopen = () => setConnected(true);
     es.onmessage = (e: MessageEvent<string>) => {
-      const now = new Date();
-      let hours = now.getHours();
+      // Force current time to IST
+      const nowIST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+      let hours = nowIST.getHours();
       const ampm = hours >= 12 ? 'PM' : 'AM';
       hours = hours % 12;
       hours = hours ? hours : 12; // the hour '0' should be '12'
-      const timeStr = `${String(hours).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')} ${ampm}`;
+      const timeStr = `${String(hours).padStart(2, '0')}:${String(nowIST.getMinutes()).padStart(2, '0')}:${String(nowIST.getSeconds()).padStart(2, '0')} ${ampm}`;
 
       const text = e.data;
       const isError = text.includes('"level":"ERROR"') || text.includes('"event":"ERROR"');
@@ -1582,6 +1591,154 @@ function ConnectionPanel({ serverBase, onServerBaseChange }: {
 }
 
 // ---------------------------------------------------------------------------
+// Reports Page
+// ---------------------------------------------------------------------------
+
+function ReportsPage({ serverBase }: { serverBase: string }) {
+  const [trades, setTrades] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedSignal, setSelectedSignal] = useState<any>(null); // For the modal
+
+  useEffect(() => {
+    apiFetch(serverBase, '/api/portfolio')
+      .then(res => res.json())
+      .then(data => {
+        setTrades(data.trades || []);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, [serverBase]);
+
+  // Group by date (YYYY-MM-DD)
+  const groupedByDate: Record<string, any[]> = {};
+  trades.forEach(t => {
+    const date = t.timestamp.split(' ')[0]; // "2026-07-24"
+    if (!groupedByDate[date]) groupedByDate[date] = [];
+    groupedByDate[date].push(t);
+  });
+
+  // Sort dates descending
+  const dates = Object.keys(groupedByDate).sort((a, b) => b.localeCompare(a));
+
+  return (
+    <div className="p-6">
+      <h2 className="text-xl font-bold mb-6">Daily Reports & PnL</h2>
+      {loading ? (
+        <p className="text-gray-400">Loading reports...</p>
+      ) : dates.length === 0 ? (
+        <p className="text-gray-400">No trades recorded yet.</p>
+      ) : (
+        <div className="flex flex-col gap-8">
+          {dates.map(date => {
+            const dayTrades = groupedByDate[date];
+            const dailyPnl = dayTrades.reduce((acc, t) => acc + t.net_value, 0);
+
+            // Group by signal_id within the day
+            const bySignal: Record<string, any[]> = {};
+            dayTrades.forEach(t => {
+              const sid = t.signal_id || 'legacy';
+              if (!bySignal[sid]) bySignal[sid] = [];
+              bySignal[sid].push(t);
+            });
+
+            return (
+              <div key={date} className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+                <div className="bg-gray-900 px-4 py-3 border-b border-gray-700 flex justify-between items-center">
+                  <h3 className="font-semibold text-lg">{date}</h3>
+                  <div className={`font-mono font-bold ${dailyPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {dailyPnl >= 0 ? '+' : ''}₹{dailyPnl.toFixed(2)}
+                  </div>
+                </div>
+                <div className="divide-y divide-gray-700">
+                  {Object.entries(bySignal).map(([sid, sigTrades]) => {
+                    const isLegacy = sid === 'legacy';
+                    const groupPnl = sigTrades.reduce((acc, t) => acc + t.net_value, 0);
+                    // Use the ticker from the first trade
+                    const ticker = sigTrades[0].ticker;
+                    const rawMsg = sigTrades[0].raw_message;
+
+                    return (
+                      <div key={sid} className="px-4 py-3 flex items-center justify-between hover:bg-gray-750 transition-colors">
+                        <div>
+                          <div className="font-semibold text-sm">{ticker}</div>
+                          <div className="text-xs text-gray-400 mt-1">
+                            {isLegacy ? (
+                              <span className="text-yellow-500/70">Legacy Trades (No context)</span>
+                            ) : (
+                              <span>Signal ID: {sid.slice(0,8)}...</span>
+                            )}
+                          </div>
+                        </div>
+                        
+                        <div className="flex items-center gap-4">
+                          <div className="flex flex-col items-end">
+                            <span className="text-[10px] text-gray-500 uppercase">Net PnL</span>
+                            <span className={`font-mono text-sm ${groupPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                              {groupPnl >= 0 ? '+' : ''}₹{groupPnl.toFixed(2)}
+                            </span>
+                          </div>
+                          
+                          {!isLegacy && (
+                            <button
+                              onClick={() => setSelectedSignal({ trades: sigTrades, message: rawMsg })}
+                              className="p-1.5 rounded-full bg-blue-900/30 text-blue-400 hover:bg-blue-600 hover:text-white transition-colors"
+                              title="View Trade Info"
+                            >
+                              <Info size={16} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Info Modal */}
+      {selectedSignal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl max-w-lg w-full overflow-hidden flex flex-col">
+            <div className="px-4 py-3 border-b border-gray-700 flex justify-between items-center bg-gray-900">
+              <h3 className="font-semibold">Trade Details</h3>
+              <button onClick={() => setSelectedSignal(null)} className="text-gray-400 hover:text-white">
+                <XCircle size={20} />
+              </button>
+            </div>
+            <div className="p-4 overflow-y-auto max-h-[70vh]">
+              <h4 className="text-xs font-semibold text-gray-400 uppercase mb-2">Original Message</h4>
+              <div className="bg-gray-950 p-3 rounded font-mono text-sm text-blue-300 whitespace-pre-wrap mb-6 border border-gray-800">
+                {selectedSignal.message || 'No message recorded.'}
+              </div>
+
+              <h4 className="text-xs font-semibold text-gray-400 uppercase mb-2">Executions</h4>
+              <div className="flex flex-col gap-2">
+                {selectedSignal.trades.map((t: any) => (
+                  <div key={t.id} className="bg-gray-700/30 p-2 rounded flex justify-between items-center border border-gray-700/50">
+                    <div className="flex flex-col">
+                      <span className={`text-xs font-bold ${t.action === 'BUY' ? 'text-blue-400' : 'text-purple-400'}`}>
+                        {t.action} {t.qty} @ ₹{t.executed_price}
+                      </span>
+                      <span className="text-[10px] text-gray-400">{t.timestamp}</span>
+                    </div>
+                    <div className={`font-mono text-sm ${t.net_value >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {t.net_value >= 0 ? '+' : ''}₹{t.net_value.toFixed(2)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -1607,6 +1764,8 @@ export default function App() {
         </header>
         {isHealthPage ? (
           <HealthPage serverBase={serverBase} />
+        ) : currentPath === '/reports' ? (
+          <ReportsPage serverBase={serverBase} />
         ) : (
           <>
             <div className="shrink-0"><SettingsBar serverBase={serverBase} /></div>
