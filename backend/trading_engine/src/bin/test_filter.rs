@@ -35,6 +35,7 @@ async fn main() {
         stop_loss: 4.0,
         source: "telegram".to_string(),
         signal_id: None,
+        raw_message: None,
     };
 
     if let Some(record) = store.resolve_signal(&signal) {

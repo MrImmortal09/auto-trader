@@ -86,7 +86,10 @@ fn find_csv_url(val: &serde_json::Value, segment: &str) -> Option<String> {
             }
         }
         serde_json::Value::String(s) => {
-            if s.contains(&format!("{}.csv", segment)) {
+            if s.contains(&format!("{}.csv", segment))
+                || s.contains(&format!("{}-", segment))
+                || (s.ends_with(".csv") && s.contains(segment))
+            {
                 return Some(s.clone());
             }
         }
@@ -281,5 +284,47 @@ impl KotakClient {
     /// Returns `(auth_token, sid)` for the active session, or `None`.
     pub fn session_credentials(&self) -> Option<(&str, &str)> {
         self.session.as_ref().map(|s| (s.auth_token.as_str(), s.sid.as_str()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_csv_url;
+    use serde_json::json;
+
+    #[test]
+    fn test_find_csv_url_standard_and_versioned() {
+        let sample_response = json!({
+            "data": {
+                "filesPaths": [
+                    "https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod/2026-07-27/transformed/nse_fo.csv",
+                    "https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod/2026-07-27/transformed/bse_fo.csv",
+                    "https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod/2026-07-27/transformed-v1/bse_cm-v1.csv",
+                    "https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod/2026-07-27/transformed-v1/nse_cm-v1.csv"
+                ],
+                "baseFolder": "https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod"
+            }
+        });
+
+        assert_eq!(
+            find_csv_url(&sample_response, "nse_fo"),
+            Some("https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod/2026-07-27/transformed/nse_fo.csv".to_string())
+        );
+        assert_eq!(
+            find_csv_url(&sample_response, "bse_fo"),
+            Some("https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod/2026-07-27/transformed/bse_fo.csv".to_string())
+        );
+        assert_eq!(
+            find_csv_url(&sample_response, "nse_cm"),
+            Some("https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod/2026-07-27/transformed-v1/nse_cm-v1.csv".to_string())
+        );
+        assert_eq!(
+            find_csv_url(&sample_response, "bse_cm"),
+            Some("https://lapi.kotaksecurities.com/wso2-scripmaster/v1/prod/2026-07-27/transformed-v1/bse_cm-v1.csv".to_string())
+        );
+        assert_eq!(
+            find_csv_url(&sample_response, "mcx_fo"),
+            None
+        );
     }
 }

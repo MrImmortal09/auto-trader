@@ -20,7 +20,7 @@ TMP_BIN="/tmp/server-latest"
 curl -sL "$DOWNLOAD_URL" -o "$TMP_BIN"
 chmod +x "$TMP_BIN"
 
-TARGET_DIR="$HOME/auto-trader/backend/server"
+TARGET_DIR="$HOME/auto-trader/backend/"
 TARGET_BIN="$TARGET_DIR/$VERSION_TAG"
 
 # 2. Stop existing server
