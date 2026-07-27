@@ -211,8 +211,8 @@ pub async fn close_position_handler(
          (ticker, action, qty, executed_price, timestamp,
           gross_value, brokerage, stt_charge, sebi_fee,
           stamp_duty, transaction_charge, gst, net_value,
-          signal_id, raw_message)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          signal_id, raw_message, exit_reason)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&instrument)
     .bind("SELL")
@@ -229,6 +229,7 @@ pub async fn close_position_handler(
     .bind(fees.net_value)
     .bind(&signal_id)
     .bind(&raw_message)
+    .bind("CLOSED_VIA_FRONTEND")
     .execute(&mut *tx)
     .await
     {

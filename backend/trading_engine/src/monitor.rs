@@ -45,6 +45,7 @@ async fn send_trade(
     c: &ChargeBreakdown,
     signal_id: Option<String>,
     raw_message: Option<String>,
+    exit_reason: Option<String>,
 ) {
     let _ = tx.send(DbWriteMessage::Trade {
         ticker: ticker.to_owned(), action: action.to_owned(), qty,
@@ -53,7 +54,7 @@ async fn send_trade(
         stt_charge: c.stt_charge, sebi_fee: c.sebi_fee,
         stamp_duty: c.stamp_duty, transaction_charge: c.transaction_charge,
         gst: c.gst, net_value: c.net_value,
-        signal_id, raw_message,
+        signal_id, raw_message, exit_reason,
     }).await;
 }
 
@@ -331,6 +332,33 @@ pub async fn start_position_monitor(
                                 }
 
                                 let mut pos_guard = positions.write().await;
+                                // Automatically exit existing opposite positions for this instrument (e.g., CE trade when PE signal arrives)
+                                for p in pos_guard.iter_mut() {
+                                    if p.signal.instrument_name.eq_ignore_ascii_case(&signal.instrument_name)
+                                        && !matches!(p.state, TradeState::Closed)
+                                    {
+                                        let is_opposite_option = p.signal.option_type.is_some()
+                                            && signal.option_type.is_some()
+                                            && p.signal.option_type != signal.option_type;
+                                        let is_opposite_action = p.signal.action != signal.action;
+
+                                        if is_opposite_option || is_opposite_action {
+                                            tracing::info!(
+                                                instrument = %signal.instrument_name,
+                                                old_id = %p.id,
+                                                old_type = ?p.signal.option_type,
+                                                new_type = ?signal.option_type,
+                                                "Exiting existing opposite trade due to new signal"
+                                            );
+                                            if matches!(p.state, TradeState::WaitingForEntry) {
+                                                p.state = TradeState::Closed;
+                                            } else {
+                                                p.force_exit = Some("OPPOSITE_SIGNAL_EXIT".to_string());
+                                            }
+                                        }
+                                    }
+                                }
+
                                 pos_guard.push(MonitoredPosition {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     signal,
@@ -516,7 +544,7 @@ pub async fn start_position_monitor(
                                 pa.ltp, fees.net_value
                             );
                             tracing::info!(instrument = %instrument, price = pa.ltp, qty, "Entry executed");
-                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone()).await;
+                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some("ENTRY".to_string())).await;
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
                         }
 
@@ -531,7 +559,7 @@ pub async fn start_position_monitor(
                                 price
                             );
                             tracing::info!(instrument = %instrument, reason, price, pnl, "Exit executed");
-                            send_trade(&db_tx, &instrument, "SELL", qty, price, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone()).await;
+                            send_trade(&db_tx, &instrument, "SELL", qty, price, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some(reason.clone())).await;
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
 
                             pos.executed_qty -= qty;
