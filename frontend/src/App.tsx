@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   ChevronDown,
@@ -1733,9 +1733,36 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
   // Sort dates descending
   const dates = Object.keys(groupedByDate).sort((a, b) => b.localeCompare(a));
 
-  const getTradePnlDelta = (t: any) => {
-    const val = t.net_value || 0;
-    return t.action?.toUpperCase() === 'BUY' ? -val : val;
+  // Average BUY cost per unit, keyed by `${signal_id}|${ticker}`, computed
+  // across ALL trades (a position may be opened/closed on different days).
+  // net_value on a BUY leg already includes fees, so this is the true per-unit
+  // cost basis.
+  const avgBuyPerUnit = useMemo(() => {
+    const buyQty: Record<string, number> = {};
+    const buyNet: Record<string, number> = {};
+    trades.forEach(t => {
+      if (t.action?.toUpperCase() !== 'BUY') return;
+      const key = `${t.signal_id || 'legacy'}|${t.ticker}`;
+      buyQty[key] = (buyQty[key] || 0) + (t.qty || 0);
+      buyNet[key] = (buyNet[key] || 0) + (t.net_value || 0);
+    });
+    const avg: Record<string, number> = {};
+    Object.keys(buyQty).forEach(k => {
+      avg[k] = buyQty[k] > 0 ? buyNet[k] / buyQty[k] : 0;
+    });
+    return avg;
+  }, [trades]);
+
+  // Realized PnL for a single trade leg.
+  //  - BUY  → 0 (opening/adding to a position realizes nothing).
+  //  - SELL → net proceeds − cost basis for the quantity sold (avg buy cost).
+  // So buying 2 lots and selling none = 0; selling 1 of 2 = P&L on that 1 lot;
+  // selling all = P&L on the full position.
+  const getRealizedPnl = (t: any) => {
+    if (t.action?.toUpperCase() !== 'SELL') return 0;
+    const key = `${t.signal_id || 'legacy'}|${t.ticker}`;
+    const costBasis = (t.qty || 0) * (avgBuyPerUnit[key] || 0);
+    return (t.net_value || 0) - costBasis;
   };
 
   return (
@@ -1749,7 +1776,7 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
         <div className="flex flex-col gap-8">
           {dates.map(date => {
             const dayTrades = groupedByDate[date];
-            const dailyPnl = dayTrades.reduce((acc, t) => acc + getTradePnlDelta(t), 0);
+            const dailyPnl = dayTrades.reduce((acc, t) => acc + getRealizedPnl(t), 0);
 
             // Group by signal_id within the day
             const bySignal: Record<string, any[]> = {};
@@ -1770,7 +1797,7 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
                 <div className="divide-y divide-gray-700">
                   {Object.entries(bySignal).map(([sid, sigTrades]) => {
                     const isLegacy = sid === 'legacy';
-                    const groupPnl = sigTrades.reduce((acc, t) => acc + getTradePnlDelta(t), 0);
+                    const groupPnl = sigTrades.reduce((acc, t) => acc + getRealizedPnl(t), 0);
                     // Use the ticker from the first trade
                     const ticker = sigTrades[0].ticker;
                     const rawMsg = sigTrades[0].raw_message;
@@ -1790,7 +1817,7 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
                         
                         <div className="flex items-center gap-4">
                           <div className="flex flex-col items-end">
-                            <span className="text-[10px] text-gray-500 uppercase">Net PnL</span>
+                            <span className="text-[10px] text-gray-500 uppercase">Realized PnL</span>
                             <span className={`font-mono text-sm ${groupPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                               {groupPnl >= 0 ? '+' : ''}₹{groupPnl.toFixed(2)}
                             </span>
@@ -1835,7 +1862,8 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
               <h4 className="text-xs font-semibold text-gray-400 uppercase mb-2">Executions</h4>
               <div className="flex flex-col gap-2">
                 {selectedSignal.trades.map((t: any) => {
-                  const delta = getTradePnlDelta(t);
+                  const isSell = t.action?.toUpperCase() === 'SELL';
+                  const delta = getRealizedPnl(t);
                   return (
                     <div key={t.id} className="bg-gray-700/30 p-2 rounded flex justify-between items-center border border-gray-700/50">
                       <div className="flex flex-col gap-1">
@@ -1851,9 +1879,13 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
                         </div>
                         <span className="text-[10px] text-gray-400">{t.timestamp}</span>
                       </div>
-                      <div className={`font-mono text-sm ${delta >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {delta >= 0 ? '+' : ''}₹{delta.toFixed(2)}
-                      </div>
+                      {isSell ? (
+                        <div className={`font-mono text-sm ${delta >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {delta >= 0 ? '+' : ''}₹{delta.toFixed(2)}
+                        </div>
+                      ) : (
+                        <div className="font-mono text-sm text-gray-500">—</div>
+                      )}
                     </div>
                   );
                 })}
