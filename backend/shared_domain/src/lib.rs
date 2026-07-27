@@ -145,6 +145,9 @@ pub struct MonitoredPosition {
     /// Set this to a string reason to force the position to exit on the next tick
     #[serde(default)]
     pub force_exit: Option<String>,
+    /// Optional price override for forced exits (e.g., from "exit at 610" Telegram reply)
+    #[serde(default)]
+    pub override_exit_price: Option<f64>,
     /// Minimum price increment for this contract (usually 0.05)
     #[serde(default = "default_tick_size")]
     pub tick_size: f64,

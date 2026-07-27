@@ -1716,7 +1716,7 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
         <div className="flex flex-col gap-8">
           {dates.map(date => {
             const dayTrades = groupedByDate[date];
-            const dailyPnl = dayTrades.reduce((acc, t) => acc + t.net_value, 0);
+            const dailyPnl = dayTrades.reduce((acc, t) => acc + (t.net_value || 0), 0);
 
             // Group by signal_id within the day
             const bySignal: Record<string, any[]> = {};
@@ -1737,7 +1737,7 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
                 <div className="divide-y divide-gray-700">
                   {Object.entries(bySignal).map(([sid, sigTrades]) => {
                     const isLegacy = sid === 'legacy';
-                    const groupPnl = sigTrades.reduce((acc, t) => acc + t.net_value, 0);
+                    const groupPnl = sigTrades.reduce((acc, t) => acc + (t.net_value || 0), 0);
                     // Use the ticker from the first trade
                     const ticker = sigTrades[0].ticker;
                     const rawMsg = sigTrades[0].raw_message;
@@ -1809,8 +1809,8 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
                       </span>
                       <span className="text-[10px] text-gray-400">{t.timestamp}</span>
                     </div>
-                    <div className={`font-mono text-sm ${t.net_value >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {t.net_value >= 0 ? '+' : ''}₹{t.net_value.toFixed(2)}
+                    <div className={`font-mono text-sm ${(t.net_value || 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {(t.net_value || 0) >= 0 ? '+' : ''}₹{(t.net_value || 0).toFixed(2)}
                     </div>
                   </div>
                 ))}

@@ -21,6 +21,7 @@ enum PosAction {
         qty: i32,
         reason: String,
         new_sl: Option<f64>,
+        exec_price: Option<f64>,
     },
     Cancel { reason: String },
 }
@@ -133,6 +134,38 @@ pub async fn start_position_monitor(
                                     let snapshot = { positions.read().await.clone() };
                                     send_positions_snapshot(&db_tx, &snapshot).await;
                                     tracing::info!(id=?sig_id, "Updated SL via reply");
+                                }
+                            }
+                            continue;
+                        }
+
+                        if signal.action == "EXIT_AT" {
+                            if let Some(ref sig_id) = signal.signal_id {
+                                let mut write_guard = positions.write().await;
+                                let mut updated = false;
+                                for p in write_guard.iter_mut() {
+                                    if p.signal.signal_id.as_ref() == Some(sig_id) {
+                                        if !matches!(p.state, TradeState::Closed) {
+                                            p.override_exit_price = Some(signal.entry_price);
+                                            p.force_exit = Some(format!("EXIT_AT_{:.2}", signal.entry_price));
+                                            if matches!(p.state, TradeState::WaitingForEntry) {
+                                                p.state = TradeState::Closed;
+                                            }
+                                            updated = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if updated {
+                                    drop(write_guard);
+                                    let msg = format!(
+                                        r#"{{"event":"SIGNAL_EXITED","instrument":"{}","exit_price":{:.2}}}"#,
+                                        "UPDATE", signal.entry_price
+                                    );
+                                    send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                                    let snapshot = { positions.read().await.clone() };
+                                    send_positions_snapshot(&db_tx, &snapshot).await;
+                                    tracing::info!(id=?sig_id, price=signal.entry_price, "Triggered EXIT_AT via reply");
                                 }
                             }
                             continue;
@@ -310,6 +343,7 @@ pub async fn start_position_monitor(
                                     ltp: None,
                                     ws_scrip_key: ws_key,
                                     force_exit: None,
+                                    override_exit_price: None,
                                     tick_size: resolved_tick_size,
                                 });
                                 let snapshot = pos_guard.clone();
@@ -397,11 +431,11 @@ pub async fn start_position_monitor(
                         TradeState::Active => {
                             if let Some(ref reason) = pos.force_exit {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: reason.clone(), new_sl: None,
+                                    qty: pos.executed_qty, reason: reason.clone(), new_sl: None, exec_price: pos.override_exit_price,
                                 })
                             } else if ltp <= pos.current_sl {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: "SL_HIT".to_string(), new_sl: None,
+                                    qty: pos.executed_qty, reason: "SL_HIT".to_string(), new_sl: None, exec_price: None,
                                 })
                             } else if !pos.signal.targets.is_empty() && ltp >= pos.signal.targets[0] {
                                 let has_t2 = pos.signal.targets.len() > 1;
@@ -430,6 +464,7 @@ pub async fn start_position_monitor(
                                     qty: exit_qty,
                                     reason: (if has_t2 { "TGT1_PARTIAL" } else { "TGT1_FULL" }).to_string(),
                                     new_sl,
+                                    exec_price: None,
                                 })
                             } else { None }
                         }
@@ -437,15 +472,15 @@ pub async fn start_position_monitor(
                         TradeState::Target1Hit => {
                             if let Some(ref reason) = pos.force_exit {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: reason.clone(), new_sl: None,
+                                    qty: pos.executed_qty, reason: reason.clone(), new_sl: None, exec_price: pos.override_exit_price,
                                 })
                             } else if ltp <= pos.current_sl {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: "TRAIL_SL_HIT".to_string(), new_sl: None,
+                                    qty: pos.executed_qty, reason: "TRAIL_SL_HIT".to_string(), new_sl: None, exec_price: None,
                                 })
                             } else if pos.signal.targets.len() > 1 && ltp >= pos.signal.targets[1] {
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: "TGT2_HIT".to_string(), new_sl: None,
+                                    qty: pos.executed_qty, reason: "TGT2_HIT".to_string(), new_sl: None, exec_price: None,
                                 })
                             } else { None }
                         }
@@ -485,17 +520,18 @@ pub async fn start_position_monitor(
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
                         }
 
-                        PosAction::ExitSell { qty, reason, new_sl } => {
+                        PosAction::ExitSell { qty, reason, new_sl, exec_price } => {
+                            let price = exec_price.unwrap_or(pa.ltp);
                             let fees = FeeCalculator::calculate(
-                                qty, pa.ltp, "SELL", is_options, cfg.brokerage_per_order,
+                                qty, price, "SELL", is_options, cfg.brokerage_per_order,
                             );
                             let pnl = fees.net_value - pos.avg_buy_price * qty as f64;
                             let msg = format!(
                                 r#"{{"event":"{reason}","instrument":"{instrument}","price":{:.2},"qty":{qty},"pnl":{pnl:.2}}}"#,
-                                pa.ltp
+                                price
                             );
-                            tracing::info!(instrument = %instrument, reason, pnl, "Exit executed");
-                            send_trade(&db_tx, &instrument, "SELL", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone()).await;
+                            tracing::info!(instrument = %instrument, reason, price, pnl, "Exit executed");
+                            send_trade(&db_tx, &instrument, "SELL", qty, price, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone()).await;
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
 
                             pos.executed_qty -= qty;
