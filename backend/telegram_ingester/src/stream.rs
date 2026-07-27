@@ -8,7 +8,7 @@ use grammers_session::updates::UpdatesLike;
 use shared_domain::TradeSignal;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::parser::{parse_signal, parse_reply_sl};
+use crate::parser::{parse_signal, parse_reply_sl, parse_reply_exit};
 use crate::session_file;
 
 // ---------------------------------------------------------------------------
@@ -98,6 +98,26 @@ pub(crate) async fn run_event_loop(
                     raw_message: Some(text.to_owned()),
                 };
                 tracing::info!(new_sl, "Reply parsed as SL update — broadcasting");
+                if tx.send(signal).is_err() {
+                    tracing::warn!("[telegram] No receivers — update dropped");
+                }
+                emitted = true;
+            } else if let Some(exit_price) = parse_reply_exit(text) {
+                let signal = TradeSignal {
+                    instrument_name: "UPDATE".to_string(),
+                    strike: None,
+                    option_type: None,
+                    expiry: None,
+                    action: "EXIT_AT".to_string(),
+                    entry_condition: "ABOVE".to_string(),
+                    entry_price: exit_price,
+                    targets: vec![],
+                    stop_loss: 0.0,
+                    source: "telegram_reply".to_string(),
+                    signal_id: Some(reply_to_id.to_string()),
+                    raw_message: Some(text.to_owned()),
+                };
+                tracing::info!(exit_price, "Reply parsed as EXIT_AT — broadcasting");
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — update dropped");
                 }

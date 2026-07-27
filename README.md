@@ -495,6 +495,12 @@ TGT 2600 / 2700
 SL 2420
 ```
 
+### Reply Commands (SL Updates & Forced Exits)
+
+When replying directly to an original trade signal message in Telegram, the ingester recognises:
+- **SL Update:** e.g., `SL to 4.50`, `Move SL to 4`, `sl -> 2.5` — updates the active stop-loss for the position.
+- **Exit Command:** e.g., `exit at 610`, `exit @610`, `exit @ 610`, `exit 610`, `exit all at 610` — immediately forces the position to exit all remaining quantities at the specified price.
+
 ---
 
 ## Position Lifecycle
@@ -524,6 +530,16 @@ On `Target1Hit`:
 | P&L chart | middle | Recharts line chart of cumulative realised P&L. |
 | Trade table | middle | Full history with gross, charges breakdown, and per-trade P&L. |
 | Log terminal | bottom | Live SSE stream of engine events (entry, SL hit, target hit, config changes). |
+| Daily Reports | `/reports` | Dedicated daily summary grouping trades by calendar date and Telegram signal ID. |
+
+### Daily Reports (`/reports`)
+
+The **Daily Reports** page provides an aggregated view of trading performance by calendar day (in IST):
+- **Date-Level Summary:** Shows the net realised P&L for each day.
+- **Signal Grouping:** Trades are grouped by their originating Telegram `signal_id`, making it easy to track net P&L per strategy or call. Trades without an ID appear under "Legacy Trades".
+- **Trade Details Modal (Info `i` button):** Clicking the `i` button next to any signal opens a modal showing:
+  - **Original Message:** The raw Telegram message text that triggered the trade signal.
+  - **Executions:** Itemized BUY/SELL executions with timestamp, executed price, quantity, and net P&L after brokerage and taxes.
 
 ---
 

@@ -36,6 +36,11 @@ static UPDATE_SL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:MOVE|SHIFT)?\s*(?:STOP[-\s]*LOSS|S\.?L\.?)\s*(?:TO|:-|:|->|-)?\s*([\d.]+)").expect("UPDATE_SL_RE")
 });
 
+/// Update Exit command from replies — handles `exit at 610`, `exit @610`, `exit@610`, `exit 610`, `EXIT AT 610.5`, `exit all at 610`.
+static UPDATE_EXIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bexit\b\s*(?:all\s+)?(?:at|@|cmp)?\s*([\d.]+)").expect("UPDATE_EXIT_RE")
+});
+
 static EXPIRY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(?:(\d{1,2})[ \t-]+)?(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)(?:\s+EXPIRY)?\b"
@@ -243,6 +248,13 @@ pub fn parse_reply_sl(text: &str) -> Option<f64> {
         .and_then(|c| c[1].parse().ok())
 }
 
+/// Parse a raw Telegram reply message to extract an exit command price.
+/// Returns `Some(exit_price)` if it matches an exit command pattern (e.g., "exit at 610").
+pub fn parse_reply_exit(text: &str) -> Option<f64> {
+    UPDATE_EXIT_RE.captures(text)
+        .and_then(|c| c[1].parse().ok())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -320,6 +332,19 @@ mod tests {
         assert_eq!(parse_reply_sl("SL:- 5"), Some(5.0));
         assert_eq!(parse_reply_sl("Update SL 6.0"), Some(6.0)); // matches SL_RE inside UPDATE_SL_RE logic
         assert_eq!(parse_reply_sl("Something else"), None);
+    }
+
+    #[test]
+    fn test_parse_reply_exit() {
+        assert_eq!(parse_reply_exit("exit at 610"), Some(610.0));
+        assert_eq!(parse_reply_exit("EXIT AT 610.50"), Some(610.5));
+        assert_eq!(parse_reply_exit("exit @ 610"), Some(610.0));
+        assert_eq!(parse_reply_exit("exit @610"), Some(610.0));
+        assert_eq!(parse_reply_exit("exit@610"), Some(610.0));
+        assert_eq!(parse_reply_exit("exit all at 610"), Some(610.0));
+        assert_eq!(parse_reply_exit("exit 610"), Some(610.0));
+        assert_eq!(parse_reply_exit("exit cmp 610"), Some(610.0));
+        assert_eq!(parse_reply_exit("Something else"), None);
     }
 
     #[test]

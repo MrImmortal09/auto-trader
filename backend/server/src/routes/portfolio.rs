@@ -35,6 +35,7 @@ pub struct PaperTrade {
     pub stamp_duty: f64,
     pub transaction_charge: f64,
     pub gst: f64,
+    pub net_value: f64,
     pub timestamp: String,
     pub signal_id: Option<String>,
     pub raw_message: Option<String>,
