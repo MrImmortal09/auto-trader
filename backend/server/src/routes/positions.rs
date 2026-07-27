@@ -147,11 +147,13 @@ pub async fn close_position_handler(
                 p.executed_qty,
                 p.avg_buy_price,
                 p.ws_scrip_key.clone(),
+                p.signal.signal_id.clone(),
+                p.signal.raw_message.clone(),
             )
         })
     };
 
-    let Some((position_state, instrument, is_options, qty, avg_buy_price, ws_scrip_key)) = snapshot else {
+    let Some((position_state, instrument, is_options, qty, avg_buy_price, ws_scrip_key, signal_id, raw_message)) = snapshot else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response();
     };
 
@@ -208,8 +210,9 @@ pub async fn close_position_handler(
         "INSERT INTO paper_trades
          (ticker, action, qty, executed_price, timestamp,
           gross_value, brokerage, stt_charge, sebi_fee,
-          stamp_duty, transaction_charge, gst, net_value)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          stamp_duty, transaction_charge, gst, net_value,
+          signal_id, raw_message)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&instrument)
     .bind("SELL")
@@ -224,6 +227,8 @@ pub async fn close_position_handler(
     .bind(fees.transaction_charge)
     .bind(fees.gst)
     .bind(fees.net_value)
+    .bind(&signal_id)
+    .bind(&raw_message)
     .execute(&mut *tx)
     .await
     {

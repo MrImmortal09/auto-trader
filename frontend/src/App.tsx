@@ -1705,6 +1705,11 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
   // Sort dates descending
   const dates = Object.keys(groupedByDate).sort((a, b) => b.localeCompare(a));
 
+  const getTradePnlDelta = (t: any) => {
+    const val = t.net_value || 0;
+    return t.action?.toUpperCase() === 'BUY' ? -val : val;
+  };
+
   return (
     <div className="p-6">
       <h2 className="text-xl font-bold mb-6">Daily Reports & PnL</h2>
@@ -1716,7 +1721,7 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
         <div className="flex flex-col gap-8">
           {dates.map(date => {
             const dayTrades = groupedByDate[date];
-            const dailyPnl = dayTrades.reduce((acc, t) => acc + (t.net_value || 0), 0);
+            const dailyPnl = dayTrades.reduce((acc, t) => acc + getTradePnlDelta(t), 0);
 
             // Group by signal_id within the day
             const bySignal: Record<string, any[]> = {};
@@ -1737,7 +1742,7 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
                 <div className="divide-y divide-gray-700">
                   {Object.entries(bySignal).map(([sid, sigTrades]) => {
                     const isLegacy = sid === 'legacy';
-                    const groupPnl = sigTrades.reduce((acc, t) => acc + (t.net_value || 0), 0);
+                    const groupPnl = sigTrades.reduce((acc, t) => acc + getTradePnlDelta(t), 0);
                     // Use the ticker from the first trade
                     const ticker = sigTrades[0].ticker;
                     const rawMsg = sigTrades[0].raw_message;
@@ -1801,19 +1806,22 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
 
               <h4 className="text-xs font-semibold text-gray-400 uppercase mb-2">Executions</h4>
               <div className="flex flex-col gap-2">
-                {selectedSignal.trades.map((t: any) => (
-                  <div key={t.id} className="bg-gray-700/30 p-2 rounded flex justify-between items-center border border-gray-700/50">
-                    <div className="flex flex-col">
-                      <span className={`text-xs font-bold ${t.action === 'BUY' ? 'text-blue-400' : 'text-purple-400'}`}>
-                        {t.action} {t.qty} @ ₹{t.executed_price}
-                      </span>
-                      <span className="text-[10px] text-gray-400">{t.timestamp}</span>
+                {selectedSignal.trades.map((t: any) => {
+                  const delta = getTradePnlDelta(t);
+                  return (
+                    <div key={t.id} className="bg-gray-700/30 p-2 rounded flex justify-between items-center border border-gray-700/50">
+                      <div className="flex flex-col">
+                        <span className={`text-xs font-bold ${t.action === 'BUY' ? 'text-blue-400' : 'text-purple-400'}`}>
+                          {t.action} {t.qty} @ ₹{t.executed_price}
+                        </span>
+                        <span className="text-[10px] text-gray-400">{t.timestamp}</span>
+                      </div>
+                      <div className={`font-mono text-sm ${delta >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                        {delta >= 0 ? '+' : ''}₹{delta.toFixed(2)}
+                      </div>
                     </div>
-                    <div className={`font-mono text-sm ${(t.net_value || 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {(t.net_value || 0) >= 0 ? '+' : ''}₹{(t.net_value || 0).toFixed(2)}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>
