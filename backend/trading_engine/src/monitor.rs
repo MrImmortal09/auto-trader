@@ -75,6 +75,28 @@ async fn send_positions_snapshot(
     }
 }
 
+/// IST hour/minute at/after which open positions are squared off on their
+/// expiry day, so an option is never carried into expiry/settlement.
+const EXPIRY_SQUAREOFF_HOUR: u32 = 15;
+const EXPIRY_SQUAREOFF_MINUTE: u32 = 10;
+
+/// True when it is at/after 15:10 IST on this position's expiry day.
+fn is_expiry_squareoff_due(pos: &MonitoredPosition) -> bool {
+    use chrono::Timelike;
+    let Some(ref expiry_str) = pos.signal.expiry else { return false; };
+    // Expiry is stored as e.g. "26-JUL-2026" (`%d-%b-%Y`, uppercased); chrono
+    // parses month abbreviations case-insensitively.
+    let Ok(exp_date) = chrono::NaiveDate::parse_from_str(expiry_str, "%d-%b-%Y") else {
+        return false;
+    };
+    let now = shared_domain::now_ist();
+    if exp_date != now.date_naive() {
+        return false;
+    }
+    let (h, m) = (now.hour(), now.minute());
+    h > EXPIRY_SQUAREOFF_HOUR || (h == EXPIRY_SQUAREOFF_HOUR && m >= EXPIRY_SQUAREOFF_MINUTE)
+}
+
 // ---------------------------------------------------------------------------
 // Public position monitor
 // ---------------------------------------------------------------------------
@@ -414,7 +436,21 @@ pub async fn start_position_monitor(
                         _ => continue,
                     };
 
-                    let pa = match pos.state {
+                    // Expiry-day square-off: at/after 15:10 IST on the option's
+                    // expiry day, force-close any still-open position at market so
+                    // it is never carried into expiry/settlement.
+                    let pa = if matches!(pos.state, TradeState::Active | TradeState::Target1Hit)
+                        && pos.force_exit.is_none()
+                        && is_expiry_squareoff_due(pos)
+                    {
+                        Some(PosAction::ExitSell {
+                            qty: pos.executed_qty,
+                            reason: "EXPIRY_SQUAREOFF".to_string(),
+                            new_sl: None,
+                            exec_price: None,
+                        })
+                    } else {
+                    match pos.state {
                         TradeState::WaitingForEntry => {
                             let triggered = match pos.signal.entry_condition.to_uppercase().as_str() {
                                 "ABOVE" => ltp >= pos.signal.entry_price,
@@ -514,6 +550,7 @@ pub async fn start_position_monitor(
                         }
 
                         TradeState::Closed => None,
+                    }
                     };
 
                     if let Some(a) = pa {

@@ -119,6 +119,7 @@ function formatExitReason(reason?: string): string {
     case 'TGT1_PARTIAL':
     case 'TGT1_HIT': return 'Target 1 Hit';
     case 'TGT2_HIT': return 'Target 2 Hit';
+    case 'EXPIRY_SQUAREOFF': return 'Expiry Square-off';
     default:
       if (reason.startsWith('EXIT_AT_')) {
         const price = reason.replace('EXIT_AT_', '');

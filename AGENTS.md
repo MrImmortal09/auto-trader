@@ -2,6 +2,8 @@
 
 ### you can connet to the cloud server where the backend server is running by running  "gcloud compute ssh --zone \"us-east1-d\" \"trader-1\" --project \"trader-502418\"
 
+### kotak api docs are present in kotak-api-docs folder
+
 ### Deployment Context
 - The backend binary is located at `~/auto-trader/backend/server` on the GCP instance.
 - The server is executed natively inside a `tmux` session named `0` (specifically pane `0:0`).
