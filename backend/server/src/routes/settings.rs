@@ -147,16 +147,23 @@ pub async fn post_update_server_handler(
     }
     let _ = std::fs::remove_file("session.json");
 
-    // 3. Trigger update.sh detached
+    // 3. Trigger update.sh in a NEW session (setsid) so it survives this server
+    //    being stopped — the script sends C-c to our own tmux pane. The binary
+    //    runs from ~/auto-trader/backend, so the script lives at ./server/update.sh.
+    //    Use an absolute HOME-based path so this does not depend on the CWD.
     tracing::info!("Spawning update.sh...");
-    if let Err(e) = std::process::Command::new("nohup")
+    let script_path = match std::env::var("HOME") {
+        Ok(home) => format!("{home}/auto-trader/backend/server/update.sh"),
+        Err(_) => "./server/update.sh".to_string(),
+    };
+    if let Err(e) = std::process::Command::new("setsid")
         .arg("bash")
-        .arg("./update.sh")
+        .arg(&script_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        tracing::error!("Failed to spawn update.sh: {e}");
+        tracing::error!("Failed to spawn update.sh ({script_path}): {e}");
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to trigger update"}))).into_response();
     }
 

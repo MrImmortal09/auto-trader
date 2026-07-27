@@ -1,2 +1,16 @@
 /target
 /backend/target
+
+# Runtime state — must never be committed (fights `git reset --hard` on deploy)
+session.json
+**/session.json
+trades.db
+trades.db-*
+**/trades.db
+**/trades.db-*
+
+# Downloaded / installed server release binaries on the deploy host
+backend/server-v*
+backend/server/server-v*
+backend/server/server-bin
+backend/server/server-latest
