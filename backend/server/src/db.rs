@@ -83,6 +83,10 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         &pool,
         "ALTER TABLE paper_trades ADD COLUMN raw_message TEXT",
     ).await;
+    ensure_column(
+        &pool,
+        "ALTER TABLE paper_trades ADD COLUMN exit_reason TEXT",
+    ).await;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS open_positions (
@@ -240,7 +244,7 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 ticker, action, qty, executed_price,
                 gross_value, brokerage, stt_charge, sebi_fee,
                 stamp_duty, transaction_charge, gst, net_value,
-                signal_id, raw_message,
+                signal_id, raw_message, exit_reason,
             } => {
                 let timestamp = current_ist_timestamp_string();
                 let mut tx = match pool.begin().await {
@@ -256,13 +260,13 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                      (ticker, action, qty, executed_price, timestamp,
                       gross_value, brokerage, stt_charge, sebi_fee,
                       stamp_duty, transaction_charge, gst, net_value,
-                      signal_id, raw_message)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      signal_id, raw_message, exit_reason)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 )
                  .bind(&ticker).bind(&action).bind(qty as i64).bind(executed_price).bind(&timestamp)
                 .bind(gross_value).bind(brokerage).bind(stt_charge).bind(sebi_fee)
                 .bind(stamp_duty).bind(transaction_charge).bind(gst).bind(net_value)
-                .bind(&signal_id).bind(&raw_message)
+                .bind(&signal_id).bind(&raw_message).bind(&exit_reason)
                 .execute(&mut *tx).await
                 {
                     tracing::error!("DB trade insert: {e}");

@@ -344,6 +344,7 @@ pub enum DbWriteMessage {
         net_value: f64,
         signal_id: Option<String>,
         raw_message: Option<String>,
+        exit_reason: Option<String>,
     },
     Log {
         level: String,

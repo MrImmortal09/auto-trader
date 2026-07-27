@@ -48,6 +48,7 @@ interface PaperTrade {
   gst: number;
   net_value: number;
   timestamp: string;
+  exit_reason?: string;
 }
 
 interface Portfolio {
@@ -103,6 +104,28 @@ function fmt(n: number) {
 function totalCharges(t: PaperTrade) {
   return t.brokerage + t.stt_charge + t.sebi_fee +
     t.stamp_duty + t.transaction_charge + t.gst;
+}
+
+function formatExitReason(reason?: string): string {
+  if (!reason || reason === 'ENTRY') return '';
+  switch (reason) {
+    case 'SL_HIT': return 'SL Hit';
+    case 'TRAILED_SL_HIT':
+    case 'TRAIL_SL_HIT': return 'Trailed SL Hit';
+    case 'CLOSED_VIA_FRONTEND': return 'Closed via Frontend';
+    case 'TELEGRAM_EXIT': return 'Exit via Telegram Msg';
+    case 'OPPOSITE_SIGNAL_EXIT': return 'Opposite Signal Exit';
+    case 'TGT1_FULL':
+    case 'TGT1_PARTIAL':
+    case 'TGT1_HIT': return 'Target 1 Hit';
+    case 'TGT2_HIT': return 'Target 2 Hit';
+    default:
+      if (reason.startsWith('EXIT_AT_')) {
+        const price = reason.replace('EXIT_AT_', '');
+        return price ? `Exit via Telegram (@ ₹${price})` : 'Exit via Telegram Msg';
+      }
+      return reason.replace(/_/g, ' ');
+  }
 }
 
 function fmtPct(n: number) {
@@ -568,10 +591,15 @@ function PortfolioSection({ serverBase }: { serverBase: string }) {
                           </>
                         )}
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 flex items-center gap-1.5">
                         <span className={`px-1.5 py-0.5 rounded text-xs font-bold ${
                           t.action === 'BUY' ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'
                         }`}>{t.action}</span>
+                        {t.exit_reason && t.exit_reason !== 'ENTRY' && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-gray-700 text-gray-200 border border-gray-600 whitespace-nowrap">
+                            {formatExitReason(t.exit_reason)}
+                          </span>
+                        )}
                       </td>
                       <td className="px-3 py-2 text-gray-200">{t.qty}</td>
                       <td className="px-3 py-2 text-gray-200">₹{fmt(t.executed_price)}</td>
@@ -1810,10 +1838,17 @@ function ReportsPage({ serverBase }: { serverBase: string }) {
                   const delta = getTradePnlDelta(t);
                   return (
                     <div key={t.id} className="bg-gray-700/30 p-2 rounded flex justify-between items-center border border-gray-700/50">
-                      <div className="flex flex-col">
-                        <span className={`text-xs font-bold ${t.action === 'BUY' ? 'text-blue-400' : 'text-purple-400'}`}>
-                          {t.action} {t.qty} @ ₹{t.executed_price}
-                        </span>
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          <span className={`text-xs font-bold ${t.action === 'BUY' ? 'text-blue-400' : 'text-purple-400'}`}>
+                            {t.action} {t.qty} @ ₹{t.executed_price}
+                          </span>
+                          {t.exit_reason && t.exit_reason !== 'ENTRY' && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] bg-gray-700 text-gray-200 border border-gray-600">
+                              {formatExitReason(t.exit_reason)}
+                            </span>
+                          )}
+                        </div>
                         <span className="text-[10px] text-gray-400">{t.timestamp}</span>
                       </div>
                       <div className={`font-mono text-sm ${delta >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>

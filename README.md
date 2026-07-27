@@ -520,6 +520,18 @@ On `Target1Hit`:
 - Sells `target_1_exit_pct %` of the position
 - Trails the SL to `(avg_buy_price + target_2) / 2`
 
+### Automatic Opposite Signal Exiting
+Whenever a new trade signal arrives for an instrument (e.g., `SENSEX 80000 PE`), any existing open position for the **same underlying instrument** in the opposite direction (e.g., an active `SENSEX CE` position or opposite side equity trade) is automatically exited with the reason **Opposite Signal Exit**.
+
+### Trade Exit Reasons
+Every completed trade records its explicit exit reason (`exit_reason` column in SQLite) which is displayed in the UI (Trade History & Daily Reports modal):
+- `SL Hit`: Initial Stop-Loss triggered
+- `Trailed SL Hit`: Trailing Stop-Loss triggered after Target 1
+- `Target 1 Hit` / `Target 2 Hit`: Target profit levels reached
+- `Closed via Frontend`: Manually closed using the dashboard Close button
+- `Exit via Telegram Msg`: Exited via a direct Telegram reply command (e.g., `exit @ 610`)
+- `Opposite Signal Exit`: Automatically closed due to an opposite trade signal arriving
+
 ---
 
 ## Dashboard
