@@ -1,13 +1,80 @@
-/* Tailwind v4 — single import, no config file needed */
+/* Tailwind v4 — single import with @theme configuration */
 @import "tailwindcss";
+
+@theme {
+  --color-surface: #faf8ff;
+  --color-surface-dim: #d2d9f4;
+  --color-surface-bright: #faf8ff;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #f2f3ff;
+  --color-surface-container: #eaedff;
+  --color-surface-container-high: #e2e7ff;
+  --color-surface-container-highest: #dae2fd;
+  --color-on-surface: #131b2e;
+  --color-on-surface-variant: #434655;
+  --color-inverse-surface: #283044;
+  --color-inverse-on-surface: #eef0ff;
+  --color-outline: #737686;
+  --color-outline-variant: #c3c6d7;
+  --color-surface-tint: #0053db;
+  --color-primary: #004ac6;
+  --color-on-primary: #ffffff;
+  --color-primary-container: #2563eb;
+  --color-on-primary-container: #eeefff;
+  --color-inverse-primary: #b4c5ff;
+  --color-secondary: #006c49;
+  --color-on-secondary: #ffffff;
+  --color-secondary-container: #6cf8bb;
+  --color-on-secondary-container: #00714d;
+  --color-tertiary: #ad0033;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-container: #d22348;
+  --color-on-tertiary-container: #ffecec;
+  --color-error: #ba1a1a;
+  --color-on-error: #ffffff;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #93000a;
+  --color-primary-fixed: #dbe1ff;
+  --color-primary-fixed-dim: #b4c5ff;
+  --color-on-primary-fixed: #00174b;
+  --color-on-primary-fixed-variant: #003ea8;
+  --color-secondary-fixed: #6ffbbe;
+  --color-secondary-fixed-dim: #4edea3;
+  --color-on-secondary-fixed: #002113;
+  --color-on-secondary-fixed-variant: #005236;
+  --color-tertiary-fixed: #ffdadb;
+  --color-tertiary-fixed-dim: #ffb2b7;
+  --color-on-tertiary-fixed: #40000d;
+  --color-on-tertiary-fixed-variant: #92002a;
+  --color-background: #faf8ff;
+  --color-on-background: #131b2e;
+  --color-surface-variant: #dae2fd;
+
+  --font-body-base: "Inter", sans-serif;
+  --font-label-caps: "Inter", sans-serif;
+  --font-body-sm: "Inter", sans-serif;
+  --font-mono-code: "JetBrains Mono", monospace;
+  --font-display-lg: "Inter", sans-serif;
+  --font-body-bold: "Inter", sans-serif;
+  --font-headline-md: "Inter", sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-background text-on-surface font-body-base antialiased;
+  }
+}
 
 /* Shared micro-component utilities used in App.tsx */
 @layer utilities {
   .input-sm {
-    @apply bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs text-white
-           placeholder-gray-500 focus:outline-none focus:border-blue-500;
+    @apply bg-surface-container-lowest border border-outline-variant rounded px-2.5 py-1 text-xs text-on-surface
+           placeholder-on-surface-variant/60 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all;
   }
   .btn-sm {
-    @apply px-3 py-1 rounded text-xs text-white transition-colors;
+    @apply px-3 py-1 rounded text-xs transition-colors font-medium;
+  }
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
   }
 }
