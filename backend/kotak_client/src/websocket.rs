@@ -41,14 +41,21 @@ pub async fn start_market_data_stream(
 
     let mut current_stdin: Option<tokio::process::ChildStdin> = None;
     let mut child_opt: Option<tokio::process::Child> = None;
+    // Deadline for the hard 15:30:00 IST cutoff, set once a connection is live.
+    let mut close_deadline: Option<tokio::time::Instant> = None;
 
     loop {
         // If child is dead or not started, start it
         if current_stdin.is_none() {
             if !shared_domain::is_market_open() {
-                info!("Market is closed. Pausing WebSocket reconnection for 5 minutes...");
-                // Sleep while still processing rx to buffer subscriptions
-                let sleep = tokio::time::sleep(std::time::Duration::from_secs(300));
+                let wait = shared_domain::duration_until_market_open();
+                info!(
+                    secs = wait.as_secs(),
+                    "Market is closed. Waiting until 09:15:00 IST sharp before connecting..."
+                );
+                // Sleep precisely until the next market open, while still
+                // processing rx to buffer subscription requests.
+                let sleep = tokio::time::sleep(wait);
                 tokio::pin!(sleep);
                 tokio::select! {
                     _ = &mut sleep => {}
@@ -107,7 +114,11 @@ pub async fn start_market_data_stream(
             }
 
             current_stdin = Some(stdin);
-            
+
+            // Arm the hard 15:30:00 IST cutoff for this connection.
+            close_deadline = shared_domain::duration_until_market_close()
+                .map(|d| tokio::time::Instant::now() + d);
+
             // Spawn reader for stdout
             let prices_clone = Arc::clone(&prices);
             tokio::spawn(async move {
@@ -154,6 +165,7 @@ pub async fn start_market_data_stream(
                             if let Err(e) = stdin.write_all(payload.as_bytes()).await {
                                 error!("Failed to write to Node bridge stdin: {}", e);
                                 current_stdin = None; // Force restart
+                                close_deadline = None;
                             }
                         }
                     }
@@ -174,7 +186,23 @@ pub async fn start_market_data_stream(
                 warn!("Node bridge child process exited with {:?}", res);
                 current_stdin = None;
                 child_opt = None;
+                close_deadline = None;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await; // Backoff before restart
+            }
+            _ = async {
+                if let Some(deadline) = close_deadline {
+                    tokio::time::sleep_until(deadline).await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                warn!("Market close (15:30:00 IST) reached — closing WebSocket sharply and clearing LTPs.");
+                if let Some(mut child) = child_opt.take() { let _ = child.kill().await; }
+                current_stdin = None;
+                close_deadline = None;
+                for scrip in active_scrips.iter() {
+                    prices.remove(scrip);
+                }
             }
         }
     }

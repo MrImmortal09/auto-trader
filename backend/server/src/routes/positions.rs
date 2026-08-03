@@ -103,6 +103,29 @@ pub async fn delete_position_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // In LIVE, forgetting a position that still holds stock or tracks a broker
+    // order would leave a real, unmonitored exposure behind — and the engine
+    // would cancel its stop as an orphan. Close it properly first.
+    if state.trading_cfg.read().await.mode == "LIVE" {
+        let blocked = {
+            let positions = state.positions.read().await;
+            positions.iter().find(|p| p.id == id).map(|p| {
+                p.executed_qty > 0
+                    || p.entry_order_id.is_some()
+                    || p.sl_order_id.is_some()
+                    || p.pending_exit_order_id.is_some()
+            })
+        };
+        if blocked == Some(true) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "This position is live at the broker. Close it first, then delete."
+                })),
+            ).into_response();
+        }
+    }
+
     let mut positions = state.positions.write().await;
     let len_before = positions.len();
     positions.retain(|p| p.id != id);
@@ -172,6 +195,34 @@ pub async fn close_position_handler(
         return (StatusCode::OK, Json(serde_json::json!({"status": "closed", "qty": 0}))).into_response();
     }
 
+    // LIVE: hand the close to the monitor rather than booking it here. It has to
+    // cancel the resting stop before selling, and the trade must be recorded at
+    // the price that actually filled — not at our last tick.
+    if state.trading_cfg.read().await.mode == "LIVE" {
+        let mut positions = state.positions.write().await;
+        let Some(pos) = positions.iter_mut().find(|p| p.id == id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response();
+        };
+        pos.force_exit = Some("CLOSED_VIA_FRONTEND".to_string());
+        pos.override_exit_price = None;
+        let snapshot = positions.clone();
+        drop(positions);
+        persist_positions_snapshot(&state, &snapshot).await;
+
+        let _ = state.log_tx.send(format!(
+            r#"{{"event":"MANUAL_CLOSE_REQUESTED","instrument":"{}","qty":{},"mode":"LIVE"}}"#,
+            instrument, qty
+        ));
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "exit_requested",
+                "instrument": instrument,
+                "qty": qty,
+            })),
+        ).into_response();
+    }
+
     let ltp = ws_scrip_key
         .as_ref()
         .and_then(|k| state.prices.get(k).map(|v| *v))
@@ -211,8 +262,8 @@ pub async fn close_position_handler(
          (ticker, action, qty, executed_price, timestamp,
           gross_value, brokerage, stt_charge, sebi_fee,
           stamp_duty, transaction_charge, gst, net_value,
-          signal_id, raw_message, exit_reason)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          signal_id, raw_message, exit_reason, mode)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&instrument)
     .bind("SELL")
@@ -230,6 +281,7 @@ pub async fn close_position_handler(
     .bind(&signal_id)
     .bind(&raw_message)
     .bind("CLOSED_VIA_FRONTEND")
+    .bind("PAPER")
     .execute(&mut *tx)
     .await
     {

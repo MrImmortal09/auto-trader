@@ -192,6 +192,7 @@ async fn main() {
         log_tx.clone(),
         Arc::clone(&scrip_store),
         Arc::clone(&ws_tx),
+        Arc::clone(&kotak_client_opt),
     ));
 
     // 9. Daily Scrip Master refresh — runs at 09:10 IST every trading day

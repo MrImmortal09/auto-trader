@@ -40,6 +40,8 @@ pub struct PaperTrade {
     pub signal_id: Option<String>,
     pub raw_message: Option<String>,
     pub exit_reason: Option<String>,
+    /// `"PAPER"` or `"LIVE"` — whether this row was a simulation or real money.
+    pub mode: String,
 }
 
 #[derive(Serialize)]
@@ -92,7 +94,7 @@ pub async fn portfolio_handler(
         "SELECT id, ticker, action, qty, executed_price,
                 gross_value, brokerage, stt_charge, sebi_fee,
                 stamp_duty, transaction_charge, gst, net_value, timestamp,
-                signal_id, raw_message, exit_reason
+                signal_id, raw_message, exit_reason, mode
          FROM paper_trades ORDER BY timestamp DESC LIMIT 1000",
     )
     .fetch_all(&state.db_pool)

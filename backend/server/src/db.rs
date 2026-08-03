@@ -61,7 +61,8 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             mode TEXT NOT NULL DEFAULT 'PAPER',
             brokerage_per_order REAL NOT NULL DEFAULT 20.0,
             target_1_exit_pct REAL NOT NULL DEFAULT 50.0,
-            target_2_exit_pct REAL NOT NULL DEFAULT 100.0
+            target_2_exit_pct REAL NOT NULL DEFAULT 100.0,
+            entry_market_protection REAL NOT NULL DEFAULT 5.0
         )",
     ).execute(&pool).await.unwrap();
     sqlx::query("INSERT OR IGNORE INTO trading_config (id) VALUES (1)")
@@ -73,6 +74,10 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     ensure_column(
         &pool,
         "ALTER TABLE trading_config ADD COLUMN other_lots INTEGER NOT NULL DEFAULT 1",
+    ).await;
+    ensure_column(
+        &pool,
+        "ALTER TABLE trading_config ADD COLUMN entry_market_protection REAL NOT NULL DEFAULT 5.0",
     ).await;
     
     ensure_column(
@@ -86,6 +91,10 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     ensure_column(
         &pool,
         "ALTER TABLE paper_trades ADD COLUMN exit_reason TEXT",
+    ).await;
+    ensure_column(
+        &pool,
+        "ALTER TABLE paper_trades ADD COLUMN mode TEXT NOT NULL DEFAULT 'PAPER'",
     ).await;
 
     sqlx::query(
@@ -130,13 +139,14 @@ struct TradingConfigRow {
     brokerage_per_order: f64,
     target_1_exit_pct: f64,
     target_2_exit_pct: f64,
+    entry_market_protection: f64,
 }
 
 /// Load `TradingConfig` from SQLite, falling back to safe defaults.
 pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
     sqlx::query_as::<_, TradingConfigRow>(
         "SELECT max_trade_amount_inr, index_lots, other_lots, mode, brokerage_per_order,
-                target_1_exit_pct, target_2_exit_pct
+                target_1_exit_pct, target_2_exit_pct, entry_market_protection
          FROM trading_config WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -151,6 +161,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         brokerage_per_order: r.brokerage_per_order,
         target_1_exit_pct: r.target_1_exit_pct,
         target_2_exit_pct: r.target_2_exit_pct,
+        entry_market_protection: r.entry_market_protection,
     })
     .unwrap_or_else(|| TradingConfig {
         max_trade_amount_inr: 10_000.0,
@@ -160,6 +171,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         brokerage_per_order: 20.0,
         target_1_exit_pct: 50.0,
         target_2_exit_pct: 100.0,
+        entry_market_protection: 5.0,
     })
 }
 
@@ -244,7 +256,7 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 ticker, action, qty, executed_price,
                 gross_value, brokerage, stt_charge, sebi_fee,
                 stamp_duty, transaction_charge, gst, net_value,
-                signal_id, raw_message, exit_reason,
+                signal_id, raw_message, exit_reason, mode,
             } => {
                 let timestamp = current_ist_timestamp_string();
                 let mut tx = match pool.begin().await {
@@ -260,13 +272,13 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                      (ticker, action, qty, executed_price, timestamp,
                       gross_value, brokerage, stt_charge, sebi_fee,
                       stamp_duty, transaction_charge, gst, net_value,
-                      signal_id, raw_message, exit_reason)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      signal_id, raw_message, exit_reason, mode)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 )
                  .bind(&ticker).bind(&action).bind(qty as i64).bind(executed_price).bind(&timestamp)
                 .bind(gross_value).bind(brokerage).bind(stt_charge).bind(sebi_fee)
                 .bind(stamp_duty).bind(transaction_charge).bind(gst).bind(net_value)
-                .bind(&signal_id).bind(&raw_message).bind(&exit_reason)
+                .bind(&signal_id).bind(&raw_message).bind(&exit_reason).bind(&mode)
                 .execute(&mut *tx).await
                 {
                     tracing::error!("DB trade insert: {e}");

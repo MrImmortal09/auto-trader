@@ -34,6 +34,9 @@ pub enum KotakError {
     #[error("order rejected by broker (code {status_code}): {message}")]
     OrderRejected { status_code: i32, message: String },
 
+    #[error("API error (code {status_code}): {message}")]
+    ApiError { status_code: i32, message: String },
+
     #[error("WebSocket error: {0}")]
     Ws(#[from] tokio_tungstenite::tungstenite::Error),
 }

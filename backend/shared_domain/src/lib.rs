@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const IST_OFFSET_SECS: i32 = 5 * 60 * 60 + 30 * 60;
@@ -19,11 +19,16 @@ pub fn current_ist_timestamp_string() -> String {
     now_ist().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+pub const MARKET_OPEN_HOUR: u32 = 9;
+pub const MARKET_OPEN_MINUTE: u32 = 15;
+pub const MARKET_CLOSE_HOUR: u32 = 15;
+pub const MARKET_CLOSE_MINUTE: u32 = 30;
+
 pub fn is_market_open() -> bool {
     use chrono::Timelike;
     use chrono::Datelike;
     let now = now_ist();
-    
+
     // Check if it is a weekday
     let weekday = now.weekday();
     if weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun {
@@ -32,16 +37,81 @@ pub fn is_market_open() -> bool {
 
     let h = now.hour();
     let m = now.minute();
-    
-    // Market hours are 09:15 to 15:30 IST
-    if h < 9 || (h == 9 && m < 15) {
+
+    // Market hours are 09:15 to 15:30 IST (close is exclusive — sharp cutoff)
+    if h < MARKET_OPEN_HOUR || (h == MARKET_OPEN_HOUR && m < MARKET_OPEN_MINUTE) {
         return false;
     }
-    if h > 15 || (h == 15 && m > 30) {
+    if h > MARKET_CLOSE_HOUR || (h == MARKET_CLOSE_HOUR && m >= MARKET_CLOSE_MINUTE) {
         return false;
     }
-    
+
     true
+}
+
+/// Today's market close instant (15:30:00 IST), regardless of weekday.
+pub fn today_market_close_ist() -> DateTime<FixedOffset> {
+    now_ist()
+        .date_naive()
+        .and_hms_opt(MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE, 0)
+        .expect("valid close time")
+        .and_local_timezone(ist_offset())
+        .single()
+        .expect("IST close time is unambiguous")
+}
+
+/// The next market open instant (09:15:00 IST) strictly in the future,
+/// skipping weekends. If today is a weekday and it's before 09:15, returns
+/// today's open; otherwise returns the next weekday's open.
+pub fn next_market_open_ist() -> DateTime<FixedOffset> {
+    use chrono::Datelike;
+    let now = now_ist();
+    let mut date = now.date_naive();
+
+    let today_open = date
+        .and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)
+        .expect("valid open time")
+        .and_local_timezone(ist_offset())
+        .single()
+        .expect("IST open time is unambiguous");
+
+    let is_weekday = date.weekday() != chrono::Weekday::Sat && date.weekday() != chrono::Weekday::Sun;
+    if is_weekday && now < today_open {
+        return today_open;
+    }
+
+    // Advance to the next weekday
+    loop {
+        date += ChronoDuration::days(1);
+        if date.weekday() != chrono::Weekday::Sat && date.weekday() != chrono::Weekday::Sun {
+            break;
+        }
+    }
+
+    date
+        .and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)
+        .expect("valid open time")
+        .and_local_timezone(ist_offset())
+        .single()
+        .expect("IST open time is unambiguous")
+}
+
+/// Duration to sleep until the next market open. Zero if the market is open right now.
+pub fn duration_until_market_open() -> std::time::Duration {
+    if is_market_open() {
+        return std::time::Duration::ZERO;
+    }
+    let now = now_ist();
+    let next_open = next_market_open_ist();
+    (next_open - now).to_std().unwrap_or(std::time::Duration::ZERO)
+}
+
+/// Duration to sleep until today's 15:30:00 IST market close. `None` if that
+/// instant has already passed for today.
+pub fn duration_until_market_close() -> Option<std::time::Duration> {
+    let now = now_ist();
+    let close = today_market_close_ist();
+    (close - now).to_std().ok()
 }
 
 // ===========================================================================
@@ -65,7 +135,13 @@ pub struct TradingConfig {
     pub target_1_exit_pct: f64,
     /// Percentage of target-2 profit at which to exit the remaining position.
     pub target_2_exit_pct: f64,
+    /// Market-price-protection percentage for LIVE entry orders (SL-M buys).
+    /// Protective exits always use 0. Kotak default 5 %, range 0–20 %.
+    #[serde(default = "default_entry_mp")]
+    pub entry_market_protection: f64,
 }
+
+fn default_entry_mp() -> f64 { 5.0 }
 
 // ===========================================================================
 // Trade signal (options-aware)
@@ -151,6 +227,53 @@ pub struct MonitoredPosition {
     /// Minimum price increment for this contract (usually 0.05)
     #[serde(default = "default_tick_size")]
     pub tick_size: f64,
+    /// LIVE mode: broker order number of the resting entry order.
+    #[serde(default)]
+    pub entry_order_id: Option<String>,
+    /// LIVE mode: broker order number of the resting stop-loss (SL-M) order.
+    #[serde(default)]
+    pub sl_order_id: Option<String>,
+    /// LIVE mode: quantity the resting SL-M order currently covers.
+    ///
+    /// Tracked so the "never sell more than we hold" invariant can be checked
+    /// before any additional sell is placed: `sell_qty + sl_order_qty` must
+    /// never exceed `executed_qty`.
+    #[serde(default)]
+    pub sl_order_qty: i32,
+    /// LIVE mode: trigger price the resting SL-M order currently sits at
+    /// (already tick-rounded). Used to detect when a trailed/updated SL needs
+    /// a modify call.
+    #[serde(default)]
+    pub sl_order_trigger: f64,
+    /// LIVE mode: broker order number of the resting target (LIMIT) order.
+    ///
+    /// Unused — targets are executed as market orders by the engine so that a
+    /// resting SL and a resting target can never over-commit the held quantity.
+    /// Retained for snapshot compatibility.
+    #[serde(default)]
+    pub target_order_id: Option<String>,
+    /// LIVE mode: broker order number of an engine-initiated exit (market sell)
+    /// that has been placed but not yet settled from the order book.
+    #[serde(default)]
+    pub pending_exit_order_id: Option<String>,
+    /// LIVE mode: quantity of [`Self::pending_exit_order_id`].
+    #[serde(default)]
+    pub pending_exit_qty: i32,
+    /// LIVE mode: exit reason recorded when [`Self::pending_exit_order_id`] settles.
+    #[serde(default)]
+    pub pending_exit_reason: Option<String>,
+    /// LIVE mode: a cancel has already been sent for a partially-filled entry,
+    /// so the poller does not spam cancels while waiting for it to take effect.
+    #[serde(default)]
+    pub entry_cancel_sent: bool,
+    /// LIVE mode: consecutive failed exit attempts. Capped so a persistently
+    /// rejecting broker cannot put the engine in a retry loop.
+    #[serde(default)]
+    pub exit_attempts: i32,
+    /// LIVE mode: set when the engine has given up acting on this position
+    /// automatically. Requires manual intervention; no further orders are sent.
+    #[serde(default)]
+    pub live_halt: Option<String>,
 }
 
 fn default_tick_size() -> f64 { 0.05 }
@@ -345,6 +468,8 @@ pub enum DbWriteMessage {
         signal_id: Option<String>,
         raw_message: Option<String>,
         exit_reason: Option<String>,
+        /// `"LIVE"` or `"PAPER"` — which engine produced this fill.
+        mode: String,
     },
     Log {
         level: String,

@@ -2,7 +2,7 @@
 //!
 //! # Modules
 //! - [`error`]     — `KotakError`, `KotakCredentials`
-//! - [`client`]    — `KotakClient` (REST: login, place_live_order)
+//! - [`client`]    — `KotakClient` (REST: login, orders, order book, positions, limits)
 //! - [`websocket`] — `start_market_data_stream` (HSM live prices)
 
 pub mod error;
@@ -10,7 +10,7 @@ pub mod client;
 pub mod websocket;
 
 pub use error::{KotakCredentials, KotakError};
-pub use client::KotakClient;
+pub use client::{KotakClient, KotakLimits, KotakOrder, KotakPosition};
 pub use websocket::start_market_data_stream;
 
 use std::sync::Arc;
