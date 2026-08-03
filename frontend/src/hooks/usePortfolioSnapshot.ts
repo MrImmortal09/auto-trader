@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { MonitoredPosition, Portfolio } from '../types';
 import { apiFetch } from '../lib/api';
+import { computeAvgBuyPerUnit, getRealizedPnl } from '../lib/format';
 
 // ---------------------------------------------------------------------------
 // Shared portfolio data hook — single source of truth for balance, realized
@@ -33,8 +34,9 @@ export function usePortfolioSnapshot(serverBase: string) {
     return () => clearInterval(id);
   }, [serverBase]);
 
+  const avgBuyPerUnit = portfolio ? computeAvgBuyPerUnit(portfolio.trades) : {};
   const realizedPnl = portfolio
-    ? portfolio.trades.reduce((acc, t) => acc + (t.action === 'BUY' ? -t.net_value : t.net_value), 0)
+    ? portfolio.trades.reduce((acc, t) => acc + getRealizedPnl(t, avgBuyPerUnit), 0)
     : 0;
   const liveMtmPnl = positions
     .filter((p) => p.state === 'Active' || p.state === 'Target1Hit')
