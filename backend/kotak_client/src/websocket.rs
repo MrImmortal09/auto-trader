@@ -27,7 +27,7 @@ pub async fn start_market_data_stream(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     let mut active_scrips = std::collections::HashSet::new();
-    for s in initial_scrips.split(',') {
+    for s in initial_scrips.split(|c| c == ',' || c == '&') {
         let s = s.trim();
         if !s.is_empty() {
             active_scrips.insert(s.to_string());
@@ -63,7 +63,12 @@ pub async fn start_market_data_stream(
                         if let Some(msg) = msg_opt {
                             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg) {
                                 if let Some(s) = parsed.get("scrips").and_then(|v| v.as_str()) {
-                                    active_scrips.insert(s.to_string());
+                                    for item in s.split(|c| c == ',' || c == '&') {
+                                        let item = item.trim();
+                                        if !item.is_empty() {
+                                            active_scrips.insert(item.to_string());
+                                        }
+                                    }
                                 }
                             }
                         } else {
@@ -74,7 +79,7 @@ pub async fn start_market_data_stream(
                 continue;
             }
 
-            let scrips_str = active_scrips.iter().cloned().collect::<Vec<_>>().join(",");
+            let scrips_str = active_scrips.iter().cloned().collect::<Vec<_>>().join("&");
             info!("Starting Node.js bridge for Kotak WebSocket with scrips: {}", scrips_str);
 
             let mut child = match Command::new("bash")
@@ -156,7 +161,12 @@ pub async fn start_market_data_stream(
                     Some(msg) => {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg) {
                             if let Some(s) = parsed.get("scrips").and_then(|v| v.as_str()) {
-                                active_scrips.insert(s.to_string());
+                                for item in s.split(|c| c == ',' || c == '&') {
+                                    let item = item.trim();
+                                    if !item.is_empty() {
+                                        active_scrips.insert(item.to_string());
+                                    }
+                                }
                             }
                         }
                         if let Some(stdin) = current_stdin.as_mut() {

@@ -24,6 +24,8 @@ eval(hslibCode);
 
 let wsClient = null;
 let heartbeatInterval = null;
+let watchdogInterval = null;
+let lastMessageTime = Date.now();
 
 // Queue for subscribe messages that arrive before wsClient.onopen fires.
 // Drained immediately once the connection is established.
@@ -51,12 +53,14 @@ function handleMessage(msg) {
         // Reset state for this new connection
         wsOpen = false;
         pendingSubscriptions = [];
+        lastMessageTime = Date.now();
 
         const url = "wss://mlhsm.kotaksecurities.com";
         wsClient = new HSWebSocket(url);
         
         wsClient.onopen = function () {
             wsOpen = true;
+            lastMessageTime = Date.now();
 
             // Send connection request
             let jObj = {
@@ -72,11 +76,22 @@ function handleMessage(msg) {
                 wsClient.send(JSON.stringify({ type: "ti", scrips: "" }));
             }, 30000);
 
+            // Start watchdog (if no message received for 30 seconds during active connection, restart)
+            if (watchdogInterval) clearInterval(watchdogInterval);
+            watchdogInterval = setInterval(() => {
+                if (wsOpen && Date.now() - lastMessageTime > 30000) {
+                    console.error("Watchdog timeout: No data received from Kotak WebSocket for 30s. Exiting bridge to force restart...");
+                    console.log(JSON.stringify({ event: "error", message: "Watchdog timeout: no data for 30s" }));
+                    process.exit(1);
+                }
+            }, 5000);
+
             // Initially subscribe if scrips are provided
             if (msg.scrips) {
+                let formattedScrips = String(msg.scrips).replace(/,/g, '&');
                 let subObj = {
                     "type": "mws",
-                    "scrips": msg.scrips,
+                    "scrips": formattedScrips,
                     "channelnum": 1
                 };
                 wsClient.send(JSON.stringify(subObj));
@@ -86,28 +101,33 @@ function handleMessage(msg) {
             if (pendingSubscriptions.length > 0) {
                 console.error(`Draining ${pendingSubscriptions.length} queued subscription(s)`);
                 for (const scrips of pendingSubscriptions) {
-                    wsClient.send(JSON.stringify({ type: "mws", scrips, channelnum: 1 }));
+                    let formattedScrips = String(scrips).replace(/,/g, '&');
+                    wsClient.send(JSON.stringify({ type: "mws", scrips: formattedScrips, channelnum: 1 }));
                 }
                 pendingSubscriptions = [];
             }
         };
 
-        wsClient.onclose = function () {
+        wsClient.onclose = function (event) {
             wsOpen = false;
             pendingSubscriptions = [];
-            console.log(JSON.stringify({ event: "closed" }));
+            console.log(JSON.stringify({ event: "closed", code: event ? event.code : null, reason: event ? event.reason : null }));
             if (heartbeatInterval) clearInterval(heartbeatInterval);
+            if (watchdogInterval) clearInterval(watchdogInterval);
             process.exit(1);
         };
 
-        wsClient.onerror = function () {
+        wsClient.onerror = function (err) {
             wsOpen = false;
             pendingSubscriptions = [];
-            console.log(JSON.stringify({ event: "error" }));
+            console.log(JSON.stringify({ event: "error", message: err ? (err.message || err.toString()) : "unknown error" }));
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            if (watchdogInterval) clearInterval(watchdogInterval);
             process.exit(1);
         };
 
         wsClient.onmessage = function (data) {
+            lastMessageTime = Date.now();
             let parsed;
             if (typeof data === 'string') {
                 try {
@@ -122,9 +142,10 @@ function handleMessage(msg) {
         };
     } else if (msg.action === 'subscribe') {
         if (wsClient) {
+            let formattedScrips = msg.scrips ? String(msg.scrips).replace(/,/g, '&') : "";
             let subObj = {
                 "type": "mws",
-                "scrips": msg.scrips,
+                "scrips": formattedScrips,
                 "channelnum": 1
             };
             if (wsOpen) {
@@ -136,7 +157,7 @@ function handleMessage(msg) {
                 }
             } else {
                 // Connection not open yet — queue for drain in onopen
-                pendingSubscriptions.push(msg.scrips);
+                pendingSubscriptions.push(formattedScrips);
             }
         }
     } else if (msg.action === 'close') {
