@@ -77,4 +77,14 @@
   .tabular-nums {
     font-variant-numeric: tabular-nums;
   }
+  .pt-safe {
+    padding-top: max(env(safe-area-inset-top), 0.75rem);
+  }
+  .pb-safe {
+    padding-bottom: max(env(safe-area-inset-bottom), 0.75rem);
+  }
+  .mb-safe {
+    margin-bottom: max(env(safe-area-inset-bottom), 0.5rem);
+  }
 }
+

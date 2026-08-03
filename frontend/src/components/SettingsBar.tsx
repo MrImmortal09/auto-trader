@@ -9,6 +9,17 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
+  const fields: { key: keyof TradingConfig | 'virtual_balance'; label: string }[] = [
+    { key: 'virtual_balance', label: 'Virtual Balance (₹)' },
+    { key: 'index_lots', label: 'Index Lots' },
+    { key: 'other_lots', label: 'Other Lots' },
+    { key: 'brokerage_per_order', label: 'Brokerage (₹)' },
+    { key: 'max_trade_amount_inr', label: 'Max Trade (₹)' },
+    { key: 'target_1_exit_pct', label: 'Target 1 Exit %' },
+    { key: 'target_2_exit_pct', label: 'Target 2 Exit %' },
+    { key: 'entry_market_protection', label: 'Entry MP %' },
+  ];
+
   useEffect(() => {
     Promise.all([
       apiFetch(serverBase, '/api/settings').then((r) => r.json()),
@@ -55,39 +66,35 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
   }
 
   return (
-    <div className="flex flex-wrap items-end gap-4 bg-surface border-b border-outline-variant px-6 py-3.5">
+    <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-end gap-3 sm:gap-4 bg-surface border-b border-outline-variant px-4 sm:px-6 py-3.5">
       {/* Mode toggle */}
-      <div className="flex flex-col gap-1">
-        <span className="text-label-caps text-on-surface-variant uppercase tracking-wide">Mode</span>
-        <button
-          onClick={() =>
-            setCfg((c) => c && { ...c, mode: c.mode === 'PAPER' ? 'LIVE' : 'PAPER' })
-          }
-          className={`px-3 py-1 rounded text-xs font-label-caps uppercase transition-colors shadow-sm ${
-            cfg.mode === 'LIVE'
-              ? 'bg-error hover:bg-error/90 text-on-error'
-              : 'bg-secondary hover:bg-secondary/90 text-on-secondary'
-          }`}
-        >
-          {cfg.mode}
-        </button>
+      <div className="flex flex-col gap-1 col-span-2 sm:col-span-1">
+        <label className="text-label-caps text-on-surface-variant uppercase tracking-wide">
+          Trading Mode
+        </label>
+        <div className="flex rounded-lg overflow-hidden border border-outline-variant text-xs font-label-caps">
+          {(['PAPER', 'LIVE'] as const).map((m) => (
+            <button
+              key={m}
+              onClick={() => setCfg((c) => c && { ...c, mode: m })}
+              className={`flex-1 sm:flex-none px-3 py-1.5 transition-colors font-semibold ${
+                cfg.mode === m
+                  ? m === 'LIVE'
+                    ? 'bg-error text-on-error font-bold'
+                    : 'bg-secondary text-on-secondary font-bold'
+                  : 'bg-surface-container-lowest text-on-surface-variant hover:bg-surface-container'
+              }`}
+            >
+              {m}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Numeric inputs */}
-      {(
-        [
-          { key: 'virtual_balance', label: 'Virtual Balance (₹)' },
-          { key: 'index_lots', label: 'Index Lots' },
-          { key: 'other_lots', label: 'Other Lots' },
-          { key: 'brokerage_per_order', label: 'Brokerage (₹)' },
-          { key: 'max_trade_amount_inr', label: 'Max Trade (₹)' },
-          { key: 'target_1_exit_pct', label: 'Target 1 Exit %' },
-          { key: 'target_2_exit_pct', label: 'Target 2 Exit %' },
-          { key: 'entry_market_protection', label: 'Entry MP %' },
-        ] as { key: keyof TradingConfig | 'virtual_balance'; label: string }[]
-      ).map(({ key, label }) => (
+      {fields.map(({ key, label }) => (
         <div key={key} className="flex flex-col gap-1">
-          <label className="text-label-caps text-on-surface-variant uppercase tracking-wide">
+          <label className="text-label-caps text-on-surface-variant uppercase tracking-wide truncate">
             {label}
           </label>
           <input
@@ -98,7 +105,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
                 ? setVirtualBalance(parseFloat(e.target.value) || 0)
                 : setCfg((c) => c && { ...c, [key]: parseFloat(e.target.value) || 0 })
             }
-            className="w-28 bg-surface-container-lowest border border-outline-variant rounded px-2.5 py-1 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
+            className="w-full sm:w-28 bg-surface-container-lowest border border-outline-variant rounded px-2.5 py-1.5 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
           />
         </div>
       ))}
@@ -107,10 +114,10 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
       <button
         onClick={handleSave}
         disabled={saving}
-        className="flex items-center gap-1.5 mt-5 px-4 py-1.5 bg-primary-container hover:bg-primary disabled:opacity-50 text-on-primary text-sm rounded transition-colors font-body-bold shadow-sm"
+        className="col-span-2 sm:col-span-1 flex items-center justify-center gap-1.5 mt-2 sm:mt-5 px-4 py-2 sm:py-1.5 bg-primary-container hover:bg-primary disabled:opacity-50 text-on-primary text-sm rounded-lg transition-colors font-body-bold shadow-sm"
       >
         <Save size={14} />
-        {saving ? 'Saving…' : saved ? '✓ Saved' : 'Save'}
+        {saving ? 'Saving…' : saved ? '✓ Saved' : 'Save Settings'}
       </button>
     </div>
   );

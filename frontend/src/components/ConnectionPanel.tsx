@@ -85,8 +85,8 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
   };
 
   return (
-    <div className="flex flex-col gap-4 bg-surface-container-low border-b border-outline-variant px-6 py-4">
-      <div className="flex items-center justify-between">
+    <div className="flex flex-col gap-4 bg-surface-container-low border-b border-outline-variant px-4 sm:px-6 py-3.5 sm:py-4">
+      <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3">
         <div className="flex gap-4 text-xs font-semibold">
           {/* Kotak status + disconnect */}
           <div className="flex items-center gap-1.5">
@@ -117,7 +117,7 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
             )}
           </div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 w-full sm:w-auto justify-end">
           {/* Update Server */}
           <button
             onClick={handleUpdate}

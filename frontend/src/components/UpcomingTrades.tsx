@@ -83,16 +83,16 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
           <div className="px-4 py-2.5 border-b border-outline-variant text-label-caps font-semibold text-on-surface-variant uppercase tracking-wider bg-surface-container-low relative z-10">
             Upcoming Trades (Awaiting Entry)
           </div>
-          <div className="overflow-x-auto">
+          <div className="hidden md:block w-full">
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-surface-container-low text-label-caps font-semibold text-on-surface-variant border-b border-outline-variant">
-                  <th className="px-3 py-2.5 text-left sticky top-0 bg-surface-container-low">Instrument</th>
-                  <th className="px-3 py-2.5 text-left sticky top-0 bg-surface-container-low">Action</th>
-                  <th className="px-3 py-2.5 text-left sticky top-0 bg-surface-container-low">Trigger</th>
-                  <th className="px-3 py-2.5 text-left sticky top-0 bg-surface-container-low">SL</th>
-                  <th className="px-3 py-2.5 text-left sticky top-0 bg-surface-container-low">Qty (Override)</th>
-                  <th className="px-3 py-2.5 text-right sticky top-0 bg-surface-container-low">Controls</th>
+                  <th className="px-3 py-2.5 text-left">Instrument</th>
+                  <th className="px-3 py-2.5 text-left">Action</th>
+                  <th className="px-3 py-2.5 text-left">Trigger</th>
+                  <th className="px-3 py-2.5 text-left">SL</th>
+                  <th className="px-3 py-2.5 text-left">Qty (Override)</th>
+                  <th className="px-3 py-2.5 text-right">Controls</th>
                 </tr>
               </thead>
               <tbody className="text-body-sm font-body-sm">
@@ -159,6 +159,52 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
               </tbody>
             </table>
           </div>
+
+          {/* iPhone 17 Mobile Card View (Waiting Trades) */}
+          <div className="md:hidden p-3 space-y-3">
+            {waiting.map((p) => (
+              <div key={p.id} className="bg-surface rounded-xl border border-outline-variant p-3.5 shadow-sm space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-bold text-on-surface text-sm">{p.signal.instrument_name}</div>
+                    {p.ltp !== undefined && p.ltp !== null && (
+                      <div className="text-[11px] text-on-surface-variant">
+                        LTP: <span className="text-primary font-mono-code font-semibold">₹{fmt(p.ltp)}</span>
+                      </div>
+                    )}
+                  </div>
+                  <span className={`px-2 py-0.5 rounded text-xs font-label-caps font-bold uppercase ${
+                    p.signal.action === 'BUY' ? 'bg-[#d1fae5] text-[#065f46]' : 'bg-[#ffe4e6] text-[#9f1239]'
+                  }`}>{p.signal.action}</span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 text-xs font-mono-code bg-surface-container-low p-2.5 rounded-lg border border-outline-variant/50">
+                  <div>
+                    <div className="text-on-surface-variant text-[10px] uppercase font-sans">Trigger</div>
+                    <div className="font-semibold text-on-surface">{p.signal.entry_condition} ₹{fmt(p.signal.entry_price)}</div>
+                  </div>
+                  <div>
+                    <div className="text-on-surface-variant text-[10px] uppercase font-sans">Stop Loss</div>
+                    <div className="font-semibold text-error">₹{fmt(p.signal.stop_loss)}</div>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  <div className="text-xs font-semibold text-on-surface-variant">Qty:</div>
+                  <QtyInput initialQty={p.override_qty} id={p.id} defaultQty={p.resolved_order?.quantity} onUpdate={updateQty} />
+                </div>
+
+                <div className="pt-1">
+                  <button
+                    onClick={() => cancelTrade(p.id)}
+                    className="w-full py-2 rounded-lg bg-error-container hover:bg-error text-on-error-container hover:text-on-error font-semibold text-xs transition-colors flex items-center justify-center"
+                  >
+                    Cancel Order
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
         </>
       )}
 
@@ -167,7 +213,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
           <div className="px-4 py-2.5 border-y border-outline-variant text-label-caps font-semibold text-on-surface-variant uppercase tracking-wider bg-surface-container-low">
             Active Positions (Live LTP + MTM)
           </div>
-          <div className="overflow-x-auto">
+          <div className="hidden md:block w-full">
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-surface-container-low text-label-caps font-semibold text-on-surface-variant border-b border-outline-variant">
@@ -255,6 +301,67 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                 })}
               </tbody>
             </table>
+          </div>
+
+          {/* iPhone 17 Mobile Card View (Active Positions) */}
+          <div className="md:hidden p-3 space-y-3">
+            {active.map((p) => {
+              const hasLtp = p.ltp !== undefined && p.ltp !== null;
+              const pnl = hasLtp ? (p.ltp! - p.avg_buy_price) * p.executed_qty : null;
+              return (
+                <div key={p.id} className="bg-surface rounded-xl border border-outline-variant p-3.5 shadow-sm space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="font-bold text-on-surface text-sm">{p.signal.instrument_name}</div>
+                      {p.ws_scrip_key && <div className="text-[10px] text-on-surface-variant">{p.ws_scrip_key}</div>}
+                    </div>
+                    <span className="px-2 py-0.5 rounded text-xs font-label-caps font-bold uppercase bg-primary-container text-on-primary">
+                      {p.state}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 text-xs font-mono-code bg-surface-container-low p-2.5 rounded-lg border border-outline-variant/50">
+                    <div>
+                      <div className="text-on-surface-variant text-[10px] uppercase font-sans">Qty &amp; Entry</div>
+                      <div className="font-semibold text-on-surface">{p.executed_qty} @ ₹{fmt(p.avg_buy_price)}</div>
+                    </div>
+                    <div>
+                      <div className="text-on-surface-variant text-[10px] uppercase font-sans">Current LTP</div>
+                      <div className="font-semibold text-primary">{hasLtp ? `₹${fmt(p.ltp!)}` : '—'}</div>
+                    </div>
+                    <div>
+                      <div className="text-on-surface-variant text-[10px] uppercase font-sans">Stop Loss</div>
+                      <div className="font-semibold text-error">₹{fmt(p.current_sl)}</div>
+                    </div>
+                    <div>
+                      <div className="text-on-surface-variant text-[10px] uppercase font-sans">Targets</div>
+                      <div className="font-semibold text-primary truncate">{p.signal.targets.map((t) => `₹${fmt(t)}`).join(' / ')}</div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-1 border-t border-outline-variant/40">
+                    <div className="text-xs font-semibold text-on-surface-variant">Unrealized P&amp;L:</div>
+                    {pnl === null ? (
+                      <span className="text-on-surface-variant font-mono-code">—</span>
+                    ) : (
+                      <span className={`text-base font-bold font-mono-code ${pnl >= 0 ? 'text-secondary' : 'text-error'}`}>
+                        {pnl >= 0 ? '+' : ''}₹{fmt(pnl)}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="pt-1">
+                    <button
+                      onClick={() => closeOngoingTrade(p.id)}
+                      disabled={closingId === p.id}
+                      className="w-full py-2 bg-tertiary-container hover:bg-tertiary text-on-tertiary-container hover:text-on-tertiary rounded-lg text-xs font-bold transition-colors disabled:opacity-50 flex items-center justify-center"
+                    >
+                      {closingId === p.id ? 'Closing…' : 'Close Position'}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </>
       )}

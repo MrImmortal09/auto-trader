@@ -7,6 +7,7 @@ import { usePortfolioSnapshot } from './hooks/usePortfolioSnapshot';
 // Layout
 import { SideNavBar } from './components/layout/SideNavBar';
 import { TopNavBar } from './components/layout/TopNavBar';
+import { BottomNavBar } from './components/layout/BottomNavBar';
 
 // Components
 import { Info } from 'lucide-react';
@@ -88,42 +89,42 @@ export default function App() {
         />
 
         {/* Dynamic Screen View */}
-        <main className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6 bg-surface">
+        <main className="flex-1 overflow-y-auto p-4 sm:p-6 md:p-8 pb-24 md:pb-8 space-y-6 bg-surface">
           {activeScreen === 'dashboard' && (
             <>
               {/* Key Metrics Header */}
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-4 shadow-sm flex flex-col justify-between">
-                  <div className="flex items-center justify-between text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+                <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-3 sm:p-4 shadow-sm flex flex-col justify-between">
+                  <div className="flex items-center justify-between text-[11px] sm:text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
                     <span>Virtual Balance</span>
                     <Info size={14} className="text-outline cursor-help" />
                   </div>
-                  <span className="text-xl font-bold text-on-surface tabular-nums mt-1">₹{fmt(portfolio?.balance ?? 0)}</span>
+                  <span className="text-lg sm:text-xl font-bold text-on-surface tabular-nums mt-1">₹{fmt(portfolio?.balance ?? 0)}</span>
                 </div>
-                <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-4 shadow-sm flex flex-col justify-between">
-                  <div className="flex items-center justify-between text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
+                <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-3 sm:p-4 shadow-sm flex flex-col justify-between">
+                  <div className="flex items-center justify-between text-[11px] sm:text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
                     <span>Realized P&amp;L</span>
                     <Info size={14} className="text-outline cursor-help" />
                   </div>
-                  <span className={`text-xl font-bold tabular-nums mt-1 ${realizedPnl >= 0 ? 'text-secondary' : 'text-error'}`}>
+                  <span className={`text-lg sm:text-xl font-bold tabular-nums mt-1 ${realizedPnl >= 0 ? 'text-secondary' : 'text-error'}`}>
                     {realizedPnl >= 0 ? '+' : ''}₹{fmt(realizedPnl)}
                   </span>
                 </div>
-                <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-4 shadow-sm flex flex-col justify-between">
-                  <div className="flex items-center justify-between text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
+                <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-3 sm:p-4 shadow-sm flex flex-col justify-between">
+                  <div className="flex items-center justify-between text-[11px] sm:text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
                     <span>Live MTM (LTP)</span>
                     <Info size={14} className="text-outline cursor-help" />
                   </div>
-                  <span className={`text-xl font-bold tabular-nums mt-1 ${liveMtmPnl >= 0 ? 'text-secondary' : 'text-error'}`}>
+                  <span className={`text-lg sm:text-xl font-bold tabular-nums mt-1 ${liveMtmPnl >= 0 ? 'text-secondary' : 'text-error'}`}>
                     {liveMtmPnl >= 0 ? '+' : ''}₹{fmt(liveMtmPnl)}
                   </span>
                 </div>
-                <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-4 shadow-sm flex flex-col justify-between">
-                  <div className="flex items-center justify-between text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
-                    <span>Total Trades Today</span>
+                <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-3 sm:p-4 shadow-sm flex flex-col justify-between">
+                  <div className="flex items-center justify-between text-[11px] sm:text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
+                    <span>Trades Today</span>
                     <Info size={14} className="text-outline cursor-help" />
                   </div>
-                  <span className="text-xl font-bold text-on-surface tabular-nums mt-1">{totalTradesToday}</span>
+                  <span className="text-lg sm:text-xl font-bold text-on-surface tabular-nums mt-1">{totalTradesToday}</span>
                 </div>
               </div>
 
@@ -159,7 +160,7 @@ export default function App() {
               </div>
               <div className="space-y-6">
                 <SettingsBar serverBase={serverBase} />
-                <div className="bg-surface-container-lowest border border-outline-variant rounded-xl p-6 shadow-sm">
+                <div className="bg-surface-container-lowest border border-outline-variant rounded-xl p-4 sm:p-6 shadow-sm">
                   <h3 className="text-base font-bold text-on-surface mb-4">System Uptime &amp; Health Snapshot</h3>
                   <HealthPage serverBase={serverBase} />
                 </div>
@@ -169,7 +170,7 @@ export default function App() {
         </main>
 
         {/* Collapsible Live Engine Log Terminal */}
-        <div className="shrink-0 relative group border-t border-outline-variant">
+        <div className="shrink-0 relative group border-t border-outline-variant mb-14 md:mb-0">
           <div
             className="absolute -top-1 left-0 right-0 h-2 cursor-ns-resize hover:bg-primary/50 z-10 transition-colors"
             onMouseDown={(e) => {
@@ -191,6 +192,12 @@ export default function App() {
           <LogTerminal serverBase={serverBase} height={logHeight} />
         </div>
       </div>
+
+      {/* iPhone 17 Bottom Navigation Bar */}
+      <BottomNavBar
+        activeScreen={activeScreen}
+        onSelectScreen={handleSelectScreen}
+      />
     </div>
   );
 }

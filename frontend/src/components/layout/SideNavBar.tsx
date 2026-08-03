@@ -24,7 +24,7 @@ export function SideNavBar({
     }`;
 
   return (
-    <aside className="w-60 bg-surface border-r border-outline-variant flex flex-col h-screen py-6 shrink-0 z-30 select-none">
+    <aside className="hidden md:flex w-60 bg-surface border-r border-outline-variant flex-col h-screen py-6 shrink-0 z-30 select-none">
       <div className="px-6 mb-8 flex items-center gap-3">
         <div className="w-10 h-10 rounded-lg bg-primary-container flex items-center justify-center text-on-primary font-bold text-lg shadow-sm">
           AT
