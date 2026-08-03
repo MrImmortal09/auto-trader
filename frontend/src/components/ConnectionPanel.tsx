@@ -51,24 +51,37 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
   const handleUpdate = async () => {
     if (!confirm('Are you sure you want to update the server? This will download the latest release, disconnect everything, and restart the server.')) return;
     setIsUpdating(true);
+    // The server kills itself (via tmux C-c) before it can flush the HTTP
+    // response, so fetch() almost always rejects with a network error. That
+    // is NOT a failure — it means the update script started successfully.
+    // Only treat an explicit HTTP 500 body as a real error.
+    let explicitError: string | null = null;
     try {
-      await apiFetch(serverBase, '/api/update_server', { method: 'POST' });
-
-      // The server will restart, which means it will temporarily go down.
-      // We will poll /api/health until it comes back, then reload.
-      const pollTimer = setInterval(async () => {
-        try {
-          const res = await apiFetch(serverBase, '/api/health');
-          if (res.ok) {
-            clearInterval(pollTimer);
-            window.location.reload();
-          }
-        } catch (e) {}
-      }, 2000);
-    } catch (e) {
-      alert('Failed to trigger update');
-      setIsUpdating(false);
+      const res = await apiFetch(serverBase, '/api/update_server', { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        explicitError = body?.error ?? `HTTP ${res.status}`;
+      }
+    } catch {
+      // Network error = server died mid-response = update is running. Fall through.
     }
+
+    if (explicitError) {
+      alert(`Failed to trigger update: ${explicitError}`);
+      setIsUpdating(false);
+      return;
+    }
+
+    // Poll /api/health until the new server comes back up, then reload.
+    const pollTimer = setInterval(async () => {
+      try {
+        const res = await apiFetch(serverBase, '/api/health');
+        if (res.ok) {
+          clearInterval(pollTimer);
+          window.location.reload();
+        }
+      } catch (e) {}
+    }, 2000);
   };
 
   return (
