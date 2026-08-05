@@ -41,7 +41,7 @@ pub async fn start_market_data_stream(
 
     let mut current_stdin: Option<tokio::process::ChildStdin> = None;
     let mut child_opt: Option<tokio::process::Child> = None;
-    // Deadline for the hard 15:30:00 IST cutoff, set once a connection is live.
+    // Deadline for the hard 15:40:00 IST cutoff, set once a connection is live.
     let mut close_deadline: Option<tokio::time::Instant> = None;
 
     loop {
@@ -120,7 +120,7 @@ pub async fn start_market_data_stream(
 
             current_stdin = Some(stdin);
 
-            // Arm the hard 15:30:00 IST cutoff for this connection.
+            // Arm the hard 15:40:00 IST cutoff for this connection.
             close_deadline = shared_domain::duration_until_market_close()
                 .map(|d| tokio::time::Instant::now() + d);
 
@@ -206,7 +206,7 @@ pub async fn start_market_data_stream(
                     std::future::pending().await
                 }
             } => {
-                warn!("Market close (15:30:00 IST) reached — closing WebSocket sharply and clearing LTPs.");
+                warn!("Market close (15:40:00 IST) reached — closing WebSocket sharply and clearing LTPs.");
                 if let Some(mut child) = child_opt.take() { let _ = child.kill().await; }
                 current_stdin = None;
                 close_deadline = None;

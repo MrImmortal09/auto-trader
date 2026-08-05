@@ -22,7 +22,7 @@ pub fn current_ist_timestamp_string() -> String {
 pub const MARKET_OPEN_HOUR: u32 = 9;
 pub const MARKET_OPEN_MINUTE: u32 = 15;
 pub const MARKET_CLOSE_HOUR: u32 = 15;
-pub const MARKET_CLOSE_MINUTE: u32 = 30;
+pub const MARKET_CLOSE_MINUTE: u32 = 40;
 
 pub fn is_market_open() -> bool {
     use chrono::Timelike;
@@ -38,7 +38,7 @@ pub fn is_market_open() -> bool {
     let h = now.hour();
     let m = now.minute();
 
-    // Market hours are 09:15 to 15:30 IST (close is exclusive — sharp cutoff)
+    // Market hours are 09:15 to 15:40 IST (close is exclusive — sharp cutoff)
     if h < MARKET_OPEN_HOUR || (h == MARKET_OPEN_HOUR && m < MARKET_OPEN_MINUTE) {
         return false;
     }
@@ -49,7 +49,7 @@ pub fn is_market_open() -> bool {
     true
 }
 
-/// Today's market close instant (15:30:00 IST), regardless of weekday.
+/// Today's market close instant (15:40:00 IST), regardless of weekday.
 pub fn today_market_close_ist() -> DateTime<FixedOffset> {
     now_ist()
         .date_naive()
@@ -106,7 +106,7 @@ pub fn duration_until_market_open() -> std::time::Duration {
     (next_open - now).to_std().unwrap_or(std::time::Duration::ZERO)
 }
 
-/// Duration to sleep until today's 15:30:00 IST market close. `None` if that
+/// Duration to sleep until today's 15:40:00 IST market close. `None` if that
 /// instant has already passed for today.
 pub fn duration_until_market_close() -> Option<std::time::Duration> {
     let now = now_ist();
