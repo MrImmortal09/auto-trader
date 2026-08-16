@@ -2,6 +2,7 @@ pub mod portfolio;
 pub mod settings;
 pub mod auth_kotak;
 pub mod auth_telegram;
+pub mod auth_passkey;
 pub mod health;
 
 pub mod positions;
@@ -16,3 +17,4 @@ pub use auth_telegram::{
     telegram_chats_handler, telegram_start_handler, disconnect_telegram,
 };
 pub use health::health_handler;
+pub use auth_passkey::verify_passkey_handler;

@@ -17,6 +17,101 @@ use sqlx::sqlite::SqlitePool;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing_subscriber::EnvFilter;
+use axum::{
+    extract::Request,
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::IntoResponse,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub struct RateLimitEntry {
+    pub attempts: u32,
+    pub window_start: std::time::Instant,
+}
+
+#[derive(Deserialize)]
+struct TokenPayload {
+    exp: u64,
+}
+
+async fn auth_middleware(
+    req: Request,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let path = req.uri().path();
+    
+    // Allow public routes
+    if path == "/api/auth/verify-passkey" || path == "/api/health" || !path.starts_with("/api/") {
+        return Ok(next.run(req).await);
+    }
+
+    let auth_header = req.headers().get(header::AUTHORIZATION)
+        .and_then(|val| val.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+        
+    let token = match auth_header {
+        Some(t) => t.to_string(),
+        None => {
+            // Check query string for SSE
+            if path == "/api/logs/stream" {
+                let query = req.uri().query().unwrap_or("");
+                let token_param = query.split('&').find(|p| p.starts_with("token="));
+                match token_param {
+                    Some(p) => p.trim_start_matches("token=").to_string(),
+                    None => return Err(StatusCode::UNAUTHORIZED),
+                }
+            } else {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+    };
+    
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    
+    let auth_secret = std::env::var("AUTH_SECRET").unwrap_or_default();
+    if auth_secret.is_empty() {
+        tracing::error!("AUTH_SECRET not configured");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let msg = format!("{}.{}", parts[0], parts[1]);
+    let mut mac = match HmacSha256::new_from_slice(auth_secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    mac.update(msg.as_bytes());
+    let expected_sig = mac.finalize().into_bytes();
+    let expected_sig_b64 = URL_SAFE_NO_PAD.encode(expected_sig);
+
+    if parts[2] != expected_sig_b64 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let payload_bytes = match URL_SAFE_NO_PAD.decode(parts[1]) {
+        Ok(b) => b,
+        Err(_) => return Err(StatusCode::UNAUTHORIZED),
+    };
+    let payload: TokenPayload = match serde_json::from_slice(&payload_bytes) {
+        Ok(p) => p,
+        Err(_) => return Err(StatusCode::UNAUTHORIZED),
+    };
+
+    let now = shared_domain::now_ist().timestamp() as u64;
+    if now > payload.exp {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(req).await)
+}
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -46,6 +141,8 @@ pub(crate) struct AppState {
     pub ws_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Channel sender to forward dynamic messages to the Node bridge.
     pub ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    /// Rate limit map for passkey auth attempts
+    pub rate_limit_map: Arc<DashMap<String, RateLimitEntry>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +405,7 @@ async fn main() {
         raw_scrip_csv,
         ws_task,
         ws_tx,
+        rate_limit_map: Arc::new(DashMap::new()),
     };
 
     let app = Router::new()
@@ -343,7 +441,9 @@ async fn main() {
         .route("/api/auth/telegram/chats",          get(routes::telegram_chats_handler))
         .route("/api/auth/telegram/start",          post(routes::telegram_start_handler))
         .route("/api/auth/telegram/disconnect",     axum::routing::delete(routes::disconnect_telegram))
+        .route("/api/auth/verify-passkey",          post(routes::verify_passkey_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
+        .layer(middleware::from_fn(auth_middleware))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
