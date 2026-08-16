@@ -77,7 +77,11 @@ async fn auth_middleware(
         return Err(StatusCode::UNAUTHORIZED);
     }
     
-    let auth_secret = std::env::var("AUTH_SECRET").unwrap_or_default();
+    let auth_secret = std::env::var("AUTH_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| option_env!("AUTH_SECRET").map(String::from))
+        .unwrap_or_default();
     if auth_secret.is_empty() {
         tracing::error!("AUTH_SECRET not configured");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
