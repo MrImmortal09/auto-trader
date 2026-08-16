@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, Wifi, WifiOff } from 'lucide-react';
 import { apiFetch, apiUrl } from '../lib/api';
+import { getToken } from '../lib/auth';
 
 export function LogTerminal({ serverBase, height = 220 }: { serverBase: string; height?: number }) {
   const [logs, setLogs] = useState<{ id: number, text: string, time: string, isError: boolean }[]>([]);
@@ -50,7 +51,9 @@ export function LogTerminal({ serverBase, height = 220 }: { serverBase: string; 
     // 2. Connect SSE
     let es: EventSource | null = null;
     try {
-      es = new EventSource(apiUrl(serverBase, '/api/logs/stream'));
+      const token = getToken();
+      const sseUrl = apiUrl(serverBase, '/api/logs/stream') + (token ? `?token=${encodeURIComponent(token)}` : '');
+      es = new EventSource(sseUrl);
     } catch (e) {
       console.error(e);
       setConnected(false);

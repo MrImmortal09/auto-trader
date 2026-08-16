@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { MessageCircle } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { getToken } from '../lib/auth';
 
 export function TelegramFeed({ serverBase }: { serverBase: string }) {
   const [messages, setMessages] = useState<{ id: string, time: string, text: string, chatId: number, isEdit: boolean }[]>([]);
@@ -38,7 +39,9 @@ export function TelegramFeed({ serverBase }: { serverBase: string }) {
 
     let es: EventSource | null = null;
     try {
-      es = new EventSource(apiUrlLocal(serverBase, '/api/logs/stream'));
+      const token = getToken();
+      const sseUrl = apiUrlLocal(serverBase, '/api/logs/stream') + (token ? `?token=${encodeURIComponent(token)}` : '');
+      es = new EventSource(sseUrl);
       es.onmessage = (event) => {
         try {
           const log = JSON.parse(event.data);
