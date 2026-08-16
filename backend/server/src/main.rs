@@ -457,5 +457,7 @@ async fn main() {
     let addr = "0.0.0.0:8080";
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind :8080");
     tracing::info!("Server listening on http://{addr}");
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await
+        .expect("server error");
 }
