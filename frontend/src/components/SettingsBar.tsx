@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Save, Settings } from 'lucide-react';
+import { Save, Settings, LogOut } from 'lucide-react';
 import type { TradingConfig } from '../types';
 import { apiFetch } from '../lib/api';
+import { clearToken } from '../lib/auth';
 
 export function SettingsBar({ serverBase }: { serverBase: string }) {
   const [cfg, setCfg] = useState<TradingConfig | null>(null);
@@ -118,6 +119,18 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
       >
         <Save size={14} />
         {saving ? 'Saving…' : saved ? '✓ Saved' : 'Save Settings'}
+      </button>
+
+      {/* Logout button */}
+      <button
+        onClick={() => {
+          clearToken();
+          if (typeof window !== 'undefined') window.location.reload();
+        }}
+        className="col-span-2 sm:col-span-1 flex items-center justify-center gap-1.5 mt-2 sm:mt-5 px-4 py-2 sm:py-1.5 bg-error/10 hover:bg-error/20 text-error text-sm rounded-lg transition-colors font-body-bold shadow-sm"
+      >
+        <LogOut size={14} />
+        Logout
       </button>
     </div>
   );

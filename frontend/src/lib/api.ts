@@ -1,4 +1,5 @@
 // ---------------------------------------------------------------------------
+import { getToken, clearToken } from './auth';
 // API helpers — server base persistence and fetch wrapper
 // ---------------------------------------------------------------------------
 
@@ -62,5 +63,21 @@ export function apiUrl(serverBase: string, path: string) {
 }
 
 export function apiFetch(serverBase: string, path: string, init?: RequestInit) {
-  return fetch(apiUrl(serverBase, path), init);
+  const token = getToken();
+  const headers = new Headers(init?.headers);
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  
+  return fetch(apiUrl(serverBase, path), { ...init, headers }).then(res => {
+    if (res.status === 401) {
+      handleUnauthorized();
+    }
+    return res;
+  });
+}
+
+export function handleUnauthorized() {
+  clearToken();
+  if (typeof window !== 'undefined') {
+    window.location.reload();
+  }
 }

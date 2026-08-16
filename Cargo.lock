@@ -2307,14 +2307,18 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "dashmap",
  "futures",
+ "hmac 0.12.1",
  "kotak_client",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shared_domain",
  "sqlx",
+ "subtle",
  "sysinfo",
  "telegram_ingester",
  "time",
