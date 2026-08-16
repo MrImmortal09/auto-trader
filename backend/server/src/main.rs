@@ -164,10 +164,10 @@ async fn main() {
         .init();
 
     // Check PASSKEY status
-    if let Ok(val) = std::env::var("PASSKEY") {
-        tracing::info!("PASSKEY env var is set (length: {})", val.len());
+    if let Some(val) = std::env::var("PASSKEY").ok().or_else(|| option_env!("PASSKEY").map(String::from)) {
+        tracing::info!("PASSKEY is set (length: {})", val.len());
     } else {
-        tracing::warn!("PASSKEY env var is NOT set!");
+        tracing::warn!("PASSKEY is NOT set (neither in runtime env nor compiled in)!");
     }
 
     // 2. SQLite
