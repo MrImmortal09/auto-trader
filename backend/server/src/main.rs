@@ -163,6 +163,13 @@ async fn main() {
         )
         .init();
 
+    // Check PASSKEY status
+    if let Ok(val) = std::env::var("PASSKEY") {
+        tracing::info!("PASSKEY env var is set (length: {})", val.len());
+    } else {
+        tracing::warn!("PASSKEY env var is NOT set!");
+    }
+
     // 2. SQLite
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://trades.db".into());
     let pool = db::init_db(&db_url).await;

@@ -75,8 +75,18 @@ pub async fn verify_passkey_handler(
     // 2. Verify passkey
     let env_passkey = std::env::var("PASSKEY").expect("PASSKEY env var must be set");
     
-    // Constant-time comparison
-    let is_valid: bool = subtle::ConstantTimeEq::ct_eq(req.passkey.as_bytes(), env_passkey.as_bytes()).into();
+    // Constant-time comparison (check length first to prevent panic)
+    let is_valid: bool = if req.passkey.len() == env_passkey.len() {
+        subtle::ConstantTimeEq::ct_eq(req.passkey.as_bytes(), env_passkey.as_bytes()).into()
+    } else {
+        tracing::warn!(
+            ip = %ip,
+            req_len = req.passkey.len(),
+            env_len = env_passkey.len(),
+            "Passkey length mismatch"
+        );
+        false
+    };
 
     if !is_valid {
         tracing::warn!(ip = %ip, attempts = current_attempts, "Invalid passkey attempt");
