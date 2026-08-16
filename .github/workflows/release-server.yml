@@ -44,6 +44,9 @@ jobs:
           echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
+        env:
+          PASSKEY: ${{ secrets.PASSKEY }}
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
         run: cargo build --release -p server --target "$TARGET_TRIPLE"
 
       - name: Prepare release asset
