@@ -72,8 +72,10 @@ pub async fn verify_passkey_handler(
         current_attempts = 1;
     }
 
-    // 2. Verify passkey
-    let env_passkey = std::env::var("PASSKEY").expect("PASSKEY env var must be set");
+    // 2. Verify passkey (support both runtime and compile-time env vars)
+    let env_passkey = std::env::var("PASSKEY")
+        .or_else(|_| option_env!("PASSKEY").map(String::from).ok_or("not set"))
+        .expect("PASSKEY must be set");
     
     // Constant-time comparison (check length first to prevent panic)
     let is_valid: bool = if req.passkey.len() == env_passkey.len() {
@@ -101,7 +103,9 @@ pub async fn verify_passkey_handler(
     state.rate_limit_map.remove(&ip);
 
     // 3. Issue Token
-    let auth_secret = std::env::var("AUTH_SECRET").expect("AUTH_SECRET env var must be set");
+    let auth_secret = std::env::var("AUTH_SECRET")
+        .or_else(|_| option_env!("AUTH_SECRET").map(String::from).ok_or("not set"))
+        .expect("AUTH_SECRET must be set");
     let now = shared_domain::now_ist().timestamp() as u64;
     let exp = now + 7 * 24 * 60 * 60; // 7 days
 
