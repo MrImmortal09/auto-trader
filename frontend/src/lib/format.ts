@@ -16,6 +16,13 @@ export function totalCharges(t: PaperTrade) {
     t.stamp_duty + t.transaction_charge + t.gst;
 }
 
+/** Label for the balance stat tile, matching what `balance_source` actually is. */
+export function balanceLabel(source?: string): string {
+  if (source === 'LIVE') return 'Wallet Balance';
+  if (source === 'LIVE_UNAVAILABLE') return 'Wallet Balance (unavailable)';
+  return 'Virtual Balance';
+}
+
 export function formatExitReason(reason?: string): string {
   if (!reason || reason === 'ENTRY') return '';
   switch (reason) {

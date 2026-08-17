@@ -92,8 +92,11 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
         </div>
       </div>
 
-      {/* Numeric inputs */}
-      {fields.map(({ key, label }) => (
+      {/* Numeric inputs — the virtual (paper) wallet seed is meaningless once
+          LIVE is selected, since LIVE reads the real broker balance instead. */}
+      {fields
+        .filter(({ key }) => key !== 'virtual_balance' || cfg.mode !== 'LIVE')
+        .map(({ key, label }) => (
         <div key={key} className="flex flex-col gap-1">
           <label className="text-label-caps text-on-surface-variant uppercase tracking-wide truncate">
             {label}

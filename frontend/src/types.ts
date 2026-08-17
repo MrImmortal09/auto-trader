@@ -36,6 +36,8 @@ export interface PaperTrade {
 
 export interface Portfolio {
   balance: number;
+  /** "LIVE" | "PAPER" | "LIVE_UNAVAILABLE" — see backend Portfolio struct. */
+  balance_source: string;
   trades: PaperTrade[];
 }
 

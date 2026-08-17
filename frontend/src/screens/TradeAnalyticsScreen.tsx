@@ -1,6 +1,6 @@
 import { CheckCircle2, Info, Shield } from 'lucide-react';
 import { usePortfolioSnapshot } from '../hooks/usePortfolioSnapshot';
-import { fmt, formatExitReason, todayIsoIST } from '../lib/format';
+import { balanceLabel, fmt, formatExitReason, todayIsoIST } from '../lib/format';
 
 export function TradeAnalyticsScreen({ serverBase }: { serverBase: string }) {
   const { portfolio, positions, realizedPnl, liveMtmPnl } = usePortfolioSnapshot(serverBase);
@@ -14,10 +14,12 @@ export function TradeAnalyticsScreen({ serverBase }: { serverBase: string }) {
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-4 shadow-sm flex flex-col justify-between">
           <div className="flex items-center justify-between text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
-            <span>Virtual Balance</span>
+            <span>{balanceLabel(portfolio?.balance_source)}</span>
             <Info size={14} className="text-outline cursor-help" />
           </div>
-          <span className="text-xl font-bold text-on-surface tabular-nums mt-1">₹{fmt(portfolio?.balance ?? 0)}</span>
+          <span className="text-xl font-bold text-on-surface tabular-nums mt-1">
+            {portfolio?.balance_source === 'LIVE_UNAVAILABLE' ? '—' : `₹${fmt(portfolio?.balance ?? 0)}`}
+          </span>
         </div>
         <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-4 shadow-sm flex flex-col justify-between">
           <div className="flex items-center justify-between text-xs text-on-surface-variant font-semibold uppercase tracking-wider">

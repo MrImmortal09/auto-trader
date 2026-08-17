@@ -47,6 +47,12 @@ pub struct PaperTrade {
 #[derive(Serialize)]
 pub struct Portfolio {
     pub balance: f64,
+    /// `"LIVE"` — `balance` is the real Kotak account's net available funds.
+    /// `"PAPER"` — `balance` is the simulated wallet.
+    /// `"LIVE_UNAVAILABLE"` — in LIVE mode but the broker balance could not be
+    /// read (no session, or the call failed); `balance` is `0.0` and must not
+    /// be presented as real money.
+    pub balance_source: String,
     pub trades: Vec<PaperTrade>,
 }
 
@@ -80,28 +86,51 @@ pub async fn sse_logs_handler(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// `GET /api/portfolio` — wallet balance + last 100 paper trades.
+/// `GET /api/portfolio` — wallet balance + trade history for the *current*
+/// trading mode.
+///
+/// LIVE and PAPER are never blended: trades are filtered to whichever mode is
+/// active right now, and the balance shown is the real Kotak account balance
+/// in LIVE (never the simulated wallet) or the simulated wallet in PAPER.
 pub async fn portfolio_handler(
     State(state): State<AppState>,
 ) -> Result<Json<Portfolio>, StatusCode> {
-    let balance: f64 = sqlx::query("SELECT balance FROM wallet WHERE id = 1")
-        .fetch_one(&state.db_pool)
-        .await
-        .map_err(|e| { tracing::error!("wallet: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?
-        .get::<f64, _>(0);
+    let mode = state.trading_cfg.read().await.mode.clone();
+
+    let (balance, balance_source) = if mode == "LIVE" {
+        let guard = state.kotak.lock().await;
+        match guard.as_ref() {
+            Some(client) => match client.get_limits().await {
+                Ok(limits) => (limits.net, "LIVE".to_string()),
+                Err(e) => {
+                    tracing::warn!("LIVE balance: could not read broker limits ({e})");
+                    (0.0, "LIVE_UNAVAILABLE".to_string())
+                }
+            },
+            None => (0.0, "LIVE_UNAVAILABLE".to_string()),
+        }
+    } else {
+        let balance: f64 = sqlx::query("SELECT balance FROM wallet WHERE id = 1")
+            .fetch_one(&state.db_pool)
+            .await
+            .map_err(|e| { tracing::error!("wallet: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?
+            .get::<f64, _>(0);
+        (balance, "PAPER".to_string())
+    };
 
     let trades: Vec<PaperTrade> = sqlx::query_as(
         "SELECT id, ticker, action, qty, executed_price,
                 gross_value, brokerage, stt_charge, sebi_fee,
                 stamp_duty, transaction_charge, gst, net_value, timestamp,
                 signal_id, raw_message, exit_reason, mode
-         FROM paper_trades ORDER BY timestamp DESC LIMIT 1000",
+         FROM paper_trades WHERE mode = ? ORDER BY timestamp DESC LIMIT 1000",
     )
+    .bind(&mode)
     .fetch_all(&state.db_pool)
     .await
     .map_err(|e| { tracing::error!("trades: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    Ok(Json(Portfolio { balance, trades }))
+    Ok(Json(Portfolio { balance, balance_source, trades }))
 }
 
 /// `GET /api/logs/history` — Fetch recent logs from DB

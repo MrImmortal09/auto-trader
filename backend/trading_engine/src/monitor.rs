@@ -652,13 +652,19 @@ async fn reconcile_live_orders(
 ///
 /// The broker is the source of truth throughout: positions decide what we hold,
 /// the order book decides what is resting.
+///
+/// Returns `true` once the broker's positions and order book were both read
+/// successfully and every tracked position was reconciled against them.
+/// Returns `false` on any failure — the caller must not let `live_tick` run
+/// against unverified state, and must retry this on the next tick rather than
+/// treating the failed attempt as done.
 async fn reconcile_on_startup(
     positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
     kotak: &KotakHandle,
     db_tx: &mpsc::Sender<DbWriteMessage>,
     log_tx: &broadcast::Sender<String>,
     brokerage: f64,
-) {
+) -> bool {
     tracing::info!("LIVE startup reconciliation starting");
 
     // 1. Settle whatever we were already tracking first, so a fill that landed
@@ -671,7 +677,7 @@ async fn reconcile_on_startup(
         let guard = kotak.lock().await;
         let Some(client) = guard.as_ref() else {
             tracing::warn!("LIVE startup reconciliation skipped — no Kotak session");
-            return;
+            return false;
         };
         (client.get_positions().await, client.get_order_book().await)
     };
@@ -681,7 +687,7 @@ async fn reconcile_on_startup(
             loud_error(db_tx, log_tx, "SYSTEM", &format!(
                 "startup reconciliation could not read positions ({e}) — engine state is unverified against the broker, check the terminal before trading"
             )).await;
-            return;
+            return false;
         }
     };
     let book = match book {
@@ -690,7 +696,7 @@ async fn reconcile_on_startup(
             loud_error(db_tx, log_tx, "SYSTEM", &format!(
                 "startup reconciliation could not read the order book ({e}) — resting orders are unverified, check the terminal before trading"
             )).await;
-            return;
+            return false;
         }
     };
 
@@ -883,6 +889,7 @@ async fn reconcile_on_startup(
         "positions": snapshot.len(),
         "mode": "LIVE",
     })).await;
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1810,10 +1817,14 @@ pub async fn start_position_monitor(
                     if !startup_reconciled {
                         let has_session = { kotak.lock().await.is_some() };
                         if has_session {
-                            startup_reconciled = true;
-                            reconcile_on_startup(&positions, &kotak, &db_tx, &log_tx, cfg.brokerage_per_order).await;
+                            startup_reconciled = reconcile_on_startup(&positions, &kotak, &db_tx, &log_tx, cfg.brokerage_per_order).await;
                         }
                     }
+                    // Never trade on unverified state: if reconciliation hasn't
+                    // succeeded yet (no session, or the broker call failed), skip
+                    // live_tick this tick and retry reconciliation on the next one
+                    // instead of silently trading blind.
+                    if !startup_reconciled { continue; }
                     if positions.read().await.is_empty() { continue; }
                     live_tick(&positions, &kotak, &db_tx, &log_tx, &ltp_map, &cfg, &mut last_live_poll).await;
                     continue;

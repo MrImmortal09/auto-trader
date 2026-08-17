@@ -5,7 +5,7 @@ import { getToken, clearToken } from './auth';
 
 export const SERVER_BASE_STORAGE_KEY = 'server_base';
 export const SERVER_BASE_COOKIE = 'server_base';
-export const DEFAULT_SERVER_BASE = 'https://at.axiosiiitl.dev';
+export const DEFAULT_SERVER_BASE = 'https://m1.axiosiiitl.dev';
 
 export function readCookie(name: string) {
   if (typeof document === 'undefined') return '';

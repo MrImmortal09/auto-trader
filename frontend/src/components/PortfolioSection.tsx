@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { IndianRupee, Info, TrendingUp, Wallet } from 'lucide-react';
 import { usePortfolioSnapshot } from '../hooks/usePortfolioSnapshot';
-import { fmt, formatExitReason, totalCharges } from '../lib/format';
+import { balanceLabel, fmt, formatExitReason, totalCharges } from '../lib/format';
 import { Stat } from './Stat';
 
 export function PortfolioSection({ serverBase }: { serverBase: string }) {
@@ -20,8 +20,8 @@ export function PortfolioSection({ serverBase }: { serverBase: string }) {
     <div className="p-4 space-y-4">
       {/* Balance strip */}
       <div className="flex gap-4 flex-wrap">
-        <Stat icon={<Wallet size={16} className="text-blue-400" />} label="Virtual Balance">
-          ₹{fmt(portfolio.balance)}
+        <Stat icon={<Wallet size={16} className="text-blue-400" />} label={balanceLabel(portfolio.balance_source)}>
+          {portfolio.balance_source === 'LIVE_UNAVAILABLE' ? '—' : `₹${fmt(portfolio.balance)}`}
         </Stat>
         <Stat
           icon={

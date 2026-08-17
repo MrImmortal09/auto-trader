@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { ScreenId } from './types';
 import { apiFetch, getStoredServerBase, persistServerBase } from './lib/api';
-import { fmt, todayIsoIST } from './lib/format';
+import { balanceLabel, fmt, todayIsoIST } from './lib/format';
 import { usePortfolioSnapshot } from './hooks/usePortfolioSnapshot';
 
 // Layout
@@ -96,10 +96,12 @@ export default function App() {
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
                 <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-3 sm:p-4 shadow-sm flex flex-col justify-between">
                   <div className="flex items-center justify-between text-[11px] sm:text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
-                    <span>Virtual Balance</span>
+                    <span>{balanceLabel(portfolio?.balance_source)}</span>
                     <Info size={14} className="text-outline cursor-help" />
                   </div>
-                  <span className="text-lg sm:text-xl font-bold text-on-surface tabular-nums mt-1">₹{fmt(portfolio?.balance ?? 0)}</span>
+                  <span className="text-lg sm:text-xl font-bold text-on-surface tabular-nums mt-1">
+                    {portfolio?.balance_source === 'LIVE_UNAVAILABLE' ? '—' : `₹${fmt(portfolio?.balance ?? 0)}`}
+                  </span>
                 </div>
                 <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-3 sm:p-4 shadow-sm flex flex-col justify-between">
                   <div className="flex items-center justify-between text-[11px] sm:text-xs text-on-surface-variant font-semibold uppercase tracking-wider">
