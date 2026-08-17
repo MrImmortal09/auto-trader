@@ -1063,10 +1063,16 @@ struct LiveCtx {
 
 /// Cancel any resting stop, then market-sell the whole holding.
 ///
-/// The cancel has to succeed first. A resting stop *plus* a market sell for the
-/// same quantity could both fill, which would leave the account short — and
-/// this account carries no margin to be short with. If the cancel fails we do
-/// not sell at all.
+/// The cancel has to succeed first — normally. A resting stop *plus* a market
+/// sell for the same quantity could both fill, which would leave the account
+/// short, and this account carries no margin to be short with. But `sl_order_id`
+/// can point at an order that is already dead at the broker (this engine no
+/// longer places its own, so the only way it's populated is by adopting a
+/// resting sell order at startup, which can itself have since filled/been
+/// rejected/cancelled) — cancelling a dead order fails with something like
+/// "please provide valid order number", which used to block every exit path,
+/// including the manual Close button, indefinitely. A dead order can't
+/// double-fill against anything, so check the order book before giving up.
 #[allow(clippy::too_many_arguments)]
 async fn exec_exit_all(
     positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
@@ -1084,11 +1090,28 @@ async fn exec_exit_all(
 
     if let Some(sl_id) = &ctx.sl_order_id {
         if let Err(e) = kotak_cancel(kotak, sl_id, &ctx.trading_symbol).await {
+            let still_open = {
+                let guard = kotak.lock().await;
+                match guard.as_ref() {
+                    Some(client) => client
+                        .get_order_book()
+                        .await
+                        .ok()
+                        .map(|book| book.iter().any(|o| o.order_no.trim() == sl_id.trim() && !o.is_terminal()))
+                        .unwrap_or(true), // couldn't check — stay conservative
+                    None => true,
+                }
+            };
+            if still_open {
+                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    "could not cancel stop-loss {sl_id} before the {reason} exit ({e}) — holding the market sell back so we cannot end up short"
+                )).await;
+                bump_exit_attempts(positions, db_tx, log_tx, pos_id, &ctx.instrument).await;
+                return;
+            }
             loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                "could not cancel stop-loss {sl_id} before the {reason} exit ({e}) — holding the market sell back so we cannot end up short"
+                "stop-loss {sl_id} was already inactive at the broker ({e}) — proceeding with the {reason} market exit"
             )).await;
-            bump_exit_attempts(positions, db_tx, log_tx, pos_id, &ctx.instrument).await;
-            return;
         }
         with_position(positions, pos_id, forget_stop).await;
     }
