@@ -229,22 +229,44 @@ fn build_market_order(
     order
 }
 
-/// Protective stop — `SL-M` sell for `qty`, triggering at `trigger`.
+/// Percentage under the trigger used for the limit price of an options stop.
+/// Confirmed live (2026-08-17) that Kotak's RMS hard-rejects `SL-M` on
+/// options — "STOP LOSS MARKET ORDER NOT ALLOWED IN OPTIONS, block type: ALL"
+/// — every single time, regardless of retries. `SL` (limit) is required
+/// instead. This buffer gives the order room to actually fill through the
+/// first few prints after it releases rather than sitting exactly at the
+/// price it just crossed.
+const SL_LIMIT_BUFFER_PCT: f64 = 2.0;
+
+/// Protective stop — sell for `qty`, triggering at `trigger`.
 ///
 /// `mp = 0`: a protective exit must never be held back by price protection.
+///
+/// Options use `SL` (stop-loss limit): Kotak's RMS rejects `SL-M` outright on
+/// this segment. Equity/futures keep `SL-M`, since a limit leg there can go
+/// unfilled on a fast move and leave the position unprotected in a different
+/// way — `SL-M` is the safer default where it's actually accepted.
 fn build_stop_order(
     base: &shared_domain::OrderRequest,
     qty: i32,
     trigger: f64,
+    is_options: bool,
+    tick_size: f64,
 ) -> shared_domain::OrderRequest {
     use shared_domain::{OrderType, TransactionType};
     let mut order = base.clone();
     order.quantity = qty.to_string();
     order.transaction_type = TransactionType::Sell;
-    order.order_type = OrderType::StopLossMarket;
-    order.price = "0".to_string();
     order.trigger_price = format!("{trigger:.2}");
     order.market_protection = "0".to_string();
+    if is_options {
+        order.order_type = OrderType::StopLoss;
+        let limit = round_down_tick(trigger * (1.0 - SL_LIMIT_BUFFER_PCT / 100.0), tick_size);
+        order.price = format!("{:.2}", limit.max(tick_size));
+    } else {
+        order.order_type = OrderType::StopLossMarket;
+        order.price = "0".to_string();
+    }
     order
 }
 
@@ -1031,20 +1053,21 @@ fn decide_live(
                 "SL_HIT"
             };
 
-            // Protection comes before anything else.
-            match pos.sl_order_id {
-                None => {
-                    return Some(match ltp {
-                        // Unprotected and already through the stop: a fresh SL-M
-                        // would be rejected for triggering immediately, so leave
-                        // at market instead.
-                        Some(p) if p <= trigger => LiveAction::ExitAll {
-                            qty: held,
-                            reason: sl_reason.to_string(),
-                        },
-                        _ => LiveAction::PlaceStop { qty: held, trigger },
-                    });
+            // Protection comes before anything else — and this check never
+            // waits on a resting broker-side stop to catch a breach. The moment
+            // LTP has crossed the stop level, exit at market immediately,
+            // regardless of what `sl_order_id` currently says: a resting order
+            // can be rejected, still settling, or simply behind the tick that
+            // just crossed it. Gating this on `sl_order_id == None` used to
+            // leave up to one poll interval (2s) where a soon-to-be-rejected
+            // but still-tracked stop blocked the immediate market exit.
+            if let Some(p) = ltp {
+                if p <= trigger {
+                    return Some(LiveAction::ExitAll { qty: held, reason: sl_reason.to_string() });
                 }
+            }
+            match pos.sl_order_id {
+                None => return Some(LiveAction::PlaceStop { qty: held, trigger }),
                 Some(_) => {
                     if pos.sl_order_qty != held || (pos.sl_order_trigger - trigger).abs() >= 0.005 {
                         return Some(LiveAction::ModifyStop { qty: held, trigger });
@@ -1097,6 +1120,8 @@ struct LiveCtx {
     entry_cancel_sent: bool,
     sl_order_id: Option<String>,
     executed_qty: i32,
+    is_options: bool,
+    tick_size: f64,
 }
 
 /// Cancel any resting stop, then market-sell the whole holding.
@@ -1181,6 +1206,8 @@ async fn exec_live_action(
             entry_cancel_sent: p.entry_cancel_sent,
             sl_order_id: p.sl_order_id.clone(),
             executed_qty: p.executed_qty,
+            is_options: p.signal.option_type.is_some(),
+            tick_size: p.tick_size,
         }
     };
 
@@ -1270,7 +1297,7 @@ async fn exec_live_action(
         }
 
         LiveAction::PlaceStop { qty, trigger } => {
-            let order = build_stop_order(&ctx.base, *qty, *trigger);
+            let order = build_stop_order(&ctx.base, *qty, *trigger, ctx.is_options, ctx.tick_size);
             match kotak_place(kotak, &order).await {
                 Ok(order_id) => {
                     with_position(positions, &pending.pos_id, |p| {
@@ -1304,7 +1331,7 @@ async fn exec_live_action(
 
         LiveAction::ModifyStop { qty, trigger } => {
             let Some(sl_id) = ctx.sl_order_id.clone() else { return false; };
-            let order = build_stop_order(&ctx.base, *qty, *trigger);
+            let order = build_stop_order(&ctx.base, *qty, *trigger, ctx.is_options, ctx.tick_size);
             match kotak_modify(kotak, &order, &sl_id).await {
                 Ok(()) => {
                     with_position(positions, &pending.pos_id, |p| {
@@ -1346,7 +1373,7 @@ async fn exec_live_action(
             // Shrink the stop *first*. After this the stop covers `keep` and the
             // sell covers `slice`, and keep + slice == what we hold, so both can
             // fill at once without going short.
-            let stop = build_stop_order(&ctx.base, *keep, *new_sl);
+            let stop = build_stop_order(&ctx.base, *keep, *new_sl, ctx.is_options, ctx.tick_size);
             if let Err(e) = kotak_modify(kotak, &stop, &sl_id).await {
                 loud_error(db_tx, log_tx, &ctx.instrument, &format!(
                     "could not resize the stop to {keep} for target 1 ({e}) — squaring the whole position off at market instead"
