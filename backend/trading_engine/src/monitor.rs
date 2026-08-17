@@ -681,6 +681,20 @@ async fn reconcile_on_startup(
         };
         (client.get_positions().await, client.get_order_book().await)
     };
+    // Temporary diagnostic: report the order-book call's own outcome even when
+    // positions already failed, so a per-endpoint failure (vs. a session/IP/auth
+    // problem that would hit every call uniformly) is visible in the UI log —
+    // routed through loud_error/live_info, not tracing, since that's the only
+    // channel reachable without a shell on the box.
+    match &book {
+        Ok(v) => live_info(db_tx, log_tx, json!({
+            "event": "DIAG_ORDER_BOOK",
+            "message": format!("get_order_book succeeded independently ({} orders)", v.len()),
+        })).await,
+        Err(e) => loud_error(db_tx, log_tx, "SYSTEM", &format!(
+            "DIAG: get_order_book also failed independently: {e}"
+        )).await,
+    }
     let broker_positions = match broker_positions {
         Ok(v) => v,
         Err(e) => {
