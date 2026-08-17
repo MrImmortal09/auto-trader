@@ -435,7 +435,6 @@ impl KotakClient {
         let mut req = self
             .http
             .post(format!("{}/quick/order/rule/ms/place", session.base_url))
-            .header("Authorization", self.access_token.trim())
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);
@@ -505,7 +504,6 @@ impl KotakClient {
         let mut req = self
             .http
             .post(format!("{}/quick/order/vr/modify", session.base_url))
-            .header("Authorization", self.access_token.trim())
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);
@@ -563,7 +561,6 @@ impl KotakClient {
         let mut req = self
             .http
             .post(format!("{}/quick/order/cancel", session.base_url))
-            .header("Authorization", self.access_token.trim())
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);
@@ -611,7 +608,6 @@ impl KotakClient {
         let mut req = self
             .http
             .get(format!("{}/quick/user/positions", session.base_url))
-            .header("Authorization", self.access_token.trim())
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);
@@ -652,7 +648,6 @@ impl KotakClient {
         let mut req = self
             .http
             .get(format!("{}/quick/user/orders", session.base_url))
-            .header("Authorization", self.access_token.trim())
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);
@@ -694,7 +689,6 @@ impl KotakClient {
         let mut req = self
             .http
             .post(format!("{}/quick/user/limits", session.base_url))
-            .header("Authorization", self.access_token.trim())
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);
