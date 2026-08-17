@@ -653,11 +653,14 @@ async fn reconcile_live_orders(
 /// The broker is the source of truth throughout: positions decide what we hold,
 /// the order book decides what is resting.
 ///
-/// Returns `true` once the broker's positions and order book were both read
-/// successfully and every tracked position was reconciled against them.
-/// Returns `false` on any failure — the caller must not let `live_tick` run
-/// against unverified state, and must retry this on the next tick rather than
-/// treating the failed attempt as done.
+/// Returns `true` once the order book was read successfully and every tracked
+/// position was reconciled against the broker. Also returns `true` in one
+/// degraded case: the positions-read failed but nothing is currently tracked,
+/// so there was nothing it could have caught — see `positions_verified` in the
+/// emitted `LIVE_STARTUP_RECONCILED` event for whether it actually ran.
+/// Returns `false` on any other failure — the caller must not let `live_tick`
+/// run against unverified state, and must retry this on the next tick rather
+/// than treating the failed attempt as done.
 async fn reconcile_on_startup(
     positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
     kotak: &KotakHandle,
@@ -672,48 +675,6 @@ async fn reconcile_on_startup(
     //    from a quantity difference below.
     reconcile_live_orders(positions, kotak, db_tx, log_tx, brokerage).await;
 
-    // 2. Broker truth.
-    let (broker_positions, book) = {
-        let guard = kotak.lock().await;
-        let Some(client) = guard.as_ref() else {
-            tracing::warn!("LIVE startup reconciliation skipped — no Kotak session");
-            return false;
-        };
-        (client.get_positions().await, client.get_order_book().await)
-    };
-    // Temporary diagnostic: report the order-book call's own outcome even when
-    // positions already failed, so a per-endpoint failure (vs. a session/IP/auth
-    // problem that would hit every call uniformly) is visible in the UI log —
-    // routed through loud_error/live_info, not tracing, since that's the only
-    // channel reachable without a shell on the box.
-    match &book {
-        Ok(v) => live_info(db_tx, log_tx, json!({
-            "event": "DIAG_ORDER_BOOK",
-            "message": format!("get_order_book succeeded independently ({} orders)", v.len()),
-        })).await,
-        Err(e) => loud_error(db_tx, log_tx, "SYSTEM", &format!(
-            "DIAG: get_order_book also failed independently: {e}"
-        )).await,
-    }
-    let broker_positions = match broker_positions {
-        Ok(v) => v,
-        Err(e) => {
-            loud_error(db_tx, log_tx, "SYSTEM", &format!(
-                "startup reconciliation could not read positions ({e}) — engine state is unverified against the broker, check the terminal before trading"
-            )).await;
-            return false;
-        }
-    };
-    let book = match book {
-        Ok(v) => v,
-        Err(e) => {
-            loud_error(db_tx, log_tx, "SYSTEM", &format!(
-                "startup reconciliation could not read the order book ({e}) — resting orders are unverified, check the terminal before trading"
-            )).await;
-            return false;
-        }
-    };
-
     struct Tracked {
         pos_id: String,
         instrument: String,
@@ -723,6 +684,11 @@ async fn reconcile_on_startup(
         entry_order_id: Option<String>,
         sl_order_id: Option<String>,
     }
+    // Computed before the broker calls: whether there is anything at all for a
+    // failed positions-read to have gotten wrong. Held positions are the only
+    // reason `get_positions()` truly needs to succeed here — its whole job below
+    // is catching drift in what this engine already believes it holds, plus
+    // flagging broker-side exposure it doesn't know about.
     let tracked: Vec<Tracked> = {
         let g = positions.read().await;
         g.iter()
@@ -741,6 +707,52 @@ async fn reconcile_on_startup(
                 sl_order_id: p.sl_order_id.clone(),
             })
             .collect()
+    };
+    let nothing_to_protect = tracked.is_empty();
+
+    // 2. Broker truth.
+    let (broker_positions, book) = {
+        let guard = kotak.lock().await;
+        let Some(client) = guard.as_ref() else {
+            tracing::warn!("LIVE startup reconciliation skipped — no Kotak session");
+            return false;
+        };
+        (client.get_positions().await, client.get_order_book().await)
+    };
+    let mut positions_verified = true;
+    let broker_positions = match broker_positions {
+        Ok(v) => v,
+        // Confirmed (2026-08-17) independent of session/IP/auth — Order Book and
+        // Limits succeed on the very same session that Positions fails on, every
+        // time, including right after a fresh login. Most likely a broker-side
+        // API product/subscription gap, not something a retry fixes. With
+        // nothing currently tracked there is nothing this read could have
+        // caught, so proceed in a degraded mode rather than block trading
+        // entirely. The moment anything is held, `nothing_to_protect` is false
+        // and this reverts to fully blocking on the next restart — exactly when
+        // it actually has something to protect.
+        Err(e) if nothing_to_protect => {
+            positions_verified = false;
+            loud_error(db_tx, log_tx, "SYSTEM", &format!(
+                "startup reconciliation could not read positions ({e}) — proceeding anyway because nothing is currently tracked, so there is nothing to mis-protect; any broker-side holding this engine doesn't already know about will NOT be flagged until positions-read works again"
+            )).await;
+            Vec::new()
+        }
+        Err(e) => {
+            loud_error(db_tx, log_tx, "SYSTEM", &format!(
+                "startup reconciliation could not read positions ({e}) — engine state is unverified against the broker, check the terminal before trading"
+            )).await;
+            return false;
+        }
+    };
+    let book = match book {
+        Ok(v) => v,
+        Err(e) => {
+            loud_error(db_tx, log_tx, "SYSTEM", &format!(
+                "startup reconciliation could not read the order book ({e}) — resting orders are unverified, check the terminal before trading"
+            )).await;
+            return false;
+        }
     };
 
     // Everything below matches broker rows to positions by trading symbol, so two
@@ -897,10 +909,11 @@ async fn reconcile_on_startup(
     let snapshot = { positions.read().await.clone() };
     send_positions_snapshot(db_tx, &snapshot).await;
 
-    tracing::info!(positions = snapshot.len(), "LIVE startup reconciliation complete");
+    tracing::info!(positions = snapshot.len(), positions_verified, "LIVE startup reconciliation complete");
     live_info(db_tx, log_tx, json!({
         "event": "LIVE_STARTUP_RECONCILED",
         "positions": snapshot.len(),
+        "positions_verified": positions_verified,
         "mode": "LIVE",
     })).await;
     true
