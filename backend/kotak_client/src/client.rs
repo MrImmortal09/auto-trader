@@ -450,7 +450,7 @@ impl KotakClient {
             .json::<KotakOrderResponse>()
             .await?;
 
-        if raw.stat != "Ok" {
+        if !raw.stat.eq_ignore_ascii_case("Ok") {
             return Err(KotakError::OrderRejected {
                 status_code: raw.st_code,
                 message: raw.emsg.unwrap_or(raw.stat),
@@ -519,7 +519,7 @@ impl KotakClient {
             .json::<KotakOrderResponse>()
             .await?;
 
-        if raw.stat != "Ok" {
+        if !raw.stat.eq_ignore_ascii_case("Ok") {
             return Err(KotakError::OrderRejected {
                 status_code: raw.st_code,
                 message: raw.emsg.unwrap_or(raw.stat),
@@ -576,7 +576,7 @@ impl KotakClient {
             .json::<KotakOrderResponse>()
             .await?;
 
-        if raw.stat != "Ok" {
+        if !raw.stat.eq_ignore_ascii_case("Ok") {
             return Err(KotakError::OrderRejected {
                 status_code: raw.st_code,
                 message: raw.emsg.unwrap_or(raw.stat),
@@ -622,7 +622,7 @@ impl KotakClient {
             .json::<KotakPositionsResponse>()
             .await?;
 
-        if raw.stat != "Ok" {
+        if !raw.stat.eq_ignore_ascii_case("Ok") {
             return Err(KotakError::ApiError {
                 status_code: raw.st_code,
                 message: raw.emsg.unwrap_or(raw.stat),
@@ -662,7 +662,7 @@ impl KotakClient {
             .json::<KotakOrderBookResponse>()
             .await?;
 
-        if raw.stat != "Ok" {
+        if !raw.stat.eq_ignore_ascii_case("Ok") {
             let message = raw.emsg.unwrap_or(raw.stat);
             if message.to_lowercase().contains("no data") {
                 return Ok(Vec::new());
@@ -704,7 +704,7 @@ impl KotakClient {
             .json::<KotakLimitsResponse>()
             .await?;
 
-        if raw.stat != "Ok" {
+        if !raw.stat.eq_ignore_ascii_case("Ok") {
             return Err(KotakError::ApiError {
                 status_code: raw.st_code,
                 message: raw.emsg.unwrap_or(raw.stat),
