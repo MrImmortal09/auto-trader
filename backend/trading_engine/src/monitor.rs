@@ -902,7 +902,14 @@ enum LiveAction {
     /// Give up on an entry that will not be taken; cancel it if it is in flight.
     AbandonEntry { reason: String },
     /// Target 1: trail the software stop to `new_sl`, then market-sell `slice`.
-    Target1 { slice: i32, keep: i32, new_sl: f64 },
+    /// `next_dynamic_target` seeds the dynamic ladder (see `TrailDynamic`)
+    /// when dynamic targeting is on; `None` keeps the existing fixed-target-2
+    /// behaviour for this position.
+    Target1 { slice: i32, keep: i32, new_sl: f64, next_dynamic_target: Option<f64> },
+    /// Dynamic-targeting rung hit: trail the stop and extend the next rung.
+    /// No broker call — this is pure local bookkeeping, since protection is
+    /// already a software LTP watch against `current_sl`.
+    TrailDynamic { new_sl: f64, next_target: f64 },
     /// Market-sell everything we hold (stop hit, target 2, forced exit, etc.).
     /// Cancels any resting sell order first if one happens to exist (e.g.
     /// adopted from the broker at startup) — this engine never places one.
@@ -1021,24 +1028,53 @@ fn decide_live(
                     if ltp < t1 {
                         return None;
                     }
-                    let slice = tgt1_slice_qty(held, lot_size_of(pos), cfg.target_1_exit_pct);
+                    // Dynamic targeting sells exactly one lot at target 1
+                    // (not the configured percentage) so there's a runner
+                    // left to extend; off, this is the existing behaviour.
+                    let slice = if cfg.dynamic_targeting {
+                        lot_size_of(pos).min(held)
+                    } else {
+                        tgt1_slice_qty(held, lot_size_of(pos), cfg.target_1_exit_pct)
+                    };
                     let has_t2 = pos.signal.targets.len() > 1;
                     if !has_t2 || slice >= held {
                         Some(LiveAction::ExitAll { qty: held, reason: "TGT1_FULL".to_string() })
                     } else {
+                        // diff = distance from entry to target 1. Every rung of
+                        // the dynamic ladder (starting with target 1 itself)
+                        // follows one rule: trail the stop to `rung - diff/2`,
+                        // and set the next rung to `rung + diff`.
+                        let diff = t1 - pos.avg_buy_price;
                         Some(LiveAction::Target1 {
                             slice,
                             keep: held - slice,
-                            new_sl: round_down_tick((pos.avg_buy_price + t1) / 2.0, pos.tick_size),
+                            new_sl: round_down_tick(t1 - diff / 2.0, pos.tick_size),
+                            next_dynamic_target: cfg.dynamic_targeting.then(|| t1 + diff),
                         })
                     }
                 }
                 TradeState::Target1Hit => {
-                    let t2 = *pos.signal.targets.get(1)?;
-                    (ltp >= t2).then(|| LiveAction::ExitAll {
-                        qty: held,
-                        reason: "TGT2_HIT".to_string(),
-                    })
+                    if let Some(next_target) = pos.next_dynamic_target {
+                        // Dynamic runner: never exits on a target hit, only
+                        // trails and extends. It only ever exits via the
+                        // unconditional stop-loss watch above, once price
+                        // pulls back through the trailed current_sl.
+                        if ltp < next_target {
+                            return None;
+                        }
+                        let t1 = *pos.signal.targets.first()?;
+                        let diff = t1 - pos.avg_buy_price;
+                        Some(LiveAction::TrailDynamic {
+                            new_sl: round_down_tick(next_target - diff / 2.0, pos.tick_size),
+                            next_target: next_target + diff,
+                        })
+                    } else {
+                        let t2 = *pos.signal.targets.get(1)?;
+                        (ltp >= t2).then(|| LiveAction::ExitAll {
+                            qty: held,
+                            reason: "TGT2_HIT".to_string(),
+                        })
+                    }
                 }
                 _ => None,
             }
@@ -1254,13 +1290,14 @@ async fn exec_live_action(
             })).await;
         }
 
-        LiveAction::Target1 { slice, keep, new_sl } => {
+        LiveAction::Target1 { slice, keep, new_sl, next_dynamic_target } => {
             // No resting stop to shrink — protection is a pure software watch
             // (see decide_live). Trail current_sl for the runner first, then
             // sell the slice at market; the next tick's LTP check enforces
             // new_sl on `keep` with no broker-side order involved.
             with_position(positions, &pending.pos_id, |p| {
                 p.current_sl = *new_sl;
+                p.next_dynamic_target = *next_dynamic_target;
                 p.state = TradeState::Target1Hit;
             }).await;
             live_info(db_tx, log_tx, json!({
@@ -1299,6 +1336,21 @@ async fn exec_live_action(
                     }).await;
                 }
             }
+        }
+
+        LiveAction::TrailDynamic { new_sl, next_target } => {
+            with_position(positions, &pending.pos_id, |p| {
+                p.current_sl = *new_sl;
+                p.next_dynamic_target = Some(*next_target);
+            }).await;
+            tracing::info!(instrument = %ctx.instrument, new_sl, next_target, "LIVE dynamic target extended");
+            live_info(db_tx, log_tx, json!({
+                "event": "SL_TRAILED",
+                "instrument": ctx.instrument,
+                "new_sl": new_sl,
+                "next_target": next_target,
+                "mode": "LIVE",
+            })).await;
         }
 
         LiveAction::ExitAll { qty, reason } => {
@@ -1692,6 +1744,7 @@ pub async fn start_position_monitor(
                                     signal,
                                     state: TradeState::WaitingForEntry,
                                     current_sl: sl,
+                                    next_dynamic_target: None,
                                     executed_qty: 0,
                                     avg_buy_price: 0.0,
                                     override_qty: None,

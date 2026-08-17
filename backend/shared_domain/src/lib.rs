@@ -139,6 +139,14 @@ pub struct TradingConfig {
     /// Protective exits always use 0. Kotak default 5 %, range 0–20 %.
     #[serde(default = "default_entry_mp")]
     pub entry_market_protection: f64,
+    /// When enabled, target 1 sells exactly one lot (not `target_1_exit_pct`)
+    /// and the runner never exits at a fixed target 2. Instead each rung,
+    /// starting at target 1, extends the next one by `diff = target1 - entry`
+    /// and trails the stop to `rung - diff/2` — see `decide_live`'s
+    /// `TradeState::Target1Hit` branch for the exact recurrence. Off by
+    /// default: existing signals keep exiting at their own target 2.
+    #[serde(default)]
+    pub dynamic_targeting: bool,
 }
 
 fn default_entry_mp() -> f64 { 5.0 }
@@ -204,6 +212,13 @@ pub struct MonitoredPosition {
     pub state: TradeState,
     /// Current stop-loss level (may be trailed upward from initial SL).
     pub current_sl: f64,
+    /// Dynamic-targeting runner state: the next rung to watch for once target 1
+    /// has been hit, if `TradingConfig::dynamic_targeting` was on when it hit.
+    /// `None` means either dynamic targeting is off for this position (it
+    /// exits at the signal's fixed target 2 as usual) or target 1 hasn't hit
+    /// yet.
+    #[serde(default)]
+    pub next_dynamic_target: Option<f64>,
     /// Number of units / lots currently held.
     pub executed_qty: i32,
     /// Volume-weighted average buy price.

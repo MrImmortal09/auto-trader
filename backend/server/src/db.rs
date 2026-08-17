@@ -79,7 +79,11 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         &pool,
         "ALTER TABLE trading_config ADD COLUMN entry_market_protection REAL NOT NULL DEFAULT 5.0",
     ).await;
-    
+    ensure_column(
+        &pool,
+        "ALTER TABLE trading_config ADD COLUMN dynamic_targeting INTEGER NOT NULL DEFAULT 0",
+    ).await;
+
     ensure_column(
         &pool,
         "ALTER TABLE paper_trades ADD COLUMN signal_id TEXT",
@@ -140,13 +144,14 @@ struct TradingConfigRow {
     target_1_exit_pct: f64,
     target_2_exit_pct: f64,
     entry_market_protection: f64,
+    dynamic_targeting: bool,
 }
 
 /// Load `TradingConfig` from SQLite, falling back to safe defaults.
 pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
     sqlx::query_as::<_, TradingConfigRow>(
         "SELECT max_trade_amount_inr, index_lots, other_lots, mode, brokerage_per_order,
-                target_1_exit_pct, target_2_exit_pct, entry_market_protection
+                target_1_exit_pct, target_2_exit_pct, entry_market_protection, dynamic_targeting
          FROM trading_config WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -162,6 +167,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         target_1_exit_pct: r.target_1_exit_pct,
         target_2_exit_pct: r.target_2_exit_pct,
         entry_market_protection: r.entry_market_protection,
+        dynamic_targeting: r.dynamic_targeting,
     })
     .unwrap_or_else(|| TradingConfig {
         max_trade_amount_inr: 10_000.0,
@@ -172,6 +178,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         target_1_exit_pct: 50.0,
         target_2_exit_pct: 100.0,
         entry_market_protection: 5.0,
+        dynamic_targeting: false,
     })
 }
 

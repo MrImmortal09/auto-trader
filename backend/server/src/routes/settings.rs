@@ -22,7 +22,7 @@ pub async fn post_settings_handler(
     if let Err(e) = sqlx::query(
         "UPDATE trading_config
          SET max_trade_amount_inr=?, index_lots=?, other_lots=?, mode=?, brokerage_per_order=?,
-             target_1_exit_pct=?, target_2_exit_pct=?, entry_market_protection=?
+             target_1_exit_pct=?, target_2_exit_pct=?, entry_market_protection=?, dynamic_targeting=?
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
@@ -33,6 +33,7 @@ pub async fn post_settings_handler(
     .bind(cfg.target_1_exit_pct)
     .bind(cfg.target_2_exit_pct)
     .bind(cfg.entry_market_protection)
+    .bind(cfg.dynamic_targeting)
     .execute(&state.db_pool)
     .await
     {

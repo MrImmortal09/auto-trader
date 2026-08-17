@@ -11,6 +11,9 @@ export interface TradingConfig {
   target_1_exit_pct: number;
   target_2_exit_pct: number;
   entry_market_protection: number;
+  /** Sell one lot at target 1, then trail an ever-extending target ladder for
+   * the runner instead of exiting at the signal's fixed target 2. */
+  dynamic_targeting: boolean;
 }
 
 export interface PaperTrade {

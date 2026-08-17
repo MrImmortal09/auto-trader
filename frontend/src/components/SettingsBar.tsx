@@ -92,6 +92,29 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
         </div>
       </div>
 
+      {/* Dynamic targeting toggle */}
+      <div className="flex flex-col gap-1 col-span-2 sm:col-span-1">
+        <label className="text-label-caps text-on-surface-variant uppercase tracking-wide">
+          Dynamic Targeting
+        </label>
+        <div className="flex rounded-lg overflow-hidden border border-outline-variant text-xs font-label-caps">
+          {([true, false] as const).map((on) => (
+            <button
+              key={String(on)}
+              onClick={() => setCfg((c) => c && { ...c, dynamic_targeting: on })}
+              title={on ? 'Sell one lot at target 1, then trail an extending target ladder for the runner' : 'Exit the runner at the signal\'s fixed target 2 (default)'}
+              className={`flex-1 sm:flex-none px-3 py-1.5 transition-colors font-semibold ${
+                cfg.dynamic_targeting === on
+                  ? 'bg-secondary text-on-secondary font-bold'
+                  : 'bg-surface-container-lowest text-on-surface-variant hover:bg-surface-container'
+              }`}
+            >
+              {on ? 'ON' : 'OFF'}
+            </button>
+          ))}
+        </div>
+      </div>
+
       {/* Numeric inputs — the virtual (paper) wallet seed is meaningless once
           LIVE is selected, since LIVE reads the real broker balance instead. */}
       {fields
