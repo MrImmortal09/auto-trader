@@ -1494,6 +1494,11 @@ pub async fn start_position_monitor(
 
     let mut last_live_poll = Instant::now() - Duration::from_secs(10);
     let mut startup_reconciled = false;
+    // Throttles retries of a *failed* startup reconciliation so they cost the
+    // same one poll per LIVE_POLL_INTERVAL as everything else, instead of
+    // hammering the broker on every 50 ms engine tick (Kotak's documented
+    // limit is 10 req/s across all APIs, and reconciliation alone is 2 calls).
+    let mut last_reconcile_attempt = Instant::now() - LIVE_POLL_INTERVAL;
 
     loop {
         tokio::select! {
@@ -1814,7 +1819,8 @@ pub async fn start_position_monitor(
                     // has a session to talk to. Deferring it until the session exists
                     // means it still runs when the user logs in after the monitor
                     // starts, or flips PAPER → LIVE mid-day.
-                    if !startup_reconciled {
+                    if !startup_reconciled && last_reconcile_attempt.elapsed() >= LIVE_POLL_INTERVAL {
+                        last_reconcile_attempt = Instant::now();
                         let has_session = { kotak.lock().await.is_some() };
                         if has_session {
                             startup_reconciled = reconcile_on_startup(&positions, &kotak, &db_tx, &log_tx, cfg.brokerage_per_order).await;

@@ -486,8 +486,18 @@ impl KotakClient {
         let session = self.session.as_ref().ok_or(KotakError::NotAuthenticated)?;
 
         // Serialise the order, then splice in `no` (the Nest order number).
+        //
+        // Modify uses a different key for validity than Place: `vd`, not `rt`.
+        // `OrderRequest`'s `#[serde(rename = "rt")]` is correct for Place (and
+        // is what `place_live_order` above relies on), so the rename happens
+        // here rather than on the shared struct. Confirmed against the Kotak
+        // Postman collection and trading-apis.md's own Modify field table —
+        // both use `vd`; only a stray curl example still shows `rt`.
         let mut payload = serde_json::to_value(order)?;
         if let serde_json::Value::Object(ref mut map) = payload {
+            if let Some(validity) = map.remove("rt") {
+                map.insert("vd".to_string(), validity);
+            }
             map.insert("no".to_string(), serde_json::Value::String(order_no.to_string()));
         }
         let j_data = serde_json::to_string(&payload)?;
