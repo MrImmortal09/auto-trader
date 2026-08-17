@@ -229,47 +229,6 @@ fn build_market_order(
     order
 }
 
-/// Percentage under the trigger used for the limit price of an options stop.
-/// Confirmed live (2026-08-17) that Kotak's RMS hard-rejects `SL-M` on
-/// options — "STOP LOSS MARKET ORDER NOT ALLOWED IN OPTIONS, block type: ALL"
-/// — every single time, regardless of retries. `SL` (limit) is required
-/// instead. This buffer gives the order room to actually fill through the
-/// first few prints after it releases rather than sitting exactly at the
-/// price it just crossed.
-const SL_LIMIT_BUFFER_PCT: f64 = 2.0;
-
-/// Protective stop — sell for `qty`, triggering at `trigger`.
-///
-/// `mp = 0`: a protective exit must never be held back by price protection.
-///
-/// Options use `SL` (stop-loss limit): Kotak's RMS rejects `SL-M` outright on
-/// this segment. Equity/futures keep `SL-M`, since a limit leg there can go
-/// unfilled on a fast move and leave the position unprotected in a different
-/// way — `SL-M` is the safer default where it's actually accepted.
-fn build_stop_order(
-    base: &shared_domain::OrderRequest,
-    qty: i32,
-    trigger: f64,
-    is_options: bool,
-    tick_size: f64,
-) -> shared_domain::OrderRequest {
-    use shared_domain::{OrderType, TransactionType};
-    let mut order = base.clone();
-    order.quantity = qty.to_string();
-    order.transaction_type = TransactionType::Sell;
-    order.trigger_price = format!("{trigger:.2}");
-    order.market_protection = "0".to_string();
-    if is_options {
-        order.order_type = OrderType::StopLoss;
-        let limit = round_down_tick(trigger * (1.0 - SL_LIMIT_BUFFER_PCT / 100.0), tick_size);
-        order.price = format!("{:.2}", limit.max(tick_size));
-    } else {
-        order.order_type = OrderType::StopLossMarket;
-        order.price = "0".to_string();
-    }
-    order
-}
-
 // ---------------------------------------------------------------------------
 // LIVE mode — broker call wrappers
 //
@@ -287,16 +246,6 @@ async fn kotak_place(kotak: &KotakHandle, order: &shared_domain::OrderRequest) -
         .await
         .map(|e| e.order_id)
         .map_err(|e| e.to_string())
-}
-
-async fn kotak_modify(
-    kotak: &KotakHandle,
-    order: &shared_domain::OrderRequest,
-    order_no: &str,
-) -> Result<(), String> {
-    let guard = kotak.lock().await;
-    let client = guard.as_ref().ok_or_else(|| "no Kotak session".to_string())?;
-    client.modify_order(order, order_no).await.map(|_| ()).map_err(|e| e.to_string())
 }
 
 async fn kotak_limits(kotak: &KotakHandle) -> Result<kotak_client::KotakLimits, String> {
@@ -952,13 +901,11 @@ enum LiveAction {
     PlaceEntry { qty: i32, ltp: f64 },
     /// Give up on an entry that will not be taken; cancel it if it is in flight.
     AbandonEntry { reason: String },
-    /// Establish protection: an `SL-M` sell covering the whole holding.
-    PlaceStop { qty: i32, trigger: f64 },
-    /// Move the resting stop to a new quantity/trigger.
-    ModifyStop { qty: i32, trigger: f64 },
-    /// Target 1: shrink the stop to the runner, then market-sell the slice.
+    /// Target 1: trail the software stop to `new_sl`, then market-sell `slice`.
     Target1 { slice: i32, keep: i32, new_sl: f64 },
-    /// Cancel the resting stop, then market-sell everything we hold.
+    /// Market-sell everything we hold (stop hit, target 2, forced exit, etc.).
+    /// Cancels any resting sell order first if one happens to exist (e.g.
+    /// adopted from the broker at startup) — this engine never places one.
     ExitAll { qty: i32, reason: String },
 }
 
@@ -1053,25 +1000,17 @@ fn decide_live(
                 "SL_HIT"
             };
 
-            // Protection comes before anything else — and this check never
-            // waits on a resting broker-side stop to catch a breach. The moment
-            // LTP has crossed the stop level, exit at market immediately,
-            // regardless of what `sl_order_id` currently says: a resting order
-            // can be rejected, still settling, or simply behind the tick that
-            // just crossed it. Gating this on `sl_order_id == None` used to
-            // leave up to one poll interval (2s) where a soon-to-be-rejected
-            // but still-tracked stop blocked the immediate market exit.
+            // Protection is a pure software watch — no resting stop order is
+            // ever placed at the broker. Kotak's RMS hard-rejects `SL-M` on
+            // options outright, and a resting `SL` (limit) risks not filling
+            // at all on a fast move, which would be worse than no order —
+            // either way, a broker-side order is not the safety net here.
+            // Instead: every tick checks LTP against the current stop level
+            // directly and fires a market sell for the whole holding the
+            // instant it's crossed, with no dependency on any order state.
             if let Some(p) = ltp {
                 if p <= trigger {
                     return Some(LiveAction::ExitAll { qty: held, reason: sl_reason.to_string() });
-                }
-            }
-            match pos.sl_order_id {
-                None => return Some(LiveAction::PlaceStop { qty: held, trigger }),
-                Some(_) => {
-                    if pos.sl_order_qty != held || (pos.sl_order_trigger - trigger).abs() >= 0.005 {
-                        return Some(LiveAction::ModifyStop { qty: held, trigger });
-                    }
                 }
             }
 
@@ -1120,8 +1059,6 @@ struct LiveCtx {
     entry_cancel_sent: bool,
     sl_order_id: Option<String>,
     executed_qty: i32,
-    is_options: bool,
-    tick_size: f64,
 }
 
 /// Cancel any resting stop, then market-sell the whole holding.
@@ -1206,8 +1143,6 @@ async fn exec_live_action(
             entry_cancel_sent: p.entry_cancel_sent,
             sl_order_id: p.sl_order_id.clone(),
             executed_qty: p.executed_qty,
-            is_options: p.signal.option_type.is_some(),
-            tick_size: p.tick_size,
         }
     };
 
@@ -1296,97 +1231,12 @@ async fn exec_live_action(
             })).await;
         }
 
-        LiveAction::PlaceStop { qty, trigger } => {
-            let order = build_stop_order(&ctx.base, *qty, *trigger, ctx.is_options, ctx.tick_size);
-            match kotak_place(kotak, &order).await {
-                Ok(order_id) => {
-                    with_position(positions, &pending.pos_id, |p| {
-                        p.sl_order_id = Some(order_id.clone());
-                        p.sl_order_qty = *qty;
-                        p.sl_order_trigger = *trigger;
-                    }).await;
-                    tracing::info!(instrument = %ctx.instrument, %order_id, qty, trigger, "LIVE stop-loss placed");
-                    live_info(db_tx, log_tx, json!({
-                        "event": "LIVE_SL_PLACED",
-                        "instrument": ctx.instrument,
-                        "order_id": order_id,
-                        "qty": qty,
-                        "trigger": trigger,
-                        "mode": "LIVE",
-                    })).await;
-                }
-                Err(e) => {
-                    // An open position with no stop is the one state we refuse to
-                    // sit in: get flat immediately.
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                        "stop-loss placement for {qty} at {trigger:.2} failed: {e} — squaring the position off at market"
-                    )).await;
-                    exec_exit_all(
-                        positions, kotak, db_tx, log_tx, &pending.pos_id, &ctx,
-                        ctx.executed_qty, "SL_PLACE_FAILED",
-                    ).await;
-                }
-            }
-        }
-
-        LiveAction::ModifyStop { qty, trigger } => {
-            let Some(sl_id) = ctx.sl_order_id.clone() else { return false; };
-            let order = build_stop_order(&ctx.base, *qty, *trigger, ctx.is_options, ctx.tick_size);
-            match kotak_modify(kotak, &order, &sl_id).await {
-                Ok(()) => {
-                    with_position(positions, &pending.pos_id, |p| {
-                        p.sl_order_qty = *qty;
-                        p.sl_order_trigger = *trigger;
-                    }).await;
-                    tracing::info!(instrument = %ctx.instrument, %sl_id, qty, trigger, "LIVE stop-loss modified");
-                    live_info(db_tx, log_tx, json!({
-                        "event": "SL_TRAILED",
-                        "instrument": ctx.instrument,
-                        "new_sl": trigger,
-                        "qty": qty,
-                        "mode": "LIVE",
-                    })).await;
-                }
-                Err(e) => {
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                        "could not move the stop to {qty} @ {trigger:.2} ({e}) — squaring the position off at market rather than running it on a stale stop"
-                    )).await;
-                    exec_exit_all(
-                        positions, kotak, db_tx, log_tx, &pending.pos_id, &ctx,
-                        ctx.executed_qty, "SL_MODIFY_FAILED",
-                    ).await;
-                }
-            }
-        }
-
         LiveAction::Target1 { slice, keep, new_sl } => {
-            let Some(sl_id) = ctx.sl_order_id.clone() else {
-                // No stop to shrink — take the whole position off at target 1
-                // rather than sell a slice with nothing protecting the runner.
-                exec_exit_all(
-                    positions, kotak, db_tx, log_tx, &pending.pos_id, &ctx,
-                    ctx.executed_qty, "TGT1_FULL",
-                ).await;
-                return true;
-            };
-
-            // Shrink the stop *first*. After this the stop covers `keep` and the
-            // sell covers `slice`, and keep + slice == what we hold, so both can
-            // fill at once without going short.
-            let stop = build_stop_order(&ctx.base, *keep, *new_sl, ctx.is_options, ctx.tick_size);
-            if let Err(e) = kotak_modify(kotak, &stop, &sl_id).await {
-                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                    "could not resize the stop to {keep} for target 1 ({e}) — squaring the whole position off at market instead"
-                )).await;
-                exec_exit_all(
-                    positions, kotak, db_tx, log_tx, &pending.pos_id, &ctx,
-                    ctx.executed_qty, "TGT1_SL_RESIZE_FAILED",
-                ).await;
-                return true;
-            }
+            // No resting stop to shrink — protection is a pure software watch
+            // (see decide_live). Trail current_sl for the runner first, then
+            // sell the slice at market; the next tick's LTP check enforces
+            // new_sl on `keep` with no broker-side order involved.
             with_position(positions, &pending.pos_id, |p| {
-                p.sl_order_qty = *keep;
-                p.sl_order_trigger = *new_sl;
                 p.current_sl = *new_sl;
                 p.state = TradeState::Target1Hit;
             }).await;
@@ -1418,7 +1268,8 @@ async fn exec_live_action(
                 }
                 Err(e) => {
                     loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                        "target-1 sell of {slice} was rejected: {e} — the stop now covers only {keep}, squaring the rest off at market"
+                        "target-1 sell of {slice} was rejected: {e} — still holding the full {} at the trailed stop, squaring off at market",
+                        ctx.executed_qty
                     )).await;
                     with_position(positions, &pending.pos_id, |p| {
                         p.force_exit = Some("TGT1_EXIT_FAILED".to_string());
