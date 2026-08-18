@@ -9,6 +9,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
   const [positions, setPositions] = useState<MonitoredPosition[]>([]);
   const [openTooltip, setOpenTooltip] = useState<string | null>(null);
   const [closingId, setClosingId] = useState<string | null>(null);
+  const [sellingId, setSellingId] = useState<string | null>(null);
 
   useEffect(() => {
     function load() {
@@ -68,6 +69,40 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
       console.error(e);
     } finally {
       setClosingId(null);
+    }
+  }
+
+  async function sellQty(id: string, held: number) {
+    const input = window.prompt(`Quantity to sell at market (of ${held} held):`, String(held));
+    if (input === null) return;
+    const qty = parseInt(input, 10);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      window.alert('Enter a whole number greater than 0.');
+      return;
+    }
+    try {
+      setSellingId(id);
+      const res = await apiFetch(serverBase, `/api/positions/${id}/sell`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qty }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        window.alert(err?.error ?? 'Failed to sell quantity');
+        return;
+      }
+      // 202 means LIVE: handed to the engine, not filled yet — the poll picks
+      // up the reduced executed_qty once it settles.
+      if (res.status === 202) return;
+      const body = await res.json().catch(() => null);
+      setPositions((prev) =>
+        prev.map((p) => (p.id === id ? { ...p, executed_qty: body?.remaining ?? p.executed_qty } : p))
+      );
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSellingId(null);
     }
   }
 
@@ -288,13 +323,22 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                         )}
                       </td>
                       <td className="px-3 py-2.5 text-right">
-                        <button
-                          onClick={() => closeOngoingTrade(p.id)}
-                          disabled={closingId === p.id}
-                          className="px-2.5 py-1 bg-tertiary-container hover:bg-tertiary text-on-tertiary-container hover:text-on-tertiary rounded text-xs transition-colors font-medium disabled:opacity-50"
-                        >
-                          {closingId === p.id ? 'Closing…' : 'Close'}
-                        </button>
+                        <div className="flex items-center justify-end gap-1.5">
+                          <button
+                            onClick={() => sellQty(p.id, p.executed_qty)}
+                            disabled={sellingId === p.id}
+                            className="px-2.5 py-1 bg-surface-container hover:bg-surface-container-high text-on-surface rounded text-xs transition-colors font-medium disabled:opacity-50"
+                          >
+                            {sellingId === p.id ? 'Selling…' : 'Sell Qty'}
+                          </button>
+                          <button
+                            onClick={() => closeOngoingTrade(p.id)}
+                            disabled={closingId === p.id}
+                            className="px-2.5 py-1 bg-tertiary-container hover:bg-tertiary text-on-tertiary-container hover:text-on-tertiary rounded text-xs transition-colors font-medium disabled:opacity-50"
+                          >
+                            {closingId === p.id ? 'Closing…' : 'Close'}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -350,11 +394,18 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                     )}
                   </div>
 
-                  <div className="pt-1">
+                  <div className="pt-1 flex items-center gap-2">
+                    <button
+                      onClick={() => sellQty(p.id, p.executed_qty)}
+                      disabled={sellingId === p.id}
+                      className="flex-1 py-2 bg-surface-container hover:bg-surface-container-high text-on-surface rounded-lg text-xs font-bold transition-colors disabled:opacity-50 flex items-center justify-center"
+                    >
+                      {sellingId === p.id ? 'Selling…' : 'Sell Qty'}
+                    </button>
                     <button
                       onClick={() => closeOngoingTrade(p.id)}
                       disabled={closingId === p.id}
-                      className="w-full py-2 bg-tertiary-container hover:bg-tertiary text-on-tertiary-container hover:text-on-tertiary rounded-lg text-xs font-bold transition-colors disabled:opacity-50 flex items-center justify-center"
+                      className="flex-1 py-2 bg-tertiary-container hover:bg-tertiary text-on-tertiary-container hover:text-on-tertiary rounded-lg text-xs font-bold transition-colors disabled:opacity-50 flex items-center justify-center"
                     >
                       {closingId === p.id ? 'Closing…' : 'Close Position'}
                     </button>

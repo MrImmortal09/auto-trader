@@ -219,6 +219,11 @@ pub struct MonitoredPosition {
     /// yet.
     #[serde(default)]
     pub next_dynamic_target: Option<f64>,
+    /// LIVE mode: a user-requested partial market sell for this quantity,
+    /// picked up and cleared on the next tick. Distinct from `force_exit`,
+    /// which always sells the whole holding.
+    #[serde(default)]
+    pub manual_sell_qty: Option<i32>,
     /// Number of units / lots currently held.
     pub executed_qty: i32,
     /// Volume-weighted average buy price.

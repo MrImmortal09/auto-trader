@@ -914,6 +914,9 @@ enum LiveAction {
     /// Cancels any resting sell order first if one happens to exist (e.g.
     /// adopted from the broker at startup) — this engine never places one.
     ExitAll { qty: i32, reason: String },
+    /// User-requested partial market sell for `qty`, leaving the rest of the
+    /// holding running exactly as before (state, current_sl untouched).
+    ManualSell { qty: i32 },
 }
 
 struct LivePending {
@@ -1018,6 +1021,16 @@ fn decide_live(
             if let Some(p) = ltp {
                 if p <= trigger {
                     return Some(LiveAction::ExitAll { qty: held, reason: sl_reason.to_string() });
+                }
+            }
+
+            // A user-requested partial sell, once protection is confirmed
+            // intact. Re-clamped against `held` here in case it changed
+            // (e.g. a fill landed) between the request and this tick.
+            if let Some(qty) = pos.manual_sell_qty {
+                let qty = qty.min(held);
+                if qty > 0 {
+                    return Some(LiveAction::ManualSell { qty });
                 }
             }
 
@@ -1355,6 +1368,39 @@ async fn exec_live_action(
 
         LiveAction::ExitAll { qty, reason } => {
             exec_exit_all(positions, kotak, db_tx, log_tx, &pending.pos_id, &ctx, *qty, reason).await;
+        }
+
+        LiveAction::ManualSell { qty } => {
+            // Clear the request immediately so a slow fill doesn't cause it to
+            // re-fire — settlement is picked up the same way as a target-1
+            // slice, via pending_exit_order_id in reconcile_live_orders.
+            with_position(positions, &pending.pos_id, |p| p.manual_sell_qty = None).await;
+
+            let sell = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, *qty, 0.0);
+            match kotak_place(kotak, &sell).await {
+                Ok(order_id) => {
+                    with_position(positions, &pending.pos_id, |p| {
+                        p.pending_exit_order_id = Some(order_id.clone());
+                        p.pending_exit_qty = *qty;
+                        p.pending_exit_reason = Some("MANUAL_SELL".to_string());
+                    }).await;
+                    tracing::info!(instrument = %ctx.instrument, %order_id, qty, "LIVE manual sell placed");
+                    live_info(db_tx, log_tx, json!({
+                        "event": "LIVE_EXIT_PLACED",
+                        "instrument": ctx.instrument,
+                        "order_id": order_id,
+                        "qty": qty,
+                        "reason": "MANUAL_SELL",
+                        "mode": "LIVE",
+                    })).await;
+                }
+                Err(e) => {
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "manual sell of {qty} was rejected: {e} — still holding the full {}, nothing changed, try again",
+                        ctx.executed_qty
+                    )).await;
+                }
+            }
         }
     }
 
@@ -1745,6 +1791,7 @@ pub async fn start_position_monitor(
                                     state: TradeState::WaitingForEntry,
                                     current_sl: sl,
                                     next_dynamic_target: None,
+                                    manual_sell_qty: None,
                                     executed_qty: 0,
                                     avg_buy_price: 0.0,
                                     override_qty: None,

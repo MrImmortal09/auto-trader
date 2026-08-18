@@ -30,6 +30,11 @@ pub struct PatchPositionReq {
     pub override_qty: Option<i32>,
 }
 
+#[derive(Deserialize)]
+pub struct SellPositionReq {
+    pub qty: i32,
+}
+
 pub async fn positions_handler(State(state): State<AppState>) -> Json<Vec<MonitoredPosition>> {
     let positions = state.positions.read().await;
     let mut live_positions: Vec<MonitoredPosition> = positions
@@ -337,6 +342,202 @@ pub async fn close_position_handler(
             "status": "closed",
             "instrument": instrument,
             "qty": qty,
+            "exit_price": exit_price,
+            "pnl": pnl,
+        })),
+    ).into_response()
+}
+
+/// `POST /api/positions/:id/sell` — sell a specific quantity at market,
+/// leaving the rest of the position running untouched. Unlike Close, this
+/// never fully exits by itself — request the full held quantity for that.
+pub async fn sell_position_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SellPositionReq>,
+) -> impl IntoResponse {
+    let snapshot = {
+        let positions = state.positions.read().await;
+        positions.iter().find(|p| p.id == id).map(|p| {
+            (
+                p.state.clone(),
+                p.signal.instrument_name.clone(),
+                p.signal.option_type.is_some(),
+                p.executed_qty,
+                p.avg_buy_price,
+                p.ws_scrip_key.clone(),
+                p.signal.signal_id.clone(),
+                p.signal.raw_message.clone(),
+                p.resolved_order.as_ref().and_then(|o| o.quantity.parse::<i32>().ok()).filter(|v| *v > 0),
+            )
+        })
+    };
+
+    let Some((position_state, instrument, is_options, held_qty, avg_buy_price, ws_scrip_key, signal_id, raw_message, lot_size)) = snapshot else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response();
+    };
+
+    if !matches!(position_state, TradeState::Active | TradeState::Target1Hit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Only ongoing trades can be manually sold"})),
+        ).into_response();
+    }
+
+    if req.qty <= 0 || req.qty > held_qty {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("quantity must be between 1 and {held_qty} (currently held)")})),
+        ).into_response();
+    }
+    if let Some(lot) = lot_size {
+        if req.qty % lot != 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("quantity must be a multiple of the lot size ({lot})")})),
+            ).into_response();
+        }
+    }
+
+    // LIVE: hand the sell to the monitor, same as Close — it has to record the
+    // trade at whatever price actually fills, not our last tick.
+    if state.trading_cfg.read().await.mode == "LIVE" {
+        let mut positions = state.positions.write().await;
+        let Some(pos) = positions.iter_mut().find(|p| p.id == id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response();
+        };
+        pos.manual_sell_qty = Some(req.qty);
+        let snapshot = positions.clone();
+        drop(positions);
+        persist_positions_snapshot(&state, &snapshot).await;
+
+        let _ = state.log_tx.send(format!(
+            r#"{{"event":"MANUAL_SELL_REQUESTED","instrument":"{}","qty":{},"mode":"LIVE"}}"#,
+            instrument, req.qty
+        ));
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "sell_requested",
+                "instrument": instrument,
+                "qty": req.qty,
+            })),
+        ).into_response();
+    }
+
+    // PAPER: book the partial sell immediately at the current LTP.
+    let ltp = ws_scrip_key
+        .as_ref()
+        .and_then(|k| state.prices.get(k).map(|v| *v))
+        .or_else(|| state.prices.get(&instrument).map(|v| *v));
+
+    let Some(exit_price) = ltp.filter(|p| *p > 0.0) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No live LTP available for this position"})),
+        ).into_response();
+    };
+
+    let cfg = state.trading_cfg.read().await;
+    let fees = FeeCalculator::calculate(req.qty, exit_price, "SELL", is_options, cfg.brokerage_per_order);
+
+    let mut tx = match state.db_pool.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(position_id = %id, error = %e, "Failed to start DB transaction for manual sell");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to persist manual sell trade"})),
+            ).into_response();
+        }
+    };
+
+    let timestamp = current_ist_timestamp_string();
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO paper_trades
+         (ticker, action, qty, executed_price, timestamp,
+          gross_value, brokerage, stt_charge, sebi_fee,
+          stamp_duty, transaction_charge, gst, net_value,
+          signal_id, raw_message, exit_reason, mode)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&instrument)
+    .bind("SELL")
+    .bind(req.qty as i64)
+    .bind(exit_price)
+    .bind(&timestamp)
+    .bind(fees.gross_value)
+    .bind(fees.brokerage)
+    .bind(fees.stt_charge)
+    .bind(fees.sebi_fee)
+    .bind(fees.stamp_duty)
+    .bind(fees.transaction_charge)
+    .bind(fees.gst)
+    .bind(fees.net_value)
+    .bind(&signal_id)
+    .bind(&raw_message)
+    .bind("MANUAL_SELL")
+    .bind("PAPER")
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!(position_id = %id, error = %e, "Failed to insert manual sell trade");
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist manual sell trade"})),
+        ).into_response();
+    }
+
+    if let Err(e) = sqlx::query("UPDATE wallet SET balance = balance + ? WHERE id = 1")
+        .bind(fees.net_value)
+        .execute(&mut *tx)
+        .await
+    {
+        tracing::error!(position_id = %id, error = %e, "Failed to update wallet for manual sell");
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to update wallet"})),
+        ).into_response();
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!(position_id = %id, error = %e, "Failed to commit manual sell transaction");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist manual sell trade"})),
+        ).into_response();
+    }
+
+    let remaining = held_qty - req.qty;
+    {
+        let mut positions = state.positions.write().await;
+        if let Some(pos) = positions.iter_mut().find(|p| p.id == id) {
+            pos.executed_qty = remaining;
+            if remaining <= 0 {
+                pos.state = TradeState::Closed;
+            }
+        }
+        let snapshot = positions.clone();
+        drop(positions);
+        persist_positions_snapshot(&state, &snapshot).await;
+    }
+
+    let pnl = fees.net_value - (avg_buy_price * req.qty as f64);
+    let _ = state.log_tx.send(format!(
+        r#"{{"event":"MANUAL_SELL","instrument":"{}","price":{:.2},"qty":{},"pnl":{:.2}}}"#,
+        instrument, exit_price, req.qty, pnl
+    ));
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "sold",
+            "instrument": instrument,
+            "qty": req.qty,
+            "remaining": remaining,
             "exit_price": exit_price,
             "pnl": pnl,
         })),

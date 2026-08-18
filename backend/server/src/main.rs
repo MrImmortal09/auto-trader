@@ -432,6 +432,7 @@ async fn main() {
         .route("/api/positions/:id",                axum::routing::delete(routes::delete_position_handler)
                                                    .patch(routes::patch_position_handler))
         .route("/api/positions/:id/close",          post(routes::close_position_handler))
+        .route("/api/positions/:id/sell",           post(routes::sell_position_handler))
         .route("/api/settings",                     get(routes::get_settings_handler)
                                                    .post(routes::post_settings_handler))
         .route("/api/settings/clear_database",      post(routes::post_clear_database_handler))
