@@ -299,6 +299,79 @@ pub struct MonitoredPosition {
 fn default_tick_size() -> f64 { 0.05 }
 
 // ===========================================================================
+// On-demand broker reconciliation — "Sync with Kotak"
+// ===========================================================================
+//
+// Startup reconciliation (trading_engine::monitor) runs once, automatically,
+// and is deliberately conservative: it self-corrects the unambiguous cases
+// (broker shows less/none) and only *logs* the ambiguous ones. This is the
+// on-demand counterpart triggered from the dashboard mid-session — same
+// comparison, but every case is surfaced as a question with explicit options
+// rather than silently acted on or merely logged, since by the time someone
+// reaches for this button, local state and broker truth have already been
+// diverging quietly for a while and a wrong guess is exactly what it exists
+// to avoid.
+
+/// One mismatch (or confirmed match) between what the engine tracks and what
+/// the broker actually shows, found by a live `GET /api/positions/reconcile`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileFinding {
+    /// `None` for broker exposure the engine has no record of at all.
+    pub position_id: Option<String>,
+    pub trading_symbol: String,
+    pub instrument: String,
+    pub category: ReconcileCategory,
+    pub engine_qty: i32,
+    pub broker_qty: i32,
+    pub message: String,
+    pub options: Vec<ReconcileOption>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconcileCategory {
+    /// Engine qty and broker qty agree — included for a complete report, not
+    /// something to act on.
+    Matches,
+    /// Broker holds less than the engine believes (partial exit elsewhere).
+    QtyReduced,
+    /// Broker holds none — the engine believes it still holds some.
+    QtyZero,
+    /// Broker holds more than the engine believes (extra entry elsewhere).
+    QtyIncreased,
+    /// The broker holds a quantity for a symbol the engine has zero record
+    /// of — not even `WaitingForEntry`.
+    UnexplainedExposure,
+    /// More than one tracked position maps to the same broker symbol —
+    /// unsafe to guess which is which; informational only, no options.
+    DuplicateAmbiguous,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileOption {
+    pub action: ReconcileAction,
+    pub label: String,
+    pub recommended: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconcileAction {
+    /// Set `executed_qty` to the broker's figure; state and stop untouched.
+    AdoptQty,
+    /// Mark the position `Closed`, `executed_qty` to 0.
+    Close,
+    /// No local state changes — acknowledges the finding without acting.
+    Ignore,
+}
+
+/// One user-confirmed action from a reconciliation report, to actually apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileApplyItem {
+    pub position_id: Option<String>,
+    pub trading_symbol: String,
+    pub action: ReconcileAction,
+}
+
+// ===========================================================================
 // Execution result with full statutory charge breakdown
 // ===========================================================================
 

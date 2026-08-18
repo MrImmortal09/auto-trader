@@ -891,6 +891,262 @@ async fn reconcile_on_startup(
 }
 
 // ---------------------------------------------------------------------------
+// LIVE mode — on-demand reconciliation ("Sync with Kotak")
+//
+// Startup reconciliation above runs once, automatically, and is deliberately
+// conservative about it: unambiguous drift it self-corrects, ambiguous drift
+// it only logs. This is the on-demand counterpart triggered from the
+// dashboard mid-session — same comparison against broker truth, but every
+// finding becomes a question with explicit options instead of being silently
+// acted on, since by the time someone reaches for this button local state and
+// broker truth have likely already been diverging quietly for a while.
+// ---------------------------------------------------------------------------
+
+struct ReconcileTracked {
+    pos_id: String,
+    instrument: String,
+    trading_symbol: String,
+    is_open: bool,
+    executed_qty: i32,
+}
+
+/// Read-only comparison against live broker positions. Never mutates
+/// anything — every mismatch is returned as a `ReconcileFinding` for the
+/// caller to present, not acted on here.
+pub async fn preview_reconciliation(
+    positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
+    kotak: &KotakHandle,
+) -> Result<Vec<shared_domain::ReconcileFinding>, String> {
+    use shared_domain::{ReconcileAction, ReconcileCategory, ReconcileFinding, ReconcileOption};
+
+    let tracked: Vec<ReconcileTracked> = {
+        let g = positions.read().await;
+        g.iter()
+            .filter(|p| !matches!(p.state, TradeState::Closed))
+            .map(|p| ReconcileTracked {
+                pos_id: p.id.clone(),
+                instrument: p.signal.instrument_name.clone(),
+                trading_symbol: p
+                    .resolved_order
+                    .as_ref()
+                    .map(|o| o.trading_symbol.clone())
+                    .unwrap_or_default(),
+                is_open: matches!(p.state, TradeState::Active | TradeState::Target1Hit),
+                executed_qty: p.executed_qty,
+            })
+            .collect()
+    };
+
+    let broker_positions = {
+        let guard = kotak.lock().await;
+        let Some(client) = guard.as_ref() else {
+            return Err("no Kotak session".to_string());
+        };
+        client.get_positions().await.map_err(|e| e.to_string())?
+    };
+
+    let mut findings = Vec::new();
+
+    // Same duplicate rule as startup: two open positions on one broker symbol
+    // can't be told apart, so don't guess whose quantity is whose.
+    let duplicated: Vec<&str> = tracked
+        .iter()
+        .filter(|t| t.is_open && !t.trading_symbol.is_empty())
+        .map(|t| t.trading_symbol.trim())
+        .fold(Vec::<(&str, usize)>::new(), |mut acc, sym| {
+            match acc.iter_mut().find(|(s, _)| *s == sym) {
+                Some(e) => e.1 += 1,
+                None => acc.push((sym, 1)),
+            }
+            acc
+        })
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(s, _)| s)
+        .collect();
+
+    for t in &tracked {
+        if !t.is_open {
+            continue; // WaitingForEntry — nothing bought yet, nothing to compare
+        }
+        if duplicated.contains(&t.trading_symbol.trim()) {
+            findings.push(ReconcileFinding {
+                position_id: Some(t.pos_id.clone()),
+                trading_symbol: t.trading_symbol.clone(),
+                instrument: t.instrument.clone(),
+                category: ReconcileCategory::DuplicateAmbiguous,
+                engine_qty: t.executed_qty,
+                broker_qty: 0,
+                message: format!(
+                    "More than one tracked position maps to {} at the broker — can't tell which is which. Resolve at the broker terminal.",
+                    t.trading_symbol
+                ),
+                options: vec![],
+            });
+            continue;
+        }
+
+        let broker_qty = broker_positions
+            .iter()
+            .find(|bp| bp.trading_symbol.trim() == t.trading_symbol.trim())
+            .map(|bp| bp.net_qty())
+            .unwrap_or(0);
+
+        let (category, message, options) = if broker_qty == t.executed_qty {
+            (
+                ReconcileCategory::Matches,
+                format!("{}: {} qty matches at both engine and broker.", t.instrument, t.executed_qty),
+                vec![],
+            )
+        } else if broker_qty <= 0 {
+            (
+                ReconcileCategory::QtyZero,
+                format!(
+                    "{}: engine shows {} qty held, broker shows none — looks like it was fully closed outside the app.",
+                    t.instrument, t.executed_qty
+                ),
+                vec![
+                    ReconcileOption { action: ReconcileAction::Close, label: "Mark as closed".to_string(), recommended: true },
+                    ReconcileOption { action: ReconcileAction::Ignore, label: "Leave as-is".to_string(), recommended: false },
+                ],
+            )
+        } else if broker_qty < t.executed_qty {
+            (
+                ReconcileCategory::QtyReduced,
+                format!(
+                    "{}: engine shows {} qty held, broker shows {} — looks like part of it was sold outside the app.",
+                    t.instrument, t.executed_qty, broker_qty
+                ),
+                vec![
+                    ReconcileOption { action: ReconcileAction::AdoptQty, label: format!("Adopt broker's quantity ({broker_qty})"), recommended: true },
+                    ReconcileOption { action: ReconcileAction::Ignore, label: "Leave as-is".to_string(), recommended: false },
+                ],
+            )
+        } else {
+            (
+                ReconcileCategory::QtyIncreased,
+                format!(
+                    "{}: engine shows {} qty held, broker shows {} — looks like more was bought outside the app.",
+                    t.instrument, t.executed_qty, broker_qty
+                ),
+                vec![
+                    ReconcileOption { action: ReconcileAction::AdoptQty, label: format!("Adopt broker's quantity ({broker_qty})"), recommended: true },
+                    ReconcileOption { action: ReconcileAction::Ignore, label: "Leave as-is".to_string(), recommended: false },
+                ],
+            )
+        };
+
+        findings.push(ReconcileFinding {
+            position_id: Some(t.pos_id.clone()),
+            trading_symbol: t.trading_symbol.clone(),
+            instrument: t.instrument.clone(),
+            category,
+            engine_qty: t.executed_qty,
+            broker_qty,
+            message,
+            options,
+        });
+    }
+
+    // Broker exposure the engine has no record of at all. Deliberately no
+    // one-click "square it off" here — this engine has zero context on why
+    // it exists (could be a manual hedge, a different strategy entirely), so
+    // the only safe option is acknowledging it, same philosophy as startup
+    // reconciliation's "reported, never touched".
+    let tracked_symbols: Vec<&str> = tracked.iter().map(|t| t.trading_symbol.trim()).filter(|s| !s.is_empty()).collect();
+    for bp in &broker_positions {
+        let sym = bp.trading_symbol.trim();
+        if bp.net_qty() > 0 && !tracked_symbols.contains(&sym) {
+            findings.push(ReconcileFinding {
+                position_id: None,
+                trading_symbol: sym.to_string(),
+                instrument: bp.symbol.clone(),
+                category: ReconcileCategory::UnexplainedExposure,
+                engine_qty: 0,
+                broker_qty: bp.net_qty(),
+                message: format!("The broker holds {} of {sym} that this app has no record of at all.", bp.net_qty()),
+                options: vec![
+                    ReconcileOption { action: ReconcileAction::Ignore, label: "Ignore — I'm managing this manually".to_string(), recommended: true },
+                ],
+            });
+        }
+    }
+
+    Ok(findings)
+}
+
+/// Applies user-confirmed actions from a `preview_reconciliation` report.
+/// Re-fetches broker positions fresh rather than trusting a client-echoed
+/// quantity, in case time passed between preview and confirmation. Only ever
+/// touches the specific positions named.
+pub async fn apply_reconciliation(
+    positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
+    kotak: &KotakHandle,
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    items: &[shared_domain::ReconcileApplyItem],
+) -> Result<(), String> {
+    use shared_domain::ReconcileAction;
+
+    let needs_broker_truth = items.iter().any(|i| i.action == ReconcileAction::AdoptQty);
+    let broker_positions = if needs_broker_truth {
+        let guard = kotak.lock().await;
+        let Some(client) = guard.as_ref() else {
+            return Err("no Kotak session".to_string());
+        };
+        Some(client.get_positions().await.map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+
+    for item in items {
+        match item.action {
+            ReconcileAction::Ignore => {
+                live_info(db_tx, log_tx, json!({
+                    "event": "RECONCILE_ACK",
+                    "instrument": item.trading_symbol,
+                })).await;
+            }
+            ReconcileAction::Close => {
+                let Some(pos_id) = &item.position_id else { continue; };
+                with_position(positions, pos_id, |p| {
+                    p.executed_qty = 0;
+                    p.state = TradeState::Closed;
+                    forget_stop(p);
+                }).await;
+                loud_error(db_tx, log_tx, &item.trading_symbol, &format!(
+                    "manually reconciled: {} marked closed (broker shows no open quantity)", item.trading_symbol
+                )).await;
+            }
+            ReconcileAction::AdoptQty => {
+                let Some(pos_id) = &item.position_id else { continue; };
+                let Some(broker_positions) = &broker_positions else { continue; };
+                let broker_qty = broker_positions
+                    .iter()
+                    .find(|bp| bp.trading_symbol.trim() == item.trading_symbol.trim())
+                    .map(|bp| bp.net_qty())
+                    .unwrap_or(0);
+                let now_closed = broker_qty <= 0;
+                with_position(positions, pos_id, |p| {
+                    p.executed_qty = broker_qty.max(0);
+                    if now_closed {
+                        p.state = TradeState::Closed;
+                        forget_stop(p);
+                    }
+                }).await;
+                loud_error(db_tx, log_tx, &item.trading_symbol, &format!(
+                    "manually reconciled: {} executed_qty adopted from broker ({broker_qty})", item.trading_symbol
+                )).await;
+            }
+        }
+    }
+
+    let snapshot = { positions.read().await.clone() };
+    send_positions_snapshot(db_tx, &snapshot).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // LIVE mode — decision pass
 // ---------------------------------------------------------------------------
 

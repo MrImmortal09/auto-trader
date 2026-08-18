@@ -544,6 +544,35 @@ pub async fn sell_position_handler(
     ).into_response()
 }
 
+/// `GET /api/positions/reconcile/preview` — live comparison against Kotak,
+/// LIVE mode only. Read-only: returns a list of findings for the frontend to
+/// show as questions, never mutates anything by itself.
+pub async fn reconcile_preview_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if state.trading_cfg.read().await.mode != "LIVE" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Only meaningful in LIVE mode"}))).into_response();
+    }
+    match trading_engine::preview_reconciliation(&state.positions, &state.kotak).await {
+        Ok(findings) => (StatusCode::OK, Json(findings)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// `POST /api/positions/reconcile/apply` — apply user-confirmed actions from
+/// a preview report. Re-checks broker truth at apply time rather than
+/// trusting anything echoed back by the client.
+pub async fn reconcile_apply_handler(
+    State(state): State<AppState>,
+    Json(items): Json<Vec<shared_domain::ReconcileApplyItem>>,
+) -> impl IntoResponse {
+    if state.trading_cfg.read().await.mode != "LIVE" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Only meaningful in LIVE mode"}))).into_response();
+    }
+    match trading_engine::apply_reconciliation(&state.positions, &state.kotak, &state.db_tx, &state.log_tx, &items).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "applied", "count": items.len()}))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
 /// Debug endpoint to show all live prices in the shared map.
 pub async fn prices_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let map: std::collections::HashMap<String, f64> = state.prices

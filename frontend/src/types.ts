@@ -123,6 +123,43 @@ export interface TelegramChat {
   kind: string;
 }
 
+// ---------------------------------------------------------------------------
+// On-demand broker reconciliation ("Sync with Kotak")
+// ---------------------------------------------------------------------------
+
+export type ReconcileCategory =
+  | 'Matches'
+  | 'QtyReduced'
+  | 'QtyZero'
+  | 'QtyIncreased'
+  | 'UnexplainedExposure'
+  | 'DuplicateAmbiguous';
+
+export type ReconcileActionKind = 'AdoptQty' | 'Close' | 'Ignore';
+
+export interface ReconcileOption {
+  action: ReconcileActionKind;
+  label: string;
+  recommended: boolean;
+}
+
+export interface ReconcileFinding {
+  position_id: string | null;
+  trading_symbol: string;
+  instrument: string;
+  category: ReconcileCategory;
+  engine_qty: number;
+  broker_qty: number;
+  message: string;
+  options: ReconcileOption[];
+}
+
+export interface ReconcileApplyItem {
+  position_id: string | null;
+  trading_symbol: string;
+  action: ReconcileActionKind;
+}
+
 export type ScreenId = 'dashboard' | 'positions' | 'analytics' | 'portfolio' | 'settings';
 
 export type TgStep = 'idle' | 'code' | 'twofa' | 'chats' | 'running';

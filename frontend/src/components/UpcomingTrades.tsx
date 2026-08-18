@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Info } from 'lucide-react';
 import type { MonitoredPosition } from '../types';
 import { apiFetch } from '../lib/api';
 import { fmt } from '../lib/format';
 import { QtyInput } from './QtyInput';
+import { SyncWithKotakButton } from './SyncWithKotakButton';
 
 export function UpcomingTrades({ serverBase }: { serverBase: string }) {
   const [positions, setPositions] = useState<MonitoredPosition[]>([]);
@@ -11,17 +12,18 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
   const [closingId, setClosingId] = useState<string | null>(null);
   const [sellingId, setSellingId] = useState<string | null>(null);
 
+  const load = useCallback(() => {
+    apiFetch(serverBase, '/api/positions')
+      .then(r => r.json())
+      .then(setPositions)
+      .catch(console.error);
+  }, [serverBase]);
+
   useEffect(() => {
-    function load() {
-      apiFetch(serverBase, '/api/positions')
-        .then(r => r.json())
-        .then(setPositions)
-        .catch(console.error);
-    }
     load();
     const id = setInterval(load, 3000);
     return () => clearInterval(id);
-  }, [serverBase]);
+  }, [load]);
 
   async function cancelTrade(id: string) {
     try {
@@ -245,8 +247,11 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
 
       {active.length > 0 && (
         <>
-          <div className="px-4 py-2.5 border-y border-outline-variant text-label-caps font-semibold text-on-surface-variant uppercase tracking-wider bg-surface-container-low">
-            Active Positions (Live LTP + MTM)
+          <div className="px-4 py-2.5 border-y border-outline-variant flex items-center justify-between bg-surface-container-low">
+            <span className="text-label-caps font-semibold text-on-surface-variant uppercase tracking-wider">
+              Active Positions (Live LTP + MTM)
+            </span>
+            <SyncWithKotakButton serverBase={serverBase} onSynced={load} />
           </div>
           <div className="hidden md:block w-full">
             <table className="w-full text-sm">
