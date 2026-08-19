@@ -401,6 +401,63 @@ async fn main() {
         });
     }
 
+    // 9b. Daily Kotak session clear — runs at 15:40:00 IST (market close) every day.
+    // The session token is only ever valid for the trading day it was issued, so
+    // there's no reason to keep the WebSocket alive or the DB row around once the
+    // market has shut — clear it here rather than waiting for tomorrow's date
+    // check in `load_kotak_session` to notice it's stale.
+    {
+        let kotak_arc = Arc::clone(&kotak_client_opt);
+        let ws_task_arc = Arc::clone(&ws_task);
+        let ws_tx_arc = Arc::clone(&ws_tx);
+        let pool_clear = pool.clone();
+        let log_tx_clear = log_tx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                // Compute seconds until next 15:40:00 IST
+                let secs_until = {
+                    let now = shared_domain::now_ist();
+                    let today_1540 = now
+                        .date_naive()
+                        .and_hms_opt(15, 40, 0)
+                        .expect("valid time")
+                        .and_local_timezone(shared_domain::ist_offset())
+                        .single()
+                        .expect("IST 15:40 is unambiguous");
+
+                    let diff = today_1540.signed_duration_since(now);
+                    if diff.num_seconds() > 0 {
+                        diff.num_seconds() as u64
+                    } else {
+                        (diff + ChronoDuration::hours(24)).num_seconds().max(1) as u64
+                    }
+                };
+
+                tracing::info!(secs = secs_until, "Daily Kotak session clear scheduled");
+                tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
+
+                if kotak_arc.lock().await.is_some() {
+                    if let Some(task) = ws_task_arc.lock().await.take() {
+                        task.abort();
+                    }
+                    *ws_tx_arc.lock().await = None;
+                    *kotak_arc.lock().await = None;
+                    let _ = sqlx::query("DELETE FROM kotak_session").execute(&pool_clear).await;
+
+                    tracing::info!("Kotak session cleared at market close (15:40 IST)");
+                    let _ = log_tx_clear.send(
+                        r#"{"event":"KOTAK_SESSION_CLEARED","message":"Kotak session cleared at market close"}"#.into(),
+                    );
+                }
+
+                // Sleep past the trigger instant so the next loop iteration
+                // recomputes tomorrow's 15:40 target instead of firing again immediately.
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
+
     // 9. Router
     let state = AppState {
         signal_tx,

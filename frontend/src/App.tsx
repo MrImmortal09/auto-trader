@@ -15,8 +15,6 @@ import { LogTerminal } from './components/LogTerminal';
 import { UpcomingTrades } from './components/UpcomingTrades';
 import { TelegramFeed } from './components/TelegramFeed';
 import { PortfolioSection } from './components/PortfolioSection';
-import { KotakLoginPanel } from './components/KotakLoginPanel';
-import { TelegramLoginPanel } from './components/TelegramLoginPanel';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { SettingsBar } from './components/SettingsBar';
 import { HealthPage } from './components/HealthPage';
@@ -156,8 +154,6 @@ export default function App() {
           {activeScreen === 'settings' && (
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
               <div className="space-y-6">
-                <KotakLoginPanel serverBase={serverBase} onServerBaseChange={handleServerBaseChange} />
-                <TelegramLoginPanel serverBase={serverBase} />
                 <ConnectionPanel serverBase={serverBase} onServerBaseChange={handleServerBaseChange} />
               </div>
               <div className="space-y-6">
