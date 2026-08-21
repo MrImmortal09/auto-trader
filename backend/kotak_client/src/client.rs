@@ -8,6 +8,7 @@ use crate::{KotakCredentials, KotakError, AUTH_BASE_URL, NEO_FIN_KEY};
 // Internal session state
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct Session {
     pub auth_token: String,
     pub sid: String,
@@ -300,6 +301,7 @@ fn find_csv_url(val: &serde_json::Value, segment: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Async HTTP client for the Kotak Neo Trade API.
+#[derive(Clone)]
 pub struct KotakClient {
     pub(crate) http: Client,
     pub(crate) access_token: String,

@@ -88,12 +88,31 @@ export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(form),
       });
-      const data = await res.json();
-      if (res.ok) { setStatus('ok'); setMsg('Connected ✓'); }
-      else        { setStatus('error'); setMsg(data.error ?? 'Login failed'); }
+      // Try to parse the JSON body regardless of status so we can surface
+      // the server's own error message when available.
+      let data: { error?: string; status?: string } = {};
+      try { data = await res.json(); } catch { /* non-JSON body, ignore */ }
+
+      if (res.ok) {
+        setStatus('ok');
+        setMsg('Connected ✓');
+      } else {
+        setStatus('error');
+        setMsg(data.error ?? `Server returned ${res.status} — check credentials`);
+      }
     } catch (e) {
       setStatus('error');
-      setMsg(String(e));
+      // `fetch` throws a TypeError("Failed to fetch") when there is no HTTP
+      // response at all (network down, proxy timeout, CORS preflight blocked,
+      // SSL error, etc.).  The raw error string is opaque to end-users, so
+      // replace it with something actionable.
+      const isNetworkError =
+        e instanceof TypeError && /failed to fetch|network/i.test(e.message);
+      setMsg(
+        isNetworkError
+          ? `Cannot reach server — verify Server URL and that the backend is running`
+          : String(e),
+      );
     }
   }
 

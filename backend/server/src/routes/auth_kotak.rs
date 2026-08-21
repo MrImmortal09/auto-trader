@@ -119,57 +119,76 @@ pub async fn kotak_login_handler(
         }
     }
 
-    // Fetch and parse Scrip Master
-    // Log to DB (persisted) AND broadcast to live SSE stream
-    let scrip_start_msg = r#"{"event":"SCRIP_FETCH","message":"Fetching Kotak Scrip Master..."}"#;
-    let _ = state.db_tx.send(shared_domain::DbWriteMessage::Log {
-        level: "INFO".into(), message: scrip_start_msg.into(),
-    }).await;
-    let _ = state.log_tx.send(scrip_start_msg.into());
-
-    let mut store = trading_engine::ScripStore::default();
-    let mut raw_sections: Vec<(&str, String)> = Vec::new();
-
-    for segment in ["nse_fo", "bse_fo", "nse_cm"] {
-        match client.get_scrip_master_csv(segment).await {
-            Ok(csv) => {
-                store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
-                raw_sections.push((segment, csv));
-            }
-            Err(e) => {
-                tracing::error!(segment = %segment, "Failed to fetch Scrip Master: {}", e);
-                let err_msg = format!(r#"{{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch {segment} scrip master: {e}"}}"#);
-                let _ = state.db_tx.send(shared_domain::DbWriteMessage::Log {
-                    level: "ERROR".into(), message: err_msg.clone(),
-                }).await;
-                let _ = state.log_tx.send(err_msg);
-            }
-        }
-    }
-
-    if raw_sections.is_empty() {
-        let err_msg = r#"{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch all scrip master segments"}"#;
-        let _ = state.db_tx.send(shared_domain::DbWriteMessage::Log {
-            level: "ERROR".into(), message: err_msg.into(),
-        }).await;
-        let _ = state.log_tx.send(err_msg.into());
-    } else {
-        *state.scrip_store.write().await = Some(store);
-        *state.raw_scrip_csv.write().await = merge_csv_sections(&raw_sections);
-        let ok_msg = r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Scrip Master loaded successfully"}"#;
-        let _ = state.db_tx.send(shared_domain::DbWriteMessage::Log {
-            level: "INFO".into(), message: ok_msg.into(),
-        }).await;
-        let _ = state.log_tx.send(ok_msg.into());
-    }
-
+    // Store the logged-in client and return HTTP 200 immediately.
+    // The scrip master download (3 segments, can be slow) is kicked off in
+    // a background task so we don't block the HTTP response long enough to
+    // trigger Cloudflare's proxy timeout, which was causing browsers to see
+    // "TypeError: Failed to fetch" before any response arrived.
     let _ = state.log_tx.send(r#"{"event":"KOTAK_CONNECTED","status":"ok"}"#.into());
     *state.kotak.lock().await = Some(client);
-    let kotak = state.kotak.lock().await;
-    match *kotak {
-        Some(_) => (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response(),
-        None => (StatusCode::OK, Json(serde_json::json!({"status": "disconnected"}))).into_response(),
+
+    // Spawn the scrip-master fetch as a background task.
+    {
+        let bg_state = state.clone();
+        // Grab a fresh client reference from the stored Arc so the background
+        // task owns its own handle — it cannot borrow `client` which was moved.
+        tokio::spawn(async move {
+            let scrip_start_msg = r#"{"event":"SCRIP_FETCH","message":"Fetching Kotak Scrip Master..."}"#;
+            let _ = bg_state.db_tx.send(shared_domain::DbWriteMessage::Log {
+                level: "INFO".into(), message: scrip_start_msg.into(),
+            }).await;
+            let _ = bg_state.log_tx.send(scrip_start_msg.into());
+
+            // Clone the client out of the mutex for the duration of the fetch.
+            let client_opt = bg_state.kotak.lock().await.clone();
+            let mut bg_client = match client_opt {
+                Some(c) => c,
+                None => {
+                    let err = r#"{"event":"SCRIP_FETCH_ERROR","message":"Kotak client disappeared before scrip fetch"}"#;
+                    let _ = bg_state.log_tx.send(err.into());
+                    return;
+                }
+            };
+
+            let mut store = trading_engine::ScripStore::default();
+            let mut raw_sections: Vec<(&str, String)> = Vec::new();
+
+            for segment in ["nse_fo", "bse_fo", "nse_cm"] {
+                match bg_client.get_scrip_master_csv(segment).await {
+                    Ok(csv) => {
+                        store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
+                        raw_sections.push((segment, csv));
+                    }
+                    Err(e) => {
+                        tracing::error!(segment = %segment, "Failed to fetch Scrip Master: {}", e);
+                        let err_msg = format!(r#"{{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch {segment} scrip master: {e}"}}"#);
+                        let _ = bg_state.db_tx.send(shared_domain::DbWriteMessage::Log {
+                            level: "ERROR".into(), message: err_msg.clone(),
+                        }).await;
+                        let _ = bg_state.log_tx.send(err_msg);
+                    }
+                }
+            }
+
+            if raw_sections.is_empty() {
+                let err_msg = r#"{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch all scrip master segments"}"#;
+                let _ = bg_state.db_tx.send(shared_domain::DbWriteMessage::Log {
+                    level: "ERROR".into(), message: err_msg.into(),
+                }).await;
+                let _ = bg_state.log_tx.send(err_msg.into());
+            } else {
+                *bg_state.scrip_store.write().await = Some(store);
+                *bg_state.raw_scrip_csv.write().await = merge_csv_sections(&raw_sections);
+                let ok_msg = r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Scrip Master loaded successfully"}"#;
+                let _ = bg_state.db_tx.send(shared_domain::DbWriteMessage::Log {
+                    level: "INFO".into(), message: ok_msg.into(),
+                }).await;
+                let _ = bg_state.log_tx.send(ok_msg.into());
+            }
+        });
     }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response()
 }
 
 /// `GET /api/auth/kotak/scrip-master/raw` — download raw CSV.
