@@ -19,10 +19,14 @@ pub async fn post_settings_handler(
     State(state): State<AppState>,
     Json(cfg): Json<TradingConfig>,
 ) -> impl IntoResponse {
+    let index_lots_by_symbol_json = serde_json::to_string(&cfg.index_lots_by_symbol)
+        .unwrap_or_else(|_| "{}".to_string());
+
     if let Err(e) = sqlx::query(
         "UPDATE trading_config
          SET max_trade_amount_inr=?, index_lots=?, other_lots=?, mode=?, brokerage_per_order=?,
-             target_1_exit_pct=?, target_2_exit_pct=?, entry_market_protection=?, dynamic_targeting=?
+             target_1_exit_pct=?, target_2_exit_pct=?, entry_market_protection=?, dynamic_targeting=?,
+             index_lots_by_symbol=?
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
@@ -34,6 +38,7 @@ pub async fn post_settings_handler(
     .bind(cfg.target_2_exit_pct)
     .bind(cfg.entry_market_protection)
     .bind(cfg.dynamic_targeting)
+    .bind(&index_lots_by_symbol_json)
     .execute(&state.db_pool)
     .await
     {

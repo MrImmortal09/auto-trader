@@ -6,6 +6,8 @@ export interface TradingConfig {
   max_trade_amount_inr: number;
   index_lots: number;
   other_lots: number;
+  /** Per-index default lot count (key: index symbol, e.g. "NIFTY"). Falls back to `index_lots` when absent. */
+  index_lots_by_symbol: Record<string, number>;
   mode: string;
   brokerage_per_order: number;
   target_1_exit_pct: number;

@@ -103,6 +103,22 @@ fn is_expiry_squareoff_due(pos: &MonitoredPosition) -> bool {
     h > EXPIRY_SQUAREOFF_HOUR || (h == EXPIRY_SQUAREOFF_HOUR && m >= EXPIRY_SQUAREOFF_MINUTE)
 }
 
+/// Lots to buy for `instrument_name`: the per-index override if one is set
+/// (see `TradingConfig::index_lots_by_symbol`), else `index_lots` for a known
+/// index, else `other_lots` for anything else (stock options).
+fn lots_for_instrument(cfg: &TradingConfig, instrument_name: &str) -> i32 {
+    let inst = instrument_name.to_uppercase();
+    match shared_domain::INDEX_NAMES.iter().find(|&&idx| inst == idx) {
+        Some(&idx) => cfg
+            .index_lots_by_symbol
+            .get(idx)
+            .copied()
+            .filter(|&l| l > 0)
+            .unwrap_or_else(|| cfg.index_lots.max(1)),
+        None => cfg.other_lots.max(1),
+    }
+}
+
 /// Compute the entry quantity for a new BUY position (lots × lot size, or a
 /// notional-capped multiple for equity). Mirrors the Pass-1 sizing so a native
 /// LIVE order is placed for the same qty the paper path would use.
@@ -118,11 +134,7 @@ fn compute_entry_qty(
         return override_lots * lot_size;
     }
     if signal.option_type.is_some() {
-        let inst = signal.instrument_name.to_uppercase();
-        const INDEX_NAMES: &[&str] = &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"];
-        let is_index = INDEX_NAMES.iter().any(|&idx| inst.contains(idx));
-        let lots = if is_index { cfg.index_lots.max(1) } else { cfg.other_lots.max(1) };
-        lots * lot_size
+        lots_for_instrument(cfg, &signal.instrument_name) * lot_size
     } else {
         let ltp = ltp.unwrap_or(0.0);
         if ltp <= 0.0 {
@@ -2185,22 +2197,7 @@ pub async fn start_position_monitor(
                                     .filter(|v| *v > 0)
                                     .unwrap_or(1);
 
-                                let qty = if let Some(override_lots) = pos.override_qty {
-                                    override_lots * lot_size
-                                } else {
-                                    if pos.signal.option_type.is_some() {
-                                        let inst = pos.signal.instrument_name.to_uppercase();
-                                        const INDEX_NAMES: &[&str] = &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"];
-                                        let is_index = INDEX_NAMES.iter().any(|&idx| inst.contains(idx));
-                                        let lots = if is_index { cfg.index_lots.max(1) } else { cfg.other_lots.max(1) };
-                                        lots * lot_size
-                                    } else {
-                                        let raw_qty = ((cfg.max_trade_amount_inr / ltp).floor() as i32).max(1);
-                                        let mut multiple = (raw_qty / lot_size) * lot_size;
-                                        if multiple == 0 { multiple = lot_size; }
-                                        multiple
-                                    }
-                                };
+                                let qty = compute_entry_qty(&pos.signal, lot_size, pos.override_qty, &cfg, Some(ltp));
 
                                 if qty <= 0 || qty % lot_size != 0 {
                                     PosAction::Cancel {

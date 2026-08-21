@@ -1,5 +1,14 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Underlying index names this app treats as "index" options (vs. stock
+/// options, which fall back to `TradingConfig::other_lots`). Matched against
+/// `TradeSignal::instrument_name.to_uppercase()` with an *exact* match — do
+/// not switch to a substring check, since e.g. "BANKNIFTY" and "FINNIFTY"
+/// both contain "NIFTY".
+pub const INDEX_NAMES: &[&str] = &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"];
 
 pub const IST_OFFSET_SECS: i32 = 5 * 60 * 60 + 30 * 60;
 
@@ -123,10 +132,18 @@ pub fn duration_until_market_close() -> Option<std::time::Duration> {
 pub struct TradingConfig {
     /// Maximum capital allocated per trade in INR.
     pub max_trade_amount_inr: f64,
-    /// Default number of index option lots to buy when no per-trade override is set.
+    /// Default number of index option lots to buy when no per-trade override
+    /// and no entry in `index_lots_by_symbol` applies.
     pub index_lots: i32,
     /// Default number of non-index option (stock option) lots to buy.
     pub other_lots: i32,
+    /// Per-index default lot count (key: one of [`INDEX_NAMES`], e.g. `"NIFTY"`).
+    /// An index missing from this map falls back to `index_lots`. Lets a
+    /// trader who only trades indexes size each one independently — e.g. 2
+    /// lots of SENSEX but 1 of MIDCPNIFTY, reflecting their very different
+    /// lot sizes and notional value.
+    #[serde(default)]
+    pub index_lots_by_symbol: HashMap<String, i32>,
     /// `"LIVE"` or `"PAPER"`.
     pub mode: String,
     /// Flat brokerage charged per order leg (INR).

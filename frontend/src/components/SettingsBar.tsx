@@ -3,6 +3,7 @@ import { Save, Settings, LogOut } from 'lucide-react';
 import type { TradingConfig } from '../types';
 import { apiFetch } from '../lib/api';
 import { clearToken } from '../lib/auth';
+import { INDEX_LOT_REFERENCE } from '../lib/indexLots';
 
 export function SettingsBar({ serverBase }: { serverBase: string }) {
   const [cfg, setCfg] = useState<TradingConfig | null>(null);
@@ -27,7 +28,9 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
       apiFetch(serverBase, '/api/wallet/balance').then((r) => r.json()),
     ])
       .then(([cfgData, walletData]) => {
-        setCfg(cfgData);
+        // An older backend (mid-deploy skew) won't send this field at all —
+        // default it so every read below can assume an object, not undefined.
+        setCfg({ ...cfgData, index_lots_by_symbol: cfgData?.index_lots_by_symbol ?? {} });
         setVirtualBalance(typeof walletData?.balance === 'number' ? walletData.balance : 0);
       })
       .catch(console.error);
@@ -66,7 +69,22 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
     );
   }
 
+  function setIndexLots(symbol: string, raw: string) {
+    setCfg((c) => {
+      if (!c) return c;
+      const next = { ...c.index_lots_by_symbol };
+      if (raw === '') {
+        delete next[symbol];
+      } else {
+        const n = parseInt(raw, 10);
+        if (!Number.isNaN(n) && n > 0) next[symbol] = n;
+      }
+      return { ...c, index_lots_by_symbol: next };
+    });
+  }
+
   return (
+    <>
     <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-end gap-3 sm:gap-4 bg-surface border-b border-outline-variant px-4 sm:px-6 py-3.5">
       {/* Mode toggle */}
       <div className="flex flex-col gap-1 col-span-2 sm:col-span-1">
@@ -159,5 +177,40 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
         Logout
       </button>
     </div>
+
+    {/* Per-index default lots — a trader who only trades indexes can size
+        each one independently (e.g. 2 lots of SENSEX, 1 of MIDCPNIFTY)
+        instead of one "Index Lots" number applied to all of them. */}
+    <div className="bg-surface border-b border-outline-variant px-4 sm:px-6 py-3.5">
+      <label className="text-label-caps text-on-surface-variant uppercase tracking-wide">
+        Default Lots by Index
+      </label>
+      <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2.5">
+        {INDEX_LOT_REFERENCE.map(({ symbol, label, lotSize }) => {
+          const configured = cfg.index_lots_by_symbol[symbol];
+          const effectiveLots = configured && configured > 0 ? configured : cfg.index_lots;
+          return (
+            <div key={symbol} className="flex flex-col gap-1 bg-surface-container-lowest border border-outline-variant rounded-lg p-2.5">
+              <div className="flex items-baseline justify-between gap-1">
+                <span className="text-xs font-bold text-on-surface truncate" title={label}>{symbol}</span>
+                <span className="text-[10px] text-on-surface-variant font-mono-code shrink-0">lot {lotSize}</span>
+              </div>
+              <input
+                type="number"
+                min={1}
+                value={configured ?? ''}
+                placeholder={`Auto (${cfg.index_lots})`}
+                onChange={(e) => setIndexLots(symbol, e.target.value)}
+                className="w-full bg-surface border border-outline-variant rounded px-2 py-1 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
+              />
+              <span className="text-[10px] text-on-surface-variant font-mono-code">
+                = {effectiveLots * lotSize} qty
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+    </>
   );
 }
