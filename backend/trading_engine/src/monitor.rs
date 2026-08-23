@@ -182,6 +182,29 @@ fn is_entry_cutoff_passed() -> bool {
     h > NO_ENTRY_HOUR || (h == NO_ENTRY_HOUR && m >= NO_ENTRY_MINUTE)
 }
 
+/// Why a `WaitingForEntry` position should be abandoned rather than left to
+/// watch for its trigger, or `None` if it is still live.
+///
+/// `entry_cutoff` (today's 15:29 IST bell) only catches a position while the
+/// engine is running continuously through that moment. A crash, redeploy, or
+/// manual restart that happens to fall before 15:29 lets a never-triggered
+/// position survive in the DB as `WaitingForEntry` with nothing to expire it;
+/// reloaded on the next day's startup, `entry_cutoff` is false again (it's
+/// morning), so it sits watching the LTP feed and can trigger a real entry
+/// the moment today's price happens to cross a reference level from a stale
+/// — possibly days-old — signal. Comparing `created_at` against today's IST
+/// date catches that case too. Positions predating this field (`created_at`
+/// empty/unparseable) are treated as stale as well: erring toward not
+/// trading rather than guessing their age.
+fn stale_entry_reason(pos: &MonitoredPosition, entry_cutoff: bool) -> Option<&'static str> {
+    if entry_cutoff {
+        return Some("EOD_NO_ENTRY");
+    }
+    let same_day = chrono::NaiveDateTime::parse_from_str(&pos.created_at, "%Y-%m-%d %H:%M:%S")
+        .is_ok_and(|dt| dt.date() == shared_domain::today_ist());
+    (!same_day).then_some("STALE_CARRYOVER")
+}
+
 /// Round `price` DOWN to a whole multiple of `tick`.
 ///
 /// Every price the engine sends to the broker goes through this. The exchange
@@ -1221,8 +1244,8 @@ fn decide_live(
             if let Some(reason) = pos.force_exit.clone() {
                 return Some(LiveAction::AbandonEntry { reason });
             }
-            if entry_cutoff {
-                return Some(LiveAction::AbandonEntry { reason: "EOD_NO_ENTRY".to_string() });
+            if let Some(reason) = stale_entry_reason(pos, entry_cutoff) {
+                return Some(LiveAction::AbandonEntry { reason: reason.to_string() });
             }
             if pos.entry_order_id.is_some() {
                 // In flight — the order book decides what happened.
@@ -2057,6 +2080,7 @@ pub async fn start_position_monitor(
                                     id: uuid::Uuid::new_v4().to_string(),
                                     signal,
                                     state: TradeState::WaitingForEntry,
+                                    created_at: shared_domain::current_ist_timestamp_string(),
                                     current_sl: sl,
                                     next_dynamic_target: None,
                                     manual_sell_qty: None,
@@ -2150,10 +2174,10 @@ pub async fn start_position_monitor(
                             pending.push(Pending { idx: i, ltp: 0.0, action: PosAction::Expire { reason } });
                             continue;
                         }
-                        if entry_cutoff {
+                        if let Some(reason) = stale_entry_reason(pos, entry_cutoff) {
                             pending.push(Pending {
                                 idx: i, ltp: 0.0,
-                                action: PosAction::Expire { reason: "EOD_NO_ENTRY".to_string() },
+                                action: PosAction::Expire { reason: reason.to_string() },
                             });
                             continue;
                         }
@@ -2378,6 +2402,83 @@ pub async fn start_position_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn position_created_at(created_at: &str) -> MonitoredPosition {
+        MonitoredPosition {
+            id: "test".to_string(),
+            signal: TradeSignal {
+                instrument_name: "NIFTY".to_string(),
+                strike: Some(25000.0),
+                option_type: Some("CE".to_string()),
+                expiry: None,
+                action: "BUY".to_string(),
+                entry_condition: "ABOVE".to_string(),
+                entry_price: 120.0,
+                targets: vec![140.0, 160.0],
+                stop_loss: 100.0,
+                source: "test".to_string(),
+                signal_id: None,
+                raw_message: None,
+            },
+            state: TradeState::WaitingForEntry,
+            created_at: created_at.to_string(),
+            current_sl: 100.0,
+            next_dynamic_target: None,
+            manual_sell_qty: None,
+            executed_qty: 0,
+            avg_buy_price: 0.0,
+            override_qty: None,
+            resolved_order: None,
+            ltp: None,
+            ws_scrip_key: None,
+            force_exit: None,
+            override_exit_price: None,
+            tick_size: 0.05,
+            entry_order_id: None,
+            sl_order_id: None,
+            sl_order_qty: 0,
+            sl_order_trigger: 0.0,
+            target_order_id: None,
+            pending_exit_order_id: None,
+            pending_exit_qty: 0,
+            pending_exit_reason: None,
+            entry_cancel_sent: false,
+            exit_attempts: 0,
+            live_halt: None,
+        }
+    }
+
+    #[test]
+    fn stale_entry_reason_past_cutoff_always_expires() {
+        // 15:29 cutoff wins regardless of created_at, including a position
+        // created moments ago today.
+        let pos = position_created_at(&shared_domain::current_ist_timestamp_string());
+        assert_eq!(stale_entry_reason(&pos, true), Some("EOD_NO_ENTRY"));
+    }
+
+    #[test]
+    fn stale_entry_reason_same_day_is_not_stale() {
+        let pos = position_created_at(&shared_domain::current_ist_timestamp_string());
+        assert_eq!(stale_entry_reason(&pos, false), None);
+    }
+
+    #[test]
+    fn stale_entry_reason_flags_carryover_from_a_previous_day() {
+        // A position that survived a restart into a new calendar day must be
+        // abandoned rather than left to trigger on a stale reference price.
+        let yesterday = shared_domain::today_ist() - chrono::Duration::days(1);
+        let created_at = yesterday.and_hms_opt(10, 0, 0).unwrap().format("%Y-%m-%d %H:%M:%S").to_string();
+        let pos = position_created_at(&created_at);
+        assert_eq!(stale_entry_reason(&pos, false), Some("STALE_CARRYOVER"));
+    }
+
+    #[test]
+    fn stale_entry_reason_flags_missing_created_at() {
+        // Positions persisted before this field existed carry an empty
+        // string (serde default) — treat as stale rather than guess their age.
+        let pos = position_created_at("");
+        assert_eq!(stale_entry_reason(&pos, false), Some("STALE_CARRYOVER"));
+    }
 
     #[test]
     fn tick_rounding_stays_on_the_grid() {

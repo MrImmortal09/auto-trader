@@ -227,6 +227,13 @@ pub struct MonitoredPosition {
     pub id: String,
     pub signal: TradeSignal,
     pub state: TradeState,
+    /// IST timestamp (`%Y-%m-%d %H:%M:%S`) this position was created from an
+    /// incoming signal. Empty for positions persisted before this field
+    /// existed. Used to tell a `WaitingForEntry` position apart from a stale
+    /// one that survived a restart into a new calendar day — see
+    /// `monitor::stale_entry_reason`.
+    #[serde(default)]
+    pub created_at: String,
     /// Current stop-loss level (may be trailed upward from initial SL).
     pub current_sl: f64,
     /// Dynamic-targeting runner state: the next rung to watch for once target 1
