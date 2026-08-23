@@ -7,10 +7,12 @@
 
 pub mod error;
 pub mod client;
+pub mod totp;
 pub mod websocket;
 
 pub use error::{KotakCredentials, KotakError};
 pub use client::{KotakClient, KotakLimits, KotakOrder, KotakPosition};
+pub use totp::generate_totp;
 pub use websocket::start_market_data_stream;
 
 use std::sync::Arc;

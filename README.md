@@ -146,26 +146,36 @@ Examples:
 
 ## Environment Variables
 
-The backend currently reads environment variables from the process environment.
-It does not automatically load a `.env` file, so either:
+The backend reads environment variables from the process environment. It also
+auto-loads a `.env` file from the working directory at startup (via
+`dotenvy`) if one is present — variables already exported in the shell or a
+`systemd` `EnvironmentFile=` still take priority. So any of the following work:
 
-- export the variables in your shell before starting the server, or
+- export the variables in your shell before starting the server,
+- put them in a `.env` file next to `trades.db` (never commit this — it's gitignored), or
 - define them in a `systemd` unit with `Environment=` or `EnvironmentFile=`
 
 All backend date-sensitive logic is normalized to Indian Standard Time (IST, `UTC+05:30`).
 That includes expiry-date interpretation, "today" checks, and persisted trade/log timestamps,
 so behavior stays aligned with Indian markets even if the server is running in another timezone.
 
-These are the supported variables:
+See [`.env.example`](.env.example) for a ready-to-copy template (and
+[`frontend/.env.example`](frontend/.env.example) for the optional frontend
+one). These are the supported variables:
 
 ```dotenv
+# ── Auth (required) ───────────────────────────────────────
+# Gates the whole app — every /api/* route needs a bearer token obtained by
+# exchanging PASSKEY at POST /api/auth/verify-passkey, signed with AUTH_SECRET.
+PASSKEY=change-me
+AUTH_SECRET=change-me-too
+
 # ── SQLite ───────────────────────────────────────────────
 DATABASE_URL=sqlite://trades.db          # default
 
-# ── Trading engine ───────────────────────────────────────
-PAPER=true                               # true = paper mode (default)
-MAX_TRADE_INR=10000                      # max capital per trade
-BROKERAGE=20                             # flat brokerage per order leg (₹)
+# Trading mode (PAPER/LIVE), max trade size, brokerage, and target/SL
+# settings all live in the `trading_config` SQLite table, not env vars —
+# edit them via the Settings bar in the UI or POST /api/settings.
 
 # ── Telegram MTProto ingester (optional) ─────────────────
 # Get these from https://my.telegram.org → API Development Tools
@@ -174,17 +184,35 @@ TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 # Comma-separated chat IDs to listen to (use a negative number for groups)
 TELEGRAM_CHAT_IDS=-1001234567890,-1009876543210
 
-# ── Kotak Neo WebSocket (set after login) ────────────────
-# These are obtained by calling kotak_client::KotakClient::login() at startup
-KOTAK_AUTH_TOKEN=eyJhbGci...
-KOTAK_SID=xxxx-xxxx-xxxx-xxxx
+# ── Kotak Neo WebSocket ───────────────────────────────────
 # Scrips to subscribe (pSymbol from scrip master, & separated)
 KOTAK_SCRIPS=nse_cm|11536&nse_cm|1594
+
+# ── Kotak Neo auto-login (optional) ───────────────────────
+# Set all five to skip the manual Kotak login form. The server will:
+#  - log in at startup if no valid session is restored from the DB,
+#  - retry once more at 09:00 IST every trading day if still not connected.
+# The 6-digit TOTP is generated from KOTAK_TOTP_SECRET (RFC 6238), so no
+# human needs to read a code off an authenticator app each morning.
+KOTAK_ACCESS_TOKEN=eyJhbGci...       # API Dashboard access token
+KOTAK_MOBILE_NUMBER=+91XXXXXXXXXX    # registered mobile, with country code
+KOTAK_UCC=Y4HAU                      # Unique Client Code
+KOTAK_MPIN=123456                    # 6-digit trading MPIN
+KOTAK_TOTP_SECRET=JBSWY3DPEHPK3PXP   # Base32 secret from TOTP registration (alias: KOTAK_TOTP_HASH)
+# KOTAK_AUTO_LOGIN=false             # set to disable unattended auto-login even if the above are set
 ```
+
+Any of `access_token` / `mobile_number` / `ucc` / `mpin` / `totp` left blank
+in a manual `POST /api/auth/kotak` request also falls back to these same env
+vars, and a blank `totp` is generated from `KOTAK_TOTP_SECRET` — so the
+Kotak login form still works with only some fields filled in. A dedicated
+`POST /api/auth/kotak/auto-login` (no body) logs in using only the env vars.
 
 Example shell startup:
 
 ```bash
+export PASSKEY=change-me
+export AUTH_SECRET=change-me-too
 export DATABASE_URL=sqlite:///home/ubuntu/auto-trader/trades.db
 export TELEGRAM_API_ID=12345678
 export TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
@@ -262,10 +290,9 @@ Export only the variables you actually need. Example:
 
 ```bash
 cd ~/auto-trader
+export PASSKEY=change-me
+export AUTH_SECRET=change-me-too
 export DATABASE_URL=sqlite:///home/ubuntu/auto-trader/trades.db
-export PAPER=true
-export MAX_TRADE_INR=10000
-export BROKERAGE=20
 export TELEGRAM_API_ID=12345678
 export TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 export TELEGRAM_CHAT_IDS=-1001234567890
@@ -286,10 +313,9 @@ Create a dedicated environment file:
 ```bash
 sudo mkdir -p /etc/auto-trader
 sudo tee /etc/auto-trader/server.env >/dev/null <<'EOF'
+PASSKEY=change-me
+AUTH_SECRET=change-me-too
 DATABASE_URL=sqlite:///home/ubuntu/auto-trader/trades.db
-PAPER=true
-MAX_TRADE_INR=10000
-BROKERAGE=20
 TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 TELEGRAM_CHAT_IDS=-1001234567890,-1009876543210
@@ -437,15 +463,20 @@ If you rebuild or redeploy, keep the same working directory or copy over the dat
 
 ## First-Time Kotak Login
 
-The Kotak session tokens (`KOTAK_AUTH_TOKEN`, `KOTAK_SID`) expire daily.  
-Run the login helper once per session before starting the server:
+Kotak session tokens expire daily. The server persists its session (auth
+token, sid, base URL) in the `kotak_session` SQLite table and restores it
+automatically at startup if it's still from today — otherwise it needs a
+fresh login, which happens one of two ways:
 
-```bash
-# Example (adapt to your setup — or integrate into a startup script)
-cargo run --example kotak_login   # TODO: add this example
-```
+- **Manual** — log in from the frontend's Kotak login panel (mobile, UCC,
+  TOTP, MPIN). This is the default if no `KOTAK_*` auto-login env vars are set.
+- **Automatic** — set `KOTAK_ACCESS_TOKEN` / `KOTAK_MOBILE_NUMBER` /
+  `KOTAK_UCC` / `KOTAK_MPIN` / `KOTAK_TOTP_SECRET` (see
+  [Environment Variables](#environment-variables)) and the server logs in on
+  its own at startup and again at 09:00 IST if still disconnected — no human
+  action required, including in LIVE mode.
 
-Until then, the WebSocket market-data feed will silently fail to connect (the position monitor still works in paper mode using `entry_price` as the assumed LTP).
+Until a session exists, the WebSocket market-data feed will silently fail to connect (the position monitor still works in paper mode using `entry_price` as the assumed LTP).
 
 ---
 

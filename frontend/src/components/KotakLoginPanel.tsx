@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { KeyRound, Plug } from 'lucide-react';
-import type { KotakForm } from '../types';
+import { KeyRound, Plug, Zap } from 'lucide-react';
+import type { KotakForm, KotakStatus } from '../types';
 import { apiFetch, apiUrl, getStoredServerBase, isValidServerBase, normalizeServerBase } from '../lib/api';
 
 export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
@@ -29,6 +29,8 @@ export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
   });
   const [status, setStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
   const [msg, setMsg] = useState('');
+  const [autoStatus, setAutoStatus] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [kotakStatus, setKotakStatus] = useState<KotakStatus | null>(null);
 
   function commitServerBase(rawValue: string) {
     const normalized = normalizeServerBase(rawValue);
@@ -63,7 +65,8 @@ export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
       try {
         const res = await apiFetch(serverBase, '/api/auth/kotak');
         if (res.ok) {
-          const data = await res.json();
+          const data: KotakStatus = await res.json();
+          setKotakStatus(data);
           if (data.connected) {
             setStatus('ok');
             setMsg('Connected ✓');
@@ -116,12 +119,38 @@ export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
     }
   }
 
+  async function handleAutoConnect() {
+    if (!commitServerBase(form.server_base)) return;
+    setAutoStatus('loading');
+    setStatus('loading');
+    try {
+      const res = await apiFetch(form.server_base, '/api/auth/kotak/auto-login', { method: 'POST' });
+      let data: { error?: string } = {};
+      try { data = await res.json(); } catch { /* non-JSON body, ignore */ }
+
+      if (res.ok) {
+        setAutoStatus('idle');
+        setStatus('ok');
+        setMsg('Connected ✓ (auto)');
+      } else {
+        setAutoStatus('error');
+        setStatus('error');
+        setMsg(data.error ?? `Server returned ${res.status}`);
+      }
+    } catch (e) {
+      setAutoStatus('error');
+      setStatus('error');
+      const isNetworkError = e instanceof TypeError && /failed to fetch|network/i.test(e.message);
+      setMsg(isNetworkError ? `Cannot reach server — verify Server URL and that the backend is running` : String(e));
+    }
+  }
+
   const fields: { key: keyof typeof form; label: string; type?: string }[] = [
     { key: 'server_base',   label: 'Server URL or IP:PORT' },
     { key: 'access_token',  label: 'API Access Token' },
     { key: 'mobile_number', label: 'Mobile (+91…)' },
     { key: 'ucc',           label: 'UCC (Client Code)' },
-    { key: 'totp',          label: 'TOTP (6 digits)', type: 'text' },
+    { key: 'totp',          label: kotakStatus?.has_totp_secret ? 'TOTP (auto-generated, or override)' : 'TOTP (6 digits)', type: 'text' },
     { key: 'mpin',          label: 'MPIN (6 digits)', type: 'password' },
   ];
 
@@ -129,6 +158,11 @@ export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
     <div className="flex flex-col gap-2">
       <div className="flex items-center gap-2 text-label-caps font-semibold text-on-surface uppercase tracking-wider">
         <KeyRound size={14} className="text-primary" /> Kotak Neo Login
+        {kotakStatus?.has_totp_secret && (
+          <span className="flex items-center gap-1 normal-case tracking-normal text-[11px] font-medium text-secondary bg-secondary/10 rounded px-1.5 py-0.5">
+            <Zap size={10} /> Auto-TOTP configured
+          </span>
+        )}
       </div>
       <div className="flex flex-wrap gap-2">
         {fields.map(({ key, label, type }) => (
@@ -148,8 +182,19 @@ export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
           className="flex items-center gap-1.5 px-3 py-1 bg-primary hover:bg-primary/90 disabled:opacity-50 text-on-primary text-xs font-semibold rounded transition-colors shadow-sm"
         >
           <Plug size={12} />
-          {status === 'loading' ? 'Connecting…' : status === 'ok' ? 'Connected' : 'Connect'}
+          {status === 'loading' && autoStatus !== 'loading' ? 'Connecting…' : status === 'ok' ? 'Connected' : 'Connect'}
         </button>
+        {kotakStatus?.has_env_credentials && status !== 'ok' && (
+          <button
+            onClick={handleAutoConnect}
+            disabled={status === 'loading'}
+            title="Log in using the server's configured KOTAK_* env credentials — no fields required"
+            className="flex items-center gap-1.5 px-3 py-1 bg-secondary hover:bg-secondary/90 disabled:opacity-50 text-on-secondary text-xs font-semibold rounded transition-colors shadow-sm"
+          >
+            <Zap size={12} />
+            {autoStatus === 'loading' ? 'Connecting…' : 'Auto Connect'}
+          </button>
+        )}
         {msg && (
           <span className={`text-xs self-center ${status === 'ok' ? 'text-secondary font-medium' : 'text-error font-medium'}`}>
             {msg}
