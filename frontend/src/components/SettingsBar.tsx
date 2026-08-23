@@ -73,11 +73,13 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
     setCfg((c) => {
       if (!c) return c;
       const next = { ...c.index_lots_by_symbol };
-      if (raw === '') {
+      const n = parseInt(raw, 10);
+      // Empty, non-numeric, or 0-and-below all mean "reset to Auto" — typing
+      // 0 is a natural way to clear an override, so it must not be a no-op.
+      if (raw === '' || Number.isNaN(n) || n <= 0) {
         delete next[symbol];
       } else {
-        const n = parseInt(raw, 10);
-        if (!Number.isNaN(n) && n > 0) next[symbol] = n;
+        next[symbol] = n;
       }
       return { ...c, index_lots_by_symbol: next };
     });
@@ -188,7 +190,10 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
       <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2.5">
         {INDEX_LOT_REFERENCE.map(({ symbol, label, lotSize }) => {
           const configured = cfg.index_lots_by_symbol[symbol];
-          const effectiveLots = configured && configured > 0 ? configured : cfg.index_lots;
+          // Mirror the backend's floor (lots_for_instrument always does
+          // `.max(1)`) so this preview never shows a qty lower than what
+          // will actually be bought.
+          const effectiveLots = configured && configured > 0 ? configured : Math.max(1, cfg.index_lots);
           return (
             <div key={symbol} className="flex flex-col gap-1 bg-surface-container-lowest border border-outline-variant rounded-lg p-2.5">
               <div className="flex items-baseline justify-between gap-1">

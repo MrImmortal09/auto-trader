@@ -78,6 +78,9 @@ export interface HealthSnapshot {
     virtual_memory_mib: number;
     run_time_secs: number;
   } | null;
+  /** Whether the backend has AUTH_SECRET set. If false, every authenticated
+   * API route fails with 500 — see auth_middleware in server/src/main.rs. */
+  auth_secret_configured: boolean;
 }
 
 export interface MonitoredPosition {
@@ -126,6 +129,12 @@ export interface KotakStatus {
   /** KOTAK_TOTP_SECRET / KOTAK_TOTP_HASH is set, so the TOTP field can be left blank. */
   has_totp_secret: boolean;
   auto_login_enabled: boolean;
+  /** `has_env_credentials && auto_login_enabled` — whether unattended
+   * auto-login will actually run at the next scheduled trigger. */
+  auto_login_ready: boolean;
+  /** Set when `auto_login_ready` is false — why (missing env var(s), or
+   * KOTAK_AUTO_LOGIN=false). */
+  auto_login_reason?: string | null;
   masked_ucc?: string | null;
 }
 

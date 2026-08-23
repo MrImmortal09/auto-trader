@@ -45,6 +45,21 @@ struct HealthDto {
     memory: MemoryDto,
     swap: MemoryDto,
     current_process: Option<ProcessDto>,
+    /// Whether `AUTH_SECRET` is set on the backend. Not a secret itself — just
+    /// a diagnostic flag — so it's safe on this public, unauthenticated route.
+    /// When `false`, every `/api/*` route except this one and
+    /// `/api/auth/verify-passkey` returns 500 (see `auth_middleware`), so the
+    /// frontend can surface a clear "backend misconfigured" message instead
+    /// of a confusing wall of failed requests.
+    auth_secret_configured: bool,
+}
+
+fn auth_secret_configured() -> bool {
+    std::env::var("AUTH_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| option_env!("AUTH_SECRET").map(String::from))
+        .is_some_and(|s| !s.is_empty())
 }
 
 fn mib(bytes: u64) -> u64 {
@@ -113,6 +128,7 @@ pub async fn health_handler() -> impl IntoResponse {
                 free_mib: mib(free_swap),
             },
             current_process,
+            auth_secret_configured: auth_secret_configured(),
         }),
     )
 }

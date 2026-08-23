@@ -67,6 +67,22 @@ async fn send_log(
 /// An empty/omitted `totp` triggers auto-generation from
 /// `KOTAK_TOTP_SECRET` / `KOTAK_TOTP_HASH`.
 fn resolve_kotak_login(req: KotakLoginReq) -> Result<ResolvedKotakLogin, String> {
+    // All-or-nothing on the four identity fields: filling in some by hand and
+    // leaving others blank would silently pull the blanks from KOTAK_* env
+    // vars, which may belong to a different account than the one just typed
+    // — a live-money credential-mixing risk, not just a UX rough edge. TOTP
+    // is exempt: typing the other four by hand while still wanting the TOTP
+    // auto-generated from KOTAK_TOTP_SECRET is a normal, safe workflow.
+    let identity_fields = [&req.access_token, &req.mobile_number, &req.ucc, &req.mpin];
+    let filled = identity_fields.iter().filter(|f| non_empty((**f).clone()).is_some()).count();
+    if filled > 0 && filled < identity_fields.len() {
+        return Err(
+            "partial login form — fill in all of access token, mobile number, UCC, and MPIN, \
+             or leave all four blank to use the configured KOTAK_* env credentials"
+                .to_string(),
+        );
+    }
+
     let access_token = non_empty(req.access_token)
         .or_else(|| env_var("KOTAK_ACCESS_TOKEN"))
         .ok_or("access_token missing (set it in the request or KOTAK_ACCESS_TOKEN)")?;
@@ -104,6 +120,7 @@ fn resolve_kotak_login(req: KotakLoginReq) -> Result<ResolvedKotakLogin, String>
 /// itself, the WebSocket task, and the scrip master store. Exists so
 /// `perform_kotak_login` can be called both from route handlers (which have
 /// an `AppState`) and from `main.rs` at startup (before `AppState` exists).
+#[derive(Clone, Copy)]
 pub struct KotakLoginDeps<'a> {
     pub db_pool: &'a sqlx::SqlitePool,
     pub db_tx: &'a mpsc::Sender<shared_domain::DbWriteMessage>,
@@ -115,6 +132,12 @@ pub struct KotakLoginDeps<'a> {
     pub positions: &'a Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
     pub scrip_store: &'a Arc<RwLock<Option<trading_engine::ScripStore>>>,
     pub raw_scrip_csv: &'a Arc<RwLock<Option<String>>>,
+    /// Serializes full login attempts end-to-end (network round-trips, the
+    /// `ws_task` swap, and the final `kotak` assignment) so a manual "Connect"
+    /// click racing the scheduled 09:05/09:15 trigger can't interleave with
+    /// it — the plain `kotak.lock().await.is_none()` check callers do before
+    /// deciding to log in only guards the *decision*, not the login itself.
+    pub login_lock: &'a Arc<Mutex<()>>,
 }
 
 impl<'a> KotakLoginDeps<'a> {
@@ -130,6 +153,7 @@ impl<'a> KotakLoginDeps<'a> {
             positions: &state.positions,
             scrip_store: &state.scrip_store,
             raw_scrip_csv: &state.raw_scrip_csv,
+            login_lock: &state.kotak_login_lock,
         }
     }
 }
@@ -144,6 +168,9 @@ async fn perform_kotak_login(
     resolved: ResolvedKotakLogin,
     source: &str,
 ) -> Result<(), kotak_client::KotakError> {
+    // Held for the whole attempt — see `KotakLoginDeps::login_lock` doc.
+    let _login_guard = deps.login_lock.lock().await;
+
     let ResolvedKotakLogin {
         access_token, mobile_number, ucc, mpin, totp, totp_auto_generated,
     } = resolved;
@@ -333,33 +360,71 @@ async fn fetch_scrip_master_background(
 /// panics) when auto-login is disabled, credentials are incomplete, or the
 /// login itself fails, so callers can just log the reason and move on.
 pub async fn try_env_auto_login(deps: KotakLoginDeps<'_>, source: &str) -> Result<(), String> {
-    let skip_reason = if !auto_login_enabled_by_env() {
-        Some("KOTAK_AUTO_LOGIN=false".to_string())
-    } else {
-        None
-    };
+    if !auto_login_enabled_by_env() {
+        let reason = "KOTAK_AUTO_LOGIN=false".to_string();
+        send_log(deps.db_tx, deps.log_tx, "INFO", serde_json::json!({
+            "event": "KOTAK_AUTO_LOGIN_SKIPPED",
+            "level": "INFO",
+            "source": source,
+            "message": format!("Kotak auto-login skipped ({source}): {reason}"),
+        })).await;
+        return Err(reason);
+    }
 
-    let resolved = match skip_reason {
-        Some(reason) => Err(reason),
-        None => resolve_kotak_login(KotakLoginReq::default()),
-    };
+    // Auto-login uses a TOTP freshly generated from KOTAK_TOTP_SECRET, so a
+    // failure right at a 30s window boundary (code generated a moment before
+    // Kotak's side rolls the counter over) gets one retry with a newly
+    // generated code before giving up — never an unbounded retry loop, and
+    // no human is present to intervene here (this runs unattended at startup
+    // and on the 09:05/09:15 schedule), so it must fail loudly rather than
+    // hang or retry forever.
+    const MAX_ATTEMPTS: u32 = 2;
+    let mut last_err = String::new();
 
-    let resolved = match resolved {
-        Ok(r) => r,
-        Err(reason) => {
-            // Not an error condition — a deployment with no auto-login
-            // credentials configured is expected to log in from the UI.
-            send_log(deps.db_tx, deps.log_tx, "INFO", serde_json::json!({
-                "event": "KOTAK_AUTO_LOGIN_SKIPPED",
-                "level": "INFO",
-                "source": source,
-                "message": format!("Kotak auto-login skipped ({source}): {reason}"),
-            })).await;
-            return Err(reason);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let resolved = match resolve_kotak_login(KotakLoginReq::default()) {
+            Ok(r) => r,
+            Err(reason) => {
+                // Missing/incomplete env credentials — deterministic across
+                // attempts (nothing here is TOTP-timing-related), and not an
+                // error condition: a deployment with no auto-login
+                // credentials configured is expected to log in from the UI.
+                send_log(deps.db_tx, deps.log_tx, "INFO", serde_json::json!({
+                    "event": "KOTAK_AUTO_LOGIN_SKIPPED",
+                    "level": "INFO",
+                    "source": source,
+                    "message": format!("Kotak auto-login skipped ({source}): {reason}"),
+                })).await;
+                return Err(reason);
+            }
+        };
+
+        match perform_kotak_login(deps, resolved, source).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < MAX_ATTEMPTS {
+                    tracing::warn!(
+                        source, attempt, error = %last_err,
+                        "Kotak auto-login attempt failed — retrying once with a freshly-generated TOTP code"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
         }
-    };
+    }
 
-    perform_kotak_login(deps, resolved, source).await.map_err(|e| e.to_string())
+    send_log(deps.db_tx, deps.log_tx, "ERROR", serde_json::json!({
+        "event": "KOTAK_AUTO_LOGIN_FAILED",
+        "level": "ERROR",
+        "source": source,
+        "message": format!(
+            "Kotak auto sign-in failed after {MAX_ATTEMPTS} attempts ({source}): {last_err} — sign in manually from the dashboard"
+        ),
+    })).await;
+    tracing::error!(source, attempts = MAX_ATTEMPTS, error = %last_err, "Kotak auto sign-in failed — manual sign-in required");
+
+    Err(last_err)
 }
 
 fn merge_csv_sections(csvs: &[(&str, String)]) -> Option<String> {
@@ -486,12 +551,31 @@ pub async fn kotak_status_handler(State(state): State<AppState>) -> Json<serde_j
         && env_var("KOTAK_MOBILE_NUMBER").is_some()
         && env_var("KOTAK_UCC").is_some()
         && env_var("KOTAK_MPIN").is_some();
+    let auto_login_enabled = auto_login_enabled_by_env();
+
+    // Single source of truth for "will unattended auto-login actually run
+    // today" — every credential present *and* not explicitly disabled. The
+    // frontend shouldn't have to re-derive this from the individual flags.
+    let auto_login_ready = has_env_credentials && auto_login_enabled;
+    let auto_login_reason = if !auto_login_enabled {
+        Some("KOTAK_AUTO_LOGIN=false".to_string())
+    } else if !has_env_credentials {
+        Some(
+            "one or more of KOTAK_ACCESS_TOKEN, KOTAK_MOBILE_NUMBER, KOTAK_UCC, KOTAK_MPIN, \
+             KOTAK_TOTP_SECRET (or KOTAK_TOTP_HASH) is not set"
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
     Json(serde_json::json!({
         "connected": state.kotak.lock().await.is_some(),
         "has_env_credentials": has_env_credentials,
         "has_totp_secret": has_totp_secret,
-        "auto_login_enabled": auto_login_enabled_by_env(),
+        "auto_login_enabled": auto_login_enabled,
+        "auto_login_ready": auto_login_ready,
+        "auto_login_reason": auto_login_reason,
         "masked_ucc": env_var("KOTAK_UCC").map(|u| mask_ucc(&u)),
     }))
 }

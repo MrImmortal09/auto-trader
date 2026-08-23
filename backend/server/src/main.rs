@@ -147,6 +147,87 @@ pub(crate) struct AppState {
     pub ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
     /// Rate limit map for passkey auth attempts
     pub rate_limit_map: Arc<DashMap<String, RateLimitEntry>>,
+    /// Serializes full Kotak login attempts — see `routes::KotakLoginDeps::login_lock`.
+    pub kotak_login_lock: Arc<Mutex<()>>,
+}
+
+// ---------------------------------------------------------------------------
+// Daily Kotak auto-login — one independent scheduled task per trigger
+// ---------------------------------------------------------------------------
+
+/// Owned handles for a scheduled auto-login task (unlike `routes::KotakLoginDeps`,
+/// which borrows — these tasks are `'static` and outlive `main()`'s stack frame).
+#[derive(Clone)]
+struct KotakAutoLoginHandles {
+    pool: SqlitePool,
+    write_tx: mpsc::Sender<DbWriteMessage>,
+    log_tx: broadcast::Sender<String>,
+    kotak: Arc<Mutex<Option<kotak_client::KotakClient>>>,
+    ws_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    prices: Arc<DashMap<String, f64>>,
+    positions: Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
+    scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
+    raw_scrip_csv: Arc<RwLock<Option<String>>>,
+    login_lock: Arc<Mutex<()>>,
+}
+
+impl KotakAutoLoginHandles {
+    fn as_deps(&self) -> routes::KotakLoginDeps<'_> {
+        routes::KotakLoginDeps {
+            db_pool: &self.pool,
+            db_tx: &self.write_tx,
+            log_tx: &self.log_tx,
+            kotak: &self.kotak,
+            ws_task: &self.ws_task,
+            ws_tx: &self.ws_tx,
+            prices: &self.prices,
+            positions: &self.positions,
+            scrip_store: &self.scrip_store,
+            raw_scrip_csv: &self.raw_scrip_csv,
+            login_lock: &self.login_lock,
+        }
+    }
+}
+
+/// Runs forever, firing `try_env_auto_login` once at `(hour, minute)` IST
+/// every weekday. Each trigger is its own independent task — see the call
+/// site's comment for why sharing one loop between the two triggers is what
+/// this replaced and why that was unsafe.
+async fn run_daily_kotak_trigger(handles: KotakAutoLoginHandles, hour: u32, minute: u32, label: &'static str) {
+    loop {
+        let now = shared_domain::now_ist();
+        let today_at = now
+            .date_naive()
+            .and_hms_opt(hour, minute, 0)
+            .expect("valid trigger time")
+            .and_local_timezone(shared_domain::ist_offset())
+            .single()
+            .expect("IST trigger time is unambiguous");
+        let next_at = if today_at > now { today_at } else { today_at + ChronoDuration::hours(24) };
+
+        let secs_until = (next_at - now).num_seconds().max(1) as u64;
+        tracing::info!(secs = secs_until, trigger = label, "Kotak auto-login scheduled");
+        tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
+
+        let wd = shared_domain::now_ist().weekday();
+        let is_weekend = wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun;
+
+        if is_weekend {
+            tracing::info!(trigger = label, "Kotak auto-login skipped — weekend");
+        } else if handles.kotak.lock().await.is_none() {
+            match routes::try_env_auto_login(handles.as_deps(), label).await {
+                Ok(()) => tracing::info!(trigger = label, "Kotak auto-login succeeded"),
+                Err(e) => tracing::info!(trigger = label, reason = %e, "Kotak auto-login not performed"),
+            }
+        } else {
+            tracing::info!(trigger = label, "Kotak auto-login skipped — already connected");
+        }
+
+        // Step past the trigger instant so the next iteration schedules
+        // tomorrow's occurrence of this same trigger, not today's again.
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +258,14 @@ async fn main() {
         tracing::info!("PASSKEY is set (length: {})", val.len());
     } else {
         tracing::warn!("PASSKEY is NOT set (neither in runtime env nor compiled in)!");
+    }
+
+    // Check AUTH_SECRET status — without it, auth_middleware 500s every
+    // authenticated route (see main.rs auth_middleware), so a missing secret
+    // needs to be loud here, not discovered later as a wall of failed requests.
+    match std::env::var("AUTH_SECRET").ok().filter(|s| !s.is_empty()).or_else(|| option_env!("AUTH_SECRET").map(String::from)) {
+        Some(val) if !val.is_empty() => tracing::info!("AUTH_SECRET is set (length: {})", val.len()),
+        _ => tracing::warn!("AUTH_SECRET is NOT set — every authenticated /api/* route will fail with 500!"),
     }
 
     // 2. SQLite
@@ -219,7 +308,11 @@ async fn main() {
     let kotak_client_opt = Arc::new(tokio::sync::Mutex::new(None));
     let ws_task = Arc::new(tokio::sync::Mutex::new(None));
     let ws_tx = Arc::new(tokio::sync::Mutex::new(None));
-    
+    // Serializes full Kotak login attempts end-to-end — see
+    // `routes::KotakLoginDeps::login_lock` for why a plain `is_none()` check
+    // before deciding to log in isn't enough on its own.
+    let kotak_login_lock = Arc::new(tokio::sync::Mutex::new(()));
+
     let ws_scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
     let scrip_store = Arc::new(RwLock::new(None));
     let raw_scrip_csv = Arc::new(RwLock::new(None));
@@ -301,6 +394,7 @@ async fn main() {
             positions: &positions,
             scrip_store: &scrip_store,
             raw_scrip_csv: &raw_scrip_csv,
+            login_lock: &kotak_login_lock,
         };
         match routes::try_env_auto_login(deps, "server startup").await {
             Ok(()) => tracing::info!("Kotak auto-login succeeded at startup"),
@@ -339,88 +433,35 @@ async fn main() {
     //           day, so the early login costs nothing.
     //   09:15 — market open (`shared_domain::MARKET_OPEN_HOUR/MINUTE`).
     //           Safety net that only does anything if the pre-warm failed.
+    // Each trigger gets its own independent spawned loop rather than one loop
+    // picking "whichever comes next" — with a shared loop, a slow 09:05
+    // attempt (network retries, the TOTP retry added in try_env_auto_login)
+    // could still be running when 09:15 arrives, and since the next sleep is
+    // only computed *after* the previous attempt fully finishes, that would
+    // push 09:15 past today's occurrence entirely and skip the one trigger
+    // whose entire purpose is to catch a failed pre-warm.
     {
-        let pool_al       = pool.clone();
-        let write_tx_al   = write_tx.clone();
-        let log_tx_al     = log_tx.clone();
-        let kotak_al      = Arc::clone(&kotak_client_opt);
-        let ws_task_al    = Arc::clone(&ws_task);
-        let ws_tx_al      = Arc::clone(&ws_tx);
-        let prices_al     = Arc::clone(&prices);
-        let positions_al  = Arc::clone(&positions);
-        let scrip_store_al   = Arc::clone(&scrip_store);
-        let raw_scrip_csv_al = Arc::clone(&raw_scrip_csv);
+        let handles = KotakAutoLoginHandles {
+            pool: pool.clone(),
+            write_tx: write_tx.clone(),
+            log_tx: log_tx.clone(),
+            kotak: Arc::clone(&kotak_client_opt),
+            ws_task: Arc::clone(&ws_task),
+            ws_tx: Arc::clone(&ws_tx),
+            prices: Arc::clone(&prices),
+            positions: Arc::clone(&positions),
+            scrip_store: Arc::clone(&scrip_store),
+            raw_scrip_csv: Arc::clone(&raw_scrip_csv),
+            login_lock: Arc::clone(&kotak_login_lock),
+        };
 
-        /// (hour, minute, label) of each daily auto-login attempt, in IST.
-        const AUTO_LOGIN_TRIGGERS: [(u32, u32, &str); 2] = [
-            (9, 5, "pre-warm 09:05 IST"),
-            (
-                shared_domain::MARKET_OPEN_HOUR,
-                shared_domain::MARKET_OPEN_MINUTE,
-                "market open 09:15 IST",
-            ),
-        ];
-
-        tokio::spawn(async move {
-            loop {
-                // Sleep until whichever trigger comes next (today's, if still
-                // ahead of us; otherwise tomorrow's).
-                let now = shared_domain::now_ist();
-                let (next_at, label) = AUTO_LOGIN_TRIGGERS
-                    .iter()
-                    .map(|&(hour, minute, label)| {
-                        let today_at = now
-                            .date_naive()
-                            .and_hms_opt(hour, minute, 0)
-                            .expect("valid trigger time")
-                            .and_local_timezone(shared_domain::ist_offset())
-                            .single()
-                            .expect("IST trigger time is unambiguous");
-                        let at = if today_at > now {
-                            today_at
-                        } else {
-                            today_at + ChronoDuration::hours(24)
-                        };
-                        (at, label)
-                    })
-                    .min_by_key(|(at, _)| *at)
-                    .expect("AUTO_LOGIN_TRIGGERS is non-empty");
-
-                let secs_until = (next_at - now).num_seconds().max(1) as u64;
-                tracing::info!(secs = secs_until, trigger = label, "Kotak auto-login scheduled");
-                tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
-
-                let wd = shared_domain::now_ist().weekday();
-                let is_weekend = wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun;
-
-                if is_weekend {
-                    tracing::info!(trigger = label, "Kotak auto-login skipped — weekend");
-                } else if kotak_al.lock().await.is_none() {
-                    let deps = routes::KotakLoginDeps {
-                        db_pool: &pool_al,
-                        db_tx: &write_tx_al,
-                        log_tx: &log_tx_al,
-                        kotak: &kotak_al,
-                        ws_task: &ws_task_al,
-                        ws_tx: &ws_tx_al,
-                        prices: &prices_al,
-                        positions: &positions_al,
-                        scrip_store: &scrip_store_al,
-                        raw_scrip_csv: &raw_scrip_csv_al,
-                    };
-                    match routes::try_env_auto_login(deps, label).await {
-                        Ok(()) => tracing::info!(trigger = label, "Kotak auto-login succeeded"),
-                        Err(e) => tracing::info!(trigger = label, reason = %e, "Kotak auto-login not performed"),
-                    }
-                } else {
-                    tracing::info!(trigger = label, "Kotak auto-login skipped — already connected");
-                }
-
-                // Step past the trigger instant so the next iteration selects
-                // the following trigger rather than re-firing this one.
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
-        });
+        tokio::spawn(run_daily_kotak_trigger(handles.clone(), 9, 5, "pre-warm 09:05 IST"));
+        tokio::spawn(run_daily_kotak_trigger(
+            handles,
+            shared_domain::MARKET_OPEN_HOUR,
+            shared_domain::MARKET_OPEN_MINUTE,
+            "market open 09:15 IST",
+        ));
     }
 
     // 9. Daily Scrip Master refresh — runs at 09:10 IST every trading day
@@ -594,6 +635,7 @@ async fn main() {
         ws_task,
         ws_tx,
         rate_limit_map: Arc::new(DashMap::new()),
+        kotak_login_lock,
     };
 
     let app = Router::new()

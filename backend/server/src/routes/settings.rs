@@ -17,8 +17,28 @@ pub async fn get_settings_handler(State(state): State<AppState>) -> Json<Trading
 /// `POST /api/settings` — persist to SQLite and update in-memory config.
 pub async fn post_settings_handler(
     State(state): State<AppState>,
-    Json(cfg): Json<TradingConfig>,
+    Json(mut cfg): Json<TradingConfig>,
 ) -> impl IntoResponse {
+    // Same floor `lots_for_instrument` applies at read time, but enforced here
+    // too so the DB row, the in-memory config, and what GET echoes back never
+    // disagree with what an order actually sizes to. Also drops keys outside
+    // the known index list (typos, a stale symbol) and normalizes casing —
+    // `lots_for_instrument` only ever looks up the uppercase `INDEX_NAMES`.
+    cfg.index_lots_by_symbol = cfg
+        .index_lots_by_symbol
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let upper = k.to_uppercase();
+            let idx = shared_domain::INDEX_NAMES.iter().find(|&&n| n == upper)?;
+            (v > 0).then(|| (idx.to_string(), v))
+        })
+        .collect();
+    // Same reasoning: keep the in-memory copy written below in lockstep with
+    // what's actually bound to SQL a few lines down, instead of only clamping
+    // at the DB-bind call site.
+    cfg.index_lots = cfg.index_lots.max(1);
+    cfg.other_lots = cfg.other_lots.max(1);
+
     let index_lots_by_symbol_json = serde_json::to_string(&cfg.index_lots_by_symbol)
         .unwrap_or_else(|_| "{}".to_string());
 
@@ -30,8 +50,8 @@ pub async fn post_settings_handler(
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
-    .bind(cfg.index_lots.max(1))
-    .bind(cfg.other_lots.max(1))
+    .bind(cfg.index_lots)
+    .bind(cfg.other_lots)
     .bind(&cfg.mode)
     .bind(cfg.brokerage_per_order)
     .bind(cfg.target_1_exit_pct)
@@ -50,9 +70,9 @@ pub async fn post_settings_handler(
 
     let _ = state.log_tx.send(format!(
         r#"{{"event":"CONFIG_UPDATED","mode":"{}","max_trade":{:.2},"index_lots":{},"other_lots":{}}}"#,
-        cfg.mode, cfg.max_trade_amount_inr, cfg.index_lots.max(1), cfg.other_lots.max(1)
+        cfg.mode, cfg.max_trade_amount_inr, cfg.index_lots, cfg.other_lots
     ));
-    tracing::info!(mode = %cfg.mode, max_trade = cfg.max_trade_amount_inr, index_lots = cfg.index_lots.max(1), other_lots = cfg.other_lots.max(1), "Config updated");
+    tracing::info!(mode = %cfg.mode, max_trade = cfg.max_trade_amount_inr, index_lots = cfg.index_lots, other_lots = cfg.other_lots, "Config updated");
     StatusCode::OK
 }
 

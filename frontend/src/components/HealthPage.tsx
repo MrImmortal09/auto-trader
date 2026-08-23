@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import { Activity, Cpu, HardDrive } from 'lucide-react';
-import type { HealthSnapshot } from '../types';
+import type { HealthSnapshot, KotakStatus } from '../types';
 import { apiFetch } from '../lib/api';
 import { fmtPct, fmtUptime } from '../lib/format';
 import { Stat } from './Stat';
 
 export function HealthPage({ serverBase }: { serverBase: string }) {
   const [snapshot, setSnapshot] = useState<HealthSnapshot | null>(null);
+  const [kotakStatus, setKotakStatus] = useState<KotakStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -14,13 +15,19 @@ export function HealthPage({ serverBase }: { serverBase: string }) {
     setLoading(true);
     setError('');
     try {
-      const res = await apiFetch(serverBase, '/api/health');
-      const data = await res.json();
-      if (!res.ok) {
+      const [healthRes, kotakRes] = await Promise.all([
+        apiFetch(serverBase, '/api/health'),
+        apiFetch(serverBase, '/api/auth/kotak'),
+      ]);
+      const data = await healthRes.json();
+      if (!healthRes.ok) {
         setError(data?.error ?? 'Failed to load health snapshot');
         return;
       }
       setSnapshot(data);
+      // Kotak status is a secondary diagnostic — don't fail the whole page
+      // fetch if it errors, just leave the auto-login card off.
+      setKotakStatus(kotakRes.ok ? await kotakRes.json() : null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -64,6 +71,37 @@ export function HealthPage({ serverBase }: { serverBase: string }) {
 
       {snapshot && (
         <>
+          {!snapshot.auth_secret_configured && (
+            <div className="bg-error-container border border-error text-on-error-container rounded-lg px-4 py-3 text-sm">
+              <span className="font-semibold">AUTH_SECRET is not set</span> on the backend — every authenticated
+              API route will fail with 500 until it's configured and the server is restarted.
+            </div>
+          )}
+
+          {kotakStatus && (
+            <div className="bg-surface-container-lowest border border-outline-variant rounded-lg overflow-hidden shadow-sm">
+              <div className="px-4 py-2 border-b border-outline-variant flex items-center justify-between bg-surface-container-low">
+                <span className="text-label-caps text-on-surface-variant uppercase tracking-wide font-semibold">
+                  Kotak Auto-Login
+                </span>
+                <span className={`px-2 py-0.5 rounded text-xs font-label-caps font-bold uppercase ${
+                  kotakStatus.auto_login_ready ? 'bg-[#d1fae5] text-[#065f46]' : 'bg-[#ffe4e6] text-[#9f1239]'
+                }`}>
+                  {kotakStatus.auto_login_ready ? 'ON' : 'OFF'}
+                </span>
+              </div>
+              <div className="p-4 grid gap-3 sm:grid-cols-2 text-sm">
+                <div><span className="text-on-surface-variant">Session connected:</span> <span className="text-on-surface font-medium">{kotakStatus.connected ? 'Yes' : 'No'}</span></div>
+                <div><span className="text-on-surface-variant">KOTAK_AUTO_LOGIN:</span> <span className="text-on-surface font-medium">{kotakStatus.auto_login_enabled ? 'enabled' : 'disabled'}</span></div>
+                <div><span className="text-on-surface-variant">TOTP secret set:</span> <span className="text-on-surface font-medium">{kotakStatus.has_totp_secret ? 'Yes' : 'No'}</span></div>
+                <div><span className="text-on-surface-variant">All KOTAK_* fields set:</span> <span className="text-on-surface font-medium">{kotakStatus.has_env_credentials ? 'Yes' : 'No'}</span></div>
+              </div>
+              {!kotakStatus.auto_login_ready && kotakStatus.auto_login_reason && (
+                <div className="px-4 pb-4 text-xs text-error">{kotakStatus.auto_login_reason}</div>
+              )}
+            </div>
+          )}
+
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
             <Stat icon={<Cpu size={16} className="text-primary" />} label="CPU Usage">
               {fmtPct(snapshot.cpu_usage_pct)}

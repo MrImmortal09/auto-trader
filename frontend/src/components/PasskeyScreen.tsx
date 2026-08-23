@@ -1,6 +1,6 @@
-import { useState, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import type { KeyboardEvent } from 'react';
-import { ShieldAlert, ShieldCheck, Loader2 } from 'lucide-react';
+import { ShieldAlert, ShieldCheck, Loader2, AlertTriangle } from 'lucide-react';
 import { apiFetch, getStoredServerBase } from '../lib/api';
 import { setToken } from '../lib/auth';
 
@@ -14,7 +14,20 @@ export function PasskeyScreen({ onSuccess }: PasskeyScreenProps) {
   const [error, setError] = useState('');
   const [lockoutSecs, setLockoutSecs] = useState(0);
   const [shake, setShake] = useState(false);
+  const [authSecretMissing, setAuthSecretMissing] = useState(false);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+
+  // /api/health is the one route that stays reachable even when AUTH_SECRET
+  // is unset (auth_middleware 500s every other authenticated route in that
+  // case) — check it proactively so a misconfigured backend shows a clear
+  // reason instead of a login form that can never succeed.
+  useEffect(() => {
+    const serverBase = getStoredServerBase();
+    apiFetch(serverBase, '/api/health')
+      .then((r) => r.json())
+      .then((data) => setAuthSecretMissing(data?.auth_secret_configured === false))
+      .catch(() => {});
+  }, []);
 
   const triggerShake = () => {
     setShake(true);
@@ -66,13 +79,19 @@ export function PasskeyScreen({ onSuccess }: PasskeyScreenProps) {
         setError('Too many attempts. Locked out.');
         triggerShake();
         startLockoutTimer(retryAfter);
+      } else if (res.status === 500) {
+        // The most likely cause is a missing AUTH_SECRET (verify_passkey_handler
+        // panics without one) — not a wrong code, so don't say "invalid passkey".
+        setError(authSecretMissing ? 'Backend misconfigured — see below' : 'Server error — check backend logs');
+        setPasskey(Array(6).fill(''));
+        triggerShake();
       } else {
         setError('Invalid passkey');
         setPasskey(Array(6).fill(''));
         inputRefs.current[0]?.focus();
         triggerShake();
       }
-    } catch (err) {
+    } catch {
       setError('Connection error');
       triggerShake();
     } finally {
@@ -107,7 +126,17 @@ export function PasskeyScreen({ onSuccess }: PasskeyScreenProps) {
         
         <h2 className="text-2xl font-bold text-on-surface mb-2">Secure Access</h2>
         <p className="text-on-surface-variant mb-8">Enter your 6-digit passkey to connect to the trading engine.</p>
-        
+
+        {authSecretMissing && (
+          <div className="flex items-start gap-2 text-left text-sm text-error bg-error-container/40 border border-error rounded-xl px-4 py-3 mb-6">
+            <AlertTriangle size={18} className="shrink-0 mt-0.5" />
+            <span>
+              Backend has no <code className="font-mono-code">AUTH_SECRET</code> configured — login will fail no matter
+              what code you enter. Set it in the backend's environment and restart the server.
+            </span>
+          </div>
+        )}
+
         <div className="flex gap-2 sm:gap-3 mb-6" dir="ltr">
           {passkey.map((digit, i) => (
             <input

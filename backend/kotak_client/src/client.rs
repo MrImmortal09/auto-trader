@@ -313,7 +313,16 @@ pub struct KotakClient {
 impl KotakClient {
     /// Construct a new client using the static API Dashboard access token.
     pub fn new(access_token: impl Into<String>) -> Result<Self, KotakError> {
-        let http = Client::builder().use_rustls_tls().build()?;
+        // Without a bound, a stalled Kotak endpoint hangs this call forever —
+        // fatal for the unattended 09:05 auto-login task, which never reaches
+        // its next scheduling loop (and so stops firing on every subsequent
+        // day) if the request it's awaiting never returns. 30s is generous
+        // for a broker API call (order placement normally completes in low
+        // single-digit seconds) while still bounding the worst case.
+        let http = Client::builder()
+            .use_rustls_tls()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
         Ok(Self {
             http,
             access_token: access_token.into(),
