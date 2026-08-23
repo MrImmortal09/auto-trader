@@ -16,6 +16,9 @@ dashmap = "6"
 flate2 = "1"
 base64 = "0.22"
 tracing = "0.1"
+hmac = "0.12"
+sha1 = "0.10"
+data-encoding = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

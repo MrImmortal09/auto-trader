@@ -31,6 +31,9 @@ pub enum KotakError {
     #[error("MPIN validation failed: {0}")]
     LoginMpinFailed(String),
 
+    #[error("invalid TOTP secret: {0}")]
+    TotpSecretInvalid(String),
+
     #[error("order rejected by broker (code {status_code}): {message}")]
     OrderRejected { status_code: i32, message: String },
 

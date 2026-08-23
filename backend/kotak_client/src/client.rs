@@ -390,6 +390,27 @@ impl KotakClient {
 
     // ── Public API ──────────────────────────────────────────────────────── //
 
+    /// Same as [`Self::login`], but derives the 6-digit TOTP from a Base32
+    /// authenticator secret instead of requiring it to be typed in — see
+    /// [`crate::totp::generate_totp`].
+    pub async fn login_with_totp_secret(
+        &mut self,
+        mobile_number: impl Into<String>,
+        ucc: impl Into<String>,
+        mpin: impl Into<String>,
+        totp_secret: &str,
+    ) -> Result<(), KotakError> {
+        let totp = crate::totp::generate_totp(totp_secret)?;
+        self.login(KotakCredentials {
+            access_token: self.access_token.clone(),
+            mobile_number: mobile_number.into(),
+            ucc: ucc.into(),
+            totp,
+            mpin: mpin.into(),
+        })
+        .await
+    }
+
     /// Two-step login: TOTP → MPIN validate.  Stores the trading session.
     pub async fn login(&mut self, creds: KotakCredentials) -> Result<(), KotakError> {
         let view = self.login_totp(&creds).await?;

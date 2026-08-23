@@ -119,6 +119,16 @@ export interface KotakForm {
   mpin: string;
 }
 
+export interface KotakStatus {
+  connected: boolean;
+  /** All five KOTAK_* env vars are set, so "Auto Connect" needs no form input. */
+  has_env_credentials: boolean;
+  /** KOTAK_TOTP_SECRET / KOTAK_TOTP_HASH is set, so the TOTP field can be left blank. */
+  has_totp_secret: boolean;
+  auto_login_enabled: boolean;
+  masked_ucc?: string | null;
+}
+
 export interface TelegramChat {
   id: number;
   name: string;
