@@ -302,7 +302,7 @@ async fn main() {
             scrip_store: &scrip_store,
             raw_scrip_csv: &raw_scrip_csv,
         };
-        match routes::try_env_auto_login(deps).await {
+        match routes::try_env_auto_login(deps, "server startup").await {
             Ok(()) => tracing::info!("Kotak auto-login succeeded at startup"),
             Err(e) => tracing::info!(reason = %e, "Kotak auto-login not performed at startup — bridge startup deferred until login"),
         }
@@ -324,11 +324,21 @@ async fn main() {
         Arc::clone(&kotak_client_opt),
     ));
 
-    // 8b. Daily Kotak auto-login retry — runs at 09:00 IST every trading day,
-    // just ahead of the 09:10 Scrip Master refresh. Covers the case where the
-    // server was already running before market open (so the startup attempt
-    // above never fired) or wasn't yet connected for some other reason. A
-    // no-op whenever a session already exists or env auto-login isn't configured.
+    // 8b. Daily Kotak auto-login. Covers the case where the server was already
+    // running before the open (so the startup attempt above never fired) or
+    // wasn't yet connected for some other reason. Every pass is a no-op when a
+    // session already exists or env auto-login isn't configured.
+    //
+    // Two triggers, both on weekdays only:
+    //   09:05 — pre-warm. A successful login kicks off the Scrip Master
+    //           download, which gates *all* order placement:
+    //           `start_position_monitor` discards any signal that arrives
+    //           while the store is still empty (no queue, no retry). Logging
+    //           in ten minutes early means the store is loaded before the
+    //           first tick. The Kotak session is valid for the whole trading
+    //           day, so the early login costs nothing.
+    //   09:15 — market open (`shared_domain::MARKET_OPEN_HOUR/MINUTE`).
+    //           Safety net that only does anything if the pre-warm failed.
     {
         let pool_al       = pool.clone();
         let write_tx_al   = write_tx.clone();
@@ -341,38 +351,51 @@ async fn main() {
         let scrip_store_al   = Arc::clone(&scrip_store);
         let raw_scrip_csv_al = Arc::clone(&raw_scrip_csv);
 
+        /// (hour, minute, label) of each daily auto-login attempt, in IST.
+        const AUTO_LOGIN_TRIGGERS: [(u32, u32, &str); 2] = [
+            (9, 5, "pre-warm 09:05 IST"),
+            (
+                shared_domain::MARKET_OPEN_HOUR,
+                shared_domain::MARKET_OPEN_MINUTE,
+                "market open 09:15 IST",
+            ),
+        ];
+
         tokio::spawn(async move {
             loop {
-                // Compute seconds until next 09:00:00 IST
-                let secs_until = {
-                    let now = shared_domain::now_ist();
-                    let today_0900 = now
-                        .date_naive()
-                        .and_hms_opt(9, 0, 0)
-                        .expect("valid time")
-                        .and_local_timezone(shared_domain::ist_offset())
-                        .single()
-                        .expect("IST 09:00 is unambiguous");
+                // Sleep until whichever trigger comes next (today's, if still
+                // ahead of us; otherwise tomorrow's).
+                let now = shared_domain::now_ist();
+                let (next_at, label) = AUTO_LOGIN_TRIGGERS
+                    .iter()
+                    .map(|&(hour, minute, label)| {
+                        let today_at = now
+                            .date_naive()
+                            .and_hms_opt(hour, minute, 0)
+                            .expect("valid trigger time")
+                            .and_local_timezone(shared_domain::ist_offset())
+                            .single()
+                            .expect("IST trigger time is unambiguous");
+                        let at = if today_at > now {
+                            today_at
+                        } else {
+                            today_at + ChronoDuration::hours(24)
+                        };
+                        (at, label)
+                    })
+                    .min_by_key(|(at, _)| *at)
+                    .expect("AUTO_LOGIN_TRIGGERS is non-empty");
 
-                    let diff = today_0900.signed_duration_since(now);
-                    if diff.num_seconds() > 0 {
-                        diff.num_seconds() as u64
-                    } else {
-                        (diff + ChronoDuration::hours(24)).num_seconds().max(1) as u64
-                    }
-                };
-
-                tracing::info!(secs = secs_until, "Scheduled 09:00 IST Kotak auto-login retry scheduled");
+                let secs_until = (next_at - now).num_seconds().max(1) as u64;
+                tracing::info!(secs = secs_until, trigger = label, "Kotak auto-login scheduled");
                 tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
 
                 let wd = shared_domain::now_ist().weekday();
-                if wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun {
-                    tracing::info!("09:00 IST Kotak auto-login retry skipped — weekend");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
-                    continue;
-                }
+                let is_weekend = wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun;
 
-                if kotak_al.lock().await.is_none() {
+                if is_weekend {
+                    tracing::info!(trigger = label, "Kotak auto-login skipped — weekend");
+                } else if kotak_al.lock().await.is_none() {
                     let deps = routes::KotakLoginDeps {
                         db_pool: &pool_al,
                         db_tx: &write_tx_al,
@@ -385,14 +408,16 @@ async fn main() {
                         scrip_store: &scrip_store_al,
                         raw_scrip_csv: &raw_scrip_csv_al,
                     };
-                    match routes::try_env_auto_login(deps).await {
-                        Ok(()) => tracing::info!("Scheduled 09:00 IST Kotak auto-login succeeded"),
-                        Err(e) => tracing::info!(reason = %e, "Scheduled 09:00 IST Kotak auto-login not performed"),
+                    match routes::try_env_auto_login(deps, label).await {
+                        Ok(()) => tracing::info!(trigger = label, "Kotak auto-login succeeded"),
+                        Err(e) => tracing::info!(trigger = label, reason = %e, "Kotak auto-login not performed"),
                     }
+                } else {
+                    tracing::info!(trigger = label, "Kotak auto-login skipped — already connected");
                 }
 
-                // Sleep past the trigger instant so the next loop iteration
-                // recomputes tomorrow's 09:00 target instead of firing again immediately.
+                // Step past the trigger instant so the next iteration selects
+                // the following trigger rather than re-firing this one.
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             }
         });

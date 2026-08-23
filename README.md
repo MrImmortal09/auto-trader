@@ -191,7 +191,8 @@ KOTAK_SCRIPS=nse_cm|11536&nse_cm|1594
 # ── Kotak Neo auto-login (optional) ───────────────────────
 # Set all five to skip the manual Kotak login form. The server will:
 #  - log in at startup if no valid session is restored from the DB,
-#  - retry once more at 09:00 IST every trading day if still not connected.
+#  - log in at 09:05 IST each trading day (pre-warm, so the Scrip Master is
+#    loaded before the 09:15 open), and retry at 09:15 if that failed.
 # The 6-digit TOTP is generated from KOTAK_TOTP_SECRET (RFC 6238), so no
 # human needs to read a code off an authenticator app each morning.
 KOTAK_ACCESS_TOKEN=eyJhbGci...       # API Dashboard access token
@@ -473,8 +474,15 @@ fresh login, which happens one of two ways:
 - **Automatic** — set `KOTAK_ACCESS_TOKEN` / `KOTAK_MOBILE_NUMBER` /
   `KOTAK_UCC` / `KOTAK_MPIN` / `KOTAK_TOTP_SECRET` (see
   [Environment Variables](#environment-variables)) and the server logs in on
-  its own at startup and again at 09:00 IST if still disconnected — no human
+  its own — at startup, at 09:05 IST (pre-warm, so the Scrip Master is loaded
+  before the bell), and again at 09:15 IST if still disconnected. No human
   action required, including in LIVE mode.
+
+Either way, every step of the login is streamed to the dashboard's log
+terminal (`KOTAK_LOGIN_START` → `KOTAK_LOGIN_OK` → `KOTAK_WS_START` →
+`KOTAK_CONNECTED` → `SCRIP_FETCH` → `SCRIP_FETCH_SUCCESS`), so you can watch
+an unattended login happen. Failures log `KOTAK_LOGIN_FAILED` in red. Secrets
+are never logged — only a masked UCC and whether the TOTP was auto-generated.
 
 Until a session exists, the WebSocket market-data feed will silently fail to connect (the position monitor still works in paper mode using `entry_price` as the assumed LTP).
 

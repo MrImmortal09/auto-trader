@@ -34,6 +34,33 @@ struct ResolvedKotakLogin {
     ucc: String,
     mpin: String,
     totp: String,
+    /// True when `totp` was derived from `KOTAK_TOTP_SECRET` rather than
+    /// typed in — surfaced in the login logs so it's obvious from the UI
+    /// whether a human or the server produced the code.
+    totp_auto_generated: bool,
+}
+
+/// Broadcast a log line to the live SSE stream *and* persist it to
+/// `system_logs`, so the frontend sees login progress whether it was already
+/// watching (SSE) or connects afterwards (`/api/logs/history`).
+///
+/// Payloads are built with `serde_json` rather than `format!` so a broker
+/// error string containing quotes can't produce malformed JSON in the UI.
+/// Never put the TOTP code, MPIN, access token, or TOTP secret in here.
+async fn send_log(
+    db_tx: &mpsc::Sender<shared_domain::DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    level: &str,
+    payload: serde_json::Value,
+) {
+    let message = payload.to_string();
+    let _ = db_tx
+        .send(shared_domain::DbWriteMessage::Log {
+            level: level.to_owned(),
+            message: message.clone(),
+        })
+        .await;
+    let _ = log_tx.send(message);
 }
 
 /// Resolve a (possibly partial) login request against env-var fallbacks.
@@ -53,17 +80,19 @@ fn resolve_kotak_login(req: KotakLoginReq) -> Result<ResolvedKotakLogin, String>
         .or_else(|| env_var("KOTAK_MPIN"))
         .ok_or("mpin missing (set it in the request or KOTAK_MPIN)")?;
 
-    let totp = match non_empty(req.totp) {
-        Some(manual) => manual,
+    let (totp, totp_auto_generated) = match non_empty(req.totp) {
+        Some(manual) => (manual, false),
         None => {
             let secret = env_var("KOTAK_TOTP_SECRET")
                 .or_else(|| env_var("KOTAK_TOTP_HASH"))
                 .ok_or("totp missing and no KOTAK_TOTP_SECRET/KOTAK_TOTP_HASH configured for auto-generation")?;
-            kotak_client::generate_totp(&secret).map_err(|e| format!("failed to generate TOTP: {e}"))?
+            let code = kotak_client::generate_totp(&secret)
+                .map_err(|e| format!("failed to generate TOTP: {e}"))?;
+            (code, true)
         }
     };
 
-    Ok(ResolvedKotakLogin { access_token, mobile_number, ucc, mpin, totp })
+    Ok(ResolvedKotakLogin { access_token, mobile_number, ucc, mpin, totp, totp_auto_generated })
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +142,23 @@ impl<'a> KotakLoginDeps<'a> {
 async fn perform_kotak_login(
     deps: KotakLoginDeps<'_>,
     resolved: ResolvedKotakLogin,
+    source: &str,
 ) -> Result<(), kotak_client::KotakError> {
-    let ResolvedKotakLogin { access_token, mobile_number, ucc, mpin, totp } = resolved;
+    let ResolvedKotakLogin {
+        access_token, mobile_number, ucc, mpin, totp, totp_auto_generated,
+    } = resolved;
+
+    let masked_ucc = mask_ucc(&ucc);
+    send_log(deps.db_tx, deps.log_tx, "INFO", serde_json::json!({
+        "event": "KOTAK_LOGIN_START",
+        "level": "INFO",
+        "source": source,
+        "ucc": masked_ucc,
+        "message": format!(
+            "Kotak login starting ({source}) — UCC {masked_ucc}, TOTP {}",
+            if totp_auto_generated { "auto-generated from KOTAK_TOTP_SECRET" } else { "entered manually" },
+        ),
+    })).await;
 
     let mut client = kotak_client::KotakClient::new(&access_token)?;
     let creds = kotak_client::KotakCredentials {
@@ -124,7 +168,24 @@ async fn perform_kotak_login(
         totp,
         mpin,
     };
-    client.login(creds).await?;
+
+    // Two-step login: TOTP -> MPIN validate. Both legs surface to the UI.
+    if let Err(e) = client.login(creds).await {
+        send_log(deps.db_tx, deps.log_tx, "ERROR", serde_json::json!({
+            "event": "KOTAK_LOGIN_FAILED",
+            "level": "ERROR",
+            "source": source,
+            "message": format!("Kotak login failed ({source}): {e}"),
+        })).await;
+        return Err(e);
+    }
+
+    send_log(deps.db_tx, deps.log_tx, "INFO", serde_json::json!({
+        "event": "KOTAK_LOGIN_OK",
+        "level": "INFO",
+        "source": source,
+        "message": "Kotak TOTP + MPIN accepted — trading session established".to_string(),
+    })).await;
 
     if let Some((auth, sid)) = client.session_credentials() {
         let base_url = client.session.as_ref().map(|s| s.base_url.clone()).unwrap_or_default();
@@ -149,6 +210,7 @@ async fn perform_kotak_login(
 
         let mut tx_guard = deps.ws_tx.lock().await;
         *tx_guard = Some(new_ws_tx);
+        let mut resubscribed = 0usize;
         if let Some(tx) = tx_guard.as_ref() {
             let keys: Vec<String> = deps
                 .positions
@@ -164,11 +226,27 @@ async fn perform_kotak_login(
                 deps.prices.insert(key.clone(), 0.0);
                 let payload = serde_json::json!({ "action": "subscribe", "scrips": key });
                 let _ = tx.send(payload.to_string());
+                resubscribed += 1;
             }
         }
+        drop(tx_guard);
+
+        send_log(deps.db_tx, deps.log_tx, "INFO", serde_json::json!({
+            "event": "KOTAK_WS_START",
+            "level": "INFO",
+            "message": format!(
+                "Session saved — market data feed starting, {resubscribed} open position(s) resubscribed",
+            ),
+        })).await;
     }
 
-    let _ = deps.log_tx.send(r#"{"event":"KOTAK_CONNECTED","status":"ok"}"#.into());
+    send_log(deps.db_tx, deps.log_tx, "INFO", serde_json::json!({
+        "event": "KOTAK_CONNECTED",
+        "level": "INFO",
+        "status": "ok",
+        "source": source,
+        "message": format!("Kotak connected ({source}) — loading Scrip Master next"),
+    })).await;
     *deps.kotak.lock().await = Some(client.clone());
 
     // Scrip master download (3 segments, can be slow) runs in the background
@@ -192,19 +270,22 @@ async fn fetch_scrip_master_background(
     db_tx: mpsc::Sender<shared_domain::DbWriteMessage>,
     log_tx: broadcast::Sender<String>,
 ) {
-    let scrip_start_msg = r#"{"event":"SCRIP_FETCH","message":"Fetching Kotak Scrip Master..."}"#;
-    let _ = db_tx.send(shared_domain::DbWriteMessage::Log {
-        level: "INFO".into(), message: scrip_start_msg.into(),
-    }).await;
-    let _ = log_tx.send(scrip_start_msg.into());
+    send_log(&db_tx, &log_tx, "INFO", serde_json::json!({
+        "event": "SCRIP_FETCH",
+        "level": "INFO",
+        "message": "Fetching Kotak Scrip Master (nse_fo, bse_fo, nse_cm) — no orders can be placed until this finishes",
+    })).await;
 
     // Clone the client out of the mutex for the duration of the fetch.
     let client_opt = kotak.lock().await.clone();
     let client = match client_opt {
         Some(c) => c,
         None => {
-            let err = r#"{"event":"SCRIP_FETCH_ERROR","message":"Kotak client disappeared before scrip fetch"}"#;
-            let _ = log_tx.send(err.into());
+            send_log(&db_tx, &log_tx, "ERROR", serde_json::json!({
+                "event": "SCRIP_FETCH_ERROR",
+                "level": "ERROR",
+                "message": "Kotak client disappeared before scrip fetch",
+            })).await;
             return;
         }
     };
@@ -220,29 +301,30 @@ async fn fetch_scrip_master_background(
             }
             Err(e) => {
                 tracing::error!(segment = %segment, "Failed to fetch Scrip Master: {}", e);
-                let err_msg = format!(r#"{{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch {segment} scrip master: {e}"}}"#);
-                let _ = db_tx.send(shared_domain::DbWriteMessage::Log {
-                    level: "ERROR".into(), message: err_msg.clone(),
-                }).await;
-                let _ = log_tx.send(err_msg);
+                send_log(&db_tx, &log_tx, "ERROR", serde_json::json!({
+                    "event": "SCRIP_FETCH_ERROR",
+                    "level": "ERROR",
+                    "segment": segment,
+                    "message": format!("Failed to fetch {segment} scrip master: {e}"),
+                })).await;
             }
         }
     }
 
     if raw_sections.is_empty() {
-        let err_msg = r#"{"event":"SCRIP_FETCH_ERROR","message":"Failed to fetch all scrip master segments"}"#;
-        let _ = db_tx.send(shared_domain::DbWriteMessage::Log {
-            level: "ERROR".into(), message: err_msg.into(),
-        }).await;
-        let _ = log_tx.send(err_msg.into());
+        send_log(&db_tx, &log_tx, "ERROR", serde_json::json!({
+            "event": "SCRIP_FETCH_ERROR",
+            "level": "ERROR",
+            "message": "Failed to fetch all scrip master segments — signals cannot be resolved to contracts",
+        })).await;
     } else {
         *scrip_store.write().await = Some(store);
         *raw_scrip_csv.write().await = merge_csv_sections(&raw_sections);
-        let ok_msg = r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Scrip Master loaded successfully"}"#;
-        let _ = db_tx.send(shared_domain::DbWriteMessage::Log {
-            level: "INFO".into(), message: ok_msg.into(),
-        }).await;
-        let _ = log_tx.send(ok_msg.into());
+        send_log(&db_tx, &log_tx, "INFO", serde_json::json!({
+            "event": "SCRIP_FETCH_SUCCESS",
+            "level": "INFO",
+            "message": "Scrip Master loaded — ready to resolve and place orders",
+        })).await;
     }
 }
 
@@ -250,12 +332,34 @@ async fn fetch_scrip_master_background(
 /// startup and by the scheduled 09:00 IST retry. Returns `Err` (never
 /// panics) when auto-login is disabled, credentials are incomplete, or the
 /// login itself fails, so callers can just log the reason and move on.
-pub async fn try_env_auto_login(deps: KotakLoginDeps<'_>) -> Result<(), String> {
-    if !auto_login_enabled_by_env() {
-        return Err("KOTAK_AUTO_LOGIN=false".into());
-    }
-    let resolved = resolve_kotak_login(KotakLoginReq::default())?;
-    perform_kotak_login(deps, resolved).await.map_err(|e| e.to_string())
+pub async fn try_env_auto_login(deps: KotakLoginDeps<'_>, source: &str) -> Result<(), String> {
+    let skip_reason = if !auto_login_enabled_by_env() {
+        Some("KOTAK_AUTO_LOGIN=false".to_string())
+    } else {
+        None
+    };
+
+    let resolved = match skip_reason {
+        Some(reason) => Err(reason),
+        None => resolve_kotak_login(KotakLoginReq::default()),
+    };
+
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(reason) => {
+            // Not an error condition — a deployment with no auto-login
+            // credentials configured is expected to log in from the UI.
+            send_log(deps.db_tx, deps.log_tx, "INFO", serde_json::json!({
+                "event": "KOTAK_AUTO_LOGIN_SKIPPED",
+                "level": "INFO",
+                "source": source,
+                "message": format!("Kotak auto-login skipped ({source}): {reason}"),
+            })).await;
+            return Err(reason);
+        }
+    };
+
+    perform_kotak_login(deps, resolved, source).await.map_err(|e| e.to_string())
 }
 
 fn merge_csv_sections(csvs: &[(&str, String)]) -> Option<String> {
@@ -311,7 +415,7 @@ pub async fn kotak_login_handler(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     };
 
-    match perform_kotak_login(KotakLoginDeps::from_state(&state), resolved).await {
+    match perform_kotak_login(KotakLoginDeps::from_state(&state), resolved, "manual login").await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -327,7 +431,7 @@ pub async fn kotak_auto_login_handler(State(state): State<AppState>) -> impl Int
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     };
 
-    match perform_kotak_login(KotakLoginDeps::from_state(&state), resolved).await {
+    match perform_kotak_login(KotakLoginDeps::from_state(&state), resolved, "Auto Connect button").await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
