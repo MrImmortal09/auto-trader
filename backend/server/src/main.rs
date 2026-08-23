@@ -231,6 +231,77 @@ async fn run_daily_kotak_trigger(handles: KotakAutoLoginHandles, hour: u32, minu
 }
 
 // ---------------------------------------------------------------------------
+// Daily Kotak session clear — shared by the 09:00 and 15:40 IST triggers
+// ---------------------------------------------------------------------------
+
+/// Tears down whatever Kotak session currently exists (websocket task, in-memory
+/// client, DB row) — a no-op if there isn't one. `reason` is only for logging.
+async fn clear_kotak_session(
+    kotak: &Arc<Mutex<Option<kotak_client::KotakClient>>>,
+    ws_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    ws_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    pool: &SqlitePool,
+    log_tx: &broadcast::Sender<String>,
+    reason: &str,
+) {
+    if kotak.lock().await.is_some() {
+        if let Some(task) = ws_task.lock().await.take() {
+            task.abort();
+        }
+        *ws_tx.lock().await = None;
+        *kotak.lock().await = None;
+        let _ = sqlx::query("DELETE FROM kotak_session").execute(pool).await;
+
+        tracing::info!(reason, "Kotak session cleared");
+        let _ = log_tx.send(format!(
+            r#"{{"event":"KOTAK_SESSION_CLEARED","message":"Kotak session cleared ({reason})"}}"#,
+        ));
+    }
+}
+
+/// Runs forever, calling `clear_kotak_session` once at `(hour, minute)` IST
+/// every day (every day, not just weekdays — clearing an absent session is a
+/// no-op, so there's no reason to special-case weekends here).
+async fn run_daily_kotak_clear(
+    hour: u32,
+    minute: u32,
+    reason: &'static str,
+    kotak: Arc<Mutex<Option<kotak_client::KotakClient>>>,
+    ws_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    pool: SqlitePool,
+    log_tx: broadcast::Sender<String>,
+) {
+    loop {
+        let secs_until = {
+            let now = shared_domain::now_ist();
+            let today_at = now
+                .date_naive()
+                .and_hms_opt(hour, minute, 0)
+                .expect("valid time")
+                .and_local_timezone(shared_domain::ist_offset())
+                .single()
+                .expect("IST time is unambiguous");
+            let diff = today_at.signed_duration_since(now);
+            if diff.num_seconds() > 0 {
+                diff.num_seconds() as u64
+            } else {
+                (diff + ChronoDuration::hours(24)).num_seconds().max(1) as u64
+            }
+        };
+
+        tracing::info!(secs = secs_until, reason, "Kotak session clear scheduled");
+        tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
+
+        clear_kotak_session(&kotak, &ws_task, &ws_tx, &pool, &log_tx, reason).await;
+
+        // Step past the trigger instant so the next iteration schedules
+        // tomorrow's occurrence, not today's again.
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -562,62 +633,26 @@ async fn main() {
         });
     }
 
-    // 9b. Daily Kotak session clear — runs at 15:40:00 IST (market close) every day.
-    // The session token is only ever valid for the trading day it was issued, so
-    // there's no reason to keep the WebSocket alive or the DB row around once the
-    // market has shut — clear it here rather than waiting for tomorrow's date
-    // check in `load_kotak_session` to notice it's stale.
-    {
-        let kotak_arc = Arc::clone(&kotak_client_opt);
-        let ws_task_arc = Arc::clone(&ws_task);
-        let ws_tx_arc = Arc::clone(&ws_tx);
-        let pool_clear = pool.clone();
-        let log_tx_clear = log_tx.clone();
-
-        tokio::spawn(async move {
-            loop {
-                // Compute seconds until next 15:40:00 IST
-                let secs_until = {
-                    let now = shared_domain::now_ist();
-                    let today_1540 = now
-                        .date_naive()
-                        .and_hms_opt(15, 40, 0)
-                        .expect("valid time")
-                        .and_local_timezone(shared_domain::ist_offset())
-                        .single()
-                        .expect("IST 15:40 is unambiguous");
-
-                    let diff = today_1540.signed_duration_since(now);
-                    if diff.num_seconds() > 0 {
-                        diff.num_seconds() as u64
-                    } else {
-                        (diff + ChronoDuration::hours(24)).num_seconds().max(1) as u64
-                    }
-                };
-
-                tracing::info!(secs = secs_until, "Daily Kotak session clear scheduled");
-                tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
-
-                if kotak_arc.lock().await.is_some() {
-                    if let Some(task) = ws_task_arc.lock().await.take() {
-                        task.abort();
-                    }
-                    *ws_tx_arc.lock().await = None;
-                    *kotak_arc.lock().await = None;
-                    let _ = sqlx::query("DELETE FROM kotak_session").execute(&pool_clear).await;
-
-                    tracing::info!("Kotak session cleared at market close (15:40 IST)");
-                    let _ = log_tx_clear.send(
-                        r#"{"event":"KOTAK_SESSION_CLEARED","message":"Kotak session cleared at market close"}"#.into(),
-                    );
-                }
-
-                // Sleep past the trigger instant so the next loop iteration
-                // recomputes tomorrow's 15:40 target instead of firing again immediately.
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
-        });
-    }
+    // 9b. Daily Kotak session clear — two triggers:
+    //   09:00 — five minutes before the 09:05 pre-warm login. Guarantees a
+    //           clean slate for that attempt regardless of what's currently
+    //           sitting in memory: a session from a manual "Connect" earlier
+    //           that night, a leftover from testing, anything — rather than
+    //           the 09:05 trigger's `is_none()` check seeing a stale-but-still-
+    //           `Some` session and silently skipping the real login for the day.
+    //   15:40 — market close. The session token is only ever valid for the
+    //           trading day it was issued, so there's no reason to keep the
+    //           WebSocket alive or the DB row around once the market has shut.
+    tokio::spawn(run_daily_kotak_clear(
+        9, 0, "pre pre-warm 09:00 IST",
+        Arc::clone(&kotak_client_opt), Arc::clone(&ws_task), Arc::clone(&ws_tx),
+        pool.clone(), log_tx.clone(),
+    ));
+    tokio::spawn(run_daily_kotak_clear(
+        15, 40, "market close 15:40 IST",
+        Arc::clone(&kotak_client_opt), Arc::clone(&ws_task), Arc::clone(&ws_tx),
+        pool.clone(), log_tx.clone(),
+    ));
 
     // 9. Router
     let state = AppState {
