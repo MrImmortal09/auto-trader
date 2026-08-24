@@ -103,9 +103,7 @@ pub async fn verify_passkey_handler(
     state.rate_limit_map.remove(&ip);
 
     // 3. Issue Token
-    let auth_secret = std::env::var("AUTH_SECRET")
-        .or_else(|_| option_env!("AUTH_SECRET").map(String::from).ok_or("not set"))
-        .expect("AUTH_SECRET must be set");
+    let auth_secret = crate::resolve_auth_secret().expect("AUTH_SECRET must be set");
     let now = shared_domain::now_ist().timestamp() as u64;
     let exp = now + 7 * 24 * 60 * 60; // 7 days
 

@@ -55,11 +55,7 @@ struct HealthDto {
 }
 
 fn auth_secret_configured() -> bool {
-    std::env::var("AUTH_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| option_env!("AUTH_SECRET").map(String::from))
-        .is_some_and(|s| !s.is_empty())
+    crate::resolve_auth_secret().is_some()
 }
 
 fn mib(bytes: u64) -> u64 {

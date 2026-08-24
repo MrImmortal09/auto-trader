@@ -40,6 +40,20 @@ struct TokenPayload {
     exp: u64,
 }
 
+/// Resolves the secret used to sign/verify session tokens: the runtime
+/// `AUTH_SECRET` env var (an empty value counts as unset, since a blank
+/// secret would let anyone forge a valid signature), falling back to
+/// whatever was baked in at compile time. `verify_passkey_handler` (signs
+/// tokens) and `auth_middleware` (verifies them) both call this — sharing it
+/// is what guarantees they can never end up using two different secrets.
+pub(crate) fn resolve_auth_secret() -> Option<String> {
+    std::env::var("AUTH_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| option_env!("AUTH_SECRET").map(String::from))
+        .filter(|s| !s.is_empty())
+}
+
 async fn auth_middleware(
     req: Request,
     next: Next,
@@ -77,15 +91,13 @@ async fn auth_middleware(
         return Err(StatusCode::UNAUTHORIZED);
     }
     
-    let auth_secret = std::env::var("AUTH_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| option_env!("AUTH_SECRET").map(String::from))
-        .unwrap_or_default();
-    if auth_secret.is_empty() {
-        tracing::error!("AUTH_SECRET not configured");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
+    let auth_secret = match resolve_auth_secret() {
+        Some(s) => s,
+        None => {
+            tracing::error!("AUTH_SECRET not configured");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     let msg = format!("{}.{}", parts[0], parts[1]);
     let mut mac = match HmacSha256::new_from_slice(auth_secret.as_bytes()) {
@@ -334,9 +346,9 @@ async fn main() {
     // Check AUTH_SECRET status — without it, auth_middleware 500s every
     // authenticated route (see main.rs auth_middleware), so a missing secret
     // needs to be loud here, not discovered later as a wall of failed requests.
-    match std::env::var("AUTH_SECRET").ok().filter(|s| !s.is_empty()).or_else(|| option_env!("AUTH_SECRET").map(String::from)) {
-        Some(val) if !val.is_empty() => tracing::info!("AUTH_SECRET is set (length: {})", val.len()),
-        _ => tracing::warn!("AUTH_SECRET is NOT set — every authenticated /api/* route will fail with 500!"),
+    match resolve_auth_secret() {
+        Some(val) => tracing::info!("AUTH_SECRET is set (length: {})", val.len()),
+        None => tracing::warn!("AUTH_SECRET is NOT set — every authenticated /api/* route will fail with 500!"),
     }
 
     // 2. SQLite
