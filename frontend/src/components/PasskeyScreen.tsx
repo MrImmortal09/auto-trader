@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from 'react';
 import type { KeyboardEvent } from 'react';
-import { ShieldAlert, ShieldCheck, Loader2, AlertTriangle } from 'lucide-react';
-import { apiFetch, getStoredServerBase } from '../lib/api';
+import { ShieldAlert, ShieldCheck, Loader2, AlertTriangle, Server, Pencil } from 'lucide-react';
+import { apiFetch, getStoredServerBase, persistServerBase, normalizeServerBase, isValidServerBase } from '../lib/api';
 import { setToken } from '../lib/auth';
 
 interface PasskeyScreenProps {
@@ -15,19 +15,38 @@ export function PasskeyScreen({ onSuccess }: PasskeyScreenProps) {
   const [lockoutSecs, setLockoutSecs] = useState(0);
   const [shake, setShake] = useState(false);
   const [authSecretMissing, setAuthSecretMissing] = useState(false);
+  const [serverBase, setServerBase] = useState(() => getStoredServerBase());
+  const [serverBaseInput, setServerBaseInput] = useState(serverBase);
+  const [serverBaseError, setServerBaseError] = useState('');
+  const [serverUnreachable, setServerUnreachable] = useState(false);
+  const [editingServer, setEditingServer] = useState(false);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+
+  function commitServerBase(rawValue: string) {
+    const normalized = normalizeServerBase(rawValue);
+    if (normalized && !isValidServerBase(normalized)) {
+      setServerBaseError('Enter a full http:// or https:// server URL');
+      return;
+    }
+    setServerBaseError('');
+    persistServerBase(normalized);
+    setServerBaseInput(normalized);
+    setServerBase(normalized);
+  }
 
   // /api/health is the one route that stays reachable even when AUTH_SECRET
   // is unset (auth_middleware 500s every other authenticated route in that
   // case) — check it proactively so a misconfigured backend shows a clear
-  // reason instead of a login form that can never succeed.
+  // reason instead of a login form that can never succeed. Re-runs whenever
+  // the server URL below is edited, so switching servers gives instant
+  // feedback without needing to submit a passkey first.
   useEffect(() => {
-    const serverBase = getStoredServerBase();
+    setServerUnreachable(false);
     apiFetch(serverBase, '/api/health')
       .then((r) => r.json())
       .then((data) => setAuthSecretMissing(data?.auth_secret_configured === false))
-      .catch(() => {});
-  }, []);
+      .catch(() => setServerUnreachable(true));
+  }, [serverBase]);
 
   const triggerShake = () => {
     setShake(true);
@@ -62,7 +81,6 @@ export function PasskeyScreen({ onSuccess }: PasskeyScreenProps) {
   const verifyPasskey = async (code: string) => {
     setLoading(true);
     try {
-      const serverBase = getStoredServerBase();
       const res = await apiFetch(serverBase, '/api/auth/verify-passkey', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -125,7 +143,42 @@ export function PasskeyScreen({ onSuccess }: PasskeyScreenProps) {
         </div>
         
         <h2 className="text-2xl font-bold text-on-surface mb-2">Secure Access</h2>
-        <p className="text-on-surface-variant mb-8">Enter your 6-digit passkey to connect to the trading engine.</p>
+        <p className="text-on-surface-variant mb-6">Enter your 6-digit passkey to connect to the trading engine.</p>
+
+        <div className="w-full mb-6">
+          {editingServer ? (
+            <div className="flex flex-col gap-1.5">
+              <input
+                type="text"
+                autoFocus
+                value={serverBaseInput}
+                placeholder="http://host:8080 or https://your-domain"
+                onChange={(e) => setServerBaseInput(e.target.value)}
+                onBlur={(e) => { commitServerBase(e.target.value); setEditingServer(false); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') { commitServerBase(serverBaseInput); setEditingServer(false); } }}
+                className="w-full bg-surface border border-outline-variant rounded-lg px-3 py-2 text-sm text-on-surface placeholder-on-surface-variant focus:outline-none focus:border-primary font-mono-code"
+              />
+              {serverBaseError && <span className="text-xs text-error text-left">{serverBaseError}</span>}
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setEditingServer(true)}
+              className={`flex items-center gap-2 w-full text-left text-xs px-3 py-2 rounded-lg border transition-colors ${
+                serverUnreachable
+                  ? 'border-error text-error bg-error-container/30 hover:bg-error-container/50'
+                  : 'border-outline-variant text-on-surface-variant hover:border-primary hover:text-on-surface'
+              }`}
+            >
+              <Server size={14} className="shrink-0" />
+              <span className="truncate font-mono-code">{serverBase || 'No server configured'}</span>
+              <Pencil size={12} className="shrink-0 ml-auto opacity-60" />
+            </button>
+          )}
+          {serverUnreachable && !editingServer && (
+            <p className="text-xs text-error text-left mt-1.5">Can't reach this server — click above to change it.</p>
+          )}
+        </div>
 
         {authSecretMissing && (
           <div className="flex items-start gap-2 text-left text-sm text-error bg-error-container/40 border border-error rounded-xl px-4 py-3 mb-6">

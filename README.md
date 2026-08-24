@@ -229,48 +229,51 @@ cd ~/auto-trader
 
 This section assumes:
 
-- backend on a GCP Ubuntu/Debian VM
+- backend on a small Ubuntu/Debian VM (any cloud — GCP, Oracle Cloud, AWS, DigitalOcean, ...)
 - frontend on Vercel
 - repo uploaded with the same folder layout
 
-### 1. Prepare the GCP VM
+### 1. Prepare the VM
 
-Create an e2-micro VM and allow:
+Create a small VM (a free/burstable tier such as GCP e2-micro or Oracle Cloud's Always Free shapes is enough) and allow, in your cloud provider's console-level firewall (security list / network security group — this is separate from and in addition to the VM's own OS firewall):
 
 - SSH from your admin IP
 - TCP `8080` if you want to expose the Rust server directly
 - TCP `80` and `443` if you will use Nginx/Caddy as a reverse proxy
 
+> **Gotcha — check the VM's own OS firewall too, and check rule *order*.** Several stock cloud images (Oracle Cloud's Ubuntu images in particular) ship with `iptables` pre-configured to accept SSH and reject everything else by default. If you (or a setup script) append new `ACCEPT` rules for `8080`/`443` after that catch-all `REJECT` rule, they are silently dead — `iptables` matches top to bottom, so the reject fires first and the port stays closed to the outside world even though `iptables -L` shows an "allow" rule for it further down. This is easy to miss because the backend still answers fine on `127.0.0.1` from inside the VM (loopback traffic skips the rule), so the API looks healthy over SSH while every external caller — including your Vercel frontend — silently times out.
+>
+> Check with `sudo iptables -L INPUT -n --line-numbers` and make sure your `ACCEPT` rules for the ports you need come *before* any blanket `REJECT`/`DROP` rule. If you need to reorder, insert the correct rules with `sudo iptables -I INPUT <line-number-before-the-reject> ...`, remove the old dead ones, then run `sudo netfilter-persistent save` (if `iptables-persistent` is installed) so the fix survives a reboot. After any change, verify from *outside* the VM — `curl http://<public-ip>:8080/api/health` from your own machine, not just from inside an SSH session.
+
 Recommended baseline packages:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libssl-dev curl git nginx
-curl https://sh.rustup.rs -sSf | sh -s -- -y
+sudo apt install -y curl git nginx
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
-source "$HOME/.cargo/env"
 node -v
 npm -v
-cargo -V
 ```
+
+Rust itself is only needed on the VM if you plan to build there; the recommended flow (below) downloads a prebuilt release binary instead, so `cargo`/`rustup` are optional.
 
 ### 2. Upload the repo and install dependencies
 
 ```bash
 cd ~
 git clone <repo-url> auto-trader
-cd auto-trader
-
-cargo build --release -p server
-cd kotak-bridge
+cd auto-trader/kotak-bridge
 npm install
 cd ..
 ```
 
-Important runtime note:
+The backend binary itself does **not** need to be built on the VM — see step 4.
 
-- run the backend from the repo root so `trades.db`, `session.json`, `frontend/dist`, and `kotak-bridge/` all resolve correctly
+Important runtime note — **PATH CONTRACT**:
+
+- the server binary must run with `auto-trader/backend/` as its working directory, not the repo root — it resolves `trades.db`, `session.json`, `../frontend/dist`, and `../kotak-bridge` relative to the working directory it was started from. Starting it from anywhere else breaks those lookups. In production the binary itself also lives directly inside `backend/` (see step 4), so in practice this means: `cd ~/auto-trader/backend && ./the-binary`.
+- `frontend/dist` doesn't need to contain a real build in production, since the frontend is served by Vercel, not this server — the static-fallback route just won't have anything to serve if you hit the VM's IP directly, which is expected.
 
 ### 3. Build the frontend for Vercel
 
@@ -285,20 +288,36 @@ Vercel settings:
 
 No frontend environment variable is required for the backend URL because the UI now asks for it and stores it in browser storage and a cookie.
 
-### 4. Start the backend manually once
+### 4. Fetch and start the backend binary
 
-Export only the variables you actually need. Example:
+Download the latest release binary built by CI (`.github/workflows/release-server.yml`) rather than building on the VM — this is a small VM that also runs the live 50ms trading-tick loop once it's live, and a `cargo build --release` here would compete with it for CPU/memory:
 
 ```bash
-cd ~/auto-trader
-export PASSKEY=change-me
-export AUTH_SECRET=change-me-too
-export DATABASE_URL=sqlite:///home/ubuntu/auto-trader/trades.db
-export TELEGRAM_API_ID=12345678
-export TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
-export TELEGRAM_CHAT_IDS=-1001234567890
+cd ~/auto-trader/backend
+LATEST_JSON=$(curl -s https://api.github.com/repos/MrImmortal09/auto-trader/releases/latest)
+DOWNLOAD_URL=$(echo "$LATEST_JSON" | grep -o '"browser_download_url": *"[^"]*"' | grep 'x86_64-unknown-linux-gnu' | head -n1 | cut -d '"' -f4)
+curl -fsSL "$DOWNLOAD_URL" -o "$(basename "$DOWNLOAD_URL")"
+chmod +x server-*-x86_64-unknown-linux-gnu
+```
 
-./target/release/server
+Put your env vars in `~/auto-trader/backend/.env` (auto-loaded from the working directory at startup — see [Environment Variables](#environment-variables)):
+
+```bash
+cat > ~/auto-trader/backend/.env <<'EOF'
+PASSKEY=change-me
+AUTH_SECRET=change-me-too
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
+TELEGRAM_CHAT_IDS=-1001234567890,-1009876543210
+KOTAK_SCRIPS=nse_cm|11536&nse_cm|1594
+EOF
+```
+
+**PATH CONTRACT, again:** start it from inside `backend/`, not the repo root — `trades.db`, `.env`, `session.json`, and the `../frontend/dist` / `../kotak-bridge` lookups are all relative to the working directory:
+
+```bash
+cd ~/auto-trader/backend
+./server-*-x86_64-unknown-linux-gnu
 ```
 
 Expected behavior:
@@ -307,55 +326,21 @@ Expected behavior:
 - Kotak bridge starts only after valid Kotak login tokens exist
 - Telegram auth state is stored in `session.json`
 
-### 5. Put the backend under systemd
+### 5. Run it under tmux, and keep it updated with `update.sh`
 
-Create a dedicated environment file:
-
-```bash
-sudo mkdir -p /etc/auto-trader
-sudo tee /etc/auto-trader/server.env >/dev/null <<'EOF'
-PASSKEY=change-me
-AUTH_SECRET=change-me-too
-DATABASE_URL=sqlite:///home/ubuntu/auto-trader/trades.db
-TELEGRAM_API_ID=12345678
-TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
-TELEGRAM_CHAT_IDS=-1001234567890,-1009876543210
-KOTAK_SCRIPS=nse_cm|11536&nse_cm|1594
-EOF
-```
-
-Create the service file:
+This project runs the backend in the foreground of a dedicated `tmux` pane rather than under systemd, so a live trading process is never silently backgrounded or auto-restarted mid-position without a human noticing:
 
 ```bash
-sudo tee /etc/systemd/system/auto-trader.service >/dev/null <<'EOF'
-[Unit]
-Description=Auto Trader backend
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/auto-trader
-EnvironmentFile=/etc/auto-trader/server.env
-ExecStart=/home/ubuntu/auto-trader/target/release/server
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+tmux new-session -d -s 0
+tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server-*-x86_64-unknown-linux-gnu" C-m
+tmux attach -t 0
 ```
 
-Enable and start it:
+Session `0`, window `0` (i.e. pane `0:0`) is what `update.sh` restarts by default — using the exact names above means it works with no edits. If you'd rather use a different session/window name, update `TMUX_PANE` at the top of `backend/server/update.sh` to match.
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable auto-trader
-sudo systemctl start auto-trader
-sudo systemctl status auto-trader
-journalctl -u auto-trader -f
-```
+`backend/server/update.sh` (already in the repo) handles subsequent updates: it's what `POST /api/update_server` spawns, or you can run it by hand. It syncs `origin/main`, downloads the newest release binary, backs up the binary that's currently running, swaps it in, restarts the `tmux` pane, and health-checks `/api/health` — rolling back to the backup automatically if the new binary doesn't come up healthy. All output goes to `/tmp/update.log` on the VM.
+
+If you'd rather run under systemd with auto-restart-on-crash instead of tmux, that's a reasonable alternative for a less hands-on setup — just be aware `update.sh` as written assumes tmux, so you'd need to adapt its stop/start steps to `systemctl restart` first.
 
 ### 6. Optional: expose backend through Nginx
 
@@ -442,8 +427,9 @@ For Kotak:
 
 Before considering the deployment ready, verify:
 
-- `curl http://127.0.0.1:8080/api/settings` returns JSON on the VM
-- `systemctl status auto-trader` shows the service is healthy
+- `curl http://127.0.0.1:8080/api/settings` returns JSON **from inside the VM** (over SSH)
+- `curl http://<public-ip>:8080/api/health` returns JSON **from your own machine, outside the VM** — this is the check that would have caught the iptables-ordering gotcha from step 1; a pass over SSH alone does not prove the outside world can reach it
+- `tmux attach -t trader` (or your session name) shows the server running and logging normally
 - the Vercel frontend can load settings and portfolio data
 - live logs connect through `/api/logs/stream`
 - Telegram chat selection works
@@ -451,14 +437,15 @@ Before considering the deployment ready, verify:
 
 ### 10. Important persistence notes
 
-These files should remain on persistent disk on the VM:
+These files should remain on persistent disk on the VM, inside `backend/`:
 
-- `trades.db`
+- `trades.db` (+ `-shm`/`-wal` companion files)
 - `session.json`
-- the built server binary under `target/release/server`
+- `.env`
+- the current release binary, `backend/server-<version>-x86_64-unknown-linux-gnu`
 - `kotak-bridge/node_modules/`
 
-If you rebuild or redeploy, keep the same working directory or copy over the database and session files.
+`update.sh` already keeps one previous binary as `backend/.server_prev` for rollback and prunes older ones — you don't need to manage binary versions by hand. If you ever move to a fresh VM, copy over `trades.db*`, `session.json`, and `.env` from `backend/` before starting the server there.
 
 ---
 
