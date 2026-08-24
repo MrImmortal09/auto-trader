@@ -418,7 +418,7 @@ pub struct ReconcileOption {
     pub recommended: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReconcileAction {
     /// Set `executed_qty` to the broker's figure; state and stop untouched.
     AdoptQty,
@@ -426,6 +426,15 @@ pub enum ReconcileAction {
     Close,
     /// No local state changes — acknowledges the finding without acting.
     Ignore,
+    /// Manually adopt broker exposure the engine has no record of (see
+    /// `ReconcileCategory::UnexplainedExposure`) as a brand-new `Active`
+    /// position, with a single user-entered target and stop-loss. `target`
+    /// seeds `signal.targets[0]` ("target 1"); if `TradingConfig::dynamic_targeting`
+    /// is on, the runner extends past it exactly like any other position —
+    /// there is no separate target 2 to enter. Quantity and average buy
+    /// price are read fresh from the broker at apply time, never trusted
+    /// from the client.
+    AdoptManual { stop_loss: f64, target: f64 },
 }
 
 /// One user-confirmed action from a reconciliation report, to actually apply.

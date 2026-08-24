@@ -175,10 +175,19 @@ export type ReconcileCategory =
   | 'UnexplainedExposure'
   | 'DuplicateAmbiguous';
 
-export type ReconcileActionKind = 'AdoptQty' | 'Close' | 'Ignore';
+export type ReconcileActionKind = 'AdoptQty' | 'Close' | 'Ignore' | 'AdoptManual';
+
+/** Mirrors the Rust `ReconcileAction` enum's default (externally-tagged) serde
+ * shape: the three unit variants serialize as bare strings, the data-carrying
+ * `AdoptManual` variant as `{ AdoptManual: { stop_loss, target } }`. */
+export type ReconcileAction =
+  | 'AdoptQty'
+  | 'Close'
+  | 'Ignore'
+  | { AdoptManual: { stop_loss: number; target: number } };
 
 export interface ReconcileOption {
-  action: ReconcileActionKind;
+  action: ReconcileAction;
   label: string;
   recommended: boolean;
 }
@@ -197,7 +206,7 @@ export interface ReconcileFinding {
 export interface ReconcileApplyItem {
   position_id: string | null;
   trading_symbol: string;
-  action: ReconcileActionKind;
+  action: ReconcileAction;
 }
 
 export type ScreenId = 'dashboard' | 'positions' | 'analytics' | 'portfolio' | 'settings';

@@ -567,7 +567,10 @@ pub async fn reconcile_apply_handler(
     if state.trading_cfg.read().await.mode != "LIVE" {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Only meaningful in LIVE mode"}))).into_response();
     }
-    match trading_engine::apply_reconciliation(&state.positions, &state.kotak, &state.db_tx, &state.log_tx, &items).await {
+    match trading_engine::apply_reconciliation(
+        &state.positions, &state.kotak, &state.scrip_store, &state.prices, &state.ws_tx,
+        &state.db_tx, &state.log_tx, &items,
+    ).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "applied", "count": items.len()}))).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e}))).into_response(),
     }

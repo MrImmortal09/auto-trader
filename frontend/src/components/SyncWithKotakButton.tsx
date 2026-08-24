@@ -1,10 +1,19 @@
 import { useState } from 'react';
 import { RefreshCw, X } from 'lucide-react';
-import type { ReconcileActionKind, ReconcileApplyItem, ReconcileFinding } from '../types';
+import type { ReconcileAction, ReconcileActionKind, ReconcileApplyItem, ReconcileFinding } from '../types';
 import { apiFetch } from '../lib/api';
 
 function keyOf(f: ReconcileFinding) {
   return f.position_id ?? `sym:${f.trading_symbol}`;
+}
+
+function kindOf(action: ReconcileAction): ReconcileActionKind {
+  return typeof action === 'string' ? action : 'AdoptManual';
+}
+
+interface ManualInputs {
+  stop_loss: string;
+  target: string;
 }
 
 /** "Sync with Kotak" — on-demand comparison against real broker positions.
@@ -14,6 +23,7 @@ export function SyncWithKotakButton({ serverBase, onSynced }: { serverBase: stri
   const [loading, setLoading] = useState(false);
   const [findings, setFindings] = useState<ReconcileFinding[] | null>(null);
   const [selections, setSelections] = useState<Record<string, ReconcileActionKind>>({});
+  const [manualInputs, setManualInputs] = useState<Record<string, ManualInputs>>({});
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -32,9 +42,10 @@ export function SyncWithKotakButton({ serverBase, onSynced }: { serverBase: stri
       const initial: Record<string, ReconcileActionKind> = {};
       for (const f of list) {
         const rec = f.options.find((o) => o.recommended);
-        if (rec) initial[keyOf(f)] = rec.action;
+        if (rec) initial[keyOf(f)] = kindOf(rec.action);
       }
       setSelections(initial);
+      setManualInputs({});
     } catch (e) {
       console.error(e);
       setError('Network error contacting the server');
@@ -43,11 +54,39 @@ export function SyncWithKotakButton({ serverBase, onSynced }: { serverBase: stri
     }
   }
 
+  function selectManualEntry(key: string) {
+    setSelections((s) => ({ ...s, [key]: 'AdoptManual' }));
+    setManualInputs((m) => (m[key] ? m : { ...m, [key]: { stop_loss: '', target: '' } }));
+  }
+
+  function updateManualInput(key: string, field: keyof ManualInputs, value: string) {
+    setManualInputs((m) => ({ ...m, [key]: { ...(m[key] ?? { stop_loss: '', target: '' }), [field]: value } }));
+  }
+
   async function applySelections() {
     if (!findings) return;
-    const items: ReconcileApplyItem[] = findings
-      .filter((f) => f.options.length > 0 && selections[keyOf(f)])
-      .map((f) => ({ position_id: f.position_id, trading_symbol: f.trading_symbol, action: selections[keyOf(f)] }));
+    setError(null);
+
+    const items: ReconcileApplyItem[] = [];
+    for (const f of findings) {
+      if (f.options.length === 0) continue;
+      const kind = selections[keyOf(f)];
+      if (!kind) continue;
+
+      if (kind === 'AdoptManual') {
+        const raw = manualInputs[keyOf(f)] ?? { stop_loss: '', target: '' };
+        const stop_loss = parseFloat(raw.stop_loss);
+        const target = parseFloat(raw.target);
+        if (!Number.isFinite(stop_loss) || stop_loss <= 0 || !Number.isFinite(target) || target <= 0) {
+          setError(`Enter a stop-loss and target greater than 0 for ${f.instrument} before applying.`);
+          return;
+        }
+        items.push({ position_id: f.position_id, trading_symbol: f.trading_symbol, action: { AdoptManual: { stop_loss, target } } });
+      } else {
+        items.push({ position_id: f.position_id, trading_symbol: f.trading_symbol, action: kind });
+      }
+    }
+
     setApplying(true);
     try {
       const res = await apiFetch(serverBase, '/api/positions/reconcile/apply', {
@@ -110,30 +149,74 @@ export function SyncWithKotakButton({ serverBase, onSynced }: { serverBase: stri
             </div>
 
             <div className="flex-1 overflow-y-auto p-5 space-y-3">
+              {error && (
+                <div className="bg-error-container border border-error text-on-error-container rounded-lg px-3.5 py-2.5 text-xs">
+                  {error}
+                </div>
+              )}
               {findings.length === 0 && (
                 <div className="text-sm text-on-surface-variant text-center py-6">Nothing tracked right now — nothing to compare.</div>
               )}
-              {actionable.map((f) => (
-                <div key={keyOf(f)} className="border border-outline-variant rounded-lg p-3.5 bg-surface">
-                  <div className="text-sm text-on-surface mb-2.5">{f.message}</div>
-                  <div className="flex flex-wrap gap-2">
-                    {f.options.map((o) => (
-                      <button
-                        key={o.action}
-                        onClick={() => setSelections((s) => ({ ...s, [keyOf(f)]: o.action }))}
-                        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-                          selections[keyOf(f)] === o.action
-                            ? 'bg-primary text-on-primary'
-                            : 'bg-surface-container text-on-surface-variant hover:bg-surface-container-high'
-                        }`}
-                      >
-                        {o.label}
-                        {o.recommended ? ' (recommended)' : ''}
-                      </button>
-                    ))}
+              {actionable.map((f) => {
+                const key = keyOf(f);
+                const selectedKind = selections[key];
+                return (
+                  <div key={key} className="border border-outline-variant rounded-lg p-3.5 bg-surface">
+                    <div className="text-sm text-on-surface mb-2.5">{f.message}</div>
+                    <div className="flex flex-wrap gap-2">
+                      {f.options.map((o) => {
+                        const kind = kindOf(o.action);
+                        return (
+                          <button
+                            key={kind}
+                            onClick={() => (kind === 'AdoptManual' ? selectManualEntry(key) : setSelections((s) => ({ ...s, [key]: kind })))}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                              selectedKind === kind
+                                ? 'bg-primary text-on-primary'
+                                : 'bg-surface-container text-on-surface-variant hover:bg-surface-container-high'
+                            }`}
+                          >
+                            {o.label}
+                            {o.recommended ? ' (recommended)' : ''}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {selectedKind === 'AdoptManual' && (
+                      <div className="mt-3 pt-3 border-t border-outline-variant/60 grid grid-cols-2 gap-3">
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] uppercase tracking-wide text-on-surface-variant font-semibold">Stop Loss (₹)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.05"
+                            value={manualInputs[key]?.stop_loss ?? ''}
+                            onChange={(e) => updateManualInput(key, 'stop_loss', e.target.value)}
+                            placeholder="e.g. 120.50"
+                            className="bg-surface-container-lowest border border-outline-variant rounded px-2.5 py-1.5 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
+                          />
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] uppercase tracking-wide text-on-surface-variant font-semibold">Target 1 (₹)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.05"
+                            value={manualInputs[key]?.target ?? ''}
+                            onChange={(e) => updateManualInput(key, 'target', e.target.value)}
+                            placeholder="e.g. 180.00"
+                            className="bg-surface-container-lowest border border-outline-variant rounded px-2.5 py-1.5 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
+                          />
+                        </div>
+                        <p className="col-span-2 text-[10px] text-on-surface-variant">
+                          If Dynamic Targeting is on in Settings, the runner extends past this target the same as any other position — no separate target 2 needed.
+                        </p>
+                      </div>
+                    )}
                   </div>
-                </div>
-              ))}
+                );
+              })}
 
               {informational.length > 0 && (
                 <div className="pt-2 border-t border-outline-variant/50 space-y-1.5">

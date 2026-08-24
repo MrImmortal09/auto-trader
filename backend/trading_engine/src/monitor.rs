@@ -1083,11 +1083,12 @@ pub async fn preview_reconciliation(
         });
     }
 
-    // Broker exposure the engine has no record of at all. Deliberately no
-    // one-click "square it off" here — this engine has zero context on why
-    // it exists (could be a manual hedge, a different strategy entirely), so
-    // the only safe option is acknowledging it, same philosophy as startup
-    // reconciliation's "reported, never touched".
+    // Broker exposure the engine has no record of at all. No one-click
+    // "square it off" here — this engine has zero context on why it exists
+    // (could be a manual hedge, a different strategy entirely). The one
+    // action offered beyond acknowledging it is bringing it under the
+    // engine's own SL/target management, but only with a stop-loss and
+    // target the user types in themselves — never guessed.
     let tracked_symbols: Vec<&str> = tracked.iter().map(|t| t.trading_symbol.trim()).filter(|s| !s.is_empty()).collect();
     for bp in &broker_positions {
         let sym = bp.trading_symbol.trim();
@@ -1102,6 +1103,14 @@ pub async fn preview_reconciliation(
                 message: format!("The broker holds {} of {sym} that this app has no record of at all.", bp.net_qty()),
                 options: vec![
                     ReconcileOption { action: ReconcileAction::Ignore, label: "Ignore — I'm managing this manually".to_string(), recommended: true },
+                    // stop_loss/target are placeholders — the frontend collects
+                    // the real numbers from the user and substitutes them into
+                    // the ReconcileApplyItem it actually sends.
+                    ReconcileOption {
+                        action: ReconcileAction::AdoptManual { stop_loss: 0.0, target: 0.0 },
+                        label: "Adopt into my positions (enter SL & target)".to_string(),
+                        recommended: false,
+                    },
                 ],
             });
         }
@@ -1114,16 +1123,22 @@ pub async fn preview_reconciliation(
 /// Re-fetches broker positions fresh rather than trusting a client-echoed
 /// quantity, in case time passed between preview and confirmation. Only ever
 /// touches the specific positions named.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_reconciliation(
     positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
     kotak: &KotakHandle,
+    scrip_store: &Arc<RwLock<Option<crate::ScripStore>>>,
+    prices: &Arc<DashMap<String, f64>>,
+    ws_tx: &Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
     db_tx: &mpsc::Sender<DbWriteMessage>,
     log_tx: &broadcast::Sender<String>,
     items: &[shared_domain::ReconcileApplyItem],
 ) -> Result<(), String> {
     use shared_domain::ReconcileAction;
 
-    let needs_broker_truth = items.iter().any(|i| i.action == ReconcileAction::AdoptQty);
+    let needs_broker_truth = items.iter().any(|i| {
+        matches!(i.action, ReconcileAction::AdoptQty | ReconcileAction::AdoptManual { .. })
+    });
     let broker_positions = if needs_broker_truth {
         let guard = kotak.lock().await;
         let Some(client) = guard.as_ref() else {
@@ -1135,7 +1150,7 @@ pub async fn apply_reconciliation(
     };
 
     for item in items {
-        match item.action {
+        match &item.action {
             ReconcileAction::Ignore => {
                 live_info(db_tx, log_tx, json!({
                     "event": "RECONCILE_ACK",
@@ -1173,12 +1188,171 @@ pub async fn apply_reconciliation(
                     "manually reconciled: {} executed_qty adopted from broker ({broker_qty})", item.trading_symbol
                 )).await;
             }
+            ReconcileAction::AdoptManual { stop_loss, target } => {
+                adopt_manual(
+                    positions, scrip_store, prices, ws_tx, db_tx, log_tx,
+                    &broker_positions, &item.trading_symbol, *stop_loss, *target,
+                ).await;
+            }
         }
     }
 
     let snapshot = { positions.read().await.clone() };
     send_positions_snapshot(db_tx, &snapshot).await;
     Ok(())
+}
+
+/// Builds a brand-new `Active` position from broker exposure the engine had
+/// no record of at all (`ReconcileCategory::UnexplainedExposure`), using a
+/// user-entered stop-loss and single target — see `ReconcileAction::AdoptManual`.
+/// Mirrors how a fresh BUY signal resolves its `OrderRequest`/`ws_scrip_key`
+/// in `start_position_monitor`, just keyed off the broker's trading symbol
+/// (via `ScripStore::find_by_trading_symbol`) instead of a parsed `TradeSignal`.
+#[allow(clippy::too_many_arguments)]
+async fn adopt_manual(
+    positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
+    scrip_store: &Arc<RwLock<Option<crate::ScripStore>>>,
+    prices: &Arc<DashMap<String, f64>>,
+    ws_tx: &Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    broker_positions: &Option<Vec<kotak_client::KotakPosition>>,
+    trading_symbol: &str,
+    stop_loss: f64,
+    target: f64,
+) {
+    // Never double-adopt: a symbol already tracked (open or waiting) has a
+    // real position id and belongs to AdoptQty/Close instead.
+    let already_tracked = {
+        let g = positions.read().await;
+        g.iter().any(|p| {
+            !matches!(p.state, TradeState::Closed)
+                && p.resolved_order.as_ref().map(|o| o.trading_symbol.trim()) == Some(trading_symbol.trim())
+        })
+    };
+    if already_tracked {
+        loud_error(db_tx, log_tx, trading_symbol, &format!(
+            "manual adopt skipped: {trading_symbol} is already a tracked position"
+        )).await;
+        return;
+    }
+
+    let Some(bp) = broker_positions.as_ref().and_then(|bps| {
+        bps.iter().find(|bp| bp.trading_symbol.trim() == trading_symbol.trim())
+    }) else {
+        loud_error(db_tx, log_tx, trading_symbol, &format!(
+            "manual adopt failed: {trading_symbol} no longer shows an open quantity at the broker"
+        )).await;
+        return;
+    };
+    let qty = bp.net_qty();
+    if qty <= 0 {
+        loud_error(db_tx, log_tx, trading_symbol, &format!(
+            "manual adopt skipped: {trading_symbol} broker quantity is now zero"
+        )).await;
+        return;
+    }
+
+    let record = {
+        let scrip_guard = scrip_store.read().await;
+        let Some(store) = scrip_guard.as_ref() else {
+            loud_error(db_tx, log_tx, trading_symbol, "manual adopt failed: Scrip Master not loaded").await;
+            return;
+        };
+        let Some(record) = store.find_by_trading_symbol(trading_symbol) else {
+            loud_error(db_tx, log_tx, trading_symbol, &format!(
+                "manual adopt failed: {trading_symbol} not found in Scrip Master"
+            )).await;
+            return;
+        };
+        record
+    };
+
+    use shared_domain::{AmoFlag, ExchangeSegment, OrderRequest, OrderType, ProductCode, TradeSignal, TransactionType, Validity};
+    let exchange_segment = match record.exchange_segment_code.as_str() {
+        "bse_fo" => ExchangeSegment::BseFo,
+        "nse_cm" => ExchangeSegment::NseCm,
+        _ => ExchangeSegment::NseFo,
+    };
+    let resolved_order = OrderRequest {
+        after_market_order: AmoFlag::No,
+        disclosed_quantity: "0".to_string(),
+        exchange_segment,
+        market_protection: "0".to_string(),
+        product_code: ProductCode::Nrml,
+        portfolio_flag: "N".to_string(),
+        price: "0".to_string(),
+        order_type: OrderType::Limit,
+        quantity: record.lot_size.to_string(),
+        validity: Validity::Day,
+        trigger_price: "0".to_string(),
+        trading_symbol: record.trading_symbol.clone(),
+        transaction_type: TransactionType::Buy,
+    };
+
+    let avg_buy_price = bp.avg_buy_price();
+    let sl = round_down_tick(stop_loss, record.tick_size);
+    let tgt = round_down_tick(target, record.tick_size);
+    let ws_scrip_key = format!("{}|{}", record.exchange_segment_code, record.instrument_token);
+
+    prices.entry(ws_scrip_key.clone()).or_insert(0.0);
+    {
+        let tx_guard = ws_tx.lock().await;
+        if let Some(tx) = tx_guard.as_ref() {
+            let _ = tx.send(json!({ "action": "subscribe", "scrips": ws_scrip_key }).to_string());
+        }
+    }
+
+    let new_pos = MonitoredPosition {
+        id: uuid::Uuid::new_v4().to_string(),
+        signal: TradeSignal {
+            instrument_name: record.symbol_name.clone(),
+            strike: Some(record.strike_price),
+            option_type: (!record.option_type.is_empty()).then(|| record.option_type.clone()),
+            expiry: Some(record.expiry_date.format("%d-%b-%Y").to_string().to_uppercase()),
+            action: "BUY".to_string(),
+            entry_condition: "ABOVE".to_string(),
+            entry_price: avg_buy_price,
+            targets: vec![tgt],
+            stop_loss: sl,
+            source: "MANUAL_RECONCILE".to_string(),
+            signal_id: None,
+            raw_message: None,
+        },
+        state: TradeState::Active,
+        created_at: shared_domain::current_ist_timestamp_string(),
+        current_sl: sl,
+        next_dynamic_target: None,
+        last_dynamic_rung: None,
+        dynamic_rung_number: 0,
+        manual_sell_qty: None,
+        executed_qty: qty,
+        avg_buy_price,
+        override_qty: None,
+        resolved_order: Some(resolved_order),
+        ltp: None,
+        ws_scrip_key: Some(ws_scrip_key),
+        force_exit: None,
+        override_exit_price: None,
+        tick_size: record.tick_size,
+        entry_order_id: None,
+        sl_order_id: None,
+        sl_order_qty: 0,
+        sl_order_trigger: 0.0,
+        target_order_id: None,
+        pending_exit_order_id: None,
+        pending_exit_qty: 0,
+        pending_exit_reason: None,
+        entry_cancel_sent: false,
+        exit_attempts: 0,
+        live_halt: None,
+    };
+
+    { positions.write().await.push(new_pos); }
+
+    loud_error(db_tx, log_tx, trading_symbol, &format!(
+        "manually adopted {trading_symbol} — qty {qty} @ avg ₹{avg_buy_price:.2}, SL ₹{sl:.2}, target ₹{tgt:.2}"
+    )).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,8 +1517,13 @@ fn decide_live(
                     } else {
                         tgt1_slice_qty(held, lot_size_of(pos), cfg.target_1_exit_pct)
                     };
+                    // Target 2 only ever mattered here as an "is there more
+                    // room to run" check — the dynamic path itself only ever
+                    // reads target 1. So a single-target signal still ladders
+                    // when dynamic targeting is on, instead of always fully
+                    // exiting at target 1 regardless of the setting.
                     let has_t2 = pos.signal.targets.len() > 1;
-                    if !has_t2 || slice >= held {
+                    if (!has_t2 && !cfg.dynamic_targeting) || slice >= held {
                         Some(LiveAction::ExitAll { qty: held, reason: "TGT1_FULL".to_string() })
                     } else {
                         // diff = distance from entry to target 1. Every rung of

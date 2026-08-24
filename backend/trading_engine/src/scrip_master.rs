@@ -143,6 +143,19 @@ impl ScripStore {
         }
     }
 
+    /// Exact lookup by broker trading symbol (e.g. `"NIFTY2872625000CE"`) —
+    /// for resolving a raw broker position/order that has no parsed
+    /// `TradeSignal` to search with, unlike `resolve_signal`'s strike/expiry/
+    /// option-type search.
+    pub fn find_by_trading_symbol(&self, trading_symbol: &str) -> Option<ScripRecord> {
+        let needle = trading_symbol.trim();
+        self.records
+            .values()
+            .flatten()
+            .find(|r| r.trading_symbol.trim() == needle)
+            .cloned()
+    }
+
     pub fn resolve_signal(&self, signal: &TradeSignal) -> Option<ScripRecord> {
         let options = self.records.get(&signal.instrument_name)?;
         
