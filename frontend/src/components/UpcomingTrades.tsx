@@ -6,6 +6,29 @@ import { fmt } from '../lib/format';
 import { QtyInput } from './QtyInput';
 import { SyncWithKotakButton } from './SyncWithKotakButton';
 
+// The static `signal.targets` list goes stale the moment a dynamic-targeting
+// runner extends past it — `next_dynamic_target` is the real rung the engine
+// is watching. Falls back to the fixed target list for everything else
+// (target 1 not hit yet, or dynamic targeting was off for this position).
+function nextTargetLabel(p: MonitoredPosition): string {
+  if (p.next_dynamic_target != null) {
+    return `₹${fmt(p.next_dynamic_target)} (dynamic)`;
+  }
+  return p.signal.targets.map((t) => `₹${fmt(t)}`).join(' / ');
+}
+
+// A dynamic-targeting runner keeps extending past target 1 without ever
+// changing `TradeState` off "Target1Hit" (that's still the correct lifecycle
+// state — see shared_domain). `dynamic_rung_number` counts how many rungs
+// have actually been hit, so the label can progress Target1Hit -> Target2Hit
+// -> Target3Hit -> … instead of freezing at "Target1Hit" forever.
+function stateLabel(p: MonitoredPosition): string {
+  if (p.state === 'Target1Hit' && (p.dynamic_rung_number ?? 0) > 1) {
+    return `Target${p.dynamic_rung_number}Hit`;
+  }
+  return p.state;
+}
+
 export function UpcomingTrades({ serverBase }: { serverBase: string }) {
   const [positions, setPositions] = useState<MonitoredPosition[]>([]);
   const [openTooltip, setOpenTooltip] = useState<string | null>(null);
@@ -303,6 +326,8 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                                   executed_qty: p.executed_qty,
                                   avg_buy_price: p.avg_buy_price,
                                   current_sl: p.current_sl,
+                                  next_dynamic_target: p.next_dynamic_target,
+                                  dynamic_rung_number: p.dynamic_rung_number,
                                   ltp: p.ltp,
                                   signal: p.signal,
                                   resolved_order: p.resolved_order,
@@ -312,12 +337,12 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                           )}
                         </div>
                       </td>
-                      <td className="px-3 py-2.5 text-surface-tint font-semibold">{p.state}</td>
+                      <td className="px-3 py-2.5 text-surface-tint font-semibold">{stateLabel(p)}</td>
                       <td className="px-3 py-2.5 text-on-surface font-mono-code">{p.executed_qty}</td>
                       <td className="px-3 py-2.5 text-on-surface font-mono-code">₹{fmt(p.avg_buy_price)}</td>
                       <td className="px-3 py-2.5 text-on-surface font-mono-code font-semibold">{hasLtp ? `₹${fmt(p.ltp!)}` : '—'}</td>
                       <td className="px-3 py-2.5 text-error font-mono-code font-semibold">₹{fmt(p.current_sl)}</td>
-                      <td className="px-3 py-2.5 text-primary font-mono-code">{p.signal.targets.map((t) => `₹${fmt(t)}`).join(' / ')}</td>
+                      <td className="px-3 py-2.5 text-primary font-mono-code">{nextTargetLabel(p)}</td>
                       <td className="px-3 py-2.5 text-right font-mono-code">
                         {pnl === null ? (
                           <span className="text-on-surface-variant">—</span>
@@ -365,7 +390,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                       {p.ws_scrip_key && <div className="text-[10px] text-on-surface-variant">{p.ws_scrip_key}</div>}
                     </div>
                     <span className="px-2 py-0.5 rounded text-xs font-label-caps font-bold uppercase bg-primary-container text-on-primary">
-                      {p.state}
+                      {stateLabel(p)}
                     </span>
                   </div>
 
@@ -384,7 +409,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                     </div>
                     <div>
                       <div className="text-on-surface-variant text-[10px] uppercase font-sans">Targets</div>
-                      <div className="font-semibold text-primary truncate">{p.signal.targets.map((t) => `₹${fmt(t)}`).join(' / ')}</div>
+                      <div className="font-semibold text-primary truncate">{nextTargetLabel(p)}</div>
                     </div>
                   </div>
 

@@ -10,7 +10,7 @@ import { TopNavBar } from './components/layout/TopNavBar';
 import { BottomNavBar } from './components/layout/BottomNavBar';
 
 // Components
-import { Info } from 'lucide-react';
+import { Info, Plug, SlidersHorizontal, Activity } from 'lucide-react';
 import { LogTerminal } from './components/LogTerminal';
 import { UpcomingTrades } from './components/UpcomingTrades';
 import { TelegramFeed } from './components/TelegramFeed';
@@ -152,17 +152,27 @@ export default function App() {
           )}
 
           {activeScreen === 'settings' && (
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
-              <div className="space-y-6">
+            <div className="space-y-10">
+              <section className="space-y-4">
+                <h2 className="flex items-center gap-2 text-lg font-bold text-on-surface">
+                  <Plug size={18} className="text-primary" /> Connections
+                </h2>
                 <ConnectionPanel serverBase={serverBase} onServerBaseChange={handleServerBaseChange} />
-              </div>
-              <div className="space-y-6">
+              </section>
+
+              <section className="space-y-4">
+                <h2 className="flex items-center gap-2 text-lg font-bold text-on-surface">
+                  <SlidersHorizontal size={18} className="text-primary" /> Trading Configuration
+                </h2>
                 <SettingsBar serverBase={serverBase} />
-                <div className="bg-surface-container-lowest border border-outline-variant rounded-xl p-4 sm:p-6 shadow-sm">
-                  <h3 className="text-base font-bold text-on-surface mb-4">System Uptime &amp; Health Snapshot</h3>
-                  <HealthPage serverBase={serverBase} />
-                </div>
-              </div>
+              </section>
+
+              <section className="space-y-4">
+                <h2 className="flex items-center gap-2 text-lg font-bold text-on-surface">
+                  <Activity size={18} className="text-primary" /> System Health
+                </h2>
+                <HealthPage serverBase={serverBase} />
+              </section>
             </div>
           )}
         </main>

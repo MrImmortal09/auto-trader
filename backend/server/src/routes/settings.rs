@@ -1,7 +1,8 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use shared_domain::TradingConfig;
+use shared_domain::{TradeState, TradingConfig};
 use serde::Deserialize;
 
+use crate::routes::positions::persist_positions_snapshot;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -38,6 +39,17 @@ pub async fn post_settings_handler(
     // at the DB-bind call site.
     cfg.index_lots = cfg.index_lots.max(1);
     cfg.other_lots = cfg.other_lots.max(1);
+    // Clamped to [0, 1]: at 1.0 the trailed stop on the first rung sits at
+    // exactly the entry price (breakeven); anything above that would trail
+    // the stop below entry, i.e. accept a loss on a position that already
+    // hit target 1. See the field's doc comment in shared_domain.
+    cfg.dynamic_targeting_trail_factor = cfg.dynamic_targeting_trail_factor.clamp(0.0, 1.0);
+    // Clamped strictly positive: at 0 (or below) the next rung would sit at
+    // or below the one just hit, so a dynamic runner would re-trigger every
+    // tick instead of climbing. Capped at 5x mainly to catch a fat-fingered
+    // value, not for safety — an oversized value just means a runner sits
+    // un-trailed for longer while waiting for the next (very distant) rung.
+    cfg.dynamic_targeting_extension_factor = cfg.dynamic_targeting_extension_factor.clamp(0.05, 5.0);
 
     let index_lots_by_symbol_json = serde_json::to_string(&cfg.index_lots_by_symbol)
         .unwrap_or_else(|_| "{}".to_string());
@@ -46,7 +58,7 @@ pub async fn post_settings_handler(
         "UPDATE trading_config
          SET max_trade_amount_inr=?, index_lots=?, other_lots=?, mode=?, brokerage_per_order=?,
              target_1_exit_pct=?, target_2_exit_pct=?, entry_market_protection=?, dynamic_targeting=?,
-             index_lots_by_symbol=?
+             index_lots_by_symbol=?, dynamic_targeting_trail_factor=?, dynamic_targeting_extension_factor=?
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
@@ -59,6 +71,8 @@ pub async fn post_settings_handler(
     .bind(cfg.entry_market_protection)
     .bind(cfg.dynamic_targeting)
     .bind(&index_lots_by_symbol_json)
+    .bind(cfg.dynamic_targeting_trail_factor)
+    .bind(cfg.dynamic_targeting_extension_factor)
     .execute(&state.db_pool)
     .await
     {
@@ -67,6 +81,7 @@ pub async fn post_settings_handler(
     }
 
     *state.trading_cfg.write().await = cfg.clone();
+    recompute_open_dynamic_runners(&state, &cfg).await;
 
     let _ = state.log_tx.send(format!(
         r#"{{"event":"CONFIG_UPDATED","mode":"{}","max_trade":{:.2},"index_lots":{},"other_lots":{}}}"#,
@@ -74,6 +89,41 @@ pub async fn post_settings_handler(
     ));
     tracing::info!(mode = %cfg.mode, max_trade = cfg.max_trade_amount_inr, index_lots = cfg.index_lots, other_lots = cfg.other_lots, "Config updated");
     StatusCode::OK
+}
+
+/// Re-derive `current_sl` and `next_dynamic_target` for every open
+/// `Target1Hit` dynamic-targeting position against the just-saved factors,
+/// so a settings change takes effect immediately instead of only at the next
+/// rung hit. Bounded the same way `decide_live` is — `current_sl` always
+/// lands in `[last_dynamic_rung - diff, last_dynamic_rung]`, so this can
+/// never trail a stop below the position's entry price. No-op for positions
+/// with `last_dynamic_rung: None` (dynamic targeting was off when target 1
+/// hit, or target 1 hasn't hit yet) — those keep whatever the fixed-target-2
+/// path already gave them.
+async fn recompute_open_dynamic_runners(state: &AppState, cfg: &TradingConfig) {
+    let mut positions = state.positions.write().await;
+    let mut changed = false;
+    for p in positions.iter_mut() {
+        if !matches!(p.state, TradeState::Target1Hit) {
+            continue;
+        }
+        let (Some(rung), Some(t1)) = (p.last_dynamic_rung, p.signal.targets.first().copied()) else {
+            continue;
+        };
+        let diff = t1 - p.avg_buy_price;
+        p.next_dynamic_target = Some(rung + diff * cfg.dynamic_targeting_extension_factor);
+        p.current_sl = trading_engine::round_down_tick(
+            rung - diff * cfg.dynamic_targeting_trail_factor,
+            p.tick_size,
+        );
+        changed = true;
+    }
+    if changed {
+        let snapshot = positions.clone();
+        drop(positions);
+        persist_positions_snapshot(state, &snapshot).await;
+        tracing::info!("Recomputed dynamic-targeting SL/next-target for open runners after settings change");
+    }
 }
 
 /// `GET /api/wallet/balance`

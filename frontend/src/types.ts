@@ -16,6 +16,16 @@ export interface TradingConfig {
   /** Sell one lot at target 1, then trail an ever-extending target ladder for
    * the runner instead of exiting at the signal's fixed target 2. */
   dynamic_targeting: boolean;
+  /** Multiplier applied to `diff = target1 - entry` when trailing the stop
+   * under `dynamic_targeting`: stop = rung - diff * factor. 0 = tightest
+   * (locks the rung itself), 1 = loosest (breakeven at entry on the first
+   * rung). Unused unless `dynamic_targeting` is on. */
+  dynamic_targeting_trail_factor: number;
+  /** Multiplier applied to `diff = target1 - entry` when extending the next
+   * rung under `dynamic_targeting`: next_rung = rung + diff * factor. 1.0
+   * reproduces the original fixed `diff` spacing. Unused unless
+   * `dynamic_targeting` is on. */
+  dynamic_targeting_extension_factor: number;
 }
 
 export interface PaperTrade {
@@ -95,6 +105,15 @@ export interface MonitoredPosition {
   };
   state: string;
   current_sl: number;
+  /** Dynamic-targeting runner: the next rung to watch for once target 1 has
+   * been hit, if `TradingConfig.dynamic_targeting` was on when it hit. `null`
+   * means the position exits at the signal's fixed target 2 as usual. */
+  next_dynamic_target?: number | null;
+  /** Dynamic-targeting runner: how many rungs have been hit (1 after target
+   * 1, 2 after the next extension, …). 0/absent for non-dynamic positions —
+   * `state` stays `"Target1Hit"` regardless, this only drives the display
+   * label ("Target2Hit", "Target3Hit", …). */
+  dynamic_rung_number?: number;
   executed_qty: number;
   avg_buy_price: number;
   override_qty: number | null;

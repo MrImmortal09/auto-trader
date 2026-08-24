@@ -85,8 +85,8 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
   };
 
   return (
-    <div className="flex flex-col gap-4 bg-surface-container-low border-b border-outline-variant px-4 sm:px-6 py-3.5 sm:py-4">
-      <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3">
+    <div className="flex flex-col gap-4 bg-surface-container-lowest border border-outline-variant rounded-xl px-4 sm:px-6 py-4 sm:py-5 shadow-sm">
+      <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 pb-4 border-b border-outline-variant">
         <div className="flex gap-4 text-xs font-semibold">
           {/* Kotak status + disconnect */}
           <div className="flex items-center gap-1.5">
@@ -140,8 +140,14 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
           </button>
         </div>
       </div>
-      <KotakLoginPanel serverBase={serverBase} onServerBaseChange={onServerBaseChange} />
-      <TelegramLoginPanel serverBase={serverBase} />
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="bg-surface border border-outline-variant rounded-lg p-3.5">
+          <KotakLoginPanel serverBase={serverBase} onServerBaseChange={onServerBaseChange} />
+        </div>
+        <div className="bg-surface border border-outline-variant rounded-lg p-3.5">
+          <TelegramLoginPanel serverBase={serverBase} />
+        </div>
+      </div>
     </div>
   );
 }

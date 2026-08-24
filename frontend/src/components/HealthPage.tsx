@@ -1,9 +1,12 @@
 import { useState } from 'react';
-import { Activity, Cpu, HardDrive } from 'lucide-react';
+import { Activity, Cpu, HardDrive, Server, KeyRound, RefreshCw } from 'lucide-react';
 import type { HealthSnapshot, KotakStatus } from '../types';
 import { apiFetch } from '../lib/api';
 import { fmtPct, fmtUptime } from '../lib/format';
 import { Stat } from './Stat';
+
+const CARD = 'bg-surface-container-lowest border border-outline-variant rounded-xl overflow-hidden shadow-sm';
+const CARD_HEADER = 'flex items-center gap-2 px-4 sm:px-6 py-3 border-b border-outline-variant bg-surface-container-low text-sm font-bold text-on-surface';
 
 export function HealthPage({ serverBase }: { serverBase: string }) {
   const [snapshot, setSnapshot] = useState<HealthSnapshot | null>(null);
@@ -36,8 +39,8 @@ export function HealthPage({ serverBase }: { serverBase: string }) {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-background">
-      <div className="flex items-center justify-between gap-4 bg-surface-container-lowest border border-outline-variant rounded-lg px-4 py-3 shadow-sm">
+    <div className="space-y-4">
+      <div className={`${CARD} flex items-center justify-between gap-4 px-4 sm:px-6 py-4`}>
         <div>
           <div className="text-sm font-semibold text-on-surface">On-demand instance health</div>
           <div className="text-xs text-on-surface-variant">Fetches CPU, memory, swap, uptime, load average, and current server-process stats only when requested.</div>
@@ -45,8 +48,9 @@ export function HealthPage({ serverBase }: { serverBase: string }) {
         <button
           onClick={loadHealth}
           disabled={loading}
-          className="px-3 py-1.5 bg-primary-container hover:bg-primary disabled:opacity-50 text-on-primary text-sm rounded transition-colors font-medium shadow-sm"
+          className="flex items-center gap-1.5 shrink-0 px-3.5 py-2 bg-primary-container hover:bg-primary disabled:opacity-50 text-on-primary text-sm rounded-lg transition-colors font-semibold shadow-sm"
         >
+          <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
           {loading ? 'Refreshing…' : 'Fetch Health'}
         </button>
       </div>
@@ -64,8 +68,8 @@ export function HealthPage({ serverBase }: { serverBase: string }) {
       )}
 
       {!snapshot && !error && !loading && (
-        <div className="bg-surface-container-lowest border border-outline-variant rounded-lg px-4 py-6 text-sm text-on-surface-variant">
-          No snapshot loaded yet.
+        <div className={`${CARD} px-4 py-8 text-sm text-on-surface-variant text-center`}>
+          No snapshot loaded yet — click "Fetch Health" above.
         </div>
       )}
 
@@ -79,25 +83,25 @@ export function HealthPage({ serverBase }: { serverBase: string }) {
           )}
 
           {kotakStatus && (
-            <div className="bg-surface-container-lowest border border-outline-variant rounded-lg overflow-hidden shadow-sm">
-              <div className="px-4 py-2 border-b border-outline-variant flex items-center justify-between bg-surface-container-low">
-                <span className="text-label-caps text-on-surface-variant uppercase tracking-wide font-semibold">
-                  Kotak Auto-Login
+            <div className={CARD}>
+              <div className={`${CARD_HEADER} justify-between`}>
+                <span className="flex items-center gap-2">
+                  <KeyRound size={15} className="text-primary" /> Kotak Auto-Login
                 </span>
-                <span className={`px-2 py-0.5 rounded text-xs font-label-caps font-bold uppercase ${
+                <span className={`px-2 py-0.5 rounded text-[11px] font-label-caps font-bold uppercase tracking-wide ${
                   kotakStatus.auto_login_ready ? 'bg-[#d1fae5] text-[#065f46]' : 'bg-[#ffe4e6] text-[#9f1239]'
                 }`}>
                   {kotakStatus.auto_login_ready ? 'ON' : 'OFF'}
                 </span>
               </div>
-              <div className="p-4 grid gap-3 sm:grid-cols-2 text-sm">
+              <div className="p-4 sm:p-6 grid gap-3 sm:grid-cols-2 text-sm">
                 <div><span className="text-on-surface-variant">Session connected:</span> <span className="text-on-surface font-medium">{kotakStatus.connected ? 'Yes' : 'No'}</span></div>
                 <div><span className="text-on-surface-variant">KOTAK_AUTO_LOGIN:</span> <span className="text-on-surface font-medium">{kotakStatus.auto_login_enabled ? 'enabled' : 'disabled'}</span></div>
                 <div><span className="text-on-surface-variant">TOTP secret set:</span> <span className="text-on-surface font-medium">{kotakStatus.has_totp_secret ? 'Yes' : 'No'}</span></div>
                 <div><span className="text-on-surface-variant">All KOTAK_* fields set:</span> <span className="text-on-surface font-medium">{kotakStatus.has_env_credentials ? 'Yes' : 'No'}</span></div>
               </div>
               {!kotakStatus.auto_login_ready && kotakStatus.auto_login_reason && (
-                <div className="px-4 pb-4 text-xs text-error">{kotakStatus.auto_login_reason}</div>
+                <div className="px-4 sm:px-6 pb-4 text-xs text-error">{kotakStatus.auto_login_reason}</div>
               )}
             </div>
           )}
@@ -118,11 +122,11 @@ export function HealthPage({ serverBase }: { serverBase: string }) {
           </div>
 
           <div className="grid gap-4 xl:grid-cols-[1.2fr_1fr]">
-            <div className="bg-surface-container-lowest border border-outline-variant rounded-lg overflow-hidden shadow-sm">
-              <div className="px-4 py-2 border-b border-outline-variant text-label-caps text-on-surface-variant uppercase tracking-wide bg-surface-container-low font-semibold">
-                Instance Overview
+            <div className={CARD}>
+              <div className={CARD_HEADER}>
+                <Server size={15} className="text-primary" /> Instance Overview
               </div>
-              <div className="p-4 grid gap-3 sm:grid-cols-2 text-sm">
+              <div className="p-4 sm:p-6 grid gap-3 sm:grid-cols-2 text-sm">
                 <div><span className="text-on-surface-variant">Generated (IST):</span> <span className="text-on-surface font-medium">{snapshot.generated_at_ist}</span></div>
                 <div><span className="text-on-surface-variant">Hostname:</span> <span className="text-on-surface font-medium">{snapshot.hostname ?? '—'}</span></div>
                 <div><span className="text-on-surface-variant">OS:</span> <span className="text-on-surface font-medium">{[snapshot.os_name, snapshot.os_version].filter(Boolean).join(' ') || '—'}</span></div>
@@ -134,11 +138,11 @@ export function HealthPage({ serverBase }: { serverBase: string }) {
               </div>
             </div>
 
-            <div className="bg-surface-container-lowest border border-outline-variant rounded-lg overflow-hidden shadow-sm">
-              <div className="px-4 py-2 border-b border-outline-variant text-label-caps text-on-surface-variant uppercase tracking-wide bg-surface-container-low font-semibold">
-                Current Server Process
+            <div className={CARD}>
+              <div className={CARD_HEADER}>
+                <Activity size={15} className="text-primary" /> Current Server Process
               </div>
-              <div className="p-4 text-sm space-y-2">
+              <div className="p-4 sm:p-6 text-sm space-y-2">
                 {snapshot.current_process ? (
                   <>
                     <div><span className="text-on-surface-variant">PID:</span> <span className="text-on-surface font-medium">{snapshot.current_process.pid}</span></div>

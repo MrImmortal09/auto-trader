@@ -210,7 +210,7 @@ fn stale_entry_reason(pos: &MonitoredPosition, entry_cutoff: bool) -> Option<&'s
 /// Every price the engine sends to the broker goes through this. The exchange
 /// rejects orders that are off the tick grid, and rounding down is the agreed
 /// default direction for all of them — stops, targets and trailed stops alike.
-fn round_down_tick(price: f64, tick: f64) -> f64 {
+pub fn round_down_tick(price: f64, tick: f64) -> f64 {
     if !price.is_finite() || tick <= 0.0 {
         return price;
     }
@@ -1193,14 +1193,17 @@ enum LiveAction {
     /// Give up on an entry that will not be taken; cancel it if it is in flight.
     AbandonEntry { reason: String },
     /// Target 1: trail the software stop to `new_sl`, then market-sell `slice`.
-    /// `next_dynamic_target` seeds the dynamic ladder (see `TrailDynamic`)
-    /// when dynamic targeting is on; `None` keeps the existing fixed-target-2
-    /// behaviour for this position.
-    Target1 { slice: i32, keep: i32, new_sl: f64, next_dynamic_target: Option<f64> },
+    /// `next_dynamic_target`/`dynamic_rung` seed the dynamic ladder (see
+    /// `TrailDynamic`) when dynamic targeting is on; `None` keeps the
+    /// existing fixed-target-2 behaviour for this position.
+    Target1 { slice: i32, keep: i32, new_sl: f64, next_dynamic_target: Option<f64>, dynamic_rung: Option<f64> },
     /// Dynamic-targeting rung hit: trail the stop and extend the next rung.
-    /// No broker call — this is pure local bookkeeping, since protection is
-    /// already a software LTP watch against `current_sl`.
-    TrailDynamic { new_sl: f64, next_target: f64 },
+    /// `rung_hit` is the price level that was just crossed, recorded as
+    /// `last_dynamic_rung` so a later settings change can recompute both
+    /// `new_sl` and `next_target` in place. No broker call — this is pure
+    /// local bookkeeping, since protection is already a software LTP watch
+    /// against `current_sl`.
+    TrailDynamic { new_sl: f64, next_target: f64, rung_hit: f64 },
     /// Market-sell everything we hold (stop hit, target 2, forced exit, etc.).
     /// Cancels any resting sell order first if one happens to exist (e.g.
     /// adopted from the broker at startup) — this engine never places one.
@@ -1346,14 +1349,22 @@ fn decide_live(
                     } else {
                         // diff = distance from entry to target 1. Every rung of
                         // the dynamic ladder (starting with target 1 itself)
-                        // follows one rule: trail the stop to `rung - diff/2`,
-                        // and set the next rung to `rung + diff`.
+                        // follows one rule: trail the stop to
+                        // `rung - diff * dynamic_targeting_trail_factor`, and
+                        // set the next rung to
+                        // `rung + diff * dynamic_targeting_extension_factor`.
                         let diff = t1 - pos.avg_buy_price;
                         Some(LiveAction::Target1 {
                             slice,
                             keep: held - slice,
-                            new_sl: round_down_tick(t1 - diff / 2.0, pos.tick_size),
-                            next_dynamic_target: cfg.dynamic_targeting.then(|| t1 + diff),
+                            new_sl: round_down_tick(
+                                t1 - diff * cfg.dynamic_targeting_trail_factor,
+                                pos.tick_size,
+                            ),
+                            next_dynamic_target: cfg.dynamic_targeting.then(|| {
+                                t1 + diff * cfg.dynamic_targeting_extension_factor
+                            }),
+                            dynamic_rung: cfg.dynamic_targeting.then_some(t1),
                         })
                     }
                 }
@@ -1369,8 +1380,12 @@ fn decide_live(
                         let t1 = *pos.signal.targets.first()?;
                         let diff = t1 - pos.avg_buy_price;
                         Some(LiveAction::TrailDynamic {
-                            new_sl: round_down_tick(next_target - diff / 2.0, pos.tick_size),
-                            next_target: next_target + diff,
+                            new_sl: round_down_tick(
+                                next_target - diff * cfg.dynamic_targeting_trail_factor,
+                                pos.tick_size,
+                            ),
+                            next_target: next_target + diff * cfg.dynamic_targeting_extension_factor,
+                            rung_hit: next_target,
                         })
                     } else {
                         let t2 = *pos.signal.targets.get(1)?;
@@ -1594,7 +1609,7 @@ async fn exec_live_action(
             })).await;
         }
 
-        LiveAction::Target1 { slice, keep, new_sl, next_dynamic_target } => {
+        LiveAction::Target1 { slice, keep, new_sl, next_dynamic_target, dynamic_rung } => {
             // No resting stop to shrink — protection is a pure software watch
             // (see decide_live). Trail current_sl for the runner first, then
             // sell the slice at market; the next tick's LTP check enforces
@@ -1602,6 +1617,8 @@ async fn exec_live_action(
             with_position(positions, &pending.pos_id, |p| {
                 p.current_sl = *new_sl;
                 p.next_dynamic_target = *next_dynamic_target;
+                p.last_dynamic_rung = *dynamic_rung;
+                p.dynamic_rung_number = if dynamic_rung.is_some() { 1 } else { 0 };
                 p.state = TradeState::Target1Hit;
             }).await;
             live_info(db_tx, log_tx, json!({
@@ -1642,10 +1659,12 @@ async fn exec_live_action(
             }
         }
 
-        LiveAction::TrailDynamic { new_sl, next_target } => {
+        LiveAction::TrailDynamic { new_sl, next_target, rung_hit } => {
             with_position(positions, &pending.pos_id, |p| {
                 p.current_sl = *new_sl;
                 p.next_dynamic_target = Some(*next_target);
+                p.last_dynamic_rung = Some(*rung_hit);
+                p.dynamic_rung_number += 1;
             }).await;
             tracing::info!(instrument = %ctx.instrument, new_sl, next_target, "LIVE dynamic target extended");
             live_info(db_tx, log_tx, json!({
@@ -2083,6 +2102,8 @@ pub async fn start_position_monitor(
                                     created_at: shared_domain::current_ist_timestamp_string(),
                                     current_sl: sl,
                                     next_dynamic_target: None,
+                                    last_dynamic_rung: None,
+                                    dynamic_rung_number: 0,
                                     manual_sell_qty: None,
                                     executed_qty: 0,
                                     avg_buy_price: 0.0,
@@ -2424,6 +2445,8 @@ mod tests {
             created_at: created_at.to_string(),
             current_sl: 100.0,
             next_dynamic_target: None,
+            last_dynamic_rung: None,
+            dynamic_rung_number: 0,
             manual_sell_qty: None,
             executed_qty: 0,
             avg_buy_price: 0.0,

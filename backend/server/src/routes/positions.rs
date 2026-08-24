@@ -11,7 +11,7 @@ use trading_engine::FeeCalculator;
 use crate::AppState;
 use shared_domain::{DbWriteMessage, MonitoredPosition, TradeState};
 
-async fn persist_positions_snapshot(state: &AppState, snapshot: &[MonitoredPosition]) {
+pub(crate) async fn persist_positions_snapshot(state: &AppState, snapshot: &[MonitoredPosition]) {
     if let Ok(json) = serde_json::to_string(snapshot) {
         let _ = state
             .db_tx

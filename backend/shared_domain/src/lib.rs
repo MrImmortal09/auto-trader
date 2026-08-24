@@ -158,15 +158,41 @@ pub struct TradingConfig {
     pub entry_market_protection: f64,
     /// When enabled, target 1 sells exactly one lot (not `target_1_exit_pct`)
     /// and the runner never exits at a fixed target 2. Instead each rung,
-    /// starting at target 1, extends the next one by `diff = target1 - entry`
-    /// and trails the stop to `rung - diff/2` — see `decide_live`'s
-    /// `TradeState::Target1Hit` branch for the exact recurrence. Off by
-    /// default: existing signals keep exiting at their own target 2.
+    /// starting at target 1, extends the next one by
+    /// `diff * dynamic_targeting_extension_factor` (`diff = target1 - entry`)
+    /// and trails the stop to `rung - diff * dynamic_targeting_trail_factor`
+    /// — see `decide_live`'s `TradeState::Target1Hit` branch for the exact
+    /// recurrence. Off by default: existing signals keep exiting at their own
+    /// target 2.
     #[serde(default)]
     pub dynamic_targeting: bool,
+    /// Multiplier applied to `diff` when trailing the stop under
+    /// `dynamic_targeting` (see above). `0.5` trails halfway back from each
+    /// rung; `0.0` locks the stop at the rung itself (tightest); `1.0` trails
+    /// only back to the previous rung (loosest — on the first rung that's
+    /// breakeven at entry). Clamped to `[0.0, 1.0]` on save so the stop can
+    /// never trail below the entry price. Unused unless `dynamic_targeting`
+    /// is on; PAPER mode does not use this — it always trails to the fixed
+    /// `(entry + target1) / 2` midpoint. Changing this retroactively updates
+    /// `current_sl` on every open `Target1Hit` dynamic-targeting position —
+    /// see `post_settings_handler`.
+    #[serde(default = "default_trail_factor")]
+    pub dynamic_targeting_trail_factor: f64,
+    /// Multiplier applied to `diff` when extending the next rung under
+    /// `dynamic_targeting` (see above): `next_rung = rung + diff * this`.
+    /// `1.0` (default) reproduces the original fixed `diff` spacing; `< 1.0`
+    /// packs rungs closer together, `> 1.0` spreads them further apart.
+    /// Clamped to `[0.05, 5.0]` on save — it must stay strictly positive, or
+    /// the next rung would sit at or below the one just hit and re-trigger
+    /// every tick. Changing this retroactively updates `next_dynamic_target`
+    /// on every open `Target1Hit` dynamic-targeting position.
+    #[serde(default = "default_extension_factor")]
+    pub dynamic_targeting_extension_factor: f64,
 }
 
 fn default_entry_mp() -> f64 { 5.0 }
+fn default_trail_factor() -> f64 { 0.5 }
+fn default_extension_factor() -> f64 { 1.0 }
 
 // ===========================================================================
 // Trade signal (options-aware)
@@ -243,6 +269,21 @@ pub struct MonitoredPosition {
     /// yet.
     #[serde(default)]
     pub next_dynamic_target: Option<f64>,
+    /// Dynamic-targeting runner state: the price level of the rung most
+    /// recently hit (target 1 itself the first time, then each extended rung
+    /// after). `current_sl` and `next_dynamic_target` are both derived from
+    /// this plus the live `dynamic_targeting_trail_factor` /
+    /// `dynamic_targeting_extension_factor`, which is what lets
+    /// `post_settings_handler` recompute both in place when those factors
+    /// change, instead of only taking effect on the next rung hit.
+    #[serde(default)]
+    pub last_dynamic_rung: Option<f64>,
+    /// Dynamic-targeting runner state: how many rungs have been hit (1 after
+    /// target 1, 2 after the next extension, …). Display-only — drives the
+    /// `TargetNHit` label in the frontend; `Target1Hit` stays the actual
+    /// `TradeState` for the whole runner regardless of this count.
+    #[serde(default)]
+    pub dynamic_rung_number: i32,
     /// LIVE mode: a user-requested partial market sell for this quantity,
     /// picked up and cleared on the next tick. Distinct from `force_exit`,
     /// which always sells the whole holding.
