@@ -655,6 +655,9 @@ impl KotakClient {
             .await?;
 
         if !raw.stat.eq_ignore_ascii_case("Ok") {
+            if raw.st_code == 5203 {
+                return Ok(Vec::new());
+            }
             return Err(KotakError::ApiError {
                 status_code: raw.st_code,
                 message: raw.emsg.unwrap_or(raw.stat),
@@ -696,7 +699,7 @@ impl KotakClient {
 
         if !raw.stat.eq_ignore_ascii_case("Ok") {
             let message = raw.emsg.unwrap_or(raw.stat);
-            if message.to_lowercase().contains("no data") {
+            if raw.st_code == 5203 || message.to_lowercase().contains("no data") {
                 return Ok(Vec::new());
             }
             return Err(KotakError::ApiError {

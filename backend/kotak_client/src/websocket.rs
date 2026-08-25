@@ -129,6 +129,7 @@ pub async fn start_market_data_stream(
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
+                    tracing::info!("KOTAK_WS_RAW: {}", line);
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
                         if parsed["event"] == "data" {
                             if let Some(arr) = parsed["data"].as_array() {
