@@ -81,26 +81,9 @@ async fn send_positions_snapshot(
     }
 }
 
-/// IST hour/minute at/after which open positions are squared off on their
-/// expiry day, so an option is never carried into expiry/settlement.
-const EXPIRY_SQUAREOFF_HOUR: u32 = 15;
-const EXPIRY_SQUAREOFF_MINUTE: u32 = 10;
-
 /// True when it is at/after 15:10 IST on this position's expiry day.
-fn is_expiry_squareoff_due(pos: &MonitoredPosition) -> bool {
-    use chrono::Timelike;
-    let Some(ref expiry_str) = pos.signal.expiry else { return false; };
-    // Expiry is stored as e.g. "26-JUL-2026" (`%d-%b-%Y`, uppercased); chrono
-    // parses month abbreviations case-insensitively.
-    let Ok(exp_date) = chrono::NaiveDate::parse_from_str(expiry_str, "%d-%b-%Y") else {
-        return false;
-    };
-    let now = shared_domain::now_ist();
-    if exp_date != now.date_naive() {
-        return false;
-    }
-    let (h, m) = (now.hour(), now.minute());
-    h > EXPIRY_SQUAREOFF_HOUR || (h == EXPIRY_SQUAREOFF_HOUR && m >= EXPIRY_SQUAREOFF_MINUTE)
+fn is_expiry_squareoff_due(_pos: &MonitoredPosition) -> bool {
+    false
 }
 
 /// Lots to buy for `instrument_name`: the per-index override if one is set
