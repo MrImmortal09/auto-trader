@@ -3,6 +3,13 @@ const WebSocket = require('ws');
 const pako = require('pako');
 const readline = require('readline');
 
+// Handle EPIPE gracefully when the Rust parent drops the stdout pipe
+process.stdout.on('error', function(err) {
+    if (err.code === 'EPIPE') {
+        process.exit(0);
+    }
+});
+
 // Mock browser globals required by hslib.js
 global.window = global;
 global.WebSocket = WebSocket;
