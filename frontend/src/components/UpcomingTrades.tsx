@@ -134,8 +134,6 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
   const waiting = positions.filter((p) => p.state === 'WaitingForEntry');
   const active = positions.filter((p) => p.state === 'Active' || p.state === 'Target1Hit');
 
-  if (waiting.length === 0 && active.length === 0) return null;
-
   return (
     <div className="bg-surface-container-lowest border-b border-outline-variant shrink-0">
       {waiting.length > 0 && (
@@ -268,14 +266,18 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
         </>
       )}
 
-      {active.length > 0 && (
+      <div className="px-4 py-2.5 border-y border-outline-variant flex items-center justify-between bg-surface-container-low">
+        <span className="text-label-caps font-semibold text-on-surface-variant uppercase tracking-wider">
+          Active Positions (Live LTP + MTM)
+        </span>
+        <SyncWithKotakButton serverBase={serverBase} onSynced={load} />
+      </div>
+      {active.length === 0 ? (
+        <div className="p-8 text-center text-on-surface-variant text-sm font-medium">
+          No active positions.
+        </div>
+      ) : (
         <>
-          <div className="px-4 py-2.5 border-y border-outline-variant flex items-center justify-between bg-surface-container-low">
-            <span className="text-label-caps font-semibold text-on-surface-variant uppercase tracking-wider">
-              Active Positions (Live LTP + MTM)
-            </span>
-            <SyncWithKotakButton serverBase={serverBase} onSynced={load} />
-          </div>
           <div className="hidden md:block w-full">
             <table className="w-full text-sm">
               <thead>
