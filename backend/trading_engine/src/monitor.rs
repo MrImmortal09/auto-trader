@@ -130,6 +130,21 @@ fn compute_entry_qty(
     }
 }
 
+/// Target-1 level when `ltp` is already at or through it — the move the signal
+/// was called on has already happened, so opening now would just book the
+/// target on the next tick. `None` when there is still room to target 1, or the
+/// signal carries no target at all.
+///
+/// Both entry paths (PAPER Pass-1 and LIVE `decide_live`) call this at the
+/// moment the entry trigger fires and refuse the entry when it returns `Some`.
+/// The usual cause is a mis-resolved contract — wrong expiry or strike, so the
+/// stream is a different, richer option — or a signal that reached the engine
+/// late; either way there is no trade left to make.
+fn entry_past_target1(signal: &TradeSignal, ltp: f64) -> Option<f64> {
+    let t1 = *signal.targets.first()?;
+    (ltp >= t1).then_some(t1)
+}
+
 // ---------------------------------------------------------------------------
 // LIVE mode — price safety, sizing, order construction
 // ---------------------------------------------------------------------------
@@ -1348,7 +1363,9 @@ enum LiveAction {
     /// `ltp` is the price that triggered it, used to size the funds check.
     PlaceEntry { qty: i32, ltp: f64 },
     /// Give up on an entry that will not be taken; cancel it if it is in flight.
-    AbandonEntry { reason: String },
+    /// `loud` surfaces it as an ERROR the dashboard highlights (the signal
+    /// looked wrong) rather than a routine INFO line (e.g. the EOD cutoff).
+    AbandonEntry { reason: String, loud: bool },
     /// Target 1: trail the software stop to `new_sl`, then market-sell `slice`.
     /// `next_dynamic_target`/`dynamic_rung` seed the dynamic ladder (see
     /// `TrailDynamic`) when dynamic targeting is on; `None` keeps the
@@ -1402,10 +1419,10 @@ fn decide_live(
 
         TradeState::WaitingForEntry => {
             if let Some(reason) = pos.force_exit.clone() {
-                return Some(LiveAction::AbandonEntry { reason });
+                return Some(LiveAction::AbandonEntry { reason, loud: false });
             }
             if let Some(reason) = stale_entry_reason(pos, entry_cutoff) {
-                return Some(LiveAction::AbandonEntry { reason: reason.to_string() });
+                return Some(LiveAction::AbandonEntry { reason: reason.to_string(), loud: false });
             }
             if pos.entry_order_id.is_some() {
                 // In flight — the order book decides what happened.
@@ -1420,11 +1437,20 @@ fn decide_live(
             if !triggered {
                 return None;
             }
+            // The signal's move is already spent — entering here just books
+            // target 1 on the next tick. Refuse it loudly instead.
+            if let Some(t1) = entry_past_target1(&pos.signal, ltp) {
+                return Some(LiveAction::AbandonEntry {
+                    reason: format!("entry {ltp:.2} is already at/through target 1 ({t1:.2}) — wrong contract or stale signal, not entering"),
+                    loud: true,
+                });
+            }
             let lot = lot_size_of(pos);
             let qty = compute_entry_qty(&pos.signal, lot, pos.override_qty, cfg, Some(ltp));
             if qty <= 0 || qty % lot != 0 {
                 return Some(LiveAction::AbandonEntry {
                     reason: format!("invalid quantity {qty} for lot size {lot}"),
+                    loud: false,
                 });
             }
             Some(LiveAction::PlaceEntry { qty, ltp })
@@ -1744,7 +1770,7 @@ async fn exec_live_action(
             }
         }
 
-        LiveAction::AbandonEntry { reason } => {
+        LiveAction::AbandonEntry { reason, loud } => {
             if let Some(entry_id) = &ctx.entry_order_id {
                 if ctx.entry_cancel_sent {
                     // Already asked once; let the order book say how it ended.
@@ -1762,13 +1788,17 @@ async fn exec_live_action(
                 p.state = TradeState::Closed;
                 p.entry_order_id = None;
             }).await;
-            tracing::info!(instrument = %ctx.instrument, reason, "LIVE entry abandoned");
-            live_info(db_tx, log_tx, json!({
-                "event": "ENTRY_ABANDONED",
-                "instrument": ctx.instrument,
-                "reason": reason,
-                "mode": "LIVE",
-            })).await;
+            if *loud {
+                loud_error(db_tx, log_tx, &ctx.instrument, &format!("entry not taken — {reason}")).await;
+            } else {
+                tracing::info!(instrument = %ctx.instrument, reason, "LIVE entry abandoned");
+                live_info(db_tx, log_tx, json!({
+                    "event": "ENTRY_ABANDONED",
+                    "instrument": ctx.instrument,
+                    "reason": reason,
+                    "mode": "LIVE",
+                })).await;
+            }
         }
 
         LiveAction::Target1 { slice, keep, new_sl, next_dynamic_target, dynamic_rung } => {
@@ -2131,23 +2161,15 @@ pub async fn start_position_monitor(
                                 }
                             }
 
-                            let mut already_above_target = false;
-                            let ltp_val = ltp_map.get(signal.instrument_name.as_str()).map(|r| *r);
-                            if let Some(price) = ltp_val {
-                                for t in &signal.targets {
-                                    if price >= *t { already_above_target = true; break; }
-                                }
-                            }
-                            
-                            if already_above_target {
-                                let price = ltp_val.unwrap_or(0.0);
-                                let msg = format!(
-                                    r#"{{"event":"ERROR","message":"Option to buy already above target","instrument":"{}","price":{:.2}}}"#,
-                                    signal.instrument_name, price
-                                );
-                                send_log(&db_tx, &log_tx, "ERROR", &msg).await;
-                                tracing::error!(instrument = %signal.instrument_name, price, "Signal discarded — already above target");
-                            } else {
+                            // "Already at target 1" is enforced in two places that
+                            // actually have a price for the specific option: the
+                            // pre-check below (keyed by the resolved scrip) and,
+                            // as the real backstop, every tick at the entry
+                            // trigger in both PAPER and LIVE. It was previously
+                            // checked here against `ltp_map[instrument_name]`,
+                            // which is never a key — that map only ever holds
+                            // `segment|token` — so the guard never fired.
+                            {
                                 let scrip_guard = scrip_store.read().await;
                                 let mut resolved_order = None;
                                 let mut resolved_token = None;
@@ -2211,7 +2233,28 @@ pub async fn start_position_monitor(
                                 if let Some(token) = resolved_token {
                                     let segment_code = resolved_segment_code.unwrap_or_else(|| "nse_fo".to_string());
                                     let ws_scrip = format!("{}|{}", segment_code, token);
-                                    ltp_map.insert(ws_scrip.clone(), 0.0);
+
+                                    // If this exact contract is already streaming
+                                    // (a second position on it, or a re-sent
+                                    // signal) and its premium is already at/through
+                                    // target 1, there is no trade left — drop the
+                                    // signal rather than open a position that
+                                    // exits on its first tick.
+                                    if let Some(px) = ltp_map.get(ws_scrip.as_str()).map(|r| *r).filter(|v| *v > 0.0) {
+                                        if let Some(t1) = signal.targets.first().copied() {
+                                            if px >= t1 {
+                                                let msg = format!(
+                                                    r#"{{"event":"ERROR","message":"Signal discarded — already at target 1 ({:.2} ≥ {:.2}), wrong contract or stale signal","instrument":"{}","price":{:.2}}}"#,
+                                                    px, t1, signal.instrument_name, px
+                                                );
+                                                send_log(&db_tx, &log_tx, "ERROR", &msg).await;
+                                                tracing::error!(instrument = %signal.instrument_name, price = px, tgt1 = t1, "Signal discarded — already at target 1");
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    ltp_map.entry(ws_scrip.clone()).or_insert(0.0);
                                     tracing::info!("Requested live price stream for {}", ws_scrip);
                                     
                                     let tx_guard = ws_tx.lock().await;
@@ -2397,6 +2440,18 @@ pub async fn start_position_monitor(
                                 _ => false,
                             };
                             triggered.then(|| {
+                                // The signal's move is already spent — entering
+                                // here just books target 1 on the next tick.
+                                // Usually a mis-resolved contract or a stale
+                                // signal; refuse it rather than take the trade.
+                                if let Some(t1) = entry_past_target1(&pos.signal, ltp) {
+                                    return PosAction::Cancel {
+                                        reason: format!(
+                                            "entry {ltp:.2} is already at/through target 1 ({t1:.2}) — wrong contract or stale signal, not entering"
+                                        ),
+                                    };
+                                }
+
                                 let lot_size = pos
                                     .resolved_order
                                     .as_ref()
@@ -2663,6 +2718,20 @@ mod tests {
         // string (serde default) — treat as stale rather than guess their age.
         let pos = position_created_at("");
         assert_eq!(stale_entry_reason(&pos, false), Some("STALE_CARRYOVER"));
+    }
+
+    #[test]
+    fn entry_past_target1_only_trips_at_or_above_target1() {
+        // Guards both entry paths: if the option is already at/through target 1
+        // when the entry trigger fires, the move is spent — refuse the trade
+        // instead of booking the target on the next tick.
+        let mut sig = position_created_at("").signal; // targets [140, 160]
+        assert_eq!(entry_past_target1(&sig, 139.99), None);
+        assert_eq!(entry_past_target1(&sig, 140.0), Some(140.0));
+        assert_eq!(entry_past_target1(&sig, 500.0), Some(140.0));
+        // A signal with no target can never trip the guard.
+        sig.targets.clear();
+        assert_eq!(entry_past_target1(&sig, 9_999.0), None);
     }
 
     #[test]

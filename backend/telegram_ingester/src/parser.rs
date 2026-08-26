@@ -43,7 +43,11 @@ static UPDATE_EXIT_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static EXPIRY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:(\d{1,2})[ \t-]+)?(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)(?:\s+EXPIRY)?\b"
+        // The `(?:ST|ND|RD|TH)?` swallows an ordinal suffix on the day — `1ST
+        // SEPTEMBER`, `3RD JULY`, `21ST NOV` — which otherwise breaks the
+        // `[ \t-]+` separator and drops the day entirely, silently turning a
+        // weekly expiry into the monthly one.
+        r"(?i)(?:(\d{1,2})(?:ST|ND|RD|TH)?[ \t-]+)?(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)(?:\s+EXPIRY)?\b"
     ).expect("EXPIRY_RE")
 });
 
@@ -345,6 +349,40 @@ mod tests {
         assert_eq!(parse_reply_exit("exit 610"), Some(610.0));
         assert_eq!(parse_reply_exit("exit cmp 610"), Some(610.0));
         assert_eq!(parse_reply_exit("Something else"), None);
+    }
+
+    #[test]
+    fn ordinal_day_expiry_keeps_the_day() {
+        // `1ST SEPTEMBER` must resolve to the weekly 01-SEP contract, not the
+        // September monthly expiry — the wrong contract streams a much richer
+        // premium and the position trips its target the moment it opens.
+        for (day, suffix) in [("1", "ST"), ("2", "ND"), ("3", "RD"), ("4", "TH"), ("21", "ST")] {
+            let text = format!("{day}{suffix} SEPTEMBER EXPIRY");
+            let caps = EXPIRY_RE.captures(&text).unwrap();
+            assert_eq!(caps.get(1).map(|m| m.as_str()), Some(day), "{day}{suffix}");
+            assert!(caps
+                .get(2)
+                .map(|m| m.as_str().to_uppercase().starts_with("SEP"))
+                .unwrap_or(false));
+        }
+
+        let now = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let expiry = resolve_expiry_date_with_now(Some("1"), "SEPTEMBER", "NIFTY", now).unwrap();
+        assert_eq!(expiry, "01-SEP-2026");
+    }
+
+    #[test]
+    fn ordinal_day_full_signal() {
+        let text = "BUY NIFTY 24600 PE ABOVE 200\n\nTARGET :- 230 / 270\n\nSL :- 160\n\n1ST SEPTEMBER EXPIRY";
+        let sig = parse_signal(text, "test", None).unwrap();
+        assert_eq!(sig.instrument_name, "NIFTY");
+        assert_eq!(sig.strike, Some(24600.0));
+        assert_eq!(sig.option_type.as_deref(), Some("PE"));
+        assert_eq!(sig.entry_price, 200.0);
+        assert_eq!(sig.targets, vec![230.0, 270.0]);
+        assert_eq!(sig.stop_loss, 160.0);
+        let expiry = sig.expiry.unwrap();
+        assert!(expiry.starts_with("01-SEP"), "got {expiry}");
     }
 
     #[test]
