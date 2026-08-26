@@ -388,6 +388,11 @@ pub struct ReconcileFinding {
     pub category: ReconcileCategory,
     pub engine_qty: i32,
     pub broker_qty: i32,
+    /// The broker's average buy price for this symbol (a same-day VWAP across
+    /// every fill), shown so the user can judge whether to override it when
+    /// adopting. `0.0` when the broker has no matching row.
+    #[serde(default)]
+    pub broker_avg_price: f64,
     pub message: String,
     pub options: Vec<ReconcileOption>,
 }
@@ -431,10 +436,20 @@ pub enum ReconcileAction {
     /// position, with a single user-entered target and stop-loss. `target`
     /// seeds `signal.targets[0]` ("target 1"); if `TradingConfig::dynamic_targeting`
     /// is on, the runner extends past it exactly like any other position —
-    /// there is no separate target 2 to enter. Quantity and average buy
-    /// price are read fresh from the broker at apply time, never trusted
-    /// from the client.
-    AdoptManual { stop_loss: f64, target: f64 },
+    /// there is no separate target 2 to enter. Quantity is always read fresh
+    /// from the broker at apply time, never trusted from the client.
+    ///
+    /// `avg_buy_price` is the entry price for this specific lot: `> 0.0` uses
+    /// it verbatim, `0.0` (or an older client that omits it) falls back to the
+    /// broker's figure. Kotak reports a day VWAP across every fill of the
+    /// symbol, so when a position was scaled or partly closed that average is
+    /// not what this lot actually cost — hence the override.
+    AdoptManual {
+        stop_loss: f64,
+        target: f64,
+        #[serde(default)]
+        avg_buy_price: f64,
+    },
 }
 
 /// One user-confirmed action from a reconciliation report, to actually apply.

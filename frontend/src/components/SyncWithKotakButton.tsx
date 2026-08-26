@@ -14,7 +14,11 @@ function kindOf(action: ReconcileAction): ReconcileActionKind {
 interface ManualInputs {
   stop_loss: string;
   target: string;
+  /** Blank → backend uses the broker's same-day average. */
+  avg_buy_price: string;
 }
+
+const EMPTY_MANUAL: ManualInputs = { stop_loss: '', target: '', avg_buy_price: '' };
 
 /** "Sync with Kotak" — on-demand comparison against real broker positions.
  * Never applies anything by itself: every mismatch is a question with
@@ -56,11 +60,11 @@ export function SyncWithKotakButton({ serverBase, onSynced }: { serverBase: stri
 
   function selectManualEntry(key: string) {
     setSelections((s) => ({ ...s, [key]: 'AdoptManual' }));
-    setManualInputs((m) => (m[key] ? m : { ...m, [key]: { stop_loss: '', target: '' } }));
+    setManualInputs((m) => (m[key] ? m : { ...m, [key]: { ...EMPTY_MANUAL } }));
   }
 
   function updateManualInput(key: string, field: keyof ManualInputs, value: string) {
-    setManualInputs((m) => ({ ...m, [key]: { ...(m[key] ?? { stop_loss: '', target: '' }), [field]: value } }));
+    setManualInputs((m) => ({ ...m, [key]: { ...(m[key] ?? EMPTY_MANUAL), [field]: value } }));
   }
 
   async function applySelections() {
@@ -74,14 +78,24 @@ export function SyncWithKotakButton({ serverBase, onSynced }: { serverBase: stri
       if (!kind) continue;
 
       if (kind === 'AdoptManual') {
-        const raw = manualInputs[keyOf(f)] ?? { stop_loss: '', target: '' };
+        const raw = manualInputs[keyOf(f)] ?? EMPTY_MANUAL;
         const stop_loss = parseFloat(raw.stop_loss);
         const target = parseFloat(raw.target);
         if (!Number.isFinite(stop_loss) || stop_loss <= 0 || !Number.isFinite(target) || target <= 0) {
           setError(`Enter a stop-loss and target greater than 0 for ${f.instrument} before applying.`);
           return;
         }
-        items.push({ position_id: f.position_id, trading_symbol: f.trading_symbol, action: { AdoptManual: { stop_loss, target } } });
+        // Optional: blank sends 0, and the backend falls back to the broker's
+        // same-day average. A typed value must be a real price.
+        let avg_buy_price = 0;
+        if (raw.avg_buy_price.trim() !== '') {
+          avg_buy_price = parseFloat(raw.avg_buy_price);
+          if (!Number.isFinite(avg_buy_price) || avg_buy_price <= 0) {
+            setError(`Buy price for ${f.instrument} must be greater than 0, or leave it blank to use the broker's average.`);
+            return;
+          }
+        }
+        items.push({ position_id: f.position_id, trading_symbol: f.trading_symbol, action: { AdoptManual: { stop_loss, target, avg_buy_price } } });
       } else {
         items.push({ position_id: f.position_id, trading_symbol: f.trading_symbol, action: kind });
       }
@@ -184,7 +198,7 @@ export function SyncWithKotakButton({ serverBase, onSynced }: { serverBase: stri
                     </div>
 
                     {selectedKind === 'AdoptManual' && (
-                      <div className="mt-3 pt-3 border-t border-outline-variant/60 grid grid-cols-2 gap-3">
+                      <div className="mt-3 pt-3 border-t border-outline-variant/60 grid grid-cols-2 sm:grid-cols-3 gap-3">
                         <div className="flex flex-col gap-1">
                           <label className="text-[10px] uppercase tracking-wide text-on-surface-variant font-semibold">Stop Loss (₹)</label>
                           <input
@@ -209,8 +223,22 @@ export function SyncWithKotakButton({ serverBase, onSynced }: { serverBase: stri
                             className="bg-surface-container-lowest border border-outline-variant rounded px-2.5 py-1.5 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
                           />
                         </div>
-                        <p className="col-span-2 text-[10px] text-on-surface-variant">
-                          If Dynamic Targeting is on in Settings, the runner extends past this target the same as any other position — no separate target 2 needed.
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] uppercase tracking-wide text-on-surface-variant font-semibold">Buy Price (₹)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.05"
+                            value={manualInputs[key]?.avg_buy_price ?? ''}
+                            onChange={(e) => updateManualInput(key, 'avg_buy_price', e.target.value)}
+                            placeholder={f.broker_avg_price > 0 ? `Broker avg ${f.broker_avg_price.toFixed(2)}` : 'e.g. 175.50'}
+                            className="bg-surface-container-lowest border border-outline-variant rounded px-2.5 py-1.5 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
+                          />
+                        </div>
+                        <p className="col-span-full text-[10px] text-on-surface-variant">
+                          <span className="font-semibold">Buy Price</span> is this lot&apos;s actual entry — leave it blank to use the broker&apos;s
+                          {f.broker_avg_price > 0 ? ` same-day average (₹${f.broker_avg_price.toFixed(2)})` : ' same-day average'}, which blends every fill of the symbol.
+                          {' '}If Dynamic Targeting is on, the runner extends past Target 1 like any other position — no target 2 needed.
                         </p>
                       </div>
                     )}

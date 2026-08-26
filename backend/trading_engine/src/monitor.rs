@@ -1016,6 +1016,7 @@ pub async fn preview_reconciliation(
                 category: ReconcileCategory::DuplicateAmbiguous,
                 engine_qty: t.executed_qty,
                 broker_qty: 0,
+                broker_avg_price: 0.0,
                 message: format!(
                     "More than one tracked position maps to {} at the broker — can't tell which is which. Resolve at the broker terminal.",
                     t.trading_symbol
@@ -1025,11 +1026,11 @@ pub async fn preview_reconciliation(
             continue;
         }
 
-        let broker_qty = broker_positions
+        let broker_row = broker_positions
             .iter()
-            .find(|bp| bp.trading_symbol.trim() == t.trading_symbol.trim())
-            .map(|bp| bp.net_qty())
-            .unwrap_or(0);
+            .find(|bp| bp.trading_symbol.trim() == t.trading_symbol.trim());
+        let broker_qty = broker_row.map(|bp| bp.net_qty()).unwrap_or(0);
+        let broker_avg_price = broker_row.map(|bp| bp.avg_buy_price()).unwrap_or(0.0);
 
         let (category, message, options) = if broker_qty == t.executed_qty {
             (
@@ -1082,6 +1083,7 @@ pub async fn preview_reconciliation(
             category,
             engine_qty: t.executed_qty,
             broker_qty,
+            broker_avg_price,
             message,
             options,
         });
@@ -1104,15 +1106,16 @@ pub async fn preview_reconciliation(
                 category: ReconcileCategory::UnexplainedExposure,
                 engine_qty: 0,
                 broker_qty: bp.net_qty(),
+                broker_avg_price: bp.avg_buy_price(),
                 message: format!("The broker holds {} of {sym} that this app has no record of at all.", bp.net_qty()),
                 options: vec![
                     ReconcileOption { action: ReconcileAction::Ignore, label: "Ignore — I'm managing this manually".to_string(), recommended: true },
-                    // stop_loss/target are placeholders — the frontend collects
-                    // the real numbers from the user and substitutes them into
-                    // the ReconcileApplyItem it actually sends.
+                    // stop_loss/target/avg_buy_price are placeholders — the
+                    // frontend collects the real numbers from the user and
+                    // substitutes them into the ReconcileApplyItem it sends.
                     ReconcileOption {
-                        action: ReconcileAction::AdoptManual { stop_loss: 0.0, target: 0.0 },
-                        label: "Adopt into my positions (enter SL & target)".to_string(),
+                        action: ReconcileAction::AdoptManual { stop_loss: 0.0, target: 0.0, avg_buy_price: 0.0 },
+                        label: "Adopt into my positions (enter SL, target & buy price)".to_string(),
                         recommended: false,
                     },
                 ],
@@ -1192,10 +1195,10 @@ pub async fn apply_reconciliation(
                     "manually reconciled: {} executed_qty adopted from broker ({broker_qty})", item.trading_symbol
                 )).await;
             }
-            ReconcileAction::AdoptManual { stop_loss, target } => {
+            ReconcileAction::AdoptManual { stop_loss, target, avg_buy_price } => {
                 adopt_manual(
                     positions, scrip_store, prices, ws_tx, db_tx, log_tx,
-                    &broker_positions, &item.trading_symbol, *stop_loss, *target,
+                    &broker_positions, &item.trading_symbol, *stop_loss, *target, *avg_buy_price,
                 ).await;
             }
         }
@@ -1224,6 +1227,7 @@ async fn adopt_manual(
     trading_symbol: &str,
     stop_loss: f64,
     target: f64,
+    avg_buy_price_entered: f64,
 ) {
     // Never double-adopt: a symbol already tracked (open or waiting) has a
     // real position id and belongs to AdoptQty/Close instead.
@@ -1294,7 +1298,10 @@ async fn adopt_manual(
         transaction_type: TransactionType::Buy,
     };
 
-    let avg_buy_price = bp.avg_buy_price();
+    // Kotak's figure is a same-day VWAP over every fill of the symbol; when the
+    // user knows what this particular lot actually cost, take their number.
+    let avg_buy_price = resolved_adopt_avg(avg_buy_price_entered, bp.avg_buy_price());
+    let avg_source = if avg_buy_price_entered > 0.0 { "you entered" } else { "broker avg" };
     let sl = round_down_tick(stop_loss, record.tick_size);
     let tgt = round_down_tick(target, record.tick_size);
     let ws_scrip_key = format!("{}|{}", record.exchange_segment_code, record.instrument_token);
@@ -1355,8 +1362,14 @@ async fn adopt_manual(
     { positions.write().await.push(new_pos); }
 
     loud_error(db_tx, log_tx, trading_symbol, &format!(
-        "manually adopted {trading_symbol} — qty {qty} @ avg ₹{avg_buy_price:.2}, SL ₹{sl:.2}, target ₹{tgt:.2}"
+        "manually adopted {trading_symbol} — qty {qty} @ ₹{avg_buy_price:.2} ({avg_source}), SL ₹{sl:.2}, target ₹{tgt:.2}"
     )).await;
+}
+
+/// The entry price for a manually-adopted position: the value the user typed
+/// if they gave one (`> 0.0`), otherwise the broker's same-day average.
+fn resolved_adopt_avg(user_entered: f64, broker_avg: f64) -> f64 {
+    if user_entered > 0.0 { user_entered } else { broker_avg }
 }
 
 // ---------------------------------------------------------------------------
@@ -2745,6 +2758,15 @@ mod tests {
         // Normal positive config is unchanged.
         assert_eq!(lots_for_instrument(&cfg_with_lots(1, 3), "NIFTY"), 1);
         assert_eq!(lots_for_instrument(&cfg_with_lots(1, 3), "TATASTEEL"), 3);
+    }
+
+    #[test]
+    fn manual_adopt_prefers_the_entered_buy_price_over_the_broker_average() {
+        // The user typed a real per-lot fill price — use it verbatim.
+        assert_eq!(resolved_adopt_avg(175.50, 182.30), 175.50);
+        // Blank / junk falls back to the broker's same-day VWAP.
+        assert_eq!(resolved_adopt_avg(0.0, 182.30), 182.30);
+        assert_eq!(resolved_adopt_avg(-4.0, 182.30), 182.30);
     }
 
     #[test]

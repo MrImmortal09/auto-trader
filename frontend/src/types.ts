@@ -179,12 +179,13 @@ export type ReconcileActionKind = 'AdoptQty' | 'Close' | 'Ignore' | 'AdoptManual
 
 /** Mirrors the Rust `ReconcileAction` enum's default (externally-tagged) serde
  * shape: the three unit variants serialize as bare strings, the data-carrying
- * `AdoptManual` variant as `{ AdoptManual: { stop_loss, target } }`. */
+ * `AdoptManual` variant as `{ AdoptManual: { stop_loss, target, avg_buy_price } }`.
+ * `avg_buy_price` of 0 tells the backend to fall back to the broker's figure. */
 export type ReconcileAction =
   | 'AdoptQty'
   | 'Close'
   | 'Ignore'
-  | { AdoptManual: { stop_loss: number; target: number } };
+  | { AdoptManual: { stop_loss: number; target: number; avg_buy_price: number } };
 
 export interface ReconcileOption {
   action: ReconcileAction;
@@ -199,6 +200,8 @@ export interface ReconcileFinding {
   category: ReconcileCategory;
   engine_qty: number;
   broker_qty: number;
+  /** Broker's same-day average buy price for the symbol; 0 when unavailable. */
+  broker_avg_price: number;
   message: string;
   options: ReconcileOption[];
 }
