@@ -1,0 +1,9 @@
+steps:
+  - name: 'rust:latest'
+    entrypoint: 'cargo'
+    args: ['build', '--release', '-p', 'server']
+timeout: 2400s
+artifacts:
+  objects:
+    location: 'gs://trader-502418-builds/artifacts/$BUILD_ID/'
+    paths: ['target/release/server']
