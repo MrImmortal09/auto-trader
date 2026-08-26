@@ -176,8 +176,11 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
     .flatten()
     .map(|r| TradingConfig {
         max_trade_amount_inr: r.max_trade_amount_inr,
-        index_lots: r.index_lots.max(1),
-        other_lots: r.other_lots.max(1),
+        // 0 is allowed — it means "don't auto-trade this class" (an index with
+        // no per-symbol override / every stock option). Only guard against a
+        // negative slipping in from a hand-edited row.
+        index_lots: r.index_lots.max(0),
+        other_lots: r.other_lots.max(0),
         mode: r.mode,
         brokerage_per_order: r.brokerage_per_order,
         target_1_exit_pct: r.target_1_exit_pct,

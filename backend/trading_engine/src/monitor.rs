@@ -89,6 +89,11 @@ fn is_expiry_squareoff_due(_pos: &MonitoredPosition) -> bool {
 /// Lots to buy for `instrument_name`: the per-index override if one is set
 /// (see `TradingConfig::index_lots_by_symbol`), else `index_lots` for a known
 /// index, else `other_lots` for anything else (stock options).
+///
+/// `0` is a real, meaningful value here — it means "don't auto-trade this
+/// class". A bare `index_lots`/`other_lots` of 0 skips every index without an
+/// explicit per-symbol override / every stock option; a signal that resolves
+/// to 0 is dropped at ingestion (`start_position_monitor`).
 fn lots_for_instrument(cfg: &TradingConfig, instrument_name: &str) -> i32 {
     let inst = instrument_name.to_uppercase();
     match shared_domain::INDEX_NAMES.iter().find(|&&idx| inst == idx) {
@@ -97,8 +102,9 @@ fn lots_for_instrument(cfg: &TradingConfig, instrument_name: &str) -> i32 {
             .get(idx)
             .copied()
             .filter(|&l| l > 0)
-            .unwrap_or_else(|| cfg.index_lots.max(1)),
-        None => cfg.other_lots.max(1),
+            .unwrap_or(cfg.index_lots)
+            .max(0),
+        None => cfg.other_lots.max(0),
     }
 }
 
@@ -2161,6 +2167,25 @@ pub async fn start_position_monitor(
                                 }
                             }
 
+                            // Lot count set to 0 for this instrument's class means
+                            // "don't auto-trade it" — an index with no per-symbol
+                            // override, or any stock option when `other_lots` is 0.
+                            // Drop the signal here rather than open a position that
+                            // can only ever size to 0. Equity signals size off
+                            // notional, not lots, so they are exempt.
+                            if signal.option_type.is_some() {
+                                let auto_lots = { lots_for_instrument(&*config.read().await, &signal.instrument_name) };
+                                if auto_lots <= 0 {
+                                    let msg = format!(
+                                        r#"{{"event":"ERROR","message":"Signal skipped — lot count for {} is 0; raise Index/Other Lots to trade it","instrument":"{}"}}"#,
+                                        signal.instrument_name, signal.instrument_name
+                                    );
+                                    send_log(&db_tx, &log_tx, "ERROR", &msg).await;
+                                    tracing::info!(instrument = %signal.instrument_name, "Signal skipped — lot count is 0");
+                                    continue;
+                                }
+                            }
+
                             // "Already at target 1" is enforced in two places that
                             // actually have a price for the specific option: the
                             // pre-check below (keyed by the resolved scrip) and,
@@ -2686,6 +2711,40 @@ mod tests {
             exit_attempts: 0,
             live_halt: None,
         }
+    }
+
+    fn cfg_with_lots(index_lots: i32, other_lots: i32) -> TradingConfig {
+        TradingConfig {
+            max_trade_amount_inr: 15_000.0,
+            index_lots,
+            other_lots,
+            index_lots_by_symbol: Default::default(),
+            mode: "PAPER".into(),
+            brokerage_per_order: 20.0,
+            target_1_exit_pct: 50.0,
+            target_2_exit_pct: 100.0,
+            entry_market_protection: 5.0,
+            dynamic_targeting: false,
+            dynamic_targeting_trail_factor: 0.5,
+            dynamic_targeting_extension_factor: 1.0,
+        }
+    }
+
+    #[test]
+    fn lot_count_of_zero_means_do_not_trade_that_class() {
+        // Bare 0 skips the whole class...
+        assert_eq!(lots_for_instrument(&cfg_with_lots(0, 0), "NIFTY"), 0);
+        assert_eq!(lots_for_instrument(&cfg_with_lots(0, 0), "RELIANCE"), 0);
+        // ...but a positive per-index override still wins for that index.
+        let mut cfg = cfg_with_lots(0, 0);
+        cfg.index_lots_by_symbol.insert("BANKNIFTY".into(), 2);
+        assert_eq!(lots_for_instrument(&cfg, "BANKNIFTY"), 2);
+        assert_eq!(lots_for_instrument(&cfg, "NIFTY"), 0);
+        // A negative from a hand-edited DB row is floored to 0, never negative.
+        assert_eq!(lots_for_instrument(&cfg_with_lots(-3, -1), "NIFTY"), 0);
+        // Normal positive config is unchanged.
+        assert_eq!(lots_for_instrument(&cfg_with_lots(1, 3), "NIFTY"), 1);
+        assert_eq!(lots_for_instrument(&cfg_with_lots(1, 3), "TATASTEEL"), 3);
     }
 
     #[test]

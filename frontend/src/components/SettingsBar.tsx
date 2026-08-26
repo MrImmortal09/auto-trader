@@ -226,6 +226,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
                 <label className={FIELD_LABEL}>{label}</label>
                 <input
                   type="number"
+                  min={0}
                   value={key === 'virtual_balance' ? String(virtualBalance) : String(cfg[key])}
                   onChange={(e) =>
                     key === 'virtual_balance'
@@ -237,6 +238,11 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
               </div>
             ))}
         </div>
+        <p className="mt-3 text-[11px] text-on-surface-variant">
+          <span className="font-semibold">Index Lots</span> / <span className="font-semibold">Other Lots</span> set to
+          {' '}<span className="font-mono-code">0</span> means don&apos;t auto-trade that class — index signals with no
+          per-index lot below, and every stock-option signal, are skipped with a log line.
+        </p>
       </div>
 
       {/* Per-index default lots — a trader who only trades indexes can size
@@ -249,10 +255,10 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2.5">
           {INDEX_LOT_REFERENCE.map(({ symbol, label, lotSize }) => {
             const configured = cfg.index_lots_by_symbol[symbol];
-            // Mirror the backend's floor (lots_for_instrument always does
-            // `.max(1)`) so this preview never shows a qty lower than what
-            // will actually be bought.
-            const effectiveLots = configured && configured > 0 ? configured : Math.max(1, cfg.index_lots);
+            // A per-index box left blank falls back to "Index Lots"; that
+            // fallback can itself be 0, which means this index is skipped
+            // unless it gets its own positive lot count here.
+            const effectiveLots = configured && configured > 0 ? configured : cfg.index_lots;
             return (
               <div key={symbol} className="flex flex-col gap-1 bg-surface border border-outline-variant rounded-lg p-2.5">
                 <div className="flex items-baseline justify-between gap-1">
@@ -263,12 +269,12 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
                   type="number"
                   min={1}
                   value={configured ?? ''}
-                  placeholder={`Auto (${cfg.index_lots})`}
+                  placeholder={cfg.index_lots > 0 ? `Auto (${cfg.index_lots})` : 'Skip (0)'}
                   onChange={(e) => setIndexLots(symbol, e.target.value)}
                   className="w-full bg-surface-container-lowest border border-outline-variant rounded px-2 py-1 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
                 />
                 <span className="text-[10px] text-on-surface-variant font-mono-code">
-                  = {effectiveLots * lotSize} qty
+                  {effectiveLots > 0 ? `= ${effectiveLots * lotSize} qty` : 'skipped'}
                 </span>
               </div>
             );

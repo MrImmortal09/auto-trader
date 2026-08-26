@@ -36,9 +36,10 @@ pub async fn post_settings_handler(
         .collect();
     // Same reasoning: keep the in-memory copy written below in lockstep with
     // what's actually bound to SQL a few lines down, instead of only clamping
-    // at the DB-bind call site.
-    cfg.index_lots = cfg.index_lots.max(1);
-    cfg.other_lots = cfg.other_lots.max(1);
+    // at the DB-bind call site. 0 is kept as-is — it means "don't auto-trade
+    // this class" (see `lots_for_instrument`); only a negative is floored.
+    cfg.index_lots = cfg.index_lots.max(0);
+    cfg.other_lots = cfg.other_lots.max(0);
     // Clamped to [0, 1]: at 1.0 the trailed stop on the first rung sits at
     // exactly the entry price (breakeven); anything above that would trail
     // the stop below entry, i.e. accept a loss on a position that already
