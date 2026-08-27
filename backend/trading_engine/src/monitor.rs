@@ -2081,6 +2081,19 @@ pub async fn start_position_monitor(
                                     let snapshot = { positions.read().await.clone() };
                                     send_positions_snapshot(&db_tx, &snapshot).await;
                                     tracing::info!(id=?sig_id, "Updated SL via reply");
+                                } else {
+                                    // Never drop this silently: an unmatched
+                                    // SL update means a reply landed on a
+                                    // message the engine holds no position
+                                    // for, and the trader believes their stop
+                                    // moved when nothing did.
+                                    drop(write_guard);
+                                    let msg = format!(
+                                        r#"{{"event":"ERROR","message":"SL update ignored — no open position for the replied-to signal (new_sl {:.2})","instrument":"UPDATE"}}"#,
+                                        signal.stop_loss
+                                    );
+                                    send_log(&db_tx, &log_tx, "ERROR", &msg).await;
+                                    tracing::warn!(id=?sig_id, new_sl = signal.stop_loss, "SL update matched no position");
                                 }
                             }
                             continue;
@@ -2113,6 +2126,17 @@ pub async fn start_position_monitor(
                                     let snapshot = { positions.read().await.clone() };
                                     send_positions_snapshot(&db_tx, &snapshot).await;
                                     tracing::info!(id=?sig_id, price=signal.entry_price, "Triggered EXIT_AT via reply");
+                                } else {
+                                    // Louder than the SL case on purpose: an
+                                    // exit that matched nothing means someone
+                                    // asked to be flat and is still holding.
+                                    drop(write_guard);
+                                    let msg = format!(
+                                        r#"{{"event":"ERROR","message":"Exit command ignored — no open position for the replied-to signal (exit {:.2}); square off manually if you meant to be flat","instrument":"UPDATE"}}"#,
+                                        signal.entry_price
+                                    );
+                                    send_log(&db_tx, &log_tx, "ERROR", &msg).await;
+                                    tracing::error!(id=?sig_id, price=signal.entry_price, "EXIT_AT matched no position");
                                 }
                             }
                             continue;
@@ -2160,6 +2184,29 @@ pub async fn start_position_monitor(
                         }
 
                         if signal.action.eq_ignore_ascii_case("BUY") {
+                            // A signal with no stop-loss or no target is not
+                            // tradeable, whatever it parsed out of. `stop_loss`
+                            // defaults to 0.0, and an LTP can never cross 0, so
+                            // the software stop would never fire; with no target
+                            // there is nothing to exit on either. Such a position
+                            // runs unprotected until the expiry square-off, so
+                            // refuse it rather than open it.
+                            if signal.stop_loss <= 0.0 || signal.targets.is_empty() {
+                                let msg = format!(
+                                    r#"{{"event":"ERROR","message":"Signal discarded — no {} parsed; refusing to open an unprotected position","instrument":"{}"}}"#,
+                                    if signal.stop_loss <= 0.0 { "stop-loss" } else { "target" },
+                                    signal.instrument_name
+                                );
+                                send_log(&db_tx, &log_tx, "ERROR", &msg).await;
+                                tracing::error!(
+                                    instrument = %signal.instrument_name,
+                                    stop_loss = signal.stop_loss,
+                                    targets = signal.targets.len(),
+                                    "Signal discarded — missing stop-loss or target"
+                                );
+                                continue;
+                            }
+
                             // Check expiry
                             if let Some(ref expiry_str) = signal.expiry {
                                 if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(expiry_str, "%d-%b-%Y") {

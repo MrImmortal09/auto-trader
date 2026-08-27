@@ -51,6 +51,24 @@ static EXPIRY_RE: LazyLock<Regex> = LazyLock::new(|| {
     ).expect("EXPIRY_RE")
 });
 
+/// Words that turn up where an equity ticker would sit in channel chatter —
+/// `Buy Only Above 550`, `Buy Now Above 550`.
+///
+/// The options pattern needs a strike and CE/PE, so plain English can't
+/// satisfy it. The equity pattern is just `BUY <word> ABOVE <price>`, which
+/// ordinary sentences do satisfy: "Buy Only Above 550" parsed as a BUY of an
+/// instrument named `ONLY`. That phantom carried no target and no stop-loss,
+/// so had the name resolved to a real scrip it would have opened a position
+/// with `current_sl` 0 (an LTP can never cross it) and no target to exit on —
+/// held until the expiry square-off with no protection at all.
+///
+/// Only words that are not NSE tickers belong here.
+const NOISE_INSTRUMENTS: &[&str] = &[
+    "ONLY", "NOW", "ABOVE", "BELOW", "AT", "CMP", "LEVEL", "WAIT", "AGAIN",
+    "TODAY", "MORE", "THIS", "THAT", "THE", "AND", "FOR", "YOUR", "ALL",
+    "ANY", "IT", "IS", "ON", "IN", "TO", "OF", "A", "AN", "BOOK", "HOLD",
+];
+
 fn parse_month(m: &str) -> Option<u32> {
     let m = m.to_uppercase();
     if m.starts_with("JAN") { Some(1) }
@@ -212,8 +230,13 @@ pub fn parse_signal(text: &str, source: &str, signal_id: Option<String>) -> Opti
                 caps[6].parse::<f64>().ok()?,
             )
         } else if let Some(caps) = EQT_RE.captures(text) {
+            let name = caps[2].to_uppercase();
+            // Plain English satisfies this pattern too — see NOISE_INSTRUMENTS.
+            if NOISE_INSTRUMENTS.contains(&name.as_str()) {
+                return None;
+            }
             (
-                caps[1].to_uppercase(), caps[2].to_uppercase(),
+                caps[1].to_uppercase(), name,
                 None, None,
                 caps[3].to_uppercase(),
                 caps[4].parse::<f64>().ok()?,
@@ -383,6 +406,39 @@ mod tests {
         assert_eq!(sig.stop_loss, 160.0);
         let expiry = sig.expiry.unwrap();
         assert!(expiry.starts_with("01-SEP"), "got {expiry}");
+    }
+
+    #[test]
+    fn chatter_is_not_an_equity_signal() {
+        // Real message from the channel. `BUY <word> ABOVE <price>` is plain
+        // English as much as it is a signal, and this one produced a phantom
+        // equity signal for an instrument literally named "ONLY".
+        assert!(parse_signal("Please Wait For Level \n\nBuy Only Above 550", "test", None).is_none());
+        assert!(parse_signal("Buy Now Above 550", "test", None).is_none());
+        // A real equity signal must still get through.
+        let sig = parse_signal("BUY RELIANCE ABOVE 2500\nTGT 2600\nSL 2420", "test", None).unwrap();
+        assert_eq!(sig.instrument_name, "RELIANCE");
+    }
+
+    #[test]
+    fn a_full_signal_also_matches_the_reply_sl_pattern() {
+        // Why `parse_signal` has to be tried before the reply patterns in
+        // `stream.rs`: every signal body carries an `SL :- x` line, so a
+        // signal the channel happens to post *as a reply* looks exactly like
+        // a stop-loss update to `parse_reply_sl`. Checking replies first
+        // swallowed the whole trade.
+        let text = "BUY NIFTY 24150 CE ABOVE 170\n\nTARGET :- 200 / 240\n\nSL :- 130\n\n1ST SEPTEMBER EXPIRY";
+        assert_eq!(parse_reply_sl(text), Some(130.0));
+        let sig = parse_signal(text, "test", None).expect("must parse as a full signal");
+        assert_eq!(sig.instrument_name, "NIFTY");
+        assert_eq!(sig.strike, Some(24150.0));
+        assert_eq!(sig.targets, vec![200.0, 240.0]);
+        assert_eq!(sig.stop_loss, 130.0);
+
+        // A genuine reply-style update must NOT look like a full signal, so
+        // the fallback still reaches the reply handler.
+        assert!(parse_signal("Move SL to 140", "test", None).is_none());
+        assert_eq!(parse_reply_sl("Move SL to 140"), Some(140.0));
     }
 
     #[test]

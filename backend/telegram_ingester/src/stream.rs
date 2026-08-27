@@ -78,10 +78,22 @@ pub(crate) async fn run_event_loop(
         tracing::info!(chat_id, msg_id = msg.id(), "[telegram] Received message: {}", text);
 
         let msg_id_str = msg.id().to_string();
-        
+
+        // Parse as a full signal FIRST, before the reply patterns.
+        //
+        // Every signal body carries an `SL :- x` line, and `parse_reply_sl`
+        // matches that line on its own — so a signal the channel posts *as a
+        // reply* (they routinely do) looked exactly like a stop-loss update.
+        // The whole BUY was thrown away and re-emitted as a bare UPDATE_SL
+        // pointing at the parent message id; no position carried that id, so
+        // the monitor's update loop found nothing and logged nothing, and the
+        // trade vanished without a trace. A complete signal is unambiguous and
+        // strictly more specific than "contains a number after SL", so it wins.
+        let new_signal = parse_signal(text, "telegram", Some(msg_id_str));
+
         let mut emitted = false;
-        
-        if let Some(reply_to_id) = msg.reply_to_message_id() {
+
+        if let (None, Some(reply_to_id)) = (&new_signal, msg.reply_to_message_id()) {
             if let Some(new_sl) = parse_reply_sl(text) {
                 let signal = TradeSignal {
                     instrument_name: "UPDATE".to_string(),
@@ -126,7 +138,7 @@ pub(crate) async fn run_event_loop(
         }
 
         if !emitted {
-            if let Some(signal) = parse_signal(text, "telegram", Some(msg_id_str)) {
+            if let Some(signal) = new_signal {
                 tracing::info!(
                     instrument = %signal.instrument_name,
                     action = %signal.action,
