@@ -1,7 +1,7 @@
 pub mod portfolio;
 pub mod settings;
 pub mod auth_kotak;
-pub use auth_kotak::{KotakLoginDeps, try_env_auto_login};
+pub use auth_kotak::{KotakLoginDeps, try_env_auto_login, auto_login_enabled_by_env};
 pub mod auth_telegram;
 pub mod auth_passkey;
 pub mod health;

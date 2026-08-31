@@ -21,7 +21,10 @@ fn non_empty(opt: Option<String>) -> Option<String> {
 /// Whether unattended (startup / scheduled) auto-login is allowed. Defaults
 /// to `true` — set `KOTAK_AUTO_LOGIN=false` to require a manual Connect even
 /// when all env credentials are present.
-fn auto_login_enabled_by_env() -> bool {
+/// Whether unattended login is permitted at all. Exposed so the scheduled
+/// session recycle can refuse to tear a session down when it has no way to
+/// build a new one.
+pub fn auto_login_enabled_by_env() -> bool {
     std::env::var("KOTAK_AUTO_LOGIN")
         .map(|v| !v.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(true)
@@ -132,6 +135,12 @@ pub struct KotakLoginDeps<'a> {
     pub positions: &'a Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
     pub scrip_store: &'a Arc<RwLock<Option<trading_engine::ScripStore>>>,
     pub raw_scrip_csv: &'a Arc<RwLock<Option<String>>>,
+    /// IST timestamp of the last *successful* Scrip Master download. Only ever set
+    /// after a login has succeeded (the download runs off the resulting
+    /// session), so `Some(today)` means both "logged in today" and "holding
+    /// today's Scrip Master" — which is exactly the condition the 09:10
+    /// session recycle checks before deciding it has nothing to do.
+    pub scrip_loaded_at: &'a Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     /// Serializes full login attempts end-to-end (network round-trips, the
     /// `ws_task` swap, and the final `kotak` assignment) so a manual "Connect"
     /// click racing the scheduled 09:05/09:15 trigger can't interleave with
@@ -153,6 +162,7 @@ impl<'a> KotakLoginDeps<'a> {
             positions: &state.positions,
             scrip_store: &state.scrip_store,
             raw_scrip_csv: &state.raw_scrip_csv,
+            scrip_loaded_at: &state.scrip_loaded_at,
             login_lock: &state.kotak_login_lock,
         }
     }
@@ -283,6 +293,7 @@ async fn perform_kotak_login(
         Arc::clone(deps.kotak),
         Arc::clone(deps.scrip_store),
         Arc::clone(deps.raw_scrip_csv),
+        Arc::clone(deps.scrip_loaded_at),
         deps.db_tx.clone(),
         deps.log_tx.clone(),
     ));
@@ -294,6 +305,7 @@ async fn fetch_scrip_master_background(
     kotak: Arc<Mutex<Option<kotak_client::KotakClient>>>,
     scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
     raw_scrip_csv: Arc<RwLock<Option<String>>>,
+    scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     db_tx: mpsc::Sender<shared_domain::DbWriteMessage>,
     log_tx: broadcast::Sender<String>,
 ) {
@@ -347,6 +359,9 @@ async fn fetch_scrip_master_background(
     } else {
         *scrip_store.write().await = Some(store);
         *raw_scrip_csv.write().await = merge_csv_sections(&raw_sections);
+        // Stamped only here, on the success path, so a day where every segment
+        // failed never looks "ready" to the 09:10 recycle.
+        *scrip_loaded_at.write().await = Some(shared_domain::now_ist());
         send_log(&db_tx, &log_tx, "INFO", serde_json::json!({
             "event": "SCRIP_FETCH_SUCCESS",
             "level": "INFO",
@@ -630,8 +645,16 @@ pub async fn system_status(State(state): State<AppState>) -> impl IntoResponse {
         let k = state.kotak.lock().await;
         k.is_some()
     };
+    // Formatted server-side in IST: this value is only ever meaningful in
+    // market time, so there is nothing for the browser to guess at.
+    let scrip_loaded_at = state
+        .scrip_loaded_at
+        .read()
+        .await
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
     (StatusCode::OK, Json(serde_json::json!({
         "telegram_connected": telegram_ok,
-        "kotak_connected": kotak_ok
+        "kotak_connected": kotak_ok,
+        "scrip_loaded_at": scrip_loaded_at
     })))
 }

@@ -61,9 +61,11 @@ There is one **pre-existing** harmless warning (`updated_at` never read in
 `db.rs`); ignore it. Any *other* warning/error is yours to fix.
 
 ### Deployment context
-- GCP: `gcloud compute ssh --zone "us-east1-d" "trader-1" --project "trader-502418"`
-- Binary lives at `~/auto-trader/backend/server`, run natively inside **tmux pane `0:0`**
-  (not systemd). Restart: `tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server" C-m`.
+- VM: `ssh ubuntu@140.245.209.140` (generic Ubuntu box in Hyderabad, 954 MB RAM / 2 vCPU / no swap)
+- Binary is version-stamped in `~/auto-trader/backend/` (e.g. `server-0.1.93-x86_64-unknown-linux-gnu`),
+  run natively inside **tmux pane `0:0`** (not systemd). `~/auto-trader/backend/server` is the source
+  crate dir, not the binary. Restart:
+  `tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server-<version>-x86_64-unknown-linux-gnu" C-m`.
 - **PATH CONTRACT:** the binary MUST run from `backend/` — it resolves
   `../frontend/dist` and `../kotak-bridge` relatively.
 - Kotak API docs are in `kotak-api-docs/`.
