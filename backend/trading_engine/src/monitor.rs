@@ -151,6 +151,44 @@ fn entry_past_target1(signal: &TradeSignal, ltp: f64) -> Option<f64> {
     (ltp >= t1).then_some(t1)
 }
 
+/// Pre-T1 trailing stop (see `TradingConfig::pre_t1_trailing`): feed one LTP
+/// observation into `peak_ltp` and, once the peak has covered
+/// `pre_t1_trail_arm_pct` % of the entry→target-1 distance, ratchet
+/// `current_sl` up to `peak - diff * pre_t1_trail_factor` (tick-rounded).
+///
+/// Ratchet-only: the stop never moves down here, and it starts from the
+/// signal's original SL, so it can never be looser than the signal asked for.
+/// A signal edit that lowers `current_sl` on an armed position is re-asserted
+/// on the next tick from the retained peak — when the two disagree, the
+/// higher stop (closer to flat) wins. Returns `Some(new_sl)` when the stop
+/// actually moved. Shared by the PAPER and LIVE paths — protection is a pure
+/// software watch in both, so moving the stop is bookkeeping, not an order.
+fn pre_t1_trail_update(
+    pos: &mut MonitoredPosition,
+    ltp: f64,
+    cfg: &TradingConfig,
+) -> Option<f64> {
+    if !cfg.pre_t1_trailing || !matches!(pos.state, TradeState::Active) {
+        return None;
+    }
+    let t1 = *pos.signal.targets.first()?;
+    let diff = t1 - pos.avg_buy_price;
+    if diff <= 0.0 {
+        return None;
+    }
+    let peak = pos.peak_ltp.map_or(ltp, |p| p.max(ltp));
+    pos.peak_ltp = Some(peak);
+    if peak < pos.avg_buy_price + diff * cfg.pre_t1_trail_arm_pct / 100.0 {
+        return None;
+    }
+    let desired = round_down_tick(peak - diff * cfg.pre_t1_trail_factor, pos.tick_size);
+    if desired > pos.current_sl {
+        pos.current_sl = desired;
+        return Some(desired);
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // LIVE mode — price safety, sizing, order construction
 // ---------------------------------------------------------------------------
@@ -1333,6 +1371,7 @@ async fn adopt_manual(
         state: TradeState::Active,
         created_at: shared_domain::current_ist_timestamp_string(),
         current_sl: sl,
+        peak_ltp: None,
         next_dynamic_target: None,
         last_dynamic_rung: None,
         dynamic_rung_number: 0,
@@ -1500,7 +1539,11 @@ fn decide_live(
             }
 
             let trigger = round_down_tick(pos.current_sl, pos.tick_size);
-            let sl_reason = if matches!(pos.state, TradeState::Target1Hit) {
+            // A stop sitting above the signal's SL while still Active means
+            // the pre-T1 trail moved it — label that exit as a trail hit.
+            let sl_reason = if matches!(pos.state, TradeState::Target1Hit)
+                || pos.current_sl > pos.signal.stop_loss
+            {
                 "TRAIL_SL_HIT"
             } else {
                 "SL_HIT"
@@ -1947,6 +1990,43 @@ async fn live_tick(
         mutated |= reconcile_live_orders(positions, kotak, db_tx, log_tx, cfg.brokerage_per_order).await;
     }
 
+    // ── Pre-T1 trail (bookkeeping only — no broker calls) ────────────── //
+    // Protection is a software watch (see decide_live), so ratcheting the
+    // stop touches no order; decide_live below reads the updated current_sl
+    // in this same tick.
+    if cfg.pre_t1_trailing {
+        let armed: Vec<(String, f64)> = {
+            let mut g = positions.write().await;
+            let mut out = Vec::new();
+            for p in g.iter_mut() {
+                let key = p.ws_scrip_key.as_ref().unwrap_or(&p.signal.instrument_name);
+                let Some(ltp) = ltp_map.get(key.as_str()).map(|r| *r).filter(|v| *v > 0.0)
+                else {
+                    continue;
+                };
+                let was_at_original = p.current_sl <= p.signal.stop_loss;
+                if pre_t1_trail_update(p, ltp, cfg).is_some() {
+                    mutated = true;
+                    if was_at_original {
+                        out.push((p.signal.instrument_name.clone(), p.current_sl));
+                    }
+                }
+            }
+            out
+        };
+        // Only the first ratchet above the signal SL is logged — one line per
+        // 50 ms new high would drown the terminal; the dashboard shows the
+        // live current_sl and the exit logs the final level.
+        for (instrument, new_sl) in armed {
+            live_info(db_tx, log_tx, json!({
+                "event": "PRE_T1_TRAIL_ARMED",
+                "instrument": instrument,
+                "new_sl": round2(new_sl),
+                "mode": "LIVE",
+            })).await;
+        }
+    }
+
     // ── Decide (read lock only) ──────────────────────────────────────── //
     let decisions: Vec<LivePending> = {
         let entry_cutoff = is_entry_cutoff_passed();
@@ -2391,6 +2471,7 @@ pub async fn start_position_monitor(
                                     state: TradeState::WaitingForEntry,
                                     created_at: shared_domain::current_ist_timestamp_string(),
                                     current_sl: sl,
+                                    peak_ltp: None,
                                     next_dynamic_target: None,
                                     last_dynamic_rung: None,
                                     dynamic_rung_number: 0,
@@ -2474,6 +2555,29 @@ pub async fn start_position_monitor(
                 let entry_cutoff = is_entry_cutoff_passed();
                 let mut pending: Vec<Pending> = Vec::new();
                 let mut positions_mutated = false;
+
+                // ── Pre-T1 trail (bookkeeping before Pass 1 reads SL) ── //
+                if cfg.pre_t1_trailing {
+                    for pos in pos_guard.iter_mut() {
+                        let key = pos.ws_scrip_key.as_ref().unwrap_or(&pos.signal.instrument_name);
+                        let Some(ltp) = ltp_map.get(key.as_str()).map(|r| *r).filter(|v| *v > 0.0)
+                        else {
+                            continue;
+                        };
+                        let was_at_original = pos.current_sl <= pos.signal.stop_loss;
+                        let instrument = pos.signal.instrument_name.clone();
+                        if let Some(new_sl) = pre_t1_trail_update(pos, ltp, &cfg) {
+                            positions_mutated = true;
+                            // Only the first ratchet above the signal SL is
+                            // logged — see the LIVE counterpart in live_tick.
+                            if was_at_original {
+                                send_log(&db_tx, &log_tx, "INFO", &format!(
+                                    r#"{{"event":"PRE_T1_TRAIL_ARMED","instrument":"{instrument}","new_sl":{new_sl:.2}}}"#
+                                )).await;
+                            }
+                        }
+                    }
+                }
 
                 // ── Pass 1: read-only scan ────────────────────────── //
                 for (i, pos) in pos_guard.iter().enumerate() {
@@ -2562,8 +2666,15 @@ pub async fn start_position_monitor(
                                     qty: pos.executed_qty, reason: reason.clone(), new_sl: None, exec_price: pos.override_exit_price,
                                 })
                             } else if ltp <= pos.current_sl {
+                                // A stop above the signal's SL while still
+                                // Active means the pre-T1 trail moved it.
+                                let reason = if pos.current_sl > pos.signal.stop_loss {
+                                    "TRAIL_SL_HIT"
+                                } else {
+                                    "SL_HIT"
+                                };
                                 Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: "SL_HIT".to_string(), new_sl: None, exec_price: None,
+                                    qty: pos.executed_qty, reason: reason.to_string(), new_sl: None, exec_price: None,
                                 })
                             } else if !pos.signal.targets.is_empty() && ltp >= pos.signal.targets[0] {
                                 let has_t2 = pos.signal.targets.len() > 1;
@@ -2746,6 +2857,7 @@ mod tests {
             state: TradeState::WaitingForEntry,
             created_at: created_at.to_string(),
             current_sl: 100.0,
+            peak_ltp: None,
             next_dynamic_target: None,
             last_dynamic_rung: None,
             dynamic_rung_number: 0,
@@ -2787,6 +2899,9 @@ mod tests {
             dynamic_targeting: false,
             dynamic_targeting_trail_factor: 0.5,
             dynamic_targeting_extension_factor: 1.0,
+            pre_t1_trailing: false,
+            pre_t1_trail_arm_pct: 60.0,
+            pre_t1_trail_factor: 0.5,
         }
     }
 
@@ -2860,6 +2975,94 @@ mod tests {
         // A signal with no target can never trip the guard.
         sig.targets.clear();
         assert_eq!(entry_past_target1(&sig, 9_999.0), None);
+    }
+
+    /// An Active position from the shared helper: entry/avg 120, targets
+    /// [140, 160], SL 100 — so diff = 20, and the default 60 % arm threshold
+    /// sits at 132 with a 0.5-factor trail distance of 10.
+    fn active_position() -> MonitoredPosition {
+        let mut pos = position_created_at(&shared_domain::current_ist_timestamp_string());
+        pos.state = TradeState::Active;
+        pos.avg_buy_price = 120.0;
+        pos.executed_qty = 75;
+        pos
+    }
+
+    fn pre_t1_cfg() -> TradingConfig {
+        let mut cfg = cfg_with_lots(1, 3);
+        cfg.pre_t1_trailing = true;
+        cfg
+    }
+
+    #[test]
+    fn pre_t1_trail_is_inert_unless_enabled_and_active() {
+        let cfg_off = cfg_with_lots(1, 3);
+        let mut pos = active_position();
+        assert_eq!(pre_t1_trail_update(&mut pos, 139.0, &cfg_off), None);
+        assert_eq!(pos.peak_ltp, None);
+        assert_eq!(pos.current_sl, 100.0);
+
+        // Once target 1 has hit, the dynamic ladder / fixed target-2 path
+        // owns the stop — this must never touch it again.
+        let cfg = pre_t1_cfg();
+        let mut pos = active_position();
+        pos.state = TradeState::Target1Hit;
+        assert_eq!(pre_t1_trail_update(&mut pos, 155.0, &cfg), None);
+        assert_eq!(pos.current_sl, 100.0);
+
+        // No target, or an entry at/through target 1 (diff <= 0): nothing to
+        // measure progress against.
+        let mut pos = active_position();
+        pos.signal.targets.clear();
+        assert_eq!(pre_t1_trail_update(&mut pos, 139.0, &cfg), None);
+        let mut pos = active_position();
+        pos.avg_buy_price = 150.0;
+        assert_eq!(pre_t1_trail_update(&mut pos, 139.0, &cfg), None);
+    }
+
+    #[test]
+    fn pre_t1_trail_arms_at_threshold_and_only_ratchets_up() {
+        let cfg = pre_t1_cfg();
+        let mut pos = active_position();
+
+        // Below the 132 arm level: peak is tracked, stop is untouched — noise
+        // near entry keeps the signal's full SL room.
+        assert_eq!(pre_t1_trail_update(&mut pos, 131.95, &cfg), None);
+        assert_eq!(pos.peak_ltp, Some(131.95));
+        assert_eq!(pos.current_sl, 100.0);
+
+        // At 132 it arms: stop = 132 - 10.
+        assert_eq!(pre_t1_trail_update(&mut pos, 132.0, &cfg), Some(122.0));
+        assert_eq!(pos.current_sl, 122.0);
+
+        // A pullback is not a new peak — the stop never moves down.
+        assert_eq!(pre_t1_trail_update(&mut pos, 125.0, &cfg), None);
+        assert_eq!(pos.peak_ltp, Some(132.0));
+        assert_eq!(pos.current_sl, 122.0);
+
+        // A new high ratchets it further, tick-rounded down onto the grid.
+        assert_eq!(pre_t1_trail_update(&mut pos, 138.33, &cfg), Some(128.30));
+        assert_eq!(pos.current_sl, 128.30);
+
+        // A signal edit that lowers the stop on an armed position is
+        // re-asserted from the retained peak on the very next observation,
+        // even one that is not a new high — the higher stop wins.
+        pos.current_sl = pos.signal.stop_loss;
+        assert_eq!(pre_t1_trail_update(&mut pos, 124.0, &cfg), Some(128.30));
+    }
+
+    #[test]
+    fn pre_t1_trail_never_loosens_a_stop_already_above_it() {
+        let cfg = pre_t1_cfg();
+        let mut pos = active_position();
+        // A stop already sitting above the would-be trail (125 > 132 - 10)
+        // stays where it is.
+        pos.current_sl = 125.0;
+        pos.signal.stop_loss = 125.0;
+        assert_eq!(pre_t1_trail_update(&mut pos, 132.0, &cfg), None);
+        assert_eq!(pos.current_sl, 125.0);
+        // ...until the peak climbs far enough to beat it.
+        assert_eq!(pre_t1_trail_update(&mut pos, 136.0, &cfg), Some(126.0));
     }
 
     #[test]

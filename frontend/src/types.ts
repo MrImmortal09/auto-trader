@@ -26,6 +26,19 @@ export interface TradingConfig {
    * reproduces the original fixed `diff` spacing. Unused unless
    * `dynamic_targeting` is on. */
   dynamic_targeting_extension_factor: number;
+  /** Protect gains before target 1: once the peak LTP since entry covers
+   * `pre_t1_trail_arm_pct` % of the entry→target-1 distance, the stop is
+   * ratcheted up to `peak - diff * pre_t1_trail_factor` (never below the
+   * signal's SL, never moved back down). Trades that reach target 1 are
+   * untouched. Applies in both PAPER and LIVE. */
+  pre_t1_trailing: boolean;
+  /** Percent of the entry→target-1 distance the peak must cover before the
+   * pre-T1 trail arms. Unused unless `pre_t1_trailing` is on. */
+  pre_t1_trail_arm_pct: number;
+  /** Trail distance once armed, as a multiplier on `diff`:
+   * stop = peak - diff * factor. 0 = tightest, 1 = loosest. Unused unless
+   * `pre_t1_trailing` is on. */
+  pre_t1_trail_factor: number;
 }
 
 export interface PaperTrade {

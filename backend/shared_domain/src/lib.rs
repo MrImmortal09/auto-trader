@@ -188,10 +188,39 @@ pub struct TradingConfig {
     /// on every open `Target1Hit` dynamic-targeting position.
     #[serde(default = "default_extension_factor")]
     pub dynamic_targeting_extension_factor: f64,
+    /// When enabled, protect gains **before** target 1: track the peak LTP
+    /// since entry and, once the peak has covered `pre_t1_trail_arm_pct` % of
+    /// the entry→target-1 distance, ratchet `current_sl` up to
+    /// `peak - diff * pre_t1_trail_factor` (`diff = target1 - entry`,
+    /// tick-rounded, never below the signal's original SL, and never moved
+    /// back down). Fixes the "price ran to 99 % of target 1, reversed, and
+    /// gave the whole stop-loss back" case while leaving trades that do reach
+    /// target 1 completely untouched — target 1 and everything after it
+    /// behave exactly as with this off. Applies in both PAPER and LIVE
+    /// (protection is a software watch in both, so trailing is bookkeeping
+    /// only — no broker order is touched). Off by default.
+    #[serde(default)]
+    pub pre_t1_trailing: bool,
+    /// Percent of the entry→target-1 distance the peak must cover before the
+    /// pre-T1 trail arms (60.0 arms at `entry + 0.6 * diff`). Below that the
+    /// position keeps the signal's full original SL room, so ordinary noise
+    /// near entry is not trailed. Clamped to `[0, 100]` on save; unused
+    /// unless `pre_t1_trailing` is on.
+    #[serde(default = "default_pre_t1_arm_pct")]
+    pub pre_t1_trail_arm_pct: f64,
+    /// Multiplier applied to `diff` for the trail distance once armed:
+    /// `stop = peak - diff * this`. `0.5` gives back half the entry→target-1
+    /// distance from the peak; `0.0` exits on the first tick that isn't a new
+    /// high (tightest); `1.0` trails a full `diff` behind (loosest — only
+    /// reaches breakeven when the peak reaches target 1 itself). Clamped to
+    /// `[0, 1]` on save; unused unless `pre_t1_trailing` is on.
+    #[serde(default = "default_trail_factor")]
+    pub pre_t1_trail_factor: f64,
 }
 
 fn default_entry_mp() -> f64 { 5.0 }
 fn default_trail_factor() -> f64 { 0.5 }
+fn default_pre_t1_arm_pct() -> f64 { 60.0 }
 fn default_extension_factor() -> f64 { 1.0 }
 
 // ===========================================================================
@@ -262,6 +291,12 @@ pub struct MonitoredPosition {
     pub created_at: String,
     /// Current stop-loss level (may be trailed upward from initial SL).
     pub current_sl: f64,
+    /// Highest LTP observed while `Active`, feeding the pre-T1 trailing stop
+    /// (see `TradingConfig::pre_t1_trailing`). `None` until the first tick
+    /// after entry, and unused once target 1 hits — from there the dynamic
+    /// ladder or the fixed target-2 path owns the stop.
+    #[serde(default)]
+    pub peak_ltp: Option<f64>,
     /// Dynamic-targeting runner state: the next rung to watch for once target 1
     /// has been hit, if `TradingConfig::dynamic_targeting` was on when it hit.
     /// `None` means either dynamic targeting is off for this position (it
