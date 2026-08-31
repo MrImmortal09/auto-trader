@@ -51,6 +51,13 @@ pub async fn post_settings_handler(
     // value, not for safety — an oversized value just means a runner sits
     // un-trailed for longer while waiting for the next (very distant) rung.
     cfg.dynamic_targeting_extension_factor = cfg.dynamic_targeting_extension_factor.clamp(0.05, 5.0);
+    // Pre-T1 trail bounds mirror the field docs in shared_domain. No
+    // retroactive recompute is needed here (unlike the dynamic-targeting
+    // factors above): the trail re-derives the stop from the retained peak on
+    // every 50 ms tick, and it is ratchet-only — loosening the factors never
+    // lowers a stop that has already moved up, which errs toward being flat.
+    cfg.pre_t1_trail_arm_pct = cfg.pre_t1_trail_arm_pct.clamp(0.0, 100.0);
+    cfg.pre_t1_trail_factor = cfg.pre_t1_trail_factor.clamp(0.0, 1.0);
 
     let index_lots_by_symbol_json = serde_json::to_string(&cfg.index_lots_by_symbol)
         .unwrap_or_else(|_| "{}".to_string());
@@ -59,7 +66,8 @@ pub async fn post_settings_handler(
         "UPDATE trading_config
          SET max_trade_amount_inr=?, index_lots=?, other_lots=?, mode=?, brokerage_per_order=?,
              target_1_exit_pct=?, target_2_exit_pct=?, entry_market_protection=?, dynamic_targeting=?,
-             index_lots_by_symbol=?, dynamic_targeting_trail_factor=?, dynamic_targeting_extension_factor=?
+             index_lots_by_symbol=?, dynamic_targeting_trail_factor=?, dynamic_targeting_extension_factor=?,
+             pre_t1_trailing=?, pre_t1_trail_arm_pct=?, pre_t1_trail_factor=?
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
@@ -74,6 +82,9 @@ pub async fn post_settings_handler(
     .bind(&index_lots_by_symbol_json)
     .bind(cfg.dynamic_targeting_trail_factor)
     .bind(cfg.dynamic_targeting_extension_factor)
+    .bind(cfg.pre_t1_trailing)
+    .bind(cfg.pre_t1_trail_arm_pct)
+    .bind(cfg.pre_t1_trail_factor)
     .execute(&state.db_pool)
     .await
     {

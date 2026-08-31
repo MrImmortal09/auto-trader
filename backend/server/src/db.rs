@@ -95,6 +95,18 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         &pool,
         "ALTER TABLE trading_config ADD COLUMN dynamic_targeting_extension_factor REAL NOT NULL DEFAULT 1.0",
     ).await;
+    ensure_column(
+        &pool,
+        "ALTER TABLE trading_config ADD COLUMN pre_t1_trailing INTEGER NOT NULL DEFAULT 0",
+    ).await;
+    ensure_column(
+        &pool,
+        "ALTER TABLE trading_config ADD COLUMN pre_t1_trail_arm_pct REAL NOT NULL DEFAULT 60.0",
+    ).await;
+    ensure_column(
+        &pool,
+        "ALTER TABLE trading_config ADD COLUMN pre_t1_trail_factor REAL NOT NULL DEFAULT 0.5",
+    ).await;
 
     ensure_column(
         &pool,
@@ -160,6 +172,9 @@ struct TradingConfigRow {
     index_lots_by_symbol: String,
     dynamic_targeting_trail_factor: f64,
     dynamic_targeting_extension_factor: f64,
+    pre_t1_trailing: bool,
+    pre_t1_trail_arm_pct: f64,
+    pre_t1_trail_factor: f64,
 }
 
 /// Load `TradingConfig` from SQLite, falling back to safe defaults.
@@ -167,7 +182,8 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
     sqlx::query_as::<_, TradingConfigRow>(
         "SELECT max_trade_amount_inr, index_lots, other_lots, mode, brokerage_per_order,
                 target_1_exit_pct, target_2_exit_pct, entry_market_protection, dynamic_targeting,
-                index_lots_by_symbol, dynamic_targeting_trail_factor, dynamic_targeting_extension_factor
+                index_lots_by_symbol, dynamic_targeting_trail_factor, dynamic_targeting_extension_factor,
+                pre_t1_trailing, pre_t1_trail_arm_pct, pre_t1_trail_factor
          FROM trading_config WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -190,6 +206,9 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         index_lots_by_symbol: serde_json::from_str(&r.index_lots_by_symbol).unwrap_or_default(),
         dynamic_targeting_trail_factor: r.dynamic_targeting_trail_factor.clamp(0.0, 1.0),
         dynamic_targeting_extension_factor: r.dynamic_targeting_extension_factor.clamp(0.05, 5.0),
+        pre_t1_trailing: r.pre_t1_trailing,
+        pre_t1_trail_arm_pct: r.pre_t1_trail_arm_pct.clamp(0.0, 100.0),
+        pre_t1_trail_factor: r.pre_t1_trail_factor.clamp(0.0, 1.0),
     })
     .unwrap_or_else(|| TradingConfig {
         max_trade_amount_inr: 10_000.0,
@@ -204,6 +223,9 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         index_lots_by_symbol: Default::default(),
         dynamic_targeting_trail_factor: 0.5,
         dynamic_targeting_extension_factor: 1.0,
+        pre_t1_trailing: false,
+        pre_t1_trail_arm_pct: 60.0,
+        pre_t1_trail_factor: 0.5,
     })
 }
 

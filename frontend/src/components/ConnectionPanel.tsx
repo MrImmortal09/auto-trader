@@ -3,11 +3,23 @@ import { apiFetch } from '../lib/api';
 import { KotakLoginPanel } from './KotakLoginPanel';
 import { TelegramLoginPanel } from './TelegramLoginPanel';
 
+type SysStatus = {
+  telegram_connected: boolean;
+  kotak_connected: boolean;
+  /** "YYYY-MM-DD HH:MM:SS" in IST, or null when no Scrip Master download has
+   *  succeeded since the server started. Older backends omit the field. */
+  scrip_loaded_at: string | null;
+};
+
 export function ConnectionPanel({ serverBase, onServerBaseChange }: {
   serverBase: string;
   onServerBaseChange: (value: string) => void;
 }) {
-  const [sysStatus, setSysStatus] = useState({ telegram_connected: false, kotak_connected: false });
+  const [sysStatus, setSysStatus] = useState<SysStatus>({
+    telegram_connected: false,
+    kotak_connected: false,
+    scrip_loaded_at: null,
+  });
   const [isUpdating, setIsUpdating] = useState(false);
 
   useEffect(() => {
@@ -84,6 +96,26 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
     }, 2000);
   };
 
+  // The backend formats this in IST, so compare against today *in IST* rather
+  // than the viewer's local date — the dashboard can be open from any timezone
+  // but the trading day is always IST.
+  const scripLoadedAt = sysStatus.scrip_loaded_at ?? null;
+  const istToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const scripFreshToday = !!scripLoadedAt && scripLoadedAt.slice(0, 10) === istToday;
+  const scripLabel = !scripLoadedAt
+    ? 'never'
+    : scripFreshToday
+      ? scripLoadedAt.slice(11, 16)
+      : scripLoadedAt.slice(0, 10);
+  const scripDot = !scripLoadedAt
+    ? 'bg-error'
+    : scripFreshToday
+      ? 'bg-secondary shadow-[0_0_5px_rgba(0,108,73,0.3)]'
+      : 'bg-tertiary';
+  const scripTitle = !scripLoadedAt
+    ? 'Scrip Master has not been downloaded successfully since this server started — signals cannot be resolved to contracts'
+    : `Scrip Master last downloaded ${scripLoadedAt} IST${scripFreshToday ? '' : ' — stale, nothing downloaded today'}`;
+
   return (
     <div className="flex flex-col gap-4 bg-surface-container-lowest border border-outline-variant rounded-xl px-4 sm:px-6 py-4 sm:py-5 shadow-sm">
       <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 pb-4 border-b border-outline-variant">
@@ -115,6 +147,13 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
                 Disconnect
               </button>
             )}
+          </div>
+          {/* Scrip Master freshness. The 09:10 session recycle only re-downloads
+              when this is stale, so it also serves as proof that pass ran. */}
+          <div className="flex items-center gap-1.5" title={scripTitle}>
+            <div className={`w-2 h-2 rounded-full ${scripDot}`} />
+            <span className={scripFreshToday ? 'text-on-surface' : 'text-on-surface-variant'}>Scrip</span>
+            <span className="font-normal text-on-surface-variant">{scripLabel}</span>
           </div>
         </div>
         <div className="flex gap-2 w-full sm:w-auto justify-end">

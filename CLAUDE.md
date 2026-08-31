@@ -90,6 +90,6 @@ Note: there is a second, unused `shared_domain/Cargo.toml` at the repo root (out
 
 ### Deployment
 
-Production backend runs on a GCP VM (`gcloud compute ssh --zone "us-east1-d" "trader-1" --project "trader-502418"`), natively (not systemd) inside `tmux` session `0`, pane `0:0`. The binary lives at `~/auto-trader/backend/server`; restarting it means `tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server" C-m`. See `README.md` for the full VM + Vercel split-deployment guide, systemd unit alternative, and Nginx reverse-proxy config.
+Production backend runs on a generic Ubuntu VM in Hyderabad (`ssh ubuntu@140.245.209.140` — 954 MB RAM, 2 vCPU, no swap), natively (not systemd) inside `tmux` session `0`, pane `0:0`. The binary is version-stamped in `~/auto-trader/backend/` (e.g. `server-0.1.93-x86_64-unknown-linux-gnu`) — note `~/auto-trader/backend/server` is the source crate directory, not the binary. Restarting it means `tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server-<version>-x86_64-unknown-linux-gnu" C-m`. See `README.md` for the full VM + Vercel split-deployment guide, systemd unit alternative, and Nginx reverse-proxy config.
 
 Kotak API reference docs are checked into `kotak-api-docs/`.

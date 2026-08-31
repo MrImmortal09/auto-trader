@@ -12,14 +12,21 @@
 
 ### Inform the user if there is a Change in db and clearing the whole db is required.
 
-### you can connet to the cloud server where the backend server is running by running  "gcloud compute ssh --zone \"us-east1-d\" \"trader-1\" --project \"trader-502418\"
+### you can connect to the cloud server where the backend server is running by running `ssh ubuntu@140.245.209.140`
+- It is a plain Ubuntu VM in **Hyderabad** (no cloud-vendor CLI involved) — the old `gcloud compute ssh ...` route is dead, do not use it.
 
 ### kotak api docs are present in kotak-api-docs folder
 
 ### Deployment Context
-- The backend binary is located at `~/auto-trader/backend/server` on the GCP instance.
+- The backend binary is located in `~/auto-trader/backend/` on the VM. It is a **version-stamped**
+  file (e.g. `server-0.1.93-x86_64-unknown-linux-gnu`), not `./server` — `~/auto-trader/backend/server`
+  is the *source crate directory*. Check `ps -eo pid,cmd | grep server-` for the one actually running.
 - The server is executed natively inside a `tmux` session named `0` (specifically pane `0:0`).
-- Restarting the server programmatically requires commands like `tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server" C-m` since it is not managed by systemd.
+- Restarting the server programmatically requires commands like
+  `tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server-<version>-x86_64-unknown-linux-gnu" C-m`
+  since it is not managed by systemd.
+- The VM has **954 MB RAM and no swap**, and stdout is only kept in the tmux scrollback (no log file),
+  so a crash or freeze leaves little forensic trail beyond the `system_logs` table in `trades.db`.
 
 ### Verification Rule
 - ALWAYS run `cargo build` (or `cargo check`) in the appropriate directory after making ANY changes to Rust code to verify compilation before concluding your turn.

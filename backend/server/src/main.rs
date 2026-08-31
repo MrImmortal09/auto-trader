@@ -151,6 +151,9 @@ pub(crate) struct AppState {
     pub positions:   Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
     /// Kotak Scrip Master loaded dynamically after login.
     pub scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
+    /// IST timestamp of the last successful Scrip Master download — see
+    /// `routes::KotakLoginDeps::scrip_loaded_at`.
+    pub scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     /// Raw CSV string for frontend download.
     pub raw_scrip_csv: Arc<RwLock<Option<String>>>,
     /// Handle to the currently running WebSocket task, so we can cancel it on re-auth.
@@ -181,6 +184,7 @@ struct KotakAutoLoginHandles {
     positions: Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
     scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
     raw_scrip_csv: Arc<RwLock<Option<String>>>,
+    scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     login_lock: Arc<Mutex<()>>,
 }
 
@@ -197,6 +201,7 @@ impl KotakAutoLoginHandles {
             positions: &self.positions,
             scrip_store: &self.scrip_store,
             raw_scrip_csv: &self.raw_scrip_csv,
+            scrip_loaded_at: &self.scrip_loaded_at,
             login_lock: &self.login_lock,
         }
     }
@@ -313,6 +318,186 @@ async fn run_daily_kotak_clear(
     }
 }
 
+/// Broadcast a log line to the live SSE stream *and* persist it to `system_logs`.
+///
+/// The Scrip Master refresh this file used to run only ever reached the SSE
+/// stream, so when it wedged the server on 2026-08-31 it left no trace in the
+/// DB at all — the incident had to be reconstructed from nginx and `sar`.
+/// Anything scheduled and unattended needs to survive a restart to be worth
+/// anything, hence the DB write.
+async fn recycle_log(handles: &KotakAutoLoginHandles, level: &str, payload: serde_json::Value) {
+    let message = payload.to_string();
+    let _ = handles
+        .write_tx
+        .send(DbWriteMessage::Log { level: level.to_owned(), message: message.clone() })
+        .await;
+    let _ = handles.log_tx.send(message);
+}
+
+/// Runs forever, performing a full Kotak session recycle at `(hour, minute)`
+/// IST every weekday: tear the existing session down, then log in fresh —
+/// which, through `fetch_scrip_master_background`, also re-downloads the Scrip
+/// Master against the new session.
+///
+/// **Nothing here holds the Kotak mutex across network I/O**, which is the
+/// whole point. `clear_kotak_session` takes it only long enough to swap in
+/// `None`; the login path logs in against a *local* `KotakClient` and only
+/// takes the mutex to store the finished client; and the Scrip Master download
+/// runs against a *clone* pulled out of the mutex. The inline 09:10 Scrip
+/// Master refresh this replaced did the opposite — it held the mutex for the
+/// entire three-segment download, up to ~180s (6 HTTP requests x the client's
+/// 30s timeout). Everything needing that mutex blocked for the whole window:
+/// `kotak_place` / `kotak_cancel` in the position monitor, plus the
+/// `/api/portfolio` and `/api/status` routes. Observed 2026-08-31 09:10 IST as
+/// a total dashboard blackout five minutes before market open.
+///
+/// A failed login is retried rather than abandoned. The point of recycling at
+/// 09:10 is to be holding a working session by the 09:15 open, and deleting a
+/// good session only to give up on the first re-login failure would leave the
+/// account with no session while the market is live. If every attempt fails,
+/// the 09:15 auto-login trigger remains as the last backstop, and the failure
+/// is written to `system_logs` so it is visible after the fact.
+async fn run_daily_kotak_recycle(
+    hour: u32,
+    minute: u32,
+    label: &'static str,
+    handles: KotakAutoLoginHandles,
+) {
+    const MAX_LOGIN_ATTEMPTS: u32 = 3;
+    const RETRY_GAP_SECS: u64 = 20;
+
+    loop {
+        let secs_until = {
+            let now = shared_domain::now_ist();
+            let today_at = now
+                .date_naive()
+                .and_hms_opt(hour, minute, 0)
+                .expect("valid time")
+                .and_local_timezone(shared_domain::ist_offset())
+                .single()
+                .expect("IST time is unambiguous");
+            let diff = today_at.signed_duration_since(now);
+            if diff.num_seconds() > 0 {
+                diff.num_seconds() as u64
+            } else {
+                (diff + ChronoDuration::hours(24)).num_seconds().max(1) as u64
+            }
+        };
+
+        tracing::info!(secs = secs_until, trigger = label, "Kotak session recycle scheduled");
+        tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
+
+        let wd = shared_domain::now_ist().weekday();
+        if wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun {
+            tracing::info!(trigger = label, "Kotak session recycle skipped — weekend");
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            continue;
+        }
+
+        // Already logged in *and* holding a Scrip Master downloaded today? Then
+        // the 09:05 pre-warm already did this work and there is nothing to
+        // recycle. Tearing a healthy session down five minutes before the open
+        // only to rebuild it is pure downside: every re-login is a chance to end
+        // up with no session at all while the market is live. Both halves are
+        // required — a live session with a stale/absent Scrip Master can't
+        // resolve a signal to a contract, and today's Scrip Master with a dead
+        // session can't place the order. So this pass is a no-op on a normal day
+        // and a real recovery pass on a bad one.
+        let ready_today = {
+            let session_live = handles.kotak.lock().await.is_some();
+            // Compare *dates*, not instants — the question is "did today's
+            // download happen", not "was it this exact microsecond".
+            let scrip_today = handles
+                .scrip_loaded_at
+                .read()
+                .await
+                .map(|t| t.date_naive())
+                == Some(shared_domain::now_ist().date_naive());
+            session_live && scrip_today
+        };
+        if ready_today {
+            tracing::info!(trigger = label, "Kotak session recycle skipped — already logged in with today's Scrip Master");
+            recycle_log(&handles, "INFO", serde_json::json!({
+                "event": "KOTAK_SESSION_RECYCLE_SKIPPED",
+                "level": "INFO",
+                "source": label,
+                "message": "Session recycle skipped — already logged in and holding today's Scrip Master",
+            })).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            continue;
+        }
+
+        // Never delete a session we have no way to rebuild. With
+        // `KOTAK_AUTO_LOGIN=false` the only way back in is a human clicking
+        // Connect, so clearing here would strand the account with no session —
+        // strictly worse than leaving the existing one in place.
+        if !routes::auto_login_enabled_by_env() {
+            tracing::warn!(trigger = label, "Kotak session recycle skipped — KOTAK_AUTO_LOGIN=false");
+            recycle_log(&handles, "INFO", serde_json::json!({
+                "event": "KOTAK_SESSION_RECYCLE_SKIPPED",
+                "level": "INFO",
+                "source": label,
+                "message": "Session recycle skipped — KOTAK_AUTO_LOGIN=false, refusing to clear a session that cannot be rebuilt automatically",
+            })).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            continue;
+        }
+
+        recycle_log(&handles, "INFO", serde_json::json!({
+            "event": "KOTAK_SESSION_RECYCLE",
+            "level": "INFO",
+            "source": label,
+            "message": format!(
+                "Recycling Kotak session ({label}) — deleting the login, logging back in, re-downloading Scrip Master"
+            ),
+        })).await;
+
+        clear_kotak_session(
+            &handles.kotak,
+            &handles.ws_task,
+            &handles.ws_tx,
+            &handles.pool,
+            &handles.log_tx,
+            label,
+        )
+        .await;
+
+        let mut logged_in = false;
+        for attempt in 1..=MAX_LOGIN_ATTEMPTS {
+            match routes::try_env_auto_login(handles.as_deps(), label).await {
+                Ok(()) => {
+                    tracing::info!(trigger = label, attempt, "Kotak recycle login succeeded");
+                    logged_in = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(trigger = label, attempt, reason = %e, "Kotak recycle login failed");
+                    if attempt < MAX_LOGIN_ATTEMPTS {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_GAP_SECS)).await;
+                    }
+                }
+            }
+        }
+
+        if !logged_in {
+            recycle_log(&handles, "ERROR", serde_json::json!({
+                "event": "KOTAK_SESSION_RECYCLE_FAILED",
+                "level": "ERROR",
+                "source": label,
+                "message": format!(
+                    "Kotak re-login failed after {MAX_LOGIN_ATTEMPTS} attempts — no session. \
+                     The 09:15 auto-login trigger is the remaining backstop; until it succeeds \
+                     no order can be placed or cancelled."
+                ),
+            })).await;
+        }
+
+        // Step past the trigger instant so the next iteration schedules
+        // tomorrow's occurrence, not today's again.
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -324,7 +509,7 @@ async fn main() {
     // (systemd EnvironmentFile=, shell exports, etc.) still works as before.
     let _ = dotenvy::dotenv();
 
-    // 1. Tracing — timestamps in IST (UTC+5:30) so GCP server logs are readable
+    // 1. Tracing — timestamps in IST (UTC+5:30) so server logs are readable
     let ist_timer = tracing_subscriber::fmt::time::OffsetTime::new(
         time::UtcOffset::from_hms(5, 30, 0).expect("valid IST offset"),
         time::format_description::well_known::Rfc3339,
@@ -399,6 +584,7 @@ async fn main() {
     let ws_scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
     let scrip_store = Arc::new(RwLock::new(None));
     let raw_scrip_csv = Arc::new(RwLock::new(None));
+    let scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>> = Arc::new(RwLock::new(None));
 
     // 7. Try to restore Kotak session from DB
     if let Some(session) = db::load_kotak_session(&pool).await {
@@ -433,6 +619,7 @@ async fn main() {
                     }
                 }
                 *raw_scrip_csv.write().await = Some(combined);
+                *scrip_loaded_at.write().await = Some(shared_domain::now_ist());
                 tracing::info!("Scrip Master fetched successfully.");
             }
 
@@ -476,6 +663,7 @@ async fn main() {
             prices: &prices,
             positions: &positions,
             scrip_store: &scrip_store,
+            scrip_loaded_at: &scrip_loaded_at,
             raw_scrip_csv: &raw_scrip_csv,
             login_lock: &kotak_login_lock,
         };
@@ -534,11 +722,17 @@ async fn main() {
             prices: Arc::clone(&prices),
             positions: Arc::clone(&positions),
             scrip_store: Arc::clone(&scrip_store),
+            scrip_loaded_at: Arc::clone(&scrip_loaded_at),
             raw_scrip_csv: Arc::clone(&raw_scrip_csv),
             login_lock: Arc::clone(&kotak_login_lock),
         };
 
         tokio::spawn(run_daily_kotak_trigger(handles.clone(), 9, 5, "pre-warm 09:05 IST"));
+        // 09:10 — full session recycle: delete the login, log back in, and
+        // re-download the Scrip Master against the fresh session. This replaced
+        // a standalone Scrip Master refresh that held the Kotak mutex for the
+        // whole download; see `run_daily_kotak_recycle`.
+        tokio::spawn(run_daily_kotak_recycle(9, 10, "daily recycle 09:10 IST", handles.clone()));
         tokio::spawn(run_daily_kotak_trigger(
             handles,
             shared_domain::MARKET_OPEN_HOUR,
@@ -547,105 +741,8 @@ async fn main() {
         ));
     }
 
-    // 9. Daily Scrip Master refresh — runs at 09:10 IST every trading day
-    {
-        let kotak_arc   = Arc::clone(&kotak_client_opt);
-        let store_arc   = Arc::clone(&scrip_store);
-        let csv_arc     = Arc::clone(&raw_scrip_csv);
-        let log_tx_scrip = log_tx.clone();
 
-        tokio::spawn(async move {
-            loop {
-                // Compute seconds until next 09:10:00 IST
-                let secs_until = {
-                    let now = shared_domain::now_ist();
-                    let today_910 = now
-                        .date_naive()
-                        .and_hms_opt(9, 10, 0)
-                        .expect("valid time")
-                        .and_local_timezone(shared_domain::ist_offset())
-                        .single()
-                        .expect("IST 09:10 is unambiguous");
-
-                    let diff = today_910.signed_duration_since(now);
-                    if diff.num_seconds() > 0 {
-                        diff.num_seconds() as u64
-                    } else {
-                        // Already past 09:10 today — wait until tomorrow's 09:10
-                        (diff + ChronoDuration::hours(24)).num_seconds().max(1) as u64
-                    }
-                };
-
-                tracing::info!(secs = secs_until, "Daily Scrip Master refresh scheduled");
-                tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
-
-                // Only refresh on weekdays (skip weekends)
-                {
-                    let wd = shared_domain::now_ist().weekday();
-                    if wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun {
-                        tracing::info!("Scrip Master refresh skipped — weekend");
-                        // Sleep 24h and loop to recalculate the next wake time
-                        tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
-                        continue;
-                    }
-                }
-
-                let client_guard = kotak_arc.lock().await;
-                if let Some(ref client) = *client_guard {
-                    tracing::info!("Daily Scrip Master refresh starting...");
-                    let _ = log_tx_scrip.send(
-                        r#"{"event":"SCRIP_FETCH","message":"Daily 09:10 Scrip Master refresh..."}"#.into(),
-                    );
-
-                    let mut new_store = trading_engine::ScripStore::default();
-                    let mut raw_sections: Vec<(&str, String)> = Vec::new();
-
-                    for segment in ["nse_fo", "bse_fo", "nse_cm"] {
-                        match client.get_scrip_master_csv(segment).await {
-                            Ok(csv) => {
-                                new_store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
-                                raw_sections.push((segment, csv));
-                            }
-                            Err(e) => {
-                                tracing::error!(segment, "Scrip Master refresh failed: {e}");
-                                let _ = log_tx_scrip.send(format!(
-                                    r#"{{"event":"SCRIP_FETCH_ERROR","message":"Refresh failed for {segment}: {e}"}}"#
-                                ));
-                            }
-                        }
-                    }
-
-                    if !raw_sections.is_empty() {
-                        // Build combined CSV (header once, then all data rows)
-                        let mut combined = String::new();
-                        for (i, (_, csv)) in raw_sections.iter().enumerate() {
-                            let mut lines = csv.lines();
-                            if let Some(header) = lines.next() {
-                                if i == 0 { combined.push_str(header); combined.push('\n'); }
-                                for line in lines {
-                                    if !line.trim().is_empty() { combined.push_str(line); combined.push('\n'); }
-                                }
-                            }
-                        }
-                        // Replace old scrip store atomically
-                        *store_arc.write().await = Some(new_store);
-                        *csv_arc.write().await   = Some(combined);
-                        tracing::info!("Daily Scrip Master refresh complete.");
-                        let _ = log_tx_scrip.send(
-                            r#"{"event":"SCRIP_FETCH_SUCCESS","message":"Daily Scrip Master refresh complete"}"#.into(),
-                        );
-                    }
-                } else {
-                    tracing::warn!("Daily Scrip Master refresh skipped — Kotak not connected");
-                }
-
-                // Sleep until next day's 09:10 (approximately 24 h)
-                tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
-            }
-        });
-    }
-
-    // 9b. Daily Kotak session clear — two triggers:
+    // 9. Daily Kotak session clear — two triggers:
     //   09:00 — five minutes before the 09:05 pre-warm login. Guarantees a
     //           clean slate for that attempt regardless of what's currently
     //           sitting in memory: a session from a manual "Connect" earlier
@@ -666,7 +763,7 @@ async fn main() {
         pool.clone(), log_tx.clone(),
     ));
 
-    // 9. Router
+    // 10. Router
     let state = AppState {
         signal_tx,
         log_tx,
@@ -679,6 +776,7 @@ async fn main() {
         positions,
         scrip_store,
         raw_scrip_csv,
+        scrip_loaded_at,
         ws_task,
         ws_tx,
         rate_limit_map: Arc::new(DashMap::new()),
