@@ -645,14 +645,36 @@ async fn reconcile_live_orders(
                 if ord.is_terminal() {
                     let filled = ord.filled_qty();
                     let avg = ord.avg_price();
+                    // Whether the broker hard-rejected the order (vs. cancelled /
+                    // IOC-expired with nothing filled). Cancels are expected when
+                    // we use IOC validity — they are not failures, just misses
+                    // that the engine retries on the next tick.
+                    let was_cancelled = ord.is_cancelled();
+
                     if filled > 0 && avg > 0.0 {
                         record_live_sell(db_tx, log_tx, leg, filled, avg, &reason, brokerage).await;
+                    } else if was_cancelled {
+                        // IOC / manual cancel with 0 fill — not an error. Clear
+                        // the pending slot; decide_live will re-detect the SL
+                        // breach / target hit naturally on the next tick and
+                        // fire a new IOC order without any force_exit needed.
+                        live_info(db_tx, log_tx, json!({
+                            "event": "EXIT_ORDER_UNFILLED",
+                            "instrument": leg.instrument,
+                            "order_id": oid,
+                            "reason": reason,
+                            "note": "cancelled (IOC or manual) with 0 fill — retrying next tick",
+                            "mode": "LIVE",
+                        })).await;
                     } else {
+                        // Hard reject from the exchange / RMS — log loudly and
+                        // count against the exit-attempt cap.
                         loud_error(db_tx, log_tx, &leg.instrument, &format!(
                             "exit order {oid} ({reason}) came back {} ({}) with nothing sold",
                             ord.status, ord.reject_reason
                         )).await;
                     }
+
                     let shortfall = leg.pending_exit_qty - filled;
                     with_position(positions, &leg.pos_id, |p| {
                         p.executed_qty = (p.executed_qty - filled).max(0);
@@ -663,14 +685,19 @@ async fn reconcile_live_orders(
                             p.state = TradeState::Closed;
                             p.force_exit = None;
                         } else if shortfall > 0 {
-                            // Still holding stock we meant to be out of, and the
-                            // stop now covers less than we hold. Square the whole
-                            // thing off rather than sit under-protected.
-                            p.exit_attempts += 1;
-                            p.force_exit = Some(format!("{reason}_SHORTFALL"));
+                            if !was_cancelled {
+                                // Hard reject: count against the exit-attempt cap
+                                // and force an explicit retry so decide_live acts
+                                // even if price has bounced above the trigger.
+                                p.exit_attempts += 1;
+                                p.force_exit = Some(format!("{reason}_SHORTFALL"));
+                            }
+                            // For cancels: no force_exit, no counter — decide_live
+                            // re-detects the SL breach / target condition on the
+                            // next tick and issues a fresh IOC order automatically.
                         }
                     }).await;
-                    if shortfall > 0 {
+                    if shortfall > 0 && !was_cancelled {
                         loud_error(db_tx, log_tx, &leg.instrument, &format!(
                             "exit order {oid} ({reason}) filled {filled} of {} — squaring off the remainder",
                             leg.pending_exit_qty
@@ -1721,7 +1748,12 @@ async fn exec_exit_all(
         with_position(positions, pos_id, forget_stop).await;
     }
 
-    let order = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, qty, 0.0);
+    // IOC so that if Kotak internally converts our MKT to a limit (which it
+    // does for F&O options), the order auto-cancels the moment it isn't
+    // immediately filled rather than sitting open and tying up margin. The
+    // reconciler will re-detect the SL condition on the next tick and retry.
+    let mut order = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, qty, 0.0);
+    order.validity = shared_domain::Validity::Ioc;
     match kotak_place(kotak, &order).await {
         Ok(order_id) => {
             with_position(positions, pos_id, |p| {
@@ -1883,7 +1915,10 @@ async fn exec_live_action(
                 "mode": "LIVE",
             })).await;
 
-            let sell = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, *slice, 0.0);
+            // IOC: Kotak converts F&O market orders to limits; IOC prevents a
+            // stale limit from sitting open and blocking the next exit cycle.
+            let mut sell = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, *slice, 0.0);
+            sell.validity = shared_domain::Validity::Ioc;
             match kotak_place(kotak, &sell).await {
                 Ok(order_id) => {
                     with_position(positions, &pending.pos_id, |p| {
