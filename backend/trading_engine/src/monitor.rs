@@ -153,16 +153,16 @@ fn entry_past_target1(signal: &TradeSignal, ltp: f64) -> Option<f64> {
 
 /// Pre-T1 trailing stop (see `TradingConfig::pre_t1_trailing`): feed one LTP
 /// observation into `peak_ltp` and, once the peak has covered
-/// `pre_t1_trail_arm_pct` % of the entry→target-1 distance, ratchet
-/// `current_sl` up to `peak - diff * pre_t1_trail_factor` (tick-rounded).
+/// `pre_t1_trail_arm_pct` % of the entry→target-1 distance, set
+/// `current_sl` to `peak - diff * pre_t1_trail_factor` (tick-rounded).
 ///
-/// Ratchet-only: the stop never moves down here, and it starts from the
-/// signal's original SL, so it can never be looser than the signal asked for.
-/// A signal edit that lowers `current_sl` on an armed position is re-asserted
-/// on the next tick from the retained peak — when the two disagree, the
-/// higher stop (closer to flat) wins. Returns `Some(new_sl)` when the stop
-/// actually moved. Shared by the PAPER and LIVE paths — protection is a pure
-/// software watch in both, so moving the stop is bookkeeping, not an order.
+/// The SL is allowed to move **both up and down** so that a runtime change to
+/// `pre_t1_trail_factor` or `pre_t1_trail_arm_pct` takes effect immediately on
+/// the next tick. The only hard floor is the signal's original `stop_loss` —
+/// the dynamic level can never go below what the signal itself asked for.
+/// Returns `Some(new_sl)` when the stop actually moved. Shared by the PAPER
+/// and LIVE paths — protection is a pure software watch in both, so moving
+/// the stop is bookkeeping, not an order.
 fn pre_t1_trail_update(
     pos: &mut MonitoredPosition,
     ltp: f64,
@@ -181,8 +181,14 @@ fn pre_t1_trail_update(
     if peak < pos.avg_buy_price + diff * cfg.pre_t1_trail_arm_pct / 100.0 {
         return None;
     }
-    let desired = round_down_tick(peak - diff * cfg.pre_t1_trail_factor, pos.tick_size);
-    if desired > pos.current_sl {
+    // Clamp to the signal's original SL as the absolute floor — config
+    // changes can loosen the trail but can never expose more than the
+    // original stop-loss risk.
+    let desired = round_down_tick(
+        (peak - diff * cfg.pre_t1_trail_factor).max(pos.signal.stop_loss),
+        pos.tick_size,
+    );
+    if (desired - pos.current_sl).abs() > pos.tick_size * 0.5 {
         pos.current_sl = desired;
         return Some(desired);
     }
