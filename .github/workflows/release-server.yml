@@ -1,5 +1,6 @@
-name: Release Server Binary
+name: Build and Release Server Binary
 
+# Only run build and release on commits pushed to main
 on:
   push:
     branches:
