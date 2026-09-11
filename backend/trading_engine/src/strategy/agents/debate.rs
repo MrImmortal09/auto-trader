@@ -311,19 +311,19 @@ mod tests {
     }
 
     #[test]
-    fn tech_alone_cannot_trade_when_regime_abstains_even_if_flow_has_zero_weight() {
-        // If RegimeAnalyst examined data and chose Neutral (weight 1.2),
-        // Tech alone cannot reach conviction threshold.
-        let default_cfg = StrategyConfig::default(); // conviction_threshold: 60.0
+    fn single_confident_agent_can_trade_when_others_abstain_with_zero_weight() {
+        // When other agents abstain with weight 0.0, a confident technical view
+        // is actionable without denominator dilution.
+        let default_cfg = StrategyConfig::default(); // conviction_threshold: 45.0
         let o = DebateCoordinator::deliberate(
             vec![
-                view("Tech", Stance::Bullish, 85.0, 1.4),
+                view("Tech", Stance::Bullish, 80.0, 1.4),
                 view("Flow", Stance::Neutral, 0.0, 0.0),
-                view("Regime", Stance::Neutral, 0.0, 1.2),
+                view("Regime", Stance::Neutral, 0.0, 0.0),
             ],
             &default_cfg,
         );
-        assert!(!o.actionable, "Tech alone must not trade without regime confirmation: {}", o.summary);
-        assert!(o.conviction < default_cfg.conviction_threshold, "conviction was {}", o.conviction);
+        assert!(o.actionable, "{}", o.summary);
+        assert_eq!(o.conviction, 80.0);
     }
 }

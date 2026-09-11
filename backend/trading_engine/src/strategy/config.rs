@@ -148,14 +148,14 @@ impl Default for StrategyConfig {
 
             max_tick_age_ms: 10_000,
 
-            conviction_threshold: 60.0,
+            conviction_threshold: 45.0,
             min_debate_margin: 15.0,
 
             strike_search_steps: 4,
             max_spread_pct: 1.5,
             min_open_interest: 50_000.0,
             min_premium: 40.0,
-            max_premium: 400.0,
+            max_premium: 1000.0,
             preferred_otm_steps: 1,
 
             min_days_to_expiry: 0,
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn default_conviction_threshold_matches_spec() {
-        assert_eq!(StrategyConfig::default().conviction_threshold, 60.0);
+        assert_eq!(StrategyConfig::default().conviction_threshold, 45.0);
     }
 
     #[test]

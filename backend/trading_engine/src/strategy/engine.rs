@@ -456,8 +456,8 @@ fn regime_agent_view(r: &RegimeReading) -> AgentView {
             evidence: vec![r.rationale.clone()],
         },
         // Volatile-but-directionless, ranging, extended and unknown all decline
-        // to take a side. The regime gate handles blocking; the vote abstains.
-        _ => AgentView::neutral("RegimeAnalyst", REGIME_WEIGHT, r.rationale.clone()),
+        // to take a side. The regime gate handles blocking; the vote abstains with weight 0.0.
+        _ => AgentView::neutral("RegimeAnalyst", 0.0, r.rationale.clone()),
     }
 }
 

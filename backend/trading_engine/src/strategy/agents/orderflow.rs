@@ -73,7 +73,7 @@ impl OrderFlowAnalyst {
         if bars.len() < cfg.min_bars_for_signal {
             return AgentView::neutral(
                 "OrderFlowAnalyst",
-                WEIGHT,
+                0.0,
                 format!("warming up — {} of {} bars", bars.len(), cfg.min_bars_for_signal),
             );
         }
@@ -167,11 +167,16 @@ impl OrderFlowAnalyst {
             Stance::Neutral
         };
 
+        // When OrderFlowAnalyst is neutral (e.g. balanced PCR, or no volume/depth edge),
+        // it must abstain with weight 0.0 rather than diluting the debate denominator.
+        // It only participates with active weight when a real order-flow imbalance is detected.
+        let weight = if stance == Stance::Neutral { 0.0 } else { WEIGHT };
+
         AgentView {
             agent: "OrderFlowAnalyst".into(),
             stance,
             confidence: score.abs().min(100.0),
-            weight: WEIGHT,
+            weight,
             evidence,
         }
     }
@@ -226,6 +231,18 @@ mod tests {
         let mut t = MarketTick::new("nse_cm|Nifty 50");
         t.merge_from(&json!({"ltp": 24000.0, "tbq": tbq, "tsq": tsq}), 1_000);
         t
+    }
+
+    #[test]
+    fn is_neutral_with_zero_weight_while_warming_up() {
+        let bars: Vec<Candle> = (0..5).map(|i| Candle {
+            minute: i, open: 100.0, high: 101.0, low: 99.0, close: 100.0, volume: 1000.0, ticks: 5,
+        }).collect();
+        let v = OrderFlowAnalyst::analyse(&bars, None, ChainOi::default(), &cfg());
+        assert_eq!(v.stance, Stance::Neutral);
+        assert_eq!(v.confidence, 0.0);
+        assert_eq!(v.weight, 0.0);
+        assert!(v.evidence[0].contains("warming up"));
     }
 
     #[test]
@@ -286,6 +303,7 @@ mod tests {
     fn balanced_pcr_is_not_directional() {
         let v = OrderFlowAnalyst::analyse(&bars_with(1_000.0, 0.0), None, ChainOi { call_oi: 100_000.0, put_oi: 100_000.0 }, &cfg());
         assert_eq!(v.stance, Stance::Neutral, "{:?}", v.evidence);
+        assert_eq!(v.weight, 0.0, "neutral order flow must abstain with 0 weight");
     }
 
     #[test]

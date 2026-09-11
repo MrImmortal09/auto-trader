@@ -6,10 +6,12 @@ import {
   Brain,
   CheckCircle2,
   Gauge,
+  Layers,
   Loader2,
   Pause,
   Play,
   ShieldAlert,
+  SlidersHorizontal,
   TrendingDown,
   TrendingUp,
   XCircle,
@@ -276,6 +278,10 @@ export function StrategyScreen({ serverBase }: { serverBase: string }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [thresholdInput, setThresholdInput] = useState<number | null>(null);
+  const [maxPremiumInput, setMaxPremiumInput] = useState<number | null>(null);
+  const [minPremiumInput, setMinPremiumInput] = useState<number | null>(null);
+  const [strikeSearchStepsInput, setStrikeSearchStepsInput] = useState<number | null>(null);
 
   const load = useCallback(() => {
     apiFetch(serverBase, '/api/strategy')
@@ -293,6 +299,15 @@ export function StrategyScreen({ serverBase }: { serverBase: string }) {
     const id = setInterval(load, POLL_MS);
     return () => clearInterval(id);
   }, [load]);
+
+  useEffect(() => {
+    if (snap) {
+      if (thresholdInput === null) setThresholdInput(snap.config.conviction_threshold);
+      if (maxPremiumInput === null) setMaxPremiumInput(snap.config.max_premium);
+      if (minPremiumInput === null) setMinPremiumInput(snap.config.min_premium);
+      if (strikeSearchStepsInput === null) setStrikeSearchStepsInput(snap.config.strike_search_steps);
+    }
+  }, [snap, thresholdInput, maxPremiumInput, minPremiumInput, strikeSearchStepsInput]);
 
   async function toggleEnabled(next: boolean) {
     if (!snap) return;
@@ -335,6 +350,57 @@ export function StrategyScreen({ serverBase }: { serverBase: string }) {
       });
       if (!res.ok) setError(await res.text());
       else load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateConvictionThreshold(next: number) {
+    if (!snap) return;
+    setBusy(true);
+    try {
+      const res = await apiFetch(serverBase, '/api/strategy/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...snap.config, conviction_threshold: next }),
+      });
+      if (!res.ok) {
+        setError(await res.text());
+      } else {
+        setThresholdInput(next);
+        load();
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateStrikeConfig(nextMax: number, nextMin: number, nextSteps: number) {
+    if (!snap) return;
+    setBusy(true);
+    try {
+      const res = await apiFetch(serverBase, '/api/strategy/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...snap.config,
+          max_premium: nextMax,
+          min_premium: nextMin,
+          strike_search_steps: nextSteps,
+        }),
+      });
+      if (!res.ok) {
+        setError(await res.text());
+      } else {
+        setMaxPremiumInput(nextMax);
+        setMinPremiumInput(nextMin);
+        setStrikeSearchStepsInput(nextSteps);
+        load();
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -459,8 +525,213 @@ export function StrategyScreen({ serverBase }: { serverBase: string }) {
         ) : null}
       </div>
 
+      {/* Conviction Threshold Tuner */}
+      <div className="rounded-xl border border-outline-variant bg-surface p-4 flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <SlidersHorizontal size={18} className="text-primary shrink-0" />
+          <div>
+            <div className="text-sm font-bold text-on-surface flex items-center gap-2">
+              Conviction Threshold:
+              <span className="font-mono text-primary text-base font-bold">
+                {thresholdInput ?? snap.config.conviction_threshold}%
+              </span>
+              {thresholdInput !== null && thresholdInput !== snap.config.conviction_threshold && (
+                <span className="text-[11px] font-normal text-amber-500">
+                  (unsaved, currently {snap.config.conviction_threshold}%)
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-on-surface-variant">
+              Minimum debate consensus required to trigger entry signals (bull vs bear net score)
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <input
+            type="range"
+            min={30}
+            max={75}
+            step={1}
+            value={thresholdInput ?? snap.config.conviction_threshold}
+            onChange={(e) => setThresholdInput(Number(e.target.value))}
+            className="w-32 sm:w-44 accent-primary cursor-pointer"
+          />
+          <div className="flex items-center gap-1">
+            {[35, 40, 45, 50, 60].map((preset) => (
+              <button
+                key={preset}
+                type="button"
+                onClick={() => setThresholdInput(preset)}
+                className={`px-2 py-1 text-xs font-mono font-bold rounded transition-colors ${
+                  (thresholdInput ?? snap.config.conviction_threshold) === preset
+                    ? 'bg-primary-container text-on-primary'
+                    : 'bg-surface-container-high text-on-surface-variant hover:text-on-surface'
+                }`}
+              >
+                {preset}%
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => updateConvictionThreshold(thresholdInput ?? snap.config.conviction_threshold)}
+            disabled={busy || thresholdInput === null || thresholdInput === snap.config.conviction_threshold}
+            className="px-3.5 py-1.5 rounded-lg text-xs font-bold bg-primary text-on-primary hover:bg-primary/90 disabled:opacity-40 transition-colors"
+          >
+            Save
+          </button>
+        </div>
+      </div>
+
+      {/* Strike Selection & Premium Filter */}
+      <div className="rounded-xl border border-outline-variant bg-surface p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <Layers size={18} className="text-primary shrink-0" />
+            <div>
+              <div className="text-sm font-bold text-on-surface flex items-center gap-2">
+                Strike Selection & Premium Band:
+                <span className="font-mono text-primary font-bold">
+                  ₹{minPremiumInput ?? snap.config.min_premium} – ₹{maxPremiumInput ?? snap.config.max_premium}
+                </span>
+                {(maxPremiumInput !== snap.config.max_premium ||
+                  minPremiumInput !== snap.config.min_premium ||
+                  strikeSearchStepsInput !== snap.config.strike_search_steps) && (
+                  <span className="text-[11px] font-normal text-amber-500">
+                    (unsaved changes)
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-on-surface-variant">
+                Search window (ATM ± {strikeSearchStepsInput ?? snap.config.strike_search_steps} strikes) and tradeable option premium floor/ceiling
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={() =>
+              updateStrikeConfig(
+                maxPremiumInput ?? snap.config.max_premium,
+                minPremiumInput ?? snap.config.min_premium,
+                strikeSearchStepsInput ?? snap.config.strike_search_steps
+              )
+            }
+            disabled={
+              busy ||
+              (maxPremiumInput === snap.config.max_premium &&
+                minPremiumInput === snap.config.min_premium &&
+                strikeSearchStepsInput === snap.config.strike_search_steps)
+            }
+            className="px-3.5 py-1.5 rounded-lg text-xs font-bold bg-primary text-on-primary hover:bg-primary/90 disabled:opacity-40 transition-colors"
+          >
+            Save Strike Settings
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3 border-t border-outline-variant/40">
+          {/* Max Premium */}
+          <div className="space-y-1.5">
+            <div className="flex justify-between items-center text-xs">
+              <span className="font-semibold text-on-surface-variant">Max Premium Cap:</span>
+              <span className="font-mono font-bold text-primary">₹{maxPremiumInput ?? snap.config.max_premium}</span>
+            </div>
+            <input
+              type="range"
+              min={200}
+              max={2500}
+              step={50}
+              value={maxPremiumInput ?? snap.config.max_premium}
+              onChange={(e) => setMaxPremiumInput(Number(e.target.value))}
+              className="w-full accent-primary cursor-pointer"
+            />
+            <div className="flex flex-wrap items-center gap-1">
+              {[400, 600, 800, 1000, 1200, 1500].map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setMaxPremiumInput(preset)}
+                  className={`px-1.5 py-0.5 text-[11px] font-mono rounded transition-colors ${
+                    (maxPremiumInput ?? snap.config.max_premium) === preset
+                      ? 'bg-primary-container text-on-primary font-bold'
+                      : 'bg-surface-container-high text-on-surface-variant hover:text-on-surface'
+                  }`}
+                >
+                  ₹{preset}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Min Premium */}
+          <div className="space-y-1.5">
+            <div className="flex justify-between items-center text-xs">
+              <span className="font-semibold text-on-surface-variant">Min Premium Floor:</span>
+              <span className="font-mono font-bold text-primary">₹{minPremiumInput ?? snap.config.min_premium}</span>
+            </div>
+            <input
+              type="range"
+              min={10}
+              max={100}
+              step={5}
+              value={minPremiumInput ?? snap.config.min_premium}
+              onChange={(e) => setMinPremiumInput(Number(e.target.value))}
+              className="w-full accent-primary cursor-pointer"
+            />
+            <div className="flex flex-wrap items-center gap-1">
+              {[20, 30, 40, 50, 75].map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setMinPremiumInput(preset)}
+                  className={`px-1.5 py-0.5 text-[11px] font-mono rounded transition-colors ${
+                    (minPremiumInput ?? snap.config.min_premium) === preset
+                      ? 'bg-primary-container text-on-primary font-bold'
+                      : 'bg-surface-container-high text-on-surface-variant hover:text-on-surface'
+                  }`}
+                >
+                  ₹{preset}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Search Steps */}
+          <div className="space-y-1.5">
+            <div className="flex justify-between items-center text-xs">
+              <span className="font-semibold text-on-surface-variant">Search Window (ATM ± N):</span>
+              <span className="font-mono font-bold text-primary">±{strikeSearchStepsInput ?? snap.config.strike_search_steps} strikes</span>
+            </div>
+            <input
+              type="range"
+              min={2}
+              max={10}
+              step={1}
+              value={strikeSearchStepsInput ?? snap.config.strike_search_steps}
+              onChange={(e) => setStrikeSearchStepsInput(Number(e.target.value))}
+              className="w-full accent-primary cursor-pointer"
+            />
+            <div className="flex flex-wrap items-center gap-1">
+              {[2, 4, 6, 8, 10].map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setStrikeSearchStepsInput(preset)}
+                  className={`px-1.5 py-0.5 text-[11px] font-mono rounded transition-colors ${
+                    (strikeSearchStepsInput ?? snap.config.strike_search_steps) === preset
+                      ? 'bg-primary-container text-on-primary font-bold'
+                      : 'bg-surface-container-high text-on-surface-variant hover:text-on-surface'
+                  }`}
+                >
+                  ±{preset}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Risk + warm-up */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         {[
           {
             label: 'Realised P&L',
@@ -485,6 +756,11 @@ export function StrategyScreen({ serverBase }: { serverBase: string }) {
           {
             label: 'Conviction bar',
             value: `${snap.config.conviction_threshold.toFixed(0)}%`,
+            tone: 'text-on-surface',
+          },
+          {
+            label: 'Max Premium',
+            value: `₹${snap.config.max_premium.toFixed(0)}`,
             tone: 'text-on-surface',
           },
         ].map((s) => (

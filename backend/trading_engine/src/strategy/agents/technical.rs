@@ -47,7 +47,7 @@ impl TechnicalAnalyst {
         if bars.len() < cfg.min_bars_for_signal {
             return AgentView::neutral(
                 "TechnicalAnalyst",
-                WEIGHT,
+                0.0,
                 format!("warming up — {} of {} bars", bars.len(), cfg.min_bars_for_signal),
             );
         }
@@ -161,11 +161,14 @@ impl TechnicalAnalyst {
             evidence.push(format!("net technical score {score:+.0} is inside the ±20 neutral band"));
         }
 
+        // When TechnicalAnalyst is neutral, it abstains with weight 0.0 to avoid diluting the debate denominator.
+        let weight = if stance == Stance::Neutral { 0.0 } else { WEIGHT };
+
         AgentView {
             agent: "TechnicalAnalyst".into(),
             stance,
             confidence: score.abs().min(100.0),
-            weight: WEIGHT,
+            weight,
             evidence,
         }
     }
@@ -204,6 +207,7 @@ mod tests {
         let v = view_for(&[100.0; 5]);
         assert_eq!(v.stance, Stance::Neutral);
         assert_eq!(v.confidence, 0.0);
+        assert_eq!(v.weight, 0.0, "cold warmup must abstain with 0 weight");
         assert!(v.evidence[0].contains("warming up"));
     }
 
@@ -212,6 +216,7 @@ mod tests {
         let closes: Vec<f64> = (0..60).map(|i| 20_000.0 + i as f64 * 4.0).collect();
         let v = view_for(&closes);
         assert_eq!(v.stance, Stance::Bullish, "evidence: {:?}", v.evidence);
+        assert_eq!(v.weight, WEIGHT);
         assert!(v.confidence > 20.0, "got {}", v.confidence);
     }
 
@@ -220,6 +225,7 @@ mod tests {
         let closes: Vec<f64> = (0..60).map(|i| 20_000.0 - i as f64 * 4.0).collect();
         let v = view_for(&closes);
         assert_eq!(v.stance, Stance::Bearish, "evidence: {:?}", v.evidence);
+        assert_eq!(v.weight, WEIGHT);
         assert!(v.confidence > 20.0);
     }
 
@@ -228,6 +234,7 @@ mod tests {
         let closes: Vec<f64> = (0..60).map(|i| 20_000.0 + if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
         let v = view_for(&closes);
         assert_eq!(v.stance, Stance::Neutral, "a directionless tape must not produce a directional view: {:?}", v.evidence);
+        assert_eq!(v.weight, 0.0, "neutral tape must abstain with 0 weight");
     }
 
     #[test]
