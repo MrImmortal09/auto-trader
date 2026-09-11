@@ -108,7 +108,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
     { key: 'max_trade_amount_inr', label: 'Max Trade (₹)',
       info: 'Sizes non-option (equity) signals only: quantity ≈ this amount ÷ price, rounded down to whole lots. Option trades are sized by the lot settings, not by this.' },
     { key: 'target_1_exit_pct', label: 'Target 1 Exit %',
-      info: 'Share of the position sold when target 1 hits, rounded up to whole lots. Ignored when Dynamic Targeting is ON — that always sells exactly one lot at target 1.' },
+      info: 'Share of the position sold when target 1 hits, rounded up to whole lots. Ignored when Dynamic Targeting is ON — that always sells exactly one lot at target 1 (or nothing on a one-lot position, if Dynamic Targeting — 1 Lot is ON).' },
     { key: 'target_2_exit_pct', label: 'Target 2 Exit %',
       info: 'Reserved — the engine currently always exits the entire remaining position when target 2 hits, whatever this is set to.' },
     { key: 'entry_market_protection', label: 'Entry MP %',
@@ -130,6 +130,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           index_lots_by_symbol: cfgData?.index_lots_by_symbol ?? {},
           dynamic_targeting_trail_factor: cfgData?.dynamic_targeting_trail_factor ?? 0.5,
           dynamic_targeting_extension_factor: cfgData?.dynamic_targeting_extension_factor ?? 1.0,
+          dynamic_targeting_single_lot: cfgData?.dynamic_targeting_single_lot ?? false,
           pre_t1_trailing: cfgData?.pre_t1_trailing ?? false,
           pre_t1_trail_arm_pct: cfgData?.pre_t1_trail_arm_pct ?? 60,
           pre_t1_trail_factor: cfgData?.pre_t1_trail_factor ?? 0.5,
@@ -282,6 +283,45 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
                 </button>
               ))}
             </div>
+          </div>
+
+          {/* One-lot runner — sub-option of Dynamic Targeting. A one-lot
+              position otherwise sells its only lot at target 1 and is flat. */}
+          <div className={`relative flex flex-col gap-1.5 transition-opacity ${cfg.dynamic_targeting ? '' : 'opacity-50'}`}>
+            <span className="flex items-center gap-1 min-w-0">
+              <label className={FIELD_LABEL}>Dynamic Targeting — 1 Lot</label>
+              <InfoTip text="With Dynamic Targeting ON, a position of only one lot normally sells that lot at target 1 and is done. ON: sell nothing at target 1 — the whole lot becomes the runner, its stop trails up and the next rung extends exactly like a multi-lot runner, and it only exits when price falls back through the trailed stop (which never sits below entry). Positions of 2+ lots are unaffected. LIVE only." />
+            </span>
+            <div className="flex rounded-lg overflow-hidden border border-outline-variant text-xs font-label-caps">
+              {([true, false] as const).map((on) => (
+                <button
+                  key={String(on)}
+                  disabled={!hasWriteAccess || !cfg.dynamic_targeting}
+                  onClick={() => {
+                    if (!hasWriteAccess) {
+                      openUnlockModal('Changing dynamic targeting requires Write Access');
+                      return;
+                    }
+                    setCfg((c) => c && { ...c, dynamic_targeting_single_lot: on });
+                  }}
+                  title={on
+                    ? 'One-lot positions keep their whole lot as a dynamic runner at target 1 instead of exiting'
+                    : 'One-lot positions exit in full at target 1 (default)'}
+                  className={`flex-1 px-3 py-1.5 transition-colors font-semibold ${
+                    cfg.dynamic_targeting_single_lot === on
+                      ? 'bg-secondary text-on-secondary font-bold'
+                      : 'bg-surface text-on-surface-variant hover:bg-surface-container'
+                  } ${!hasWriteAccess || !cfg.dynamic_targeting ? 'opacity-60 cursor-not-allowed' : ''}`}
+                >
+                  {on ? 'ON' : 'OFF'}
+                </button>
+              ))}
+            </div>
+            {!cfg.dynamic_targeting && (
+              <span className="text-[11px] text-on-surface-variant italic">
+                Only applies when Dynamic Targeting is ON.
+              </span>
+            )}
           </div>
 
           <FactorSlider

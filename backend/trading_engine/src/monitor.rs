@@ -1713,7 +1713,8 @@ enum LiveAction {
     /// Target 1: trail the software stop to `new_sl`, then market-sell `slice`.
     /// `next_dynamic_target`/`dynamic_rung` seed the dynamic ladder (see
     /// `TrailDynamic`) when dynamic targeting is on; `None` keeps the
-    /// existing fixed-target-2 behaviour for this position.
+    /// existing fixed-target-2 behaviour for this position. `slice == 0` is a
+    /// one-lot runner (`dynamic_targeting_single_lot`): trail only, no sell.
     Target1 { slice: i32, keep: i32, new_sl: f64, next_dynamic_target: Option<f64>, dynamic_rung: Option<f64> },
     /// Dynamic-targeting rung hit: trail the stop and extend the next rung.
     /// `rung_hit` is the price level that was just crossed, recorded as
@@ -1906,13 +1907,25 @@ fn decide_live(
                     if ltp < t1 {
                         return None;
                     }
+                    let lot = lot_size_of(pos);
+                    // One-lot runner: selling one lot at target 1 would leave
+                    // nothing to run, so when opted in the whole holding stays
+                    // on as the runner instead (slice 0, no sell at all). Only
+                    // when target 1 sits above our fill — otherwise diff <= 0
+                    // and the ladder can't climb, so exit in full as before.
+                    let keep_whole_lot = cfg.dynamic_targeting
+                        && cfg.dynamic_targeting_single_lot
+                        && held <= lot
+                        && t1 > pos.avg_buy_price;
                     // Dynamic targeting sells exactly one lot at target 1
                     // (not the configured percentage) so there's a runner
                     // left to extend; off, this is the existing behaviour.
-                    let slice = if cfg.dynamic_targeting {
-                        lot_size_of(pos).min(held)
+                    let slice = if keep_whole_lot {
+                        0
+                    } else if cfg.dynamic_targeting {
+                        lot.min(held)
                     } else {
-                        tgt1_slice_qty(held, lot_size_of(pos), cfg.target_1_exit_pct)
+                        tgt1_slice_qty(held, lot, cfg.target_1_exit_pct)
                     };
                     // Target 2 only ever mattered here as an "is there more
                     // room to run" check — the dynamic path itself only ever
@@ -1920,7 +1933,7 @@ fn decide_live(
                     // when dynamic targeting is on, instead of always fully
                     // exiting at target 1 regardless of the setting.
                     let has_t2 = pos.signal.targets.len() > 1;
-                    if (!has_t2 && !cfg.dynamic_targeting) || slice >= held {
+                    if !keep_whole_lot && ((!has_t2 && !cfg.dynamic_targeting) || slice >= held) {
                         Some(LiveAction::ExitAll { qty: held, reason: "TGT1_FULL".to_string() })
                     } else {
                         // diff = distance from entry to target 1. Every rung of
@@ -2409,6 +2422,13 @@ async fn exec_live_action(
                 "qty": keep,
                 "mode": "LIVE",
             })).await;
+
+            // One-lot runner: the whole holding stays on the ladder, so there
+            // is nothing to sell at target 1. Never send a zero-qty order.
+            if *slice <= 0 {
+                tracing::info!(instrument = %ctx.instrument, keep, new_sl, "LIVE target 1 hit — keeping the whole lot as a dynamic runner");
+                return true;
+            }
 
             // IOC market, falling back to an IOC limit if the RMS refuses it
             // (Kotak converts F&O market orders to limits anyway; IOC keeps a
@@ -3446,6 +3466,7 @@ mod tests {
             dynamic_targeting: false,
             dynamic_targeting_trail_factor: 0.5,
             dynamic_targeting_extension_factor: 1.0,
+            dynamic_targeting_single_lot: false,
             pre_t1_trailing: false,
             pre_t1_trail_arm_pct: 60.0,
             pre_t1_trail_factor: 0.5,
@@ -3694,6 +3715,118 @@ mod tests {
         // decide_live re-checks entry_triggered before every limit send.
         ltp.insert("nse_fo|999".to_string(), 119.0);
         assert!(decide_live(&pos, &ltp, &cfg, false, true).is_none());
+    }
+
+    /// A LIVE position holding one 75-lot at avg 120 with LTP at target 1
+    /// (140) — diff = 20.
+    fn live_one_lot_at_target1(ltp_map: &Arc<DashMap<String, f64>>) -> MonitoredPosition {
+        let mut pos = live_waiting_position(ltp_map);
+        pos.state = TradeState::Active;
+        pos.avg_buy_price = 120.0;
+        pos.executed_qty = 75;
+        ltp_map.insert("nse_fo|999".to_string(), 140.0);
+        pos
+    }
+
+    fn dynamic_cfg(single_lot: bool) -> TradingConfig {
+        let mut cfg = cfg_with_lots(1, 3);
+        cfg.dynamic_targeting = true;
+        cfg.dynamic_targeting_single_lot = single_lot;
+        cfg
+    }
+
+    #[test]
+    fn one_lot_exits_in_full_at_target1_unless_single_lot_runner_is_on() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_one_lot_at_target1(&ltp);
+
+        // Default: dynamic targeting sells its one lot, leaving nothing to run.
+        match decide_live(&pos, &ltp, &dynamic_cfg(false), false, true) {
+            Some(LiveAction::ExitAll { qty, reason }) => {
+                assert_eq!(qty, 75);
+                assert_eq!(reason, "TGT1_FULL");
+            }
+            other => panic!("expected TGT1_FULL, got {other:?}"),
+        }
+
+        // Opted in: nothing is sold, the whole lot rides the ladder with the
+        // stop at 140 - 20*0.5 = 130 and the next rung at 140 + 20*1.0 = 160.
+        assert_eq!(
+            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true),
+            Some(LiveAction::Target1 {
+                slice: 0,
+                keep: 75,
+                new_sl: 130.0,
+                next_dynamic_target: Some(160.0),
+                dynamic_rung: Some(140.0),
+            })
+        );
+
+        // The toggle is a sub-option — inert while dynamic targeting is off.
+        let mut cfg = dynamic_cfg(true);
+        cfg.dynamic_targeting = false;
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true),
+            Some(LiveAction::ExitAll { .. })
+        ));
+    }
+
+    #[test]
+    fn single_lot_runner_leaves_multi_lot_and_bad_fills_alone() {
+        let ltp = Arc::new(DashMap::new());
+
+        // Two lots: still sells exactly one lot at target 1, as before.
+        let mut pos = live_one_lot_at_target1(&ltp);
+        pos.executed_qty = 150;
+        match decide_live(&pos, &ltp, &dynamic_cfg(true), false, true) {
+            Some(LiveAction::Target1 { slice, keep, .. }) => {
+                assert_eq!((slice, keep), (75, 75));
+            }
+            other => panic!("expected a one-lot Target1 slice, got {other:?}"),
+        }
+
+        // Filled at/above target 1 (diff <= 0): the ladder can't climb, so
+        // err toward flat and exit in full instead of keeping a runner.
+        let mut pos = live_one_lot_at_target1(&ltp);
+        pos.avg_buy_price = 140.0;
+        assert!(matches!(
+            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true),
+            Some(LiveAction::ExitAll { .. })
+        ));
+    }
+
+    #[test]
+    fn single_lot_runner_climbs_and_exits_only_on_the_trailed_stop() {
+        let ltp = Arc::new(DashMap::new());
+        let cfg = dynamic_cfg(true);
+        let mut pos = live_one_lot_at_target1(&ltp);
+        // State as left by the slice-0 Target1 action.
+        pos.state = TradeState::Target1Hit;
+        pos.current_sl = 130.0;
+        pos.next_dynamic_target = Some(160.0);
+        pos.last_dynamic_rung = Some(140.0);
+        pos.dynamic_rung_number = 1;
+
+        // Between the stop and the next rung: hold.
+        ltp.insert("nse_fo|999".to_string(), 150.0);
+        assert!(decide_live(&pos, &ltp, &cfg, false, true).is_none());
+
+        // Next rung: trail to 150, extend to 180 — no sell.
+        ltp.insert("nse_fo|999".to_string(), 160.0);
+        assert_eq!(
+            decide_live(&pos, &ltp, &cfg, false, true),
+            Some(LiveAction::TrailDynamic { new_sl: 150.0, next_target: 180.0, rung_hit: 160.0 })
+        );
+
+        // Back through the trailed stop: sell the whole lot.
+        ltp.insert("nse_fo|999".to_string(), 129.0);
+        match decide_live(&pos, &ltp, &cfg, false, true) {
+            Some(LiveAction::ExitAll { qty, reason }) => {
+                assert_eq!(qty, 75);
+                assert_eq!(reason, "TRAIL_SL_HIT");
+            }
+            other => panic!("expected TRAIL_SL_HIT, got {other:?}"),
+        }
     }
 
     #[test]

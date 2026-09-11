@@ -188,6 +188,17 @@ pub struct TradingConfig {
     /// on every open `Target1Hit` dynamic-targeting position.
     #[serde(default = "default_extension_factor")]
     pub dynamic_targeting_extension_factor: f64,
+    /// Extends `dynamic_targeting` to one-lot positions. Normally a position
+    /// holding one lot (or less) has nothing left to run after target 1 sells
+    /// its only lot, so it exits in full (`TGT1_FULL`). With this on, target 1
+    /// sells **nothing** — the whole lot becomes the runner, with its stop
+    /// trailed and next rung extended exactly as for a multi-lot runner. The
+    /// trailed stop still never sits below entry (trail factor is clamped to
+    /// `[0, 1]`). Multi-lot positions are unaffected. Unused unless
+    /// `dynamic_targeting` is on; LIVE only, like the rest of dynamic
+    /// targeting. Off by default.
+    #[serde(default)]
+    pub dynamic_targeting_single_lot: bool,
     /// When enabled, protect gains **before** target 1: track the peak LTP
     /// since entry and, once the peak has covered `pre_t1_trail_arm_pct` % of
     /// the entry→target-1 distance, ratchet `current_sl` up to

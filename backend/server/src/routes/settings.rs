@@ -74,7 +74,8 @@ pub async fn post_settings_handler(
          SET max_trade_amount_inr=?, index_lots=?, other_lots=?, mode=?, brokerage_per_order=?,
              target_1_exit_pct=?, target_2_exit_pct=?, entry_market_protection=?, dynamic_targeting=?,
              index_lots_by_symbol=?, dynamic_targeting_trail_factor=?, dynamic_targeting_extension_factor=?,
-             pre_t1_trailing=?, pre_t1_trail_arm_pct=?, pre_t1_trail_factor=?, entry_window_pct=?
+             pre_t1_trailing=?, pre_t1_trail_arm_pct=?, pre_t1_trail_factor=?, entry_window_pct=?,
+             dynamic_targeting_single_lot=?
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
@@ -93,6 +94,7 @@ pub async fn post_settings_handler(
     .bind(cfg.pre_t1_trail_arm_pct)
     .bind(cfg.pre_t1_trail_factor)
     .bind(cfg.entry_window_pct)
+    .bind(cfg.dynamic_targeting_single_lot)
     .execute(&state.db_pool)
     .await
     {
