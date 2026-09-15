@@ -5,5 +5,6 @@ members = [
     "backend/trading_engine",
     "backend/server",
     "backend/telegram_ingester",
+    "backend/upstox_client",
 ]
 resolver = "2"

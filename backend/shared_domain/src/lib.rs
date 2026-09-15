@@ -767,6 +767,22 @@ pub enum DbWriteMessage {
     PositionsSnapshot {
         json: String,
     },
+    /// One minute's aggregated option-chain OI for an index over a strike
+    /// window (analytics only — sourced from Upstox, never used for orders).
+    OiSnapshot {
+        ts: String,
+        underlying: String,
+        expiry: String,
+        /// Strikes each side of ATM included; 0 = the whole chain.
+        strike_window: i64,
+        call_oi: f64,
+        put_oi: f64,
+        call_oi_chg: f64,
+        put_oi_chg: f64,
+        spot: f64,
+        fut_ltp: Option<f64>,
+        fut_vwap: Option<f64>,
+    },
 }
 
 #[cfg(test)]

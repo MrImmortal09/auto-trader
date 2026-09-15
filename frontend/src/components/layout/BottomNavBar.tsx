@@ -1,5 +1,6 @@
 import {
   BarChart2,
+  Gauge,
   LayoutDashboard,
   Settings,
   TrendingUp,
@@ -43,6 +44,13 @@ export function BottomNavBar({
       >
         <BarChart2 size={20} className={activeScreen === 'analytics' ? 'scale-110 transition-transform' : ''} />
         <span className="text-[10px] mt-1 font-medium">Analytics</span>
+      </div>
+      <div
+        onClick={() => onSelectScreen('market')}
+        className={itemClass(activeScreen === 'market')}
+      >
+        <Gauge size={20} className={activeScreen === 'market' ? 'scale-110 transition-transform' : ''} />
+        <span className="text-[10px] mt-1 font-medium">Market</span>
       </div>
       <div
         onClick={() => onSelectScreen('portfolio')}

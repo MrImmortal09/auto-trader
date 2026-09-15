@@ -1,0 +1,17 @@
+[package]
+name = "upstox_client"
+version = "0.1.0"
+edition = "2021"
+
+# Read-only Upstox market-data client. Used for analytics only (option chain
+# OI, futures VWAP) — never for order placement, which stays on Kotak.
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt"] }
+flate2 = "1"
+chrono = { version = "0.4", features = ["std"] }
+shared_domain = { path = "../shared_domain" }

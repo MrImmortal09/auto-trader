@@ -159,6 +159,31 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    // Upstox option-chain analytics (see `market_data.rs`). New table, so this
+    // is backward compatible with existing databases.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS oi_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            underlying TEXT NOT NULL,
+            expiry TEXT NOT NULL,
+            strike_window INTEGER NOT NULL,
+            call_oi REAL NOT NULL,
+            put_oi REAL NOT NULL,
+            call_oi_chg REAL NOT NULL,
+            put_oi_chg REAL NOT NULL,
+            spot REAL NOT NULL,
+            fut_ltp REAL,
+            fut_vwap REAL
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_oi_snapshots_lookup ON oi_snapshots (underlying, strike_window, ts)",
+    ).execute(&pool).await.unwrap();
+    // ~4.5k rows per trading day; keep a month.
+    let cutoff = (shared_domain::now_ist() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+    let _ = sqlx::query("DELETE FROM oi_snapshots WHERE ts < ?").bind(cutoff).execute(&pool).await;
+
     pool
 }
 
@@ -398,6 +423,26 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 .await
                 {
                     tracing::error!("DB positions snapshot update: {e}");
+                }
+            }
+            DbWriteMessage::OiSnapshot {
+                ts, underlying, expiry, strike_window,
+                call_oi, put_oi, call_oi_chg, put_oi_chg,
+                spot, fut_ltp, fut_vwap,
+            } => {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO oi_snapshots
+                     (ts, underlying, expiry, strike_window, call_oi, put_oi,
+                      call_oi_chg, put_oi_chg, spot, fut_ltp, fut_vwap)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                )
+                .bind(&ts).bind(&underlying).bind(&expiry).bind(strike_window)
+                .bind(call_oi).bind(put_oi).bind(call_oi_chg).bind(put_oi_chg)
+                .bind(spot).bind(fut_ltp).bind(fut_vwap)
+                .execute(&pool)
+                .await
+                {
+                    tracing::error!("DB oi snapshot insert: {e}");
                 }
             }
         }

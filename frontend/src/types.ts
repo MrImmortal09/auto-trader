@@ -249,6 +249,6 @@ export interface ReconcileApplyItem {
   action: ReconcileAction;
 }
 
-export type ScreenId = 'dashboard' | 'positions' | 'analytics' | 'portfolio' | 'settings';
+export type ScreenId = 'dashboard' | 'positions' | 'analytics' | 'market' | 'portfolio' | 'settings';
 
 export type TgStep = 'idle' | 'code' | 'twofa' | 'chats' | 'running';

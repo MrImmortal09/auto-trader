@@ -5,6 +5,7 @@
 //! - [`routes`] — Axum route handlers (portfolio, settings, auth)
 
 mod db;
+mod market_data;
 mod routes;
 
 use std::sync::Arc;
@@ -143,6 +144,9 @@ pub(crate) struct AppState {
     /// `kotak.is_some() && this`, so a silently-dead session shows as
     /// disconnected and the dashboard offers a Reconnect.
     pub kotak_session_healthy: Arc<AtomicBool>,
+    /// Upstox option-chain analytics for the Market page (read-only, never
+    /// consulted by the position monitor).
+    pub market: Arc<market_data::MarketDataState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +883,28 @@ async fn main() {
         pool.clone(), log_tx.clone(),
     ));
 
+    // 9b. Upstox market-data poller (analytics only). Disabled unless
+    // UPSTOX_ANALYTICS_TOKEN is set; completely independent of the Kotak
+    // session, so a dead/slow Upstox never affects order placement.
+    let upstox_token = std::env::var("UPSTOX_ANALYTICS_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    // `configured` only when a poller actually runs, so a client build failure
+    // shows the "not configured" banner instead of waiting forever.
+    let upstox = match upstox_token.map(upstox_client::UpstoxClient::new) {
+        Some(Ok(client)) => Some(client),
+        Some(Err(e)) => {
+            tracing::error!(error = %e, "Failed to build Upstox client — market data disabled");
+            None
+        }
+        None => {
+            tracing::info!("UPSTOX_ANALYTICS_TOKEN not set — Market page data disabled");
+            None
+        }
+    };
+    let market = Arc::new(market_data::MarketDataState::new(upstox.is_some()));
+    if let Some(client) = upstox {
+        tokio::spawn(market_data::run_poller(client, Arc::clone(&market), write_tx.clone()));
+    }
+
     // 10. Router
     let state = AppState {
         signal_tx,
@@ -898,6 +924,7 @@ async fn main() {
         rate_limit_map: Arc::new(DashMap::new()),
         kotak_login_lock,
         kotak_session_healthy,
+        market,
     };
 
     let app = Router::new()
@@ -906,6 +933,9 @@ async fn main() {
         .route("/api/logs/history",                 get(routes::logs_history_handler))
         .route("/api/portfolio",                    get(routes::portfolio_handler))
         .route("/api/health",                       get(routes::health_handler))
+        .route("/api/market/live",                  get(routes::market_live_handler))
+        .route("/api/market/intraday-trend",        get(routes::market_trend_handler))
+        .route("/api/market/option-chain",          get(routes::market_option_chain_handler))
         .route("/api/positions",                    get(routes::positions_handler))
         .route("/api/prices",                       get(routes::prices_handler))
         .route("/api/scrip/search",                 get(routes::scrip_search_handler))

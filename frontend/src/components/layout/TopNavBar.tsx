@@ -20,6 +20,7 @@ export function TopNavBar({
     dashboard: 'Trading Dashboard',
     positions: 'Active Positions & Signals',
     analytics: 'Trade Analytics & Order Flow Deep Dive',
+    market: 'Market Data — OI, PCR & VWAP Trend',
     portfolio: 'Portfolio Performance & Reports',
     settings: 'Configurations & System Settings',
   };
