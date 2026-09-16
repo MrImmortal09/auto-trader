@@ -382,7 +382,7 @@ export function MarketDataScreen({ serverBase }: { serverBase: string }) {
 
               <div className="grid grid-cols-4 gap-2 mt-3 text-xs">
                 <div>
-                  <div className="text-on-surface-variant">PCR</div>
+                  <div className="text-on-surface-variant">{s.basis === 'chg' ? 'PCR ΔOI' : 'PCR OI'}</div>
                   <div className={`font-bold tabular-nums ${sc?.ratio == null ? '' : sc.ratio >= 1 ? 'text-secondary' : 'text-error'}`}>
                     {sc?.ratio != null ? sc.ratio.toFixed(2) : '—'}
                   </div>
@@ -520,7 +520,7 @@ export function MarketDataScreen({ serverBase }: { serverBase: string }) {
           <table className="w-full text-xs tabular-nums">
             <thead className="text-on-surface-variant">
               <tr className="border-b border-outline-variant">
-                {['Time', 'Call', 'Put', 'Diff', 'PCR', 'Option Signal', 'Spot', 'Future', 'VWAP', 'VWAP Signal', 'Overall'].map((h) => (
+                {['Time', 'Call', 'Put', 'Diff', s.basis === 'chg' ? 'PCR ΔOI' : 'PCR OI', 'Option Signal', 'Spot', 'Future', 'VWAP', 'VWAP Signal', 'Overall'].map((h) => (
                   <th key={h} className="px-3 py-2.5 font-semibold text-center whitespace-nowrap">{h}</th>
                 ))}
               </tr>

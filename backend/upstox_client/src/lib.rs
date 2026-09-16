@@ -25,6 +25,11 @@ const API_BASE: &str = "https://api.upstox.com/v2";
 const API_TIMEOUT: Duration = Duration::from_secs(20);
 /// Budget for downloading a multi-MB gzipped instruments file.
 const INSTRUMENTS_TIMEOUT: Duration = Duration::from_secs(180);
+/// Sent on every request. `assets.upstox.com` (the instruments files) sits
+/// behind Cloudflare and answers 403 to a request with no User-Agent, which is
+/// what reqwest sends by default — that silently emptied the futures map and
+/// left the VWAP columns blank while the api.upstox.com calls kept working.
+const USER_AGENT: &str = concat!("auto-trader/", env!("CARGO_PKG_VERSION"));
 pub const NSE_INSTRUMENTS_URL: &str =
     "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz";
 pub const BSE_INSTRUMENTS_URL: &str =
@@ -170,6 +175,7 @@ impl UpstoxClient {
         // download get separate per-request budgets.
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .user_agent(USER_AGENT)
             .build()?;
         Ok(Self { http, token: analytics_token.into() })
     }
