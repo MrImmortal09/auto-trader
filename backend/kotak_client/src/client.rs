@@ -227,10 +227,21 @@ pub struct KotakPosition {
     pub filled_buy_qty: String,
     #[serde(rename = "flSellQty", default)]
     pub filled_sell_qty: String,
+    /// Quantity bought on a prior day and carried forward (NRML positions
+    /// held past one day, which is the normal case here — see `buy_qty`).
+    #[serde(rename = "cfBuyQty", default)]
+    pub cf_buy_qty: String,
+    /// Quantity sold on a prior day and carried forward.
+    #[serde(rename = "cfSellQty", default)]
+    pub cf_sell_qty: String,
     #[serde(rename = "buyAmt", default)]
     pub buy_amount: String,
     #[serde(rename = "sellAmt", default)]
     pub sell_amount: String,
+    #[serde(rename = "cfBuyAmt", default)]
+    pub cf_buy_amount: String,
+    #[serde(rename = "cfSellAmt", default)]
+    pub cf_sell_amount: String,
     #[serde(rename = "optTp", default)]
     pub option_type: String,
     #[serde(rename = "expDt", default)]
@@ -241,22 +252,35 @@ impl KotakPosition {
     fn parse_f64(s: &str) -> f64 { s.trim().parse().unwrap_or(0.0) }
     fn parse_i32(s: &str) -> i32 { s.trim().parse().unwrap_or(0) }
 
-    /// Filled buy quantity.
-    pub fn buy_qty(&self) -> i32 { Self::parse_i32(&self.filled_buy_qty) }
-    /// Filled sell quantity.
-    pub fn sell_qty(&self) -> i32 { Self::parse_i32(&self.filled_sell_qty) }
-    /// Net open quantity (filled buys − filled sells).
+    /// Total bought quantity: today's fills plus anything carried forward
+    /// from a prior day. `flBuyQty` alone silently undercounts every NRML
+    /// position that has been held past one trading day — which, in this
+    /// account, is the common case, not the exception.
+    pub fn buy_qty(&self) -> i32 {
+        Self::parse_i32(&self.filled_buy_qty) + Self::parse_i32(&self.cf_buy_qty)
+    }
+    /// Total sold quantity: today's fills plus anything carried forward.
+    pub fn sell_qty(&self) -> i32 {
+        Self::parse_i32(&self.filled_sell_qty) + Self::parse_i32(&self.cf_sell_qty)
+    }
+    /// Net open quantity (total buys − total sells, across today and carry-forward).
     pub fn net_qty(&self) -> i32 { self.buy_qty() - self.sell_qty() }
 
-    /// Volume-weighted average buy fill price (`0.0` if nothing was bought).
+    /// Volume-weighted average buy fill price (`0.0` if nothing was bought),
+    /// across today's fills and any carried-forward quantity.
     pub fn avg_buy_price(&self) -> f64 {
         let q = self.buy_qty();
-        if q > 0 { Self::parse_f64(&self.buy_amount) / q as f64 } else { 0.0 }
+        if q > 0 {
+            (Self::parse_f64(&self.buy_amount) + Self::parse_f64(&self.cf_buy_amount)) / q as f64
+        } else {
+            0.0
+        }
     }
-    /// Volume-weighted average sell fill price (`0.0` if nothing was sold).
+    /// Volume-weighted average sell fill price (`0.0` if nothing was sold),
+    /// across today's fills and any carried-forward quantity.
     pub fn avg_sell_price(&self) -> f64 {
         let q = self.sell_qty();
-        if q > 0 { Self::parse_f64(&self.sell_amount) / q as f64 } else { 0.0 }
+        if q > 0 { (Self::parse_f64(&self.sell_amount) + Self::parse_f64(&self.cf_sell_amount)) / q as f64 } else { 0.0 }
     }
 }
 
@@ -791,8 +815,51 @@ impl KotakClient {
 
 #[cfg(test)]
 mod tests {
-    use super::find_csv_url;
+    use super::{find_csv_url, KotakPosition};
     use serde_json::json;
+
+    #[test]
+    fn net_qty_counts_carried_forward_quantity() {
+        // MIDCPNIFTY held from a prior day, untouched today — Kotak reports
+        // it entirely under cfBuyQty with flBuyQty at 0. Before this fix,
+        // net_qty() read flBuyQty alone and came back 0 for a real 120-qty
+        // holding, making it invisible to reconciliation.
+        let carried: KotakPosition = serde_json::from_value(json!({
+            "trdSym": "MIDCPNIFTY26SEP14100PE",
+            "flBuyQty": "0", "flSellQty": "0",
+            "cfBuyQty": "120", "cfSellQty": "0",
+            "buyAmt": "0.00", "sellAmt": "0.00",
+            "cfBuyAmt": "11370.00", "cfSellAmt": "0.00",
+        })).unwrap();
+        assert_eq!(carried.net_qty(), 120);
+        assert!((carried.avg_buy_price() - 94.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn net_qty_combines_carry_forward_with_todays_fills() {
+        // 120 carried in, all 120 sold today, then 60 bought back today —
+        // real holding is 60. Before this fix this came back -60 (flBuyQty
+        // 60 minus flSellQty 120), a negative "net short" that never existed.
+        let mixed: KotakPosition = serde_json::from_value(json!({
+            "trdSym": "BANKNIFTY26SEP55900PE",
+            "flBuyQty": "60", "flSellQty": "120",
+            "cfBuyQty": "120", "cfSellQty": "0",
+            "buyAmt": "18079.50", "sellAmt": "43293.00",
+            "cfBuyAmt": "49476.00", "cfSellAmt": "0.00",
+        })).unwrap();
+        assert_eq!(mixed.net_qty(), 60);
+    }
+
+    #[test]
+    fn net_qty_with_no_carry_forward_matches_old_behavior() {
+        let day_only: KotakPosition = serde_json::from_value(json!({
+            "trdSym": "AXISBANK-EQ",
+            "flBuyQty": "9", "flSellQty": "0",
+            "buyAmt": "5862.90", "sellAmt": "0.00",
+        })).unwrap();
+        assert_eq!(day_only.net_qty(), 9);
+        assert!((day_only.avg_buy_price() - 651.43).abs() < 0.01);
+    }
 
     #[test]
     fn test_find_csv_url_standard_and_versioned() {

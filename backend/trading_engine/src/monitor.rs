@@ -86,6 +86,42 @@ fn is_expiry_squareoff_due(_pos: &MonitoredPosition) -> bool {
     false
 }
 
+/// The open/waiting position, if any, that already matches `signal` on
+/// contract (instrument/strike/option_type/expiry) *and* entry
+/// condition/price. Two different Telegram messages (so the signal_id match
+/// in `start_position_monitor` never catches it) can carry the identical
+/// call — e.g. a channel resending it with a "BTST" tag — and each used to
+/// become its own tracked position while the broker netted both into one
+/// line. When their exits later fired together, whichever leg lost the race
+/// asked to sell qty the broker no longer had. Matching on entry price/
+/// condition too (not just the contract) still lets a genuinely revised call
+/// on the same strike through as a new position — only an exact repeat of
+/// the contract *and* entry matches here.
+///
+/// Known gap: this compares the raw parsed fields, not the resolved
+/// contract, so two resends that differ only in how the expiry was written
+/// (e.g. one omits it and resolves to the nearest expiry, the other spells
+/// it out) are not caught. Fixing that needs the expiry resolved before this
+/// check runs, which is a bigger reordering left for later — under-matching
+/// here is the safer failure mode (a possible duplicate position, which the
+/// startup reconciler already flags) versus over-matching and silently
+/// refusing a real second trade.
+fn find_duplicate_open_position<'a>(
+    positions: &'a [MonitoredPosition],
+    signal: &TradeSignal,
+) -> Option<&'a MonitoredPosition> {
+    positions.iter().find(|p| {
+        !matches!(p.state, TradeState::Closed)
+            && p.signal.instrument_name.eq_ignore_ascii_case(&signal.instrument_name)
+            && p.signal.strike == signal.strike
+            && p.signal.option_type == signal.option_type
+            && p.signal.expiry == signal.expiry
+            && p.signal.entry_condition == signal.entry_condition
+            && (p.signal.entry_price - signal.entry_price).abs() < f64::EPSILON
+    })
+}
+
+
 /// Lots to buy for `instrument_name`: the per-index override if one is set
 /// (see `TradingConfig::index_lots_by_symbol`), else `index_lots` for a known
 /// index, else `other_lots` for anything else (stock options).
@@ -544,6 +580,55 @@ async fn bump_exit_attempts(
     }
 }
 
+/// How much of `qty` this position can safely ask the broker to sell right
+/// now, given what *every other* tracked position on the same broker symbol
+/// has already committed to selling.
+///
+/// More than one tracked position can map to the same broker trading symbol
+/// (two signals on one contract). Each position's own resting stop
+/// (`sl_order_qty`) and in-flight exit (`pending_exit_qty`) are already
+/// tracked in memory and kept current by `reconcile_live_orders`, which runs
+/// immediately before every exit decision in the same tick — so summing them
+/// here enforces "resting stop qty + in-flight sell qty <= executed_qty"
+/// across sibling legs without an extra broker call on the hot exit path,
+/// and without depending on a Positions endpoint that has failed on every
+/// call for this account before (2026-08-17). Pass 2 of `live_tick` applies
+/// exits one at a time, so a sibling leg's exit that goes out first is
+/// already reflected here before this one is computed.
+///
+/// This is a cap on the engine's *own* bookkeeping, not broker truth — it
+/// cannot see a quantity sold manually outside the engine that hasn't been
+/// reconciled yet. That gap is closed by the periodic broker reconciliation,
+/// with the broker's own RMS rejection as the final backstop.
+async fn sellable_qty(
+    positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
+    pos_id: &str,
+    trading_symbol: &str,
+    qty: i32,
+) -> i32 {
+    let g = positions.read().await;
+    let mut tracked_total = 0i32;
+    let mut committed_elsewhere = 0i32;
+    for p in g.iter() {
+        if matches!(p.state, TradeState::Closed) {
+            continue;
+        }
+        let same_symbol = p
+            .resolved_order
+            .as_ref()
+            .map(|o| o.trading_symbol.trim() == trading_symbol.trim())
+            .unwrap_or(false);
+        if !same_symbol {
+            continue;
+        }
+        tracked_total += p.executed_qty;
+        if p.id != pos_id {
+            committed_elsewhere += p.sl_order_qty + p.pending_exit_qty;
+        }
+    }
+    (tracked_total - committed_elsewhere).max(0).min(qty)
+}
+
 /// Record a real LIVE sell fill as a trade + log line.
 #[allow(clippy::too_many_arguments)]
 async fn record_live_sell(
@@ -914,6 +999,7 @@ async fn reconcile_live_orders(
                     }
 
                     let shortfall = leg.pending_exit_qty - filled;
+                    let mut now_closed = false;
                     with_position(positions, &leg.pos_id, |p| {
                         p.executed_qty = (p.executed_qty - filled).max(0);
                         p.pending_exit_order_id = None;
@@ -922,24 +1008,43 @@ async fn reconcile_live_orders(
                         if p.executed_qty <= 0 {
                             p.state = TradeState::Closed;
                             p.force_exit = None;
-                        } else if shortfall > 0 {
-                            if !was_cancelled {
-                                // Hard reject: count against the exit-attempt cap
-                                // and force an explicit retry so decide_live acts
-                                // even if price has bounced above the trigger.
-                                p.exit_attempts += 1;
-                                p.force_exit = Some(format!("{reason}_SHORTFALL"));
-                            }
-                            // For cancels: no force_exit, no counter — decide_live
-                            // re-detects the SL breach / target condition on the
-                            // next tick and issues a fresh IOC order automatically.
+                            now_closed = true;
+                        } else if shortfall > 0 && !was_cancelled {
+                            // Hard reject with qty still outstanding: force an
+                            // explicit retry so decide_live acts even if price has
+                            // bounced above the trigger. Keep the reason
+                            // recognizable as a shortfall retry (append the
+                            // suffix once, not on every retry — `reason` here is
+                            // fed back in from a previous retry's own
+                            // `force_exit`, so appending unconditionally grew
+                            // this without bound, and dropping it entirely made
+                            // a rejected TGT1_PARTIAL/MANUAL_SELL retry
+                            // indistinguishable from a real one once it turned
+                            // into a full-quantity ExitAll in decide_live).
+                            // `bump_exit_attempts` below applies the shared
+                            // retry cap and halts the position once it's reached.
+                            p.force_exit = Some(if reason.ends_with("_SHORTFALL") {
+                                reason.clone()
+                            } else {
+                                format!("{reason}_SHORTFALL")
+                            });
                         }
+                        // For cancels: no force_exit change — decide_live
+                        // re-detects the SL breach / target condition on the
+                        // next tick and issues a fresh IOC order automatically.
                     }).await;
                     if shortfall > 0 && !was_cancelled {
                         loud_error(db_tx, log_tx, &leg.instrument, &format!(
                             "exit order {oid} ({reason}) filled {filled} of {} — squaring off the remainder",
                             leg.pending_exit_qty
                         )).await;
+                        // Don't count this against the retry cap if the fill
+                        // just closed the position outright (executed_qty hit
+                        // 0) — there's nothing left to retry, so counting it
+                        // could halt an already-closed position on its way out.
+                        if !now_closed {
+                            bump_exit_attempts(positions, db_tx, log_tx, &leg.pos_id, &leg.instrument).await;
+                        }
                     }
                     mutated = true;
                 }
@@ -2066,6 +2171,36 @@ async fn exec_exit_all(
         with_position(positions, pos_id, forget_stop).await;
     }
 
+    // Never ask the broker to sell more than the engine's own bookkeeping can
+    // account for — see `sellable_qty`. This replaces an earlier live
+    // Positions read here: that read could come back empty or stale right
+    // after a fresh fill (or fail outright — this account's Positions
+    // endpoint has failed on every call before, 2026-08-17) and there is no
+    // safe way to tell "broker shows nothing because we hold nothing" apart
+    // from "broker shows nothing because the read is lagging or broken" —
+    // treating both the same way skipped real stop-losses on real holdings.
+    // It also held the shared Kotak mutex on every single exit (implicated
+    // in the 2026-08-31 freeze). Pure in-memory accounting has none of that:
+    // for the common case of one position per symbol it never trims anything
+    // (see `sellable_qty`'s doc comment for the residual gap it doesn't
+    // cover).
+    let safe_qty = sellable_qty(positions, pos_id, &ctx.trading_symbol, qty).await;
+    if safe_qty < qty {
+        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+            "{reason} exit trimmed from {qty} to {safe_qty} — another tracked leg on {} already has a stop resting or a sell in flight",
+            ctx.trading_symbol
+        )).await;
+    }
+    let qty = safe_qty;
+    if qty <= 0 {
+        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+            "{reason} exit produced no sellable quantity for {} — another tracked leg on this contract already accounts for the full holding; check for a duplicate-position or bookkeeping mismatch",
+            ctx.trading_symbol
+        )).await;
+        bump_exit_attempts(positions, db_tx, log_tx, pos_id, &ctx.instrument).await;
+        return;
+    }
+
     match place_exit_sell(kotak, db_tx, log_tx, ctx, cfg, ref_ltp, qty, reason).await {
         Some(order_id) => {
             with_position(positions, pos_id, |p| {
@@ -2430,21 +2565,37 @@ async fn exec_live_action(
                 return true;
             }
 
+            // Same cross-leg cap as a full exit (see `sellable_qty`) — a
+            // second tracked position on this contract can already have a
+            // stop resting or a sell in flight that this slice would stack
+            // on top of.
+            let slice_qty = sellable_qty(positions, &pending.pos_id, &ctx.trading_symbol, *slice).await;
+            if slice_qty < *slice {
+                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    "target-1 sell trimmed from {slice} to {slice_qty} — another tracked leg on {} already has a stop resting or a sell in flight",
+                    ctx.trading_symbol
+                )).await;
+            }
+            if slice_qty <= 0 {
+                tracing::info!(instrument = %ctx.instrument, "LIVE target 1 slice skipped — another tracked leg on this contract already accounts for the full holding");
+                return true;
+            }
+
             // IOC market, falling back to an IOC limit if the RMS refuses it
             // (Kotak converts F&O market orders to limits anyway; IOC keeps a
             // miss from sitting open and blocking the next exit cycle).
-            match place_exit_sell(kotak, db_tx, log_tx, &ctx, cfg, ctx_ltp, *slice, "TGT1_PARTIAL").await {
+            match place_exit_sell(kotak, db_tx, log_tx, &ctx, cfg, ctx_ltp, slice_qty, "TGT1_PARTIAL").await {
                 Some(order_id) => {
                     with_position(positions, &pending.pos_id, |p| {
                         p.pending_exit_order_id = Some(order_id);
-                        p.pending_exit_qty = *slice;
+                        p.pending_exit_qty = slice_qty;
                         p.pending_exit_reason = Some("TGT1_PARTIAL".to_string());
                     }).await;
-                    tracing::info!(instrument = %ctx.instrument, slice, keep, "LIVE target 1 slice placed");
+                    tracing::info!(instrument = %ctx.instrument, slice_qty, keep, "LIVE target 1 slice placed");
                 }
                 None => {
                     loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                        "target-1 sell of {slice} could not be placed — still holding the full {} at the trailed stop, squaring off at market",
+                        "target-1 sell of {slice_qty} could not be placed — still holding the full {} at the trailed stop, squaring off at market",
                         ctx.executed_qty
                     )).await;
                     with_position(positions, &pending.pos_id, |p| {
@@ -2481,12 +2632,22 @@ async fn exec_live_action(
             // slice, via pending_exit_order_id in reconcile_live_orders.
             with_position(positions, &pending.pos_id, |p| p.manual_sell_qty = None).await;
 
-            let sell = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, *qty, 0.0);
+            // Same cross-leg cap as any other live sell (see `sellable_qty`).
+            let qty = sellable_qty(positions, &pending.pos_id, &ctx.trading_symbol, *qty).await;
+            if qty <= 0 {
+                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    "manual sell skipped — another tracked leg on {} already accounts for the full holding",
+                    ctx.trading_symbol
+                )).await;
+                return true;
+            }
+
+            let sell = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, qty, 0.0);
             match kotak_place(kotak, &sell).await {
                 Ok(order_id) => {
                     with_position(positions, &pending.pos_id, |p| {
                         p.pending_exit_order_id = Some(order_id.clone());
-                        p.pending_exit_qty = *qty;
+                        p.pending_exit_qty = qty;
                         p.pending_exit_reason = Some("MANUAL_SELL".to_string());
                     }).await;
                     tracing::info!(instrument = %ctx.instrument, %order_id, qty, "LIVE manual sell placed");
@@ -2805,6 +2966,65 @@ pub async fn start_position_monitor(
                         }
 
                         if signal.action.eq_ignore_ascii_case("BUY") {
+                            // A second BUY that exactly repeats a contract +
+                            // entry already open or waiting — see
+                            // `find_duplicate_open_position`. Never open a
+                            // second position for it, but a resend can still
+                            // carry a genuinely revised SL/target (the same
+                            // channel correcting itself under a new message,
+                            // so signal_id doesn't match either) — apply that
+                            // in place, the same way an edited-message resend
+                            // is applied above, rather than silently dropping
+                            // the revision with only a WARN.
+                            let dup_id = {
+                                let g = positions.read().await;
+                                find_duplicate_open_position(&g, &signal).map(|p| p.id.clone())
+                            };
+                            if let Some(dup_id) = dup_id {
+                                let mut revised = false;
+                                {
+                                    let mut g = positions.write().await;
+                                    if let Some(p) = g.iter_mut().find(|p| p.id == dup_id) {
+                                        if (p.signal.stop_loss - signal.stop_loss).abs() > f64::EPSILON
+                                            || p.signal.targets != signal.targets
+                                        {
+                                            p.signal.stop_loss = signal.stop_loss;
+                                            p.signal.targets = signal.targets.clone();
+                                            if matches!(p.state, TradeState::WaitingForEntry | TradeState::Active) {
+                                                p.current_sl = signal.stop_loss;
+                                            }
+                                            revised = true;
+                                        }
+                                    }
+                                }
+                                if revised {
+                                    let msg = format!(
+                                        r#"{{"event":"SIGNAL_UPDATED","instrument":"{}","new_sl":{}}}"#,
+                                        signal.instrument_name, signal.stop_loss
+                                    );
+                                    send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                                    let snapshot = { positions.read().await.clone() };
+                                    send_positions_snapshot(&db_tx, &snapshot).await;
+                                    tracing::info!(
+                                        instrument = %signal.instrument_name,
+                                        "Resend of an already-tracked contract carried a revised SL/target — applied in place instead of opening a duplicate"
+                                    );
+                                } else {
+                                    let msg = format!(
+                                        r#"{{"event":"DUPLICATE_SIGNAL_SKIPPED","message":"Signal skipped — an open or waiting position already exists for this exact contract and entry","instrument":"{}"}}"#,
+                                        signal.instrument_name
+                                    );
+                                    send_log(&db_tx, &log_tx, "WARN", &msg).await;
+                                    tracing::warn!(
+                                        instrument = %signal.instrument_name,
+                                        strike = ?signal.strike,
+                                        entry = signal.entry_price,
+                                        "Duplicate BUY signal skipped — identical contract + entry already tracked"
+                                    );
+                                }
+                                continue;
+                            }
+
                             // A signal with no stop-loss or no target is not
                             // tradeable, whatever it parsed out of. `stop_loss`
                             // defaults to 0.0, and an LTP can never cross 0, so
@@ -3450,6 +3670,62 @@ mod tests {
             live_halt: None,
             entry_zone: None,
         }
+    }
+
+    fn matching_signal() -> TradeSignal {
+        // Mirrors position_created_at's signal exactly.
+        TradeSignal {
+            instrument_name: "NIFTY".to_string(),
+            strike: Some(25000.0),
+            option_type: Some("CE".to_string()),
+            expiry: None,
+            action: "BUY".to_string(),
+            entry_condition: "ABOVE".to_string(),
+            entry_price: 120.0,
+            targets: vec![140.0, 160.0],
+            stop_loss: 100.0,
+            source: "test".to_string(),
+            signal_id: Some("different-message-id".to_string()),
+            raw_message: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_signal_skipped_when_contract_and_entry_match() {
+        // The actual incident: a channel resent the identical call under a
+        // second Telegram message a moment later — different signal_id, same
+        // contract and entry — and it opened a second real position on top
+        // of the first, doubling the broker exposure with no way to tell the
+        // two apart afterwards.
+        let positions = vec![position_created_at("2026-09-16 15:19:29")];
+        assert!(find_duplicate_open_position(&positions, &matching_signal()).is_some());
+    }
+
+    #[test]
+    fn revised_entry_on_the_same_contract_is_not_a_duplicate() {
+        // A genuinely different call on the same strike (new entry price)
+        // must still get through — this is a real trade, not a resend.
+        let positions = vec![position_created_at("2026-09-17 09:00:00")];
+        let mut sig = matching_signal();
+        sig.entry_price = 90.0;
+        assert!(find_duplicate_open_position(&positions, &sig).is_none());
+    }
+
+    #[test]
+    fn a_closed_position_does_not_block_a_repeat_signal() {
+        // Once the earlier trade is done, a fresh identical call later in
+        // the day is a new trade, not a duplicate.
+        let mut pos = position_created_at("2026-09-17 09:00:00");
+        pos.state = TradeState::Closed;
+        assert!(find_duplicate_open_position(&[pos], &matching_signal()).is_none());
+    }
+
+    #[test]
+    fn different_strike_is_not_a_duplicate() {
+        let positions = vec![position_created_at("2026-09-17 09:00:00")];
+        let mut sig = matching_signal();
+        sig.strike = Some(25100.0);
+        assert!(find_duplicate_open_position(&positions, &sig).is_none());
     }
 
     fn cfg_with_lots(index_lots: i32, other_lots: i32) -> TradingConfig {
