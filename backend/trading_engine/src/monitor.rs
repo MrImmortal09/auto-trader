@@ -81,9 +81,28 @@ async fn send_positions_snapshot(
     }
 }
 
-/// True when it is at/after 15:10 IST on this position's expiry day.
-fn is_expiry_squareoff_due(_pos: &MonitoredPosition) -> bool {
-    false
+/// True when `now` is at/after 15:38 IST on this position's *resolved*
+/// expiry day — two minutes ahead of the 15:40 close, since this account
+/// trades options only and nothing is ever meant to carry into settlement.
+///
+/// Uses `resolved_expiry` (the Scrip Master record `resolved_order` was
+/// built from), not `signal.expiry` — the raw parsed field is `None`
+/// whenever the incoming message didn't state a date, which `resolve_signal`
+/// then defaults to the nearest upcoming expiry; `resolved_expiry` is what
+/// that resolution actually landed on. Returns `false` — never due — for a
+/// position with no recorded `resolved_expiry` (e.g. adopted from the
+/// broker without a Scrip Master lookup) rather than guessing at one.
+///
+/// Takes `now` rather than calling `shared_domain::now_ist()` itself, the
+/// same way `stale_entry_reason` takes a precomputed `entry_cutoff` — so
+/// this stays a pure, directly testable function.
+fn is_expiry_squareoff_due(pos: &MonitoredPosition, now: chrono::DateTime<chrono::FixedOffset>) -> bool {
+    use chrono::Timelike;
+    let Some(expiry) = pos.resolved_expiry else { return false; };
+    now.date_naive() == expiry
+        && (now.hour() > shared_domain::EXPIRY_SQUAREOFF_HOUR
+            || (now.hour() == shared_domain::EXPIRY_SQUAREOFF_HOUR
+                && now.minute() >= shared_domain::EXPIRY_SQUAREOFF_MINUTE))
 }
 
 /// The open/waiting position, if any, that already matches `signal` on
@@ -1763,6 +1782,7 @@ async fn adopt_manual(
         avg_buy_price,
         override_qty: None,
         resolved_order: Some(resolved_order),
+        resolved_expiry: Some(record.expiry_date),
         ltp: None,
         ws_scrip_key: Some(ws_scrip_key),
         force_exit: None,
@@ -1963,7 +1983,7 @@ fn decide_live(
             if let Some(reason) = pos.force_exit.clone() {
                 return Some(LiveAction::ExitAll { qty: held, reason });
             }
-            if is_expiry_squareoff_due(pos) {
+            if is_expiry_squareoff_due(pos, shared_domain::now_ist()) {
                 return Some(LiveAction::ExitAll {
                     qty: held,
                     reason: "EXPIRY_SQUAREOFF".to_string(),
@@ -3025,27 +3045,43 @@ pub async fn start_position_monitor(
                                 continue;
                             }
 
-                            // A signal with no stop-loss or no target is not
-                            // tradeable, whatever it parsed out of. `stop_loss`
-                            // defaults to 0.0, and an LTP can never cross 0, so
-                            // the software stop would never fire; with no target
-                            // there is nothing to exit on either. Such a position
-                            // runs unprotected until the expiry square-off, so
-                            // refuse it rather than open it.
-                            if signal.stop_loss <= 0.0 || signal.targets.is_empty() {
+                            // A signal with no target is not tradeable, whatever
+                            // it parsed out of — there is nothing to exit on.
+                            // Refuse it rather than open a position that can
+                            // only ever be closed by the expiry square-off.
+                            if signal.targets.is_empty() {
                                 let msg = format!(
-                                    r#"{{"event":"ERROR","message":"Signal discarded — no {} parsed; refusing to open an unprotected position","instrument":"{}"}}"#,
-                                    if signal.stop_loss <= 0.0 { "stop-loss" } else { "target" },
+                                    r#"{{"event":"ERROR","message":"Signal discarded — no target parsed; refusing to open an unprotected position","instrument":"{}"}}"#,
                                     signal.instrument_name
                                 );
                                 send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                                 tracing::error!(
                                     instrument = %signal.instrument_name,
-                                    stop_loss = signal.stop_loss,
-                                    targets = signal.targets.len(),
-                                    "Signal discarded — missing stop-loss or target"
+                                    "Signal discarded — missing target"
                                 );
                                 continue;
+                            }
+
+                            // `stop_loss <= 0.0` ("HERO-ZERO" calls — SL :- 0,
+                            // trade the full premium with no stop) is allowed
+                            // through deliberately: an LTP can never cross 0, so
+                            // the software stop never fires, and the position is
+                            // protected only by its target(s) and the expiry-day
+                            // square-off (`is_expiry_squareoff_due`, 15:38 IST).
+                            // Note this can't tell an explicit "SL :- 0" apart
+                            // from a message whose SL line just failed to parse
+                            // — both default to 0.0 the same way — so log it
+                            // loudly rather than silently.
+                            if signal.stop_loss <= 0.0 {
+                                let msg = format!(
+                                    r#"{{"event":"WARN","message":"Signal has no stop-loss (SL :- 0 or unparsed) — opening unprotected, exits only on target or the 15:38 IST expiry square-off","instrument":"{}"}}"#,
+                                    signal.instrument_name
+                                );
+                                send_log(&db_tx, &log_tx, "WARN", &msg).await;
+                                tracing::warn!(
+                                    instrument = %signal.instrument_name,
+                                    "Signal accepted with stop_loss <= 0 — unprotected until target or expiry square-off"
+                                );
                             }
 
                             // Check expiry
@@ -3112,6 +3148,7 @@ pub async fn start_position_monitor(
                                 let mut resolved_token = None;
                                 let mut resolved_segment_code = None;
                                 let mut resolved_tick_size = 0.05;
+                                let mut resolved_expiry = None;
                                 if let Some(ref store) = *scrip_guard {
                                     if let Some(record) = store.resolve_signal(&signal) {
                                         // Build OrderRequest
@@ -3120,6 +3157,7 @@ pub async fn start_position_monitor(
                                         resolved_token = Some(record.instrument_token.clone());
                                         resolved_segment_code = Some(record.exchange_segment_code.clone());
                                         resolved_tick_size = record.tick_size;
+                                        resolved_expiry = Some(record.expiry_date);
                                         let exchange_segment = match record.exchange_segment_code.as_str() {
                                             "bse_fo" => ExchangeSegment::BseFo,
                                             "nse_cm" => ExchangeSegment::NseCm,
@@ -3252,6 +3290,7 @@ pub async fn start_position_monitor(
                                     avg_buy_price: 0.0,
                                     override_qty: None,
                                     resolved_order,
+                                    resolved_expiry,
                                     ltp: None,
                                     ws_scrip_key: ws_key,
                                     force_exit: None,
@@ -3393,12 +3432,12 @@ pub async fn start_position_monitor(
                         _ => continue,
                     };
 
-                    // Expiry-day square-off: at/after 15:10 IST on the option's
-                    // expiry day, force-close any still-open position at market so
-                    // it is never carried into expiry/settlement.
+                    // Expiry-day square-off: at/after 15:38 IST on the option's
+                    // resolved expiry day, force-close any still-open position at
+                    // market so it is never carried into expiry/settlement.
                     let pa = if matches!(pos.state, TradeState::Active | TradeState::Target1Hit)
                         && pos.force_exit.is_none()
-                        && is_expiry_squareoff_due(pos)
+                        && is_expiry_squareoff_due(pos, shared_domain::now_ist())
                     {
                         Some(PosAction::ExitSell {
                             qty: pos.executed_qty,
@@ -3647,6 +3686,7 @@ mod tests {
             avg_buy_price: 0.0,
             override_qty: None,
             resolved_order: None,
+            resolved_expiry: None,
             ltp: None,
             ws_scrip_key: None,
             force_exit: None,
@@ -3807,6 +3847,51 @@ mod tests {
         // string (serde default) — treat as stale rather than guess their age.
         let pos = position_created_at("");
         assert_eq!(stale_entry_reason(&pos, false), Some("STALE_CARRYOVER"));
+    }
+
+    /// A fixed IST instant for `is_expiry_squareoff_due` tests.
+    fn ist(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> chrono::DateTime<chrono::FixedOffset> {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, mi, s)
+            .unwrap()
+            .and_local_timezone(shared_domain::ist_offset())
+            .unwrap()
+    }
+
+    #[test]
+    fn expiry_squareoff_never_due_without_a_resolved_expiry() {
+        // A position adopted from the broker with no Scrip Master lookup
+        // (`resolved_expiry: None`) never guesses at an expiry — never due,
+        // whatever the clock says.
+        let pos = position_created_at("2026-09-17 09:00:00");
+        assert!(pos.resolved_expiry.is_none());
+        assert!(!is_expiry_squareoff_due(&pos, ist(2026, 9, 17, 15, 50, 0)));
+    }
+
+    #[test]
+    fn expiry_squareoff_fires_at_1538_on_the_resolved_expiry_day() {
+        let mut pos = position_created_at("2026-09-17 09:00:00");
+        pos.resolved_expiry = Some(chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap());
+
+        assert!(!is_expiry_squareoff_due(&pos, ist(2026, 9, 17, 15, 37, 59)));
+        assert!(is_expiry_squareoff_due(&pos, ist(2026, 9, 17, 15, 38, 0)));
+        // Still due right up to (and past) the 15:40 close — this is what
+        // forces the exit before the exchange stops accepting orders.
+        assert!(is_expiry_squareoff_due(&pos, ist(2026, 9, 17, 15, 40, 0)));
+    }
+
+    #[test]
+    fn expiry_squareoff_is_inert_on_any_other_day() {
+        let mut pos = position_created_at("2026-09-17 09:00:00");
+        pos.resolved_expiry = Some(chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap());
+
+        // A day before the resolved expiry, even past 15:38 — not due yet.
+        assert!(!is_expiry_squareoff_due(&pos, ist(2026, 9, 16, 15, 50, 0)));
+        // A day after — should have already been closed on the actual day;
+        // this only guards against ever firing on the wrong day, not against
+        // a position that outlived its own expiry.
+        assert!(!is_expiry_squareoff_due(&pos, ist(2026, 9, 18, 15, 50, 0)));
     }
 
     #[test]

@@ -33,6 +33,12 @@ pub const MARKET_OPEN_MINUTE: u32 = 15;
 pub const MARKET_CLOSE_HOUR: u32 = 15;
 pub const MARKET_CLOSE_MINUTE: u32 = 40;
 
+/// Cutoff for the automatic options expiry-day square-off: 15:38 IST, two
+/// minutes ahead of the 15:40 market close. This account trades options
+/// only, so nothing is ever meant to be carried into expiry/settlement.
+pub const EXPIRY_SQUAREOFF_HOUR: u32 = 15;
+pub const EXPIRY_SQUAREOFF_MINUTE: u32 = 38;
+
 pub fn is_market_open() -> bool {
     use chrono::Timelike;
     use chrono::Datelike;
@@ -362,6 +368,17 @@ pub struct MonitoredPosition {
     pub override_qty: Option<i32>,
     /// The precise Kotak OrderRequest mapped from the Scrip Master.
     pub resolved_order: Option<OrderRequest>,
+    /// The resolved contract's actual expiry date, from the Scrip Master
+    /// record `resolved_order` was built from. Distinct from
+    /// `signal.expiry`, which is the raw *parsed* string and is `None`
+    /// whenever the incoming message never stated one (`resolve_signal`
+    /// then falls back to the nearest upcoming expiry) — this is what that
+    /// resolution actually landed on, and what the expiry-day square-off
+    /// checks against. `None` until resolved, e.g. a position adopted from
+    /// the broker without a Scrip Master lookup — such a position never
+    /// gets an automatic expiry square-off.
+    #[serde(default)]
+    pub resolved_expiry: Option<NaiveDate>,
     /// Live Last Traded Price populated just before returning via API
     #[serde(default)]
     pub ltp: Option<f64>,
