@@ -3,6 +3,8 @@
 //! - `GET /api/market/live`                          — latest state for all indices
 //! - `GET /api/market/intraday-trend?underlying=&interval=&window=&date=`
 //! - `GET /api/market/option-chain?underlying=`      — latest per-strike chain
+//! - `GET /api/market/indicator`                     — last closed VWAP + PCR check per
+//!   index and the CE / PE sizing verdict the engine would apply right now
 
 use std::collections::BTreeMap;
 
@@ -13,6 +15,10 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+
+use shared_domain::entry_gate::{
+    self, check_minute, Bias, IndicatorReading, SizingVerdict, INDICATOR_INDICES, INDICATOR_INTERVALS,
+};
 
 use crate::market_data::{aggregate, IndexLive, StrikeRow, WindowAgg, INDICES, STRIKE_WINDOWS};
 use crate::AppState;
@@ -151,26 +157,8 @@ struct TrendDto {
     rows: Vec<TrendRowDto>,
 }
 
-pub const TREND_INTERVALS: [u32; 4] = [5, 15, 30, 60];
-
-/// First check of the day: one minute after the 09:15 open.
-const OPEN_CHECK_MINUTE: u32 = 9 * 60 + 16;
-/// Last check of the day: one minute after the 15:30 close. Caps intervals that
-/// would otherwise land after the market (60 min → 16:01).
-const CLOSE_CHECK_MINUTE: u32 = 15 * 60 + 31;
-
-/// The check a snapshot taken at `minute` (of day, IST) belongs to: the first
-/// "interval boundary + 1 minute" at or after it — 09:16, 09:31, 09:46… for
-/// 15 min. Boundaries are clock-aligned multiples of `interval`; 09:16 is
-/// always the first check and 15:31 always the last, regardless of interval
-/// (so 60 min → 09:16, 10:01, 11:01 … 15:01, 15:31).
-/// The +1 lets the boundary minute fully complete before it is read.
-fn check_minute(minute: u32, interval: u32) -> u32 {
-    if minute <= OPEN_CHECK_MINUTE {
-        return OPEN_CHECK_MINUTE;
-    }
-    ((minute - 1).div_ceil(interval) * interval + 1).min(CLOSE_CHECK_MINUTE.max(minute))
-}
+/// Same set the indicator (and the Settings page) accepts.
+pub const TREND_INTERVALS: [u32; 4] = INDICATOR_INTERVALS;
 
 fn minute_of_day(ts: &str) -> Option<u32> {
     let h: u32 = ts.get(11..13)?.parse().ok()?;
@@ -281,34 +269,87 @@ pub async fn market_trend_handler(
     Json(TrendDto { underlying: id, date: Some(date), interval, window, rows: out }).into_response()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::check_minute;
+// ---------------------------------------------------------------------------
+// /api/market/indicator — what the entry gate would decide right now
+// ---------------------------------------------------------------------------
 
-    const fn hm(h: u32, m: u32) -> u32 {
-        h * 60 + m
-    }
+#[derive(Serialize)]
+struct CallVerdictDto {
+    /// `"SCALE"` (buy, scaled) or `"SKIP"` (the call would be dropped).
+    action: &'static str,
+    multiplier: Option<f64>,
+    /// The index's default lot count before the indicator.
+    base_lots: i32,
+    /// `base_lots` × `multiplier` after rounding — what would actually be bought.
+    lots: Option<i32>,
+    /// The same explanation the engine logs.
+    note: String,
+}
 
-    #[test]
-    fn checks_one_minute_after_each_boundary() {
-        // Opening snapshots all belong to the 09:16 check, for every interval.
-        for iv in [5, 15, 30, 60] {
-            assert_eq!(check_minute(hm(9, 15), iv), hm(9, 16));
-            assert_eq!(check_minute(hm(9, 16), iv), hm(9, 16));
-        }
-        assert_eq!(check_minute(hm(9, 17), 5), hm(9, 21));
-        assert_eq!(check_minute(hm(9, 21), 5), hm(9, 21));
-        assert_eq!(check_minute(hm(9, 17), 15), hm(9, 31));
-        assert_eq!(check_minute(hm(9, 31), 15), hm(9, 31));
-        assert_eq!(check_minute(hm(9, 32), 15), hm(9, 46));
-        assert_eq!(check_minute(hm(9, 17), 30), hm(9, 31));
-        assert_eq!(check_minute(hm(9, 32), 30), hm(10, 1));
-        assert_eq!(check_minute(hm(9, 17), 60), hm(10, 1));
-        assert_eq!(check_minute(hm(10, 2), 60), hm(11, 1));
-        assert_eq!(check_minute(hm(15, 30), 15), hm(15, 31));
-        // 60 min: the afternoon tail closes at 15:31, not 16:01.
-        assert_eq!(check_minute(hm(15, 1), 60), hm(15, 1));
-        assert_eq!(check_minute(hm(15, 2), 60), hm(15, 31));
-        assert_eq!(check_minute(hm(15, 31), 60), hm(15, 31));
-    }
+#[derive(Serialize)]
+struct IndicatorIndexDto {
+    index: &'static str,
+    /// The last closed check, or `None` when there is no fresh one.
+    reading: Option<IndicatorReading>,
+    bias: Bias,
+    ce: CallVerdictDto,
+    pe: CallVerdictDto,
+}
+
+#[derive(Serialize)]
+struct IndicatorDto {
+    /// Upstox market data is configured at all.
+    configured: bool,
+    /// `TradingConfig::indicator_sizing`.
+    enabled: bool,
+    /// IST time the verdicts were computed for.
+    now: String,
+    indices: Vec<IndicatorIndexDto>,
+}
+
+/// `GET /api/market/indicator` — each index's last closed check and the
+/// BUY CE / BUY PE verdict a call triggering right now would get, computed by
+/// the very `entry_gate` code the position monitor runs (with the saved
+/// settings). Read-only.
+pub async fn market_indicator_handler(State(state): State<AppState>) -> axum::response::Response {
+    let cfg = state.trading_cfg.read().await.clone();
+    let params = cfg.indicator_params();
+    let now = shared_domain::current_ist_timestamp_string();
+
+    let indices = INDICATOR_INDICES
+        .iter()
+        .map(|&index| {
+            let reading = entry_gate::feed_reading(&state.indicator_feed, index, &params, &now);
+            let base_lots = trading_engine::lots_for_instrument(&cfg, index);
+            let verdict = |option_type: &str| match entry_gate::sizing_verdict(
+                option_type,
+                index,
+                reading.as_ref(),
+                cfg.indicator_agree_multiplier,
+                cfg.indicator_neutral_multiplier,
+            ) {
+                SizingVerdict::Scale { multiplier, note, .. } => CallVerdictDto {
+                    action: "SCALE",
+                    multiplier: Some(multiplier),
+                    base_lots,
+                    lots: Some(entry_gate::scale_lots(base_lots, multiplier)),
+                    note,
+                },
+                SizingVerdict::Skip { reason } => CallVerdictDto {
+                    action: "SKIP",
+                    multiplier: None,
+                    base_lots,
+                    lots: None,
+                    note: reason,
+                },
+            };
+            let ce = verdict("CE");
+            let pe = verdict("PE");
+            let bias = reading.as_ref().map_or(Bias::Neutral, |r| r.bias);
+            IndicatorIndexDto { index, reading, bias, ce, pe }
+        })
+        .collect();
+
+    Json(IndicatorDto { configured: state.market.configured, enabled: cfg.indicator_sizing, now, indices })
+        .into_response()
 }

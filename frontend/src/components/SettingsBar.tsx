@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
-import { Save, Settings, Sliders, Wallet, Layers3, Info, AlertTriangle, KeyRound, Lock } from 'lucide-react';
-import type { TradingConfig } from '../types';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Save, Settings, Sliders, Wallet, Layers3, Info, AlertTriangle, KeyRound, Lock, Gauge } from 'lucide-react';
+import type { CallVerdict, IndicatorIndex, IndicatorPreview, TradingConfig } from '../types';
 import { apiFetch } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import { INDEX_LOT_REFERENCE } from '../lib/indexLots';
@@ -8,6 +8,9 @@ import { INDEX_LOT_REFERENCE } from '../lib/indexLots';
 const CARD = 'bg-surface-container-lowest border border-outline-variant rounded-xl p-4 sm:p-6 shadow-sm';
 const CARD_HEADER = 'flex items-center gap-2 text-base font-bold text-on-surface mb-4';
 const FIELD_LABEL = 'text-label-caps text-on-surface-variant uppercase tracking-wide truncate';
+/** Same look as FIELD_LABEL but wraps — for long labels (slider formulas) that
+ * must stay readable on a phone instead of being cut off. */
+const FIELD_LABEL_WRAP = 'text-label-caps text-on-surface-variant uppercase tracking-wide break-words';
 const NUMBER_INPUT = 'w-full bg-surface border border-outline-variant rounded px-2.5 py-1.5 text-sm text-on-surface tabular-nums focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all';
 
 /// Small ⓘ button that toggles an explainer popover. The popover spans the
@@ -56,13 +59,13 @@ function FactorSlider({ label, value, min, max, step, enabled, disabled, onChang
 }) {
   const isInteractive = enabled && !disabled;
   return (
-    <div className={`relative flex flex-col gap-1.5 sm:col-span-2 rounded-lg border border-outline-variant p-3.5 transition-opacity ${isInteractive ? 'bg-surface' : 'bg-surface opacity-50'}`}>
-      <div className="flex items-center justify-between">
+    <div className={`relative flex flex-col gap-1.5 min-w-0 sm:col-span-2 rounded-lg border border-outline-variant p-3.5 transition-opacity ${isInteractive ? 'bg-surface' : 'bg-surface opacity-50'}`}>
+      <div className="flex items-start justify-between gap-3">
         <span className="flex items-center gap-1 min-w-0">
-          <label className={FIELD_LABEL}>{label}</label>
+          <label className={FIELD_LABEL_WRAP}>{label}</label>
           {info && <InfoTip text={info} />}
         </span>
-        <span className="text-sm font-mono-code font-bold text-primary tabular-nums">
+        <span className="shrink-0 text-sm font-mono-code font-bold text-primary tabular-nums">
           {value.toFixed(decimals ?? 2)}
         </span>
       </div>
@@ -76,9 +79,9 @@ function FactorSlider({ label, value, min, max, step, enabled, disabled, onChang
         onChange={(e) => onChange(parseFloat(e.target.value))}
         className="w-full accent-primary disabled:cursor-not-allowed"
       />
-      <div className="flex justify-between text-[10px] text-on-surface-variant font-mono-code">
-        <span>{lowLabel}</span>
-        <span>{highLabel}</span>
+      <div className="flex justify-between gap-3 text-[10px] text-on-surface-variant font-mono-code">
+        <span className="min-w-0">{lowLabel}</span>
+        <span className="min-w-0 text-right">{highLabel}</span>
       </div>
       {!enabled && (
         <span className="text-[11px] text-on-surface-variant italic">
@@ -89,12 +92,350 @@ function FactorSlider({ label, value, min, max, step, enabled, disabled, onChang
   );
 }
 
+/// Number input that never silently turns a half-typed or emptied value into
+/// 0: keystrokes commit only while they parse, blur clamps to [min, max], and
+/// an empty / invalid field snaps back to the value it had on focus.
+function NumberField({ label, info, value, onCommit, min, max, step, disabled, suffix }: {
+  label: string;
+  info: string;
+  value: number;
+  onCommit: (v: number) => void;
+  min: number;
+  max: number;
+  step: number;
+  disabled?: boolean;
+  suffix?: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const atFocus = useRef(value);
+  const clamp = (n: number) => Math.min(max, Math.max(min, n));
+  return (
+    <div className="relative flex flex-col justify-between gap-1.5 min-w-0">
+      <span className="flex items-center gap-1 min-w-0">
+        <label className={FIELD_LABEL_WRAP}>{label}</label>
+        <InfoTip text={info} />
+      </span>
+      <div className="relative">
+        <input
+          type="number"
+          inputMode="decimal"
+          min={min}
+          max={max}
+          step={step}
+          disabled={disabled}
+          value={draft ?? String(value)}
+          onFocus={() => {
+            atFocus.current = value;
+            setDraft(String(value));
+          }}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            const n = parseFloat(e.target.value);
+            if (Number.isFinite(n)) onCommit(n);
+          }}
+          onBlur={() => {
+            const n = parseFloat(draft ?? '');
+            onCommit(clamp(Number.isFinite(n) ? n : atFocus.current));
+            setDraft(null);
+          }}
+          className={`${NUMBER_INPUT} ${suffix ? 'pr-9' : ''} ${disabled ? 'opacity-60 cursor-not-allowed' : ''}`}
+        />
+        {suffix && (
+          <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] text-on-surface-variant">
+            {suffix}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Segmented<T extends string | number>({ options, value, onChange, disabled }: {
+  options: { value: T; label: string }[];
+  value: T;
+  onChange: (v: T) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="flex rounded-lg overflow-hidden border border-outline-variant text-xs font-label-caps">
+      {options.map((o) => (
+        <button
+          key={String(o.value)}
+          type="button"
+          disabled={disabled}
+          onClick={() => onChange(o.value)}
+          className={`flex-1 min-w-0 px-2 py-1.5 transition-colors font-semibold whitespace-nowrap ${
+            o.value === value
+              ? 'bg-secondary text-on-secondary font-bold'
+              : 'bg-surface text-on-surface-variant hover:bg-surface-container'
+          } ${disabled ? 'opacity-60 cursor-not-allowed' : ''}`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function verdictText(v: CallVerdict): string {
+  if (v.action === 'SKIP') return 'Skip';
+  if (v.base_lots <= 0) return 'Not traded (0 lots)';
+  return `×${v.multiplier} → ${v.lots} lot${v.lots === 1 ? '' : 's'}`;
+}
+
+function IndexPreviewRow({ ix }: { ix: IndicatorIndex }) {
+  const r = ix.reading;
+  const tone = ix.bias === 'BULLISH'
+    ? 'bg-secondary/15 text-secondary'
+    : ix.bias === 'BEARISH'
+      ? 'bg-error/15 text-error'
+      : 'bg-surface-container text-on-surface-variant';
+  const word = ix.bias === 'BULLISH' ? 'BUY' : ix.bias === 'BEARISH' ? 'SELL' : 'NEUTRAL';
+  return (
+    <li className="py-2.5 first:pt-0 last:pb-0 space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-bold text-on-surface">{ix.index}</span>
+        <span className={`rounded-md px-2 py-0.5 text-[11px] font-bold tabular-nums whitespace-nowrap ${tone}`}>
+          {r ? `${r.score.overall > 0 ? '+' : ''}${r.score.overall} ${word} · ${r.check_time}` : 'No fresh reading → NEUTRAL'}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        {([['BUY CE', ix.ce], ['BUY PE', ix.pe]] as const).map(([label, v]) => (
+          <div
+            key={label}
+            title={v.note}
+            className={`rounded-md border px-2 py-1.5 min-w-0 ${
+              v.action === 'SKIP' ? 'border-error/40 bg-error/5' : 'border-outline-variant bg-surface-container-lowest'
+            }`}
+          >
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-on-surface-variant">{label}</div>
+            <div className={`text-xs font-bold tabular-nums ${v.action === 'SKIP' ? 'text-error' : 'text-on-surface'}`}>
+              {verdictText(v)}
+            </div>
+          </div>
+        ))}
+      </div>
+    </li>
+  );
+}
+
+/// What the engine would do with a call triggering right now — straight from
+/// `GET /api/market/indicator`, i.e. the engine's own code and saved settings.
+function IndicatorPreviewPanel({ preview }: { preview: IndicatorPreview }) {
+  return (
+    <div className="rounded-lg border border-outline-variant bg-surface p-3.5 space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-on-surface-variant">
+          If a call triggered now
+        </span>
+        <span className="text-[11px] font-mono-code text-on-surface-variant">{preview.now.slice(11, 16)} IST</span>
+      </div>
+      {!preview.enabled && (
+        <p className="text-[11px] text-on-surface-variant italic">
+          Indicator sizing is OFF — calls are bought at their default lots. This shows what it would do if ON.
+        </p>
+      )}
+      {!preview.configured && (
+        <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] text-amber-700">
+          Upstox market data is not configured on the server, so there is never a fresh reading — every call would be
+          sized as NEUTRAL.
+        </p>
+      )}
+      <ul className="divide-y divide-outline-variant/60">
+        {preview.indices.map((ix) => <IndexPreviewRow key={ix.index} ix={ix} />)}
+      </ul>
+      <p className="text-[10px] leading-snug text-on-surface-variant">
+        FINNIFTY, MIDCPNIFTY, BANKEX and stock options follow the NIFTY reading. Uses saved settings — save to refresh.
+      </p>
+    </div>
+  );
+}
+
+const INDICATOR_INTERVALS = [5, 15, 30, 60];
+const INDICATOR_WINDOWS = [
+  { value: 5, label: '±5' },
+  { value: 10, label: '±10' },
+  { value: 20, label: '±20' },
+  { value: 0, label: 'All' },
+];
+
+/// Telegram call rules: how long a call stays valid, and VWAP + PCR indicator
+/// sizing at the moment of buying (see backend `shared_domain::entry_gate`).
+function CallRulesCard({ cfg, setCfg, disabled, preview }: {
+  cfg: TradingConfig;
+  setCfg: (fn: (c: TradingConfig | null) => TradingConfig | null) => void;
+  disabled: boolean;
+  preview: IndicatorPreview | null;
+}) {
+  const set = (patch: Partial<TradingConfig>) => setCfg((c) => c && { ...c, ...patch });
+  const on = cfg.indicator_sizing;
+  return (
+    <div className={CARD}>
+      <div className={`${CARD_HEADER} relative`}>
+        <Gauge size={16} className="text-primary" /> Telegram Call Rules
+        <InfoTip text="How long a Telegram call stays valid, and how the VWAP + PCR indicator sizes it at the moment it is bought. Both apply in PAPER and LIVE." />
+      </div>
+
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+        <div className="space-y-5 min-w-0">
+          {/* Call validity — independent of the indicator toggle */}
+          <div className="grid grid-cols-2 gap-3.5 items-end">
+            <NumberField
+              label="Call Valid For (min)"
+              info="A call that hasn't been bought within this many minutes of arriving is dropped (logged as CALL_EXPIRED). Only calls not yet bought — an entry already sent to the broker and every open position are untouched. Cancelling it yourself still works any time. 0 = off (valid until the 15:39 cutoff)."
+              value={cfg.call_validity_minutes}
+              onCommit={(v) => set({ call_validity_minutes: Math.round(v) })}
+              min={0}
+              max={390}
+              step={5}
+              suffix="min"
+              disabled={disabled}
+            />
+            <p className="pb-1.5 text-[11px] leading-snug text-on-surface-variant">
+              {cfg.call_validity_minutes > 0
+                ? `= ${Math.floor(cfg.call_validity_minutes / 60)}h ${String(cfg.call_validity_minutes % 60).padStart(2, '0')}m after the call`
+                : 'Off — valid until 15:39'}
+            </p>
+          </div>
+
+          <div className="relative flex flex-col gap-1.5">
+            <span className="flex items-center gap-1 min-w-0">
+              <label className={FIELD_LABEL}>Indicator Sizing (VWAP + PCR)</label>
+              <InfoTip text="ON: when a call triggers, read the last closed VWAP + PCR check of its index (BANKNIFTY and SENSEX their own; NIFTY for everything else). Agrees with the call (BUY CE + BUY reading, BUY PE + SELL reading) → default lots × the agree multiplier. NEUTRAL or no fresh reading → × the neutral multiplier. Disagrees → the call is skipped and the log says why. A manual qty override is never scaled, but is still skipped on disagreement. OFF: every call is bought at its default lots." />
+            </span>
+            <Segmented
+              options={[{ value: 1, label: 'ON' }, { value: 0, label: 'OFF' }]}
+              value={on ? 1 : 0}
+              onChange={(v) => set({ indicator_sizing: v === 1 })}
+              disabled={disabled}
+            />
+          </div>
+
+          <div className={`space-y-4 transition-opacity ${on ? '' : 'opacity-50'}`}>
+            <div className="grid grid-cols-2 gap-3.5">
+              <NumberField
+                label="Agrees ×"
+                info="Lot multiplier when the indicator agrees with the call. Lots round to the nearest whole lot (exact halves round down), never below 1 — so 1 lot × 1.5 stays 1 lot, 2 lots × 1.5 → 3."
+                value={cfg.indicator_agree_multiplier}
+                onCommit={(v) => set({ indicator_agree_multiplier: v })}
+                min={0.1}
+                max={5}
+                step={0.1}
+                disabled={disabled}
+              />
+              <NumberField
+                label="Neutral ×"
+                info="Lot multiplier when the indicator is NEUTRAL — or has no fresh reading (Upstox down, before the 09:16 first check). Same rounding, never below 1 lot."
+                value={cfg.indicator_neutral_multiplier}
+                onCommit={(v) => set({ indicator_neutral_multiplier: v })}
+                min={0.1}
+                max={5}
+                step={0.1}
+                disabled={disabled}
+              />
+            </div>
+            <p className="text-[11px] leading-snug text-on-surface-variant">
+              <span className="font-semibold text-error">Disagrees → skip.</span> Lots round to the nearest whole lot,
+              exact halves down, minimum 1.
+            </p>
+          </div>
+
+          {/* Indicator parameters — also what the Market Data page scores with */}
+          <div className="space-y-3.5 rounded-lg border border-outline-variant p-3.5">
+            <div className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-on-surface-variant">
+              Indicator settings
+              <InfoTip text="How the VWAP + PCR score is computed — the same settings the Market Data page scores with, so its badges show exactly what the engine sizes on. Overall = Option Signal (PCR: +1 BUY / −1 SELL / 0) + VWAP Signal (future vs VWAP: +1 / −1 / 0); above 0 is BUY, below 0 SELL, 0 NEUTRAL." />
+            </div>
+            <div className="relative flex flex-col gap-1.5">
+              <label className={FIELD_LABEL}>Check interval</label>
+              <Segmented
+                options={INDICATOR_INTERVALS.map((m) => ({ value: m, label: `${m}m` }))}
+                value={cfg.indicator_interval_min}
+                onChange={(v) => set({ indicator_interval_min: v })}
+                disabled={disabled}
+              />
+            </div>
+            <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
+              <div className="relative flex flex-col gap-1.5 min-w-0">
+                <label className={FIELD_LABEL}>OI basis</label>
+                <Segmented
+                  options={[
+                    { value: 'chg' as const, label: 'Change' },
+                    { value: 'total' as const, label: 'Total' },
+                  ]}
+                  value={cfg.indicator_basis}
+                  onChange={(v) => set({ indicator_basis: v })}
+                  disabled={disabled}
+                />
+              </div>
+              <div className="relative flex flex-col gap-1.5 min-w-0">
+                <label className={FIELD_LABEL}>Strike range (ATM)</label>
+                <Segmented
+                  options={INDICATOR_WINDOWS}
+                  value={cfg.indicator_strike_window}
+                  onChange={(v) => set({ indicator_strike_window: v })}
+                  disabled={disabled}
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-2.5">
+              <NumberField
+                label="PCR buy >"
+                info="Option Signal = BUY (+1) when PCR is above this."
+                value={cfg.indicator_pcr_buy_above}
+                onCommit={(v) => set({ indicator_pcr_buy_above: v })}
+                min={0}
+                max={10}
+                step={0.05}
+                disabled={disabled}
+              />
+              <NumberField
+                label="PCR sell <"
+                info="Option Signal = SELL (−1) when PCR is below this (never above the buy threshold). Between the two = 0."
+                value={cfg.indicator_pcr_sell_below}
+                onCommit={(v) => set({ indicator_pcr_sell_below: v })}
+                min={0}
+                max={10}
+                step={0.05}
+                disabled={disabled}
+              />
+              <NumberField
+                label="VWAP band"
+                info="VWAP Signal = 0 while the index future is within ± this % of its VWAP."
+                value={cfg.indicator_vwap_band_pct}
+                onCommit={(v) => set({ indicator_vwap_band_pct: v })}
+                min={0}
+                max={5}
+                step={0.01}
+                suffix="%"
+                disabled={disabled}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="min-w-0">
+          {preview ? (
+            <IndicatorPreviewPanel preview={preview} />
+          ) : (
+            <div className="rounded-lg border border-dashed border-outline-variant p-3.5 text-[11px] text-on-surface-variant">
+              Live preview unavailable — the server hasn&apos;t been updated to a version with indicator sizing yet.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsBar({ serverBase }: { serverBase: string }) {
   const { hasWriteAccess, openUnlockModal, lock } = useAuth();
   const [cfg, setCfg] = useState<TradingConfig | null>(null);
   const [virtualBalance, setVirtualBalance] = useState<number>(0);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<IndicatorPreview | null>(null);
 
   const fields: { key: keyof TradingConfig | 'virtual_balance'; label: string; info: string }[] = [
     { key: 'virtual_balance', label: 'Virtual Balance (₹)',
@@ -117,8 +458,8 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
       info: 'Refuses to chase a runaway entry. As a % of the entry→target-1 distance: for "ABOVE X" the engine only buys between X and X + this%×(target1−X); for "BELOW X", between X − that and X. If the price has already blown past the far edge, the trade waits for a pull-back into the window and expires unfilled at the 15:39 no-entry cutoff if it never comes. 0 = off (buy the instant the trigger is crossed). Applies in PAPER and LIVE.' },
   ];
 
-  useEffect(() => {
-    Promise.all([
+  const loadSettings = useCallback(() => {
+    return Promise.all([
       apiFetch(serverBase, '/api/settings').then((r) => r.json()),
       apiFetch(serverBase, '/api/wallet/balance').then((r) => r.json()),
     ])
@@ -135,11 +476,39 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           pre_t1_trail_arm_pct: cfgData?.pre_t1_trail_arm_pct ?? 60,
           pre_t1_trail_factor: cfgData?.pre_t1_trail_factor ?? 0.5,
           entry_window_pct: cfgData?.entry_window_pct ?? 0,
+          indicator_sizing: cfgData?.indicator_sizing ?? false,
+          indicator_agree_multiplier: cfgData?.indicator_agree_multiplier ?? 1.5,
+          indicator_neutral_multiplier: cfgData?.indicator_neutral_multiplier ?? 0.5,
+          indicator_interval_min: cfgData?.indicator_interval_min ?? 15,
+          indicator_basis: cfgData?.indicator_basis === 'total' ? 'total' : 'chg',
+          indicator_strike_window: cfgData?.indicator_strike_window ?? 10,
+          indicator_pcr_buy_above: cfgData?.indicator_pcr_buy_above ?? 1,
+          indicator_pcr_sell_below: cfgData?.indicator_pcr_sell_below ?? 1,
+          indicator_vwap_band_pct: cfgData?.indicator_vwap_band_pct ?? 0,
+          call_validity_minutes: cfgData?.call_validity_minutes ?? 120,
         });
         setVirtualBalance(typeof walletData?.balance === 'number' ? walletData.balance : 0);
       })
       .catch(console.error);
   }, [serverBase]);
+
+  const loadPreview = useCallback(() => {
+    apiFetch(serverBase, '/api/market/indicator')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: IndicatorPreview | null) => setPreview(d && Array.isArray(d.indices) ? d : null))
+      .catch(() => setPreview(null));
+  }, [serverBase]);
+
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
+
+  // The preview follows the market minute by minute, so keep it fresh.
+  useEffect(() => {
+    loadPreview();
+    const timer = setInterval(loadPreview, 30_000);
+    return () => clearInterval(timer);
+  }, [loadPreview]);
 
   async function handleSave() {
     if (!cfg) return;
@@ -148,8 +517,9 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
       return;
     }
     setSaving(true);
+    setSaveError(null);
     try {
-      await Promise.all([
+      const [settingsRes, walletRes] = await Promise.all([
         apiFetch(serverBase, '/api/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -161,10 +531,21 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           body: JSON.stringify({ balance: virtualBalance }),
         }),
       ]);
+      // A rejected save used to still flash "Saved" — never claim a setting
+      // that real orders depend on was stored when it wasn't.
+      if (!settingsRes.ok || !walletRes.ok) {
+        setSaveError(`Save failed (HTTP ${!settingsRes.ok ? settingsRes.status : walletRes.status}) — nothing changed on the server.`);
+        return;
+      }
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
+      // Show what the server actually stored (it clamps out-of-range values)
+      // and what the indicator now says with the new settings.
+      await loadSettings();
+      loadPreview();
     } catch (e) {
       console.error(e);
+      setSaveError('Save failed — could not reach the server. Nothing was confirmed as saved.');
     } finally {
       setSaving(false);
     }
@@ -223,7 +604,10 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           <Sliders size={16} className="text-primary" /> Trading Mode &amp; Risk
         </div>
 
-        <div className="grid gap-5 sm:grid-cols-2">
+        {/* grid-cols-1 = minmax(0, 1fr): without an explicit column template the
+            single mobile column grew to fit the longest slider label (~600px)
+            and the whole settings page panned sideways on a phone. */}
+        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
           <div className="relative flex flex-col gap-1.5">
             <span className="flex items-center gap-1 min-w-0">
               <label className={FIELD_LABEL}>Trading Mode</label>
@@ -429,9 +813,9 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           {fields
             .filter(({ key }) => key !== 'virtual_balance' || cfg.mode !== 'LIVE')
             .map(({ key, label, info }) => (
-              <div key={key} className="relative flex flex-col gap-1.5">
+              <div key={key} className="relative flex flex-col justify-between gap-1.5 min-w-0">
                 <span className="flex items-center gap-1 min-w-0">
-                  <label className={FIELD_LABEL}>{label}</label>
+                  <label className={FIELD_LABEL_WRAP}>{label}</label>
                   <InfoTip text={info} />
                 </span>
                 <input
@@ -495,17 +879,20 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
         </div>
       </div>
 
-      {/* Save / lock action bar */}
-      <div className="flex items-center justify-between gap-4 bg-surface-container-lowest border border-outline-variant rounded-lg px-4 py-3 shadow-sm">
-        <span className="text-xs text-on-surface-variant">
-          Changes apply immediately on save — including recomputing SL &amp; next target on any open dynamic-targeting runner.
+      <CallRulesCard cfg={cfg} setCfg={setCfg} disabled={!hasWriteAccess} preview={preview} />
+
+      {/* Save / lock action bar — sticky so Save is reachable on a phone
+          without scrolling past seven screens of settings. */}
+      <div className="sticky bottom-0 z-10 flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between sm:gap-4 bg-surface-container-lowest/95 backdrop-blur border border-outline-variant rounded-lg px-3 sm:px-4 py-2.5 sm:py-3 shadow-md">
+        <span className={`text-xs ${saveError ? 'text-error font-semibold' : 'text-on-surface-variant hidden sm:block'}`}>
+          {saveError ?? 'Changes apply immediately on save — including recomputing SL & next target on any open dynamic-targeting runner.'}
         </span>
         <div className="flex items-center gap-2 shrink-0">
           <button
             onClick={handleSave}
             disabled={saving || !hasWriteAccess}
             title={!hasWriteAccess ? 'Write access required to save changes' : undefined}
-            className="flex items-center justify-center gap-1.5 px-4 py-2 bg-primary-container hover:bg-primary disabled:opacity-50 text-on-primary text-sm rounded-lg transition-colors font-body-bold shadow-sm"
+            className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 bg-primary-container hover:bg-primary disabled:opacity-50 text-on-primary text-sm rounded-lg transition-colors font-body-bold shadow-sm"
           >
             <Save size={14} />
             {saving ? 'Saving…' : saved ? '✓ Saved' : 'Save Settings'}
@@ -514,7 +901,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
             <button
               type="button"
               onClick={lock}
-              className="flex items-center justify-center gap-1.5 px-4 py-2 bg-error/10 hover:bg-error/20 text-error text-sm rounded-lg transition-colors font-body-bold shadow-sm"
+              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 bg-error/10 hover:bg-error/20 text-error text-sm rounded-lg transition-colors font-body-bold shadow-sm"
               title="Lock session and switch to Read-Only mode"
             >
               <Lock size={14} />
@@ -524,7 +911,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
             <button
               type="button"
               onClick={() => openUnlockModal('Enter passkey to unlock write access')}
-              className="flex items-center justify-center gap-1.5 px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 text-sm rounded-lg transition-colors font-body-bold shadow-sm"
+              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 text-sm rounded-lg transition-colors font-body-bold shadow-sm"
               title="Enter passkey to unlock write access"
             >
               <KeyRound size={14} />

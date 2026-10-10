@@ -235,7 +235,7 @@ export default function App() {
         </main>
 
         {/* Collapsible Live Engine Log Terminal */}
-        <div className="shrink-0 relative group border-t border-outline-variant mb-14 md:mb-0">
+        <div className="shrink-0 relative group border-t border-outline-variant mb-bottom-nav">
           <div
             className="absolute -top-1 left-0 right-0 h-2 cursor-ns-resize hover:bg-primary/50 z-10 transition-colors"
             onMouseDown={(e) => {

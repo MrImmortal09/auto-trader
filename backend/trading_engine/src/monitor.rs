@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use kotak_client::KotakClient;
+use shared_domain::entry_gate::{self, IndicatorFeed, SizingVerdict};
 use shared_domain::{
     DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradingConfig,
 };
@@ -17,7 +18,8 @@ use serde_json::json;
 
 #[derive(Debug)]
 enum PosAction {
-    EntryBuy { qty: i32 },
+    /// `note` explains an indicator-sizing adjustment, logged with the entry.
+    EntryBuy { qty: i32, note: Option<String> },
     ExitSell {
         qty: i32,
         reason: String,
@@ -149,7 +151,7 @@ fn find_duplicate_open_position<'a>(
 /// class". A bare `index_lots`/`other_lots` of 0 skips every index without an
 /// explicit per-symbol override / every stock option; a signal that resolves
 /// to 0 is dropped at ingestion (`start_position_monitor`).
-fn lots_for_instrument(cfg: &TradingConfig, instrument_name: &str) -> i32 {
+pub fn lots_for_instrument(cfg: &TradingConfig, instrument_name: &str) -> i32 {
     let inst = instrument_name.to_uppercase();
     match shared_domain::INDEX_NAMES.iter().find(|&&idx| inst == idx) {
         Some(&idx) => cfg
@@ -189,6 +191,93 @@ fn compute_entry_qty(
         if multiple == 0 { multiple = lot_size; }
         multiple
     }
+}
+
+/// Per-tick inputs to the entry gate — the indicator feed and "now" — taken
+/// once per tick so the decision functions themselves stay pure.
+struct EntryGate {
+    feed: IndicatorFeed,
+    /// IST `YYYY-MM-DD HH:MM:SS`.
+    now_ts: String,
+}
+
+impl EntryGate {
+    fn new(feed: &IndicatorFeed) -> Self {
+        Self { feed: Arc::clone(feed), now_ts: shared_domain::current_ist_timestamp_string() }
+    }
+}
+
+/// How a triggered entry is to be sized once the indicator has had its say.
+#[derive(Debug, PartialEq)]
+enum EntrySizing {
+    /// Buy `qty`. `note` explains an indicator adjustment, for the log.
+    Buy { qty: i32, note: Option<String> },
+    /// The indicator disagrees with the call — do not buy; `reason` says why.
+    Skip { reason: String },
+}
+
+/// Entry quantity for `pos` at the moment its trigger fires: the usual
+/// [`compute_entry_qty`], then — for an option, with `indicator_sizing` on —
+/// scaled up, scaled down or vetoed by the parent index's last closed VWAP +
+/// PCR check (see `shared_domain::entry_gate`).
+///
+/// A manual per-position qty override is the trader's explicit number, so it
+/// is never scaled — but a disagreeing reading still skips the call, which
+/// errs toward not trading.
+fn size_entry(
+    pos: &MonitoredPosition,
+    lot_size: i32,
+    cfg: &TradingConfig,
+    ltp: f64,
+    gate: &EntryGate,
+) -> EntrySizing {
+    let base_qty = compute_entry_qty(&pos.signal, lot_size, pos.override_qty, cfg, Some(ltp));
+    if !cfg.indicator_sizing {
+        return EntrySizing::Buy { qty: base_qty, note: None };
+    }
+    // Equity / futures signals are sized on notional and not gated.
+    let Some(option_type) = pos.signal.option_type.as_deref() else {
+        return EntrySizing::Buy { qty: base_qty, note: None };
+    };
+    let parent = entry_gate::indicator_parent(&pos.signal.instrument_name);
+    let reading = entry_gate::feed_reading(&gate.feed, parent, &cfg.indicator_params(), &gate.now_ts);
+    match entry_gate::sizing_verdict(
+        option_type,
+        &pos.signal.instrument_name,
+        reading.as_ref(),
+        cfg.indicator_agree_multiplier,
+        cfg.indicator_neutral_multiplier,
+    ) {
+        SizingVerdict::Skip { reason } => EntrySizing::Skip { reason },
+        SizingVerdict::Scale { multiplier, note, .. } => {
+            if pos.override_qty.is_some() {
+                return EntrySizing::Buy {
+                    qty: base_qty,
+                    note: Some(format!("{note} — manual qty override kept, multiplier not applied")),
+                };
+            }
+            let lot = lot_size.max(1);
+            let base_lots = base_qty / lot;
+            let lots = entry_gate::scale_lots(base_lots, multiplier);
+            EntrySizing::Buy {
+                qty: lots * lot,
+                note: Some(format!("{note}: {base_lots} → {lots} lot(s)")),
+            }
+        }
+    }
+}
+
+/// `Some(reason)` once a call still waiting for its entry has outlived
+/// `TradingConfig::call_validity_minutes` (counted from `created_at`, when the
+/// engine received it).
+fn call_expired_reason(pos: &MonitoredPosition, cfg: &TradingConfig, now_ts: &str) -> Option<String> {
+    entry_gate::call_expired(&pos.created_at, cfg.call_validity_minutes, now_ts).then(|| {
+        format!(
+            "CALL_EXPIRED — not bought within {} min of the call (received {})",
+            cfg.call_validity_minutes,
+            pos.created_at.get(11..16).unwrap_or("?")
+        )
+    })
 }
 
 /// Target-1 level when `ltp` is already at or through it — the move the signal
@@ -1805,6 +1894,7 @@ async fn adopt_manual(
         entry_retry_as_limit: false,
         live_halt: None,
         entry_zone: None,
+        call_expires_at: None,
     };
 
     { positions.write().await.push(new_pos); }
@@ -1830,7 +1920,8 @@ enum LiveAction {
     /// that triggered it, used to size the funds check. `limit_price` is `None`
     /// for the normal market buy; `Some(p)` when a prior market send was
     /// RMS-rejected and the retry must go in as an IOC limit at `p`.
-    PlaceEntry { qty: i32, ltp: f64, limit_price: Option<f64> },
+    /// `sizing_note` explains an indicator-sizing adjustment to `qty`, for the log.
+    PlaceEntry { qty: i32, ltp: f64, limit_price: Option<f64>, sizing_note: Option<String> },
     /// Give up on an entry that will not be taken; cancel it if it is in flight.
     /// `loud` surfaces it as an ERROR the dashboard highlights (the signal
     /// looked wrong) rather than a routine INFO line (e.g. the EOD cutoff).
@@ -1876,6 +1967,7 @@ fn decide_live(
     cfg: &TradingConfig,
     entry_cutoff: bool,
     retry_window: bool,
+    gate: &EntryGate,
 ) -> Option<LiveAction> {
     if pos.live_halt.is_some() || pos.resolved_order.is_none() {
         return None;
@@ -1915,6 +2007,12 @@ fn decide_live(
                 // In flight — the order book decides what happened.
                 return None;
             }
+            // The call has outlived its validity window without being bought.
+            // Checked only once nothing is in flight: an entry already sent was
+            // triggered inside the window, and is the order book's to settle.
+            if let Some(reason) = call_expired_reason(pos, cfg, &gate.now_ts) {
+                return Some(LiveAction::AbandonEntry { reason, loud: false });
+            }
             // Every send of this entry failed before the broker gave a verdict
             // and every follow-up hunt came up empty. Stop trying.
             if pos.entry_attempts >= shared_domain::MAX_ENTRY_ATTEMPTS {
@@ -1939,7 +2037,17 @@ fn decide_live(
                 });
             }
             let lot = lot_size_of(pos);
-            let qty = compute_entry_qty(&pos.signal, lot, pos.override_qty, cfg, Some(ltp));
+            // The VWAP + PCR gate is read here, at the moment of buying (and
+            // again on any retry), not when the call arrived.
+            let (qty, sizing_note) = match size_entry(pos, lot, cfg, ltp, gate) {
+                EntrySizing::Buy { qty, note } => (qty, note),
+                EntrySizing::Skip { reason } => {
+                    return Some(LiveAction::AbandonEntry {
+                        reason: format!("INDICATOR_SKIP — {reason}"),
+                        loud: false,
+                    });
+                }
+            };
             if qty <= 0 || qty % lot != 0 {
                 return Some(LiveAction::AbandonEntry {
                     reason: format!("invalid quantity {qty} for lot size {lot}"),
@@ -1963,7 +2071,7 @@ fn decide_live(
             } else {
                 None
             };
-            Some(LiveAction::PlaceEntry { qty, ltp, limit_price })
+            Some(LiveAction::PlaceEntry { qty, ltp, limit_price, sizing_note })
         }
 
         TradeState::Active | TradeState::Target1Hit => {
@@ -2364,7 +2472,7 @@ async fn exec_live_action(
         .filter(|v| *v > 0.0);
 
     match &pending.action {
-        LiveAction::PlaceEntry { qty, ltp, limit_price } => {
+        LiveAction::PlaceEntry { qty, ltp, limit_price, sizing_note } => {
             // Stamp the attempt time first, so decide_live's throttle spaces
             // out the next pre-flight even if this one bails out below.
             with_position(positions, &pending.pos_id, |p| {
@@ -2448,6 +2556,7 @@ async fn exec_live_action(
                                 "qty": qty,
                                 "order_type": "IOC_LIMIT",
                                 "limit_price": round2(*lp),
+                                "sizing": sizing_note,
                                 "mode": "LIVE",
                             })).await;
                         }
@@ -2458,6 +2567,7 @@ async fn exec_live_action(
                                 "instrument": ctx.instrument,
                                 "order_id": order_id,
                                 "qty": qty,
+                                "sizing": sizing_note,
                                 "mode": "LIVE",
                             })).await;
                         }
@@ -2703,6 +2813,7 @@ async fn live_tick(
     ltp_map: &Arc<DashMap<String, f64>>,
     cfg: &TradingConfig,
     last_poll: &mut Instant,
+    gate: &EntryGate,
 ) {
     let mut mutated = false;
 
@@ -2755,7 +2866,7 @@ async fn live_tick(
         let g = positions.read().await;
         g.iter()
             .filter_map(|p| {
-                decide_live(p, ltp_map, cfg, entry_cutoff, poll_due)
+                decide_live(p, ltp_map, cfg, entry_cutoff, poll_due, gate)
                     .map(|action| LivePending { pos_id: p.id.clone(), action })
             })
             .collect()
@@ -2835,6 +2946,7 @@ pub async fn start_position_monitor(
     scrip_store: Arc<RwLock<Option<crate::scrip_master::ScripStore>>>,
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
     kotak: Arc<tokio::sync::Mutex<Option<KotakClient>>>,
+    indicator_feed: IndicatorFeed,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3313,6 +3425,7 @@ pub async fn start_position_monitor(
                                     entry_retry_as_limit: false,
                                     live_halt: None,
                                     entry_zone: None,
+                                    call_expires_at: None,
                                 });
                                 let snapshot = pos_guard.clone();
                                 drop(pos_guard);
@@ -3361,7 +3474,8 @@ pub async fn start_position_monitor(
                     // instead of silently trading blind.
                     if !startup_reconciled { continue; }
                     if positions.read().await.is_empty() { continue; }
-                    live_tick(&positions, &kotak, &db_tx, &log_tx, &ltp_map, &cfg, &mut last_live_poll).await;
+                    let gate = EntryGate::new(&indicator_feed);
+                    live_tick(&positions, &kotak, &db_tx, &log_tx, &ltp_map, &cfg, &mut last_live_poll, &gate).await;
                     continue;
                 }
 
@@ -3370,6 +3484,7 @@ pub async fn start_position_monitor(
 
                 let cfg = config.read().await;
                 let entry_cutoff = is_entry_cutoff_passed();
+                let gate = EntryGate::new(&indicator_feed);
                 let mut pending: Vec<Pending> = Vec::new();
                 let mut positions_mutated = false;
 
@@ -3421,6 +3536,10 @@ pub async fn start_position_monitor(
                             });
                             continue;
                         }
+                        if let Some(reason) = call_expired_reason(pos, &cfg, &gate.now_ts) {
+                            pending.push(Pending { idx: i, ltp: 0.0, action: PosAction::Expire { reason } });
+                            continue;
+                        }
                     }
 
                     let lookup_key = pos.ws_scrip_key.as_ref().unwrap_or(&pos.signal.instrument_name);
@@ -3468,14 +3587,20 @@ pub async fn start_position_monitor(
                                     .filter(|v| *v > 0)
                                     .unwrap_or(1);
 
-                                let qty = compute_entry_qty(&pos.signal, lot_size, pos.override_qty, &cfg, Some(ltp));
+                                // VWAP + PCR gate, read at the moment of buying.
+                                let (qty, note) = match size_entry(pos, lot_size, &cfg, ltp, &gate) {
+                                    EntrySizing::Buy { qty, note } => (qty, note),
+                                    EntrySizing::Skip { reason } => {
+                                        return PosAction::Expire { reason: format!("INDICATOR_SKIP — {reason}") };
+                                    }
+                                };
 
                                 if qty <= 0 || qty % lot_size != 0 {
                                     PosAction::Cancel {
                                         reason: format!("Invalid quantity {}, must be positive multiple of lot size {}", qty, lot_size)
                                     }
                                 } else {
-                                    PosAction::EntryBuy { qty }
+                                    PosAction::EntryBuy { qty, note }
                                 }
                             })
                         }
@@ -3562,7 +3687,17 @@ pub async fn start_position_monitor(
                     let instrument = pos.signal.instrument_name.clone();
 
                     match pa.action {
-                        PosAction::EntryBuy { qty } => {
+                        PosAction::EntryBuy { qty, note } => {
+                            if let Some(note) = note {
+                                let msg = json!({
+                                    "event": "INDICATOR_SIZING",
+                                    "instrument": instrument,
+                                    "qty": qty,
+                                    "note": note,
+                                    "mode": cfg.mode.as_str(),
+                                });
+                                send_log(&db_tx, &log_tx, "INFO", &msg.to_string()).await;
+                            }
                             let fees = FeeCalculator::calculate(
                                 qty, pa.ltp, "BUY", is_options, cfg.brokerage_per_order,
                             );
@@ -3622,10 +3757,14 @@ pub async fn start_position_monitor(
                         PosAction::Expire { reason } => {
                             pos.state = TradeState::Closed;
                             positions_mutated = true;
-                            let msg = format!(
-                                r#"{{"event":"ENTRY_ABANDONED","instrument":"{}","reason":"{}"}}"#,
-                                instrument, reason
-                            );
+                            // Built with json! so a reason containing quotes
+                            // (indicator / expiry explanations) stays valid JSON.
+                            let msg = json!({
+                                "event": "ENTRY_ABANDONED",
+                                "instrument": instrument,
+                                "reason": reason,
+                            })
+                            .to_string();
                             tracing::info!(instrument = %instrument, reason = %reason, "Waiting position dropped");
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
                         }
@@ -3709,6 +3848,7 @@ mod tests {
             entry_retry_as_limit: false,
             live_halt: None,
             entry_zone: None,
+            call_expires_at: None,
         }
     }
 
@@ -3788,7 +3928,24 @@ mod tests {
             pre_t1_trail_factor: 0.5,
             kill_switch_active: false,
             entry_window_pct: 0.0,
+            indicator_sizing: false,
+            indicator_agree_multiplier: 1.5,
+            indicator_neutral_multiplier: 0.5,
+            indicator_interval_min: 15,
+            indicator_basis: "chg".into(),
+            indicator_strike_window: 10,
+            indicator_pcr_buy_above: 1.0,
+            indicator_pcr_sell_below: 1.0,
+            indicator_vwap_band_pct: 0.0,
+            // Off in the shared helper so the older tests keep testing exactly
+            // what they did; the call-validity tests switch it on themselves.
+            call_validity_minutes: 0,
         }
+    }
+
+    /// An entry gate with an empty indicator feed at the real current time.
+    fn test_gate() -> EntryGate {
+        EntryGate::new(&entry_gate::new_indicator_feed())
     }
 
     #[test]
@@ -3939,7 +4096,7 @@ mod tests {
         let ltp = Arc::new(DashMap::new());
         let pos = live_waiting_position(&ltp);
         assert!(matches!(
-            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true),
+            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true, &test_gate()),
             Some(LiveAction::PlaceEntry { .. })
         ));
     }
@@ -4000,7 +4157,7 @@ mod tests {
         let mut pos = live_waiting_position(&ltp);
         pos.entry_send_uncertain = true;
         pos.force_exit = Some("USER_EXIT".to_string());
-        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), true, true).is_none());
+        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), true, true, &test_gate()).is_none());
     }
 
     #[test]
@@ -4009,14 +4166,14 @@ mod tests {
         let mut pos = live_waiting_position(&ltp);
         // An attempt a moment ago blocks another on this tick.
         pos.entry_attempt_at = Some(shared_domain::current_ist_timestamp_string());
-        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true).is_none());
+        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true, &test_gate()).is_none());
         // One from well before the throttle window does not.
         let stale = (shared_domain::now_ist() - chrono::Duration::seconds(10))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         pos.entry_attempt_at = Some(stale);
         assert!(matches!(
-            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true),
+            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true, &test_gate()),
             Some(LiveAction::PlaceEntry { .. })
         ));
     }
@@ -4026,7 +4183,7 @@ mod tests {
         let ltp = Arc::new(DashMap::new());
         let mut pos = live_waiting_position(&ltp);
         pos.entry_attempts = shared_domain::MAX_ENTRY_ATTEMPTS;
-        match decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true) {
+        match decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true, &test_gate()) {
             Some(LiveAction::AbandonEntry { loud, .. }) => assert!(loud),
             other => panic!("expected a loud AbandonEntry, got {other:?}"),
         }
@@ -4058,14 +4215,14 @@ mod tests {
         let cfg = cfg_with_lots(1, 3);
 
         // Normal first attempt is a plain market buy.
-        match decide_live(&pos, &ltp, &cfg, false, true) {
+        match decide_live(&pos, &ltp, &cfg, false, true, &test_gate()) {
             Some(LiveAction::PlaceEntry { limit_price, .. }) => assert_eq!(limit_price, None),
             other => panic!("expected a market PlaceEntry, got {other:?}"),
         }
 
         // After a market rejection the retry carries an IOC limit price.
         pos.entry_retry_as_limit = true;
-        match decide_live(&pos, &ltp, &cfg, false, true) {
+        match decide_live(&pos, &ltp, &cfg, false, true, &test_gate()) {
             Some(LiveAction::PlaceEntry { limit_price: Some(p), .. }) => {
                 assert!((p - 127.05).abs() < 1e-6, "got {p}");
             }
@@ -4075,7 +4232,7 @@ mod tests {
         // A price that no longer satisfies the trigger stops the retries —
         // decide_live re-checks entry_triggered before every limit send.
         ltp.insert("nse_fo|999".to_string(), 119.0);
-        assert!(decide_live(&pos, &ltp, &cfg, false, true).is_none());
+        assert!(decide_live(&pos, &ltp, &cfg, false, true, &test_gate()).is_none());
     }
 
     /// A LIVE position holding one 75-lot at avg 120 with LTP at target 1
@@ -4102,7 +4259,7 @@ mod tests {
         let pos = live_one_lot_at_target1(&ltp);
 
         // Default: dynamic targeting sells its one lot, leaving nothing to run.
-        match decide_live(&pos, &ltp, &dynamic_cfg(false), false, true) {
+        match decide_live(&pos, &ltp, &dynamic_cfg(false), false, true, &test_gate()) {
             Some(LiveAction::ExitAll { qty, reason }) => {
                 assert_eq!(qty, 75);
                 assert_eq!(reason, "TGT1_FULL");
@@ -4113,7 +4270,7 @@ mod tests {
         // Opted in: nothing is sold, the whole lot rides the ladder with the
         // stop at 140 - 20*0.5 = 130 and the next rung at 140 + 20*1.0 = 160.
         assert_eq!(
-            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true),
+            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true, &test_gate()),
             Some(LiveAction::Target1 {
                 slice: 0,
                 keep: 75,
@@ -4127,7 +4284,7 @@ mod tests {
         let mut cfg = dynamic_cfg(true);
         cfg.dynamic_targeting = false;
         assert!(matches!(
-            decide_live(&pos, &ltp, &cfg, false, true),
+            decide_live(&pos, &ltp, &cfg, false, true, &test_gate()),
             Some(LiveAction::ExitAll { .. })
         ));
     }
@@ -4139,7 +4296,7 @@ mod tests {
         // Two lots: still sells exactly one lot at target 1, as before.
         let mut pos = live_one_lot_at_target1(&ltp);
         pos.executed_qty = 150;
-        match decide_live(&pos, &ltp, &dynamic_cfg(true), false, true) {
+        match decide_live(&pos, &ltp, &dynamic_cfg(true), false, true, &test_gate()) {
             Some(LiveAction::Target1 { slice, keep, .. }) => {
                 assert_eq!((slice, keep), (75, 75));
             }
@@ -4151,7 +4308,7 @@ mod tests {
         let mut pos = live_one_lot_at_target1(&ltp);
         pos.avg_buy_price = 140.0;
         assert!(matches!(
-            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true),
+            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true, &test_gate()),
             Some(LiveAction::ExitAll { .. })
         ));
     }
@@ -4170,18 +4327,18 @@ mod tests {
 
         // Between the stop and the next rung: hold.
         ltp.insert("nse_fo|999".to_string(), 150.0);
-        assert!(decide_live(&pos, &ltp, &cfg, false, true).is_none());
+        assert!(decide_live(&pos, &ltp, &cfg, false, true, &test_gate()).is_none());
 
         // Next rung: trail to 150, extend to 180 — no sell.
         ltp.insert("nse_fo|999".to_string(), 160.0);
         assert_eq!(
-            decide_live(&pos, &ltp, &cfg, false, true),
+            decide_live(&pos, &ltp, &cfg, false, true, &test_gate()),
             Some(LiveAction::TrailDynamic { new_sl: 150.0, next_target: 180.0, rung_hit: 160.0 })
         );
 
         // Back through the trailed stop: sell the whole lot.
         ltp.insert("nse_fo|999".to_string(), 129.0);
-        match decide_live(&pos, &ltp, &cfg, false, true) {
+        match decide_live(&pos, &ltp, &cfg, false, true, &test_gate()) {
             Some(LiveAction::ExitAll { qty, reason }) => {
                 assert_eq!(qty, 75);
                 assert_eq!(reason, "TRAIL_SL_HIT");
@@ -4350,7 +4507,7 @@ mod tests {
         let ltp_map = Arc::new(DashMap::new());
         ltp_map.insert("NIFTY".to_string(), 125.0);
 
-        let action = decide_live(&pos, &ltp_map, &cfg, false, false);
+        let action = decide_live(&pos, &ltp_map, &cfg, false, false, &test_gate());
         assert_eq!(
             action,
             Some(LiveAction::AbandonEntry {
@@ -4374,7 +4531,7 @@ mod tests {
         let ltp_map = Arc::new(DashMap::new());
         ltp_map.insert("NIFTY".to_string(), 125.0);
 
-        let action = decide_live(&pos, &ltp_map, &cfg, false, false);
+        let action = decide_live(&pos, &ltp_map, &cfg, false, false, &test_gate());
         assert!(matches!(action, Some(LiveAction::PlaceEntry { .. })));
     }
 
@@ -4389,7 +4546,7 @@ mod tests {
         let ltp_map = Arc::new(DashMap::new());
         ltp_map.insert("NIFTY".to_string(), 130.0);
 
-        let action = decide_live(&pos, &ltp_map, &cfg, false, false);
+        let action = decide_live(&pos, &ltp_map, &cfg, false, false, &test_gate());
         assert_eq!(
             action,
             Some(LiveAction::ExitAll {
@@ -4397,5 +4554,169 @@ mod tests {
                 reason: "KILL_SWITCH".to_string(),
             })
         );
+    }
+
+    // ── Entry gate: indicator sizing + call validity ─────────────────── //
+
+    fn ist_today() -> String {
+        shared_domain::today_ist().format("%Y-%m-%d").to_string()
+    }
+
+    /// A gate whose feed holds one closed 11:01 check for `index` (+2 BUY or
+    /// −2 SELL) and whose clock reads 11:05 today.
+    fn gate_with(index: &str, bullish: bool) -> EntryGate {
+        let feed = entry_gate::new_indicator_feed();
+        let (call_chg, put_chg, fut) = if bullish { (100.0, 200.0, 25_100.0) } else { (200.0, 100.0, 24_900.0) };
+        entry_gate::feed_push(
+            &feed,
+            index,
+            vec![entry_gate::OiMinute {
+                ts: format!("{} 11:01:02", ist_today()),
+                strike_window: 10,
+                call_oi: 1_000.0,
+                put_oi: 1_000.0,
+                call_oi_chg: call_chg,
+                put_oi_chg: put_chg,
+                spot: 25_000.0,
+                fut_ltp: Some(fut),
+                fut_vwap: Some(25_000.0),
+            }],
+        );
+        EntryGate { feed, now_ts: format!("{} 11:05:00", ist_today()) }
+    }
+
+    fn sizing_cfg(lots: i32) -> TradingConfig {
+        let mut cfg = cfg_with_lots(lots, lots);
+        cfg.indicator_sizing = true;
+        cfg
+    }
+
+    #[test]
+    fn indicator_sizing_off_leaves_the_quantity_untouched() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_waiting_position(&ltp); // BUY NIFTY CE, lot 75
+        assert_eq!(
+            size_entry(&pos, 75, &cfg_with_lots(2, 2), 121.0, &gate_with("NIFTY", false)),
+            EntrySizing::Buy { qty: 150, note: None }
+        );
+    }
+
+    #[test]
+    fn indicator_agreeing_scales_up_and_no_reading_scales_down() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_waiting_position(&ltp); // BUY NIFTY CE
+        match size_entry(&pos, 75, &sizing_cfg(2), 121.0, &gate_with("NIFTY", true)) {
+            EntrySizing::Buy { qty, note } => {
+                assert_eq!(qty, 3 * 75);
+                let note = note.expect("a sizing note");
+                assert!(note.contains("agrees with BUY CE") && note.contains("2 → 3 lot(s)"), "{note}");
+            }
+            other => panic!("expected a scaled-up buy, got {other:?}"),
+        }
+        // Empty feed → no fresh reading → treated as neutral (0.5×): 2 lots → 1.
+        match size_entry(&pos, 75, &sizing_cfg(2), 121.0, &test_gate()) {
+            EntrySizing::Buy { qty, note } => {
+                assert_eq!(qty, 75);
+                assert!(note.expect("a sizing note").contains("no fresh reading"));
+            }
+            other => panic!("expected a scaled-down buy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indicator_disagreeing_skips_the_call_and_says_why() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_waiting_position(&ltp); // BUY NIFTY CE
+        let bearish = gate_with("NIFTY", false);
+        match decide_live(&pos, &ltp, &sizing_cfg(1), false, true, &bearish) {
+            Some(LiveAction::AbandonEntry { reason, loud }) => {
+                assert!(!loud);
+                assert!(reason.starts_with("INDICATOR_SKIP"), "{reason}");
+                assert!(reason.contains("-2 SELL at the 11:01 check"), "{reason}");
+                assert!(reason.contains("disagrees with BUY CE"), "{reason}");
+            }
+            other => panic!("expected the call to be skipped, got {other:?}"),
+        }
+        // The same bearish reading agrees with a PE call: 2 lots × 1.5 → 3.
+        let mut put = pos.clone();
+        put.signal.option_type = Some("PE".to_string());
+        assert!(matches!(
+            decide_live(&put, &ltp, &sizing_cfg(2), false, true, &bearish),
+            Some(LiveAction::PlaceEntry { qty: 225, .. })
+        ));
+    }
+
+    #[test]
+    fn a_manual_override_is_never_scaled_but_still_skipped_on_disagreement() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        pos.override_qty = Some(4);
+        match size_entry(&pos, 75, &sizing_cfg(1), 121.0, &gate_with("NIFTY", true)) {
+            EntrySizing::Buy { qty, note } => {
+                assert_eq!(qty, 4 * 75);
+                assert!(note.expect("a sizing note").contains("manual qty override kept"));
+            }
+            other => panic!("expected the override untouched, got {other:?}"),
+        }
+        assert!(matches!(
+            size_entry(&pos, 75, &sizing_cfg(1), 121.0, &gate_with("NIFTY", false)),
+            EntrySizing::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn other_names_follow_nifty_but_banknifty_reads_its_own_index() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        let nifty_bearish = gate_with("NIFTY", false);
+        for name in ["RELIANCE", "FINNIFTY", "BANKEX"] {
+            pos.signal.instrument_name = name.to_string();
+            assert!(
+                matches!(size_entry(&pos, 75, &sizing_cfg(1), 121.0, &nifty_bearish), EntrySizing::Skip { .. }),
+                "{name} should follow NIFTY"
+            );
+        }
+        // BANKNIFTY has no data in this feed → no fresh reading → neutral, 1 lot.
+        pos.signal.instrument_name = "BANKNIFTY".to_string();
+        assert!(matches!(
+            size_entry(&pos, 75, &sizing_cfg(1), 121.0, &nifty_bearish),
+            EntrySizing::Buy { qty: 75, .. }
+        ));
+    }
+
+    #[test]
+    fn an_unbought_call_expires_after_its_validity_window() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        pos.created_at = format!("{} 09:30:00", ist_today());
+        let mut cfg = cfg_with_lots(1, 1);
+        cfg.call_validity_minutes = 120;
+        let at = |hms: &str| EntryGate {
+            feed: entry_gate::new_indicator_feed(),
+            now_ts: format!("{} {hms}", ist_today()),
+        };
+
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &at("11:29:59")),
+            Some(LiveAction::PlaceEntry { .. })
+        ));
+        match decide_live(&pos, &ltp, &cfg, false, true, &at("11:30:00")) {
+            Some(LiveAction::AbandonEntry { reason, loud: false }) => {
+                assert!(reason.starts_with("CALL_EXPIRED"), "{reason}");
+                assert!(reason.contains("received 09:30"), "{reason}");
+            }
+            other => panic!("expected the call to expire, got {other:?}"),
+        }
+        // An entry already sent to the broker was triggered inside the window:
+        // never abandoned by it — the order book settles it.
+        pos.entry_order_id = Some("240101000000001".to_string());
+        assert!(decide_live(&pos, &ltp, &cfg, false, true, &at("12:00:00")).is_none());
+        // 0 switches the rule off.
+        pos.entry_order_id = None;
+        cfg.call_validity_minutes = 0;
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &at("15:00:00")),
+            Some(LiveAction::PlaceEntry { .. })
+        ));
     }
 }

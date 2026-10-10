@@ -1,11 +1,14 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, RotateCcw, SlidersHorizontal } from 'lucide-react';
+import { AlertTriangle, SlidersHorizontal } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { fmt } from '../lib/format';
 
 // ---------------------------------------------------------------------------
-// Market data (Upstox option chain → OI / PCR / VWAP trend). Read-only analytics;
-// nothing on this screen affects order placement.
+// Market data (Upstox option chain → OI / PCR / VWAP trend). Read-only: nothing
+// on this screen changes anything. The signal settings it scores with are the
+// server's (Settings → Telegram Call Rules), the same ones the engine sizes
+// entries on when indicator sizing is ON — so the badges here show exactly what
+// the engine would read.
 // ---------------------------------------------------------------------------
 
 type IndexId = 'NIFTY' | 'BANKNIFTY' | 'SENSEX';
@@ -28,7 +31,7 @@ const WINDOWS = [
 const INTERVALS = [5, 15, 30, 60];
 
 // ---------------------------------------------------------------------------
-// Signal settings (per-browser, localStorage)
+// Signal settings (from the server's trading config)
 // ---------------------------------------------------------------------------
 
 interface SignalSettings {
@@ -52,7 +55,6 @@ const DEFAULT_SETTINGS: SignalSettings = {
   pcrSellBelow: 1,
   vwapBandPct: 0,
 };
-const SETTINGS_KEY = 'market_signal_settings_v1';
 
 function finite(v: unknown, fallback: number) {
   const n = Number(v);
@@ -69,14 +71,27 @@ function sanitize(raw: Partial<SignalSettings>): SignalSettings {
   return { interval, basis, window, pcrBuyAbove, pcrSellBelow, vwapBandPct };
 }
 
-function loadSettings(): SignalSettings {
-  try {
-    const saved = localStorage.getItem(SETTINGS_KEY);
-    if (saved) return sanitize(JSON.parse(saved));
-  } catch {
-    // unavailable storage / bad JSON → defaults
-  }
-  return DEFAULT_SETTINGS;
+interface ServerSignalConfig {
+  indicator_sizing?: boolean;
+  indicator_interval_min?: number;
+  indicator_basis?: string;
+  indicator_strike_window?: number;
+  indicator_pcr_buy_above?: number;
+  indicator_pcr_sell_below?: number;
+  indicator_vwap_band_pct?: number;
+}
+
+/** Map the server's trading config onto the scoring settings; an older server
+ * without these fields falls back to the defaults. */
+function fromServer(c: ServerSignalConfig): SignalSettings {
+  return sanitize({
+    interval: c.indicator_interval_min,
+    basis: c.indicator_basis === 'total' ? 'total' : 'chg',
+    window: c.indicator_strike_window,
+    pcrBuyAbove: c.indicator_pcr_buy_above,
+    pcrSellBelow: c.indicator_pcr_sell_below,
+    vwapBandPct: c.indicator_vwap_band_pct,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -222,46 +237,15 @@ function OverallBadge({ score, size = 'sm' }: { score: number; size?: 'sm' | 'lg
 // UI helpers
 // ---------------------------------------------------------------------------
 
-function Segmented<T extends string | number>({
-  options,
-  value,
-  onChange,
-}: {
-  options: { value: T; label: string }[];
-  value: T;
-  onChange: (v: T) => void;
-}) {
+function Setting({ label, value, hint }: { label: string; value: string; hint: string }) {
   return (
-    <div className="inline-flex flex-wrap rounded-lg border border-outline-variant overflow-hidden text-xs font-semibold">
-      {options.map((o) => (
-        <button
-          key={String(o.value)}
-          onClick={() => onChange(o.value)}
-          className={`px-3 py-1.5 transition-colors ${
-            o.value === value
-              ? 'bg-primary-container text-on-primary'
-              : 'bg-surface-container-lowest text-on-surface-variant hover:bg-surface-container'
-          }`}
-        >
-          {o.label}
-        </button>
-      ))}
+    <div className="flex flex-col gap-1 min-w-0">
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-on-surface-variant">{label}</span>
+      <span className="text-sm font-bold text-on-surface tabular-nums">{value}</span>
+      <span className="text-[11px] text-on-surface-variant">{hint}</span>
     </div>
   );
 }
-
-function Field({ label, hint, children }: { label: string; hint: string; children: React.ReactNode }) {
-  return (
-    <label className="flex flex-col gap-1.5">
-      <span className="text-[11px] font-semibold uppercase tracking-wider text-on-surface-variant">{label}</span>
-      {children}
-      <span className="text-[11px] text-on-surface-variant">{hint}</span>
-    </label>
-  );
-}
-
-const inputClass =
-  'w-28 rounded-lg border border-outline-variant bg-surface-container-lowest px-2.5 py-1.5 text-xs text-on-surface tabular-nums focus:outline-none focus:border-primary';
 
 function usePolling<T>(serverBase: string, path: string, everyMs: number): T | null {
   const [data, setData] = useState<T | null>(null);
@@ -290,29 +274,9 @@ function usePolling<T>(serverBase: string, path: string, everyMs: number): T | n
 
 export function MarketDataScreen({ serverBase }: { serverBase: string }) {
   const [selected, setSelected] = useState<IndexId>('NIFTY');
-  const [draft, setDraft] = useState<Partial<SignalSettings>>(loadSettings);
-  const s = sanitize(draft);
-
-  function update(patch: Partial<SignalSettings>) {
-    setDraft((prev) => {
-      const next = { ...prev, ...patch };
-      try {
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(sanitize(next)));
-      } catch {
-        // storage unavailable — settings just won't persist
-      }
-      return next;
-    });
-  }
-
-  function resetSettings() {
-    setDraft(DEFAULT_SETTINGS);
-    try {
-      localStorage.removeItem(SETTINGS_KEY);
-    } catch {
-      // ignore
-    }
-  }
+  const serverCfg = usePolling<ServerSignalConfig>(serverBase, '/api/settings', 60_000);
+  const s = serverCfg ? fromServer(serverCfg) : DEFAULT_SETTINGS;
+  const sizingOn = serverCfg?.indicator_sizing === true;
 
   const trendPath = (id: IndexId) => `/api/market/intraday-trend?underlying=${id}&interval=${s.interval}&window=${s.window}`;
   const live = usePolling<LiveResp>(serverBase, '/api/market/live', 20_000);
@@ -428,78 +392,47 @@ export function MarketDataScreen({ serverBase }: { serverBase: string }) {
         })}
       </div>
 
-      {/* Signal settings */}
+      {/* Signal settings — read-only here, edited on the Settings page */}
       <div className="bg-surface-container-lowest rounded-xl border border-outline-variant shadow-sm p-4 space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="flex items-center gap-2 font-bold text-on-surface text-sm">
             <SlidersHorizontal size={16} className="text-primary" /> Signal Settings
           </h3>
-          <button
-            onClick={resetSettings}
-            className="flex items-center gap-1.5 text-xs font-semibold text-on-surface-variant hover:text-on-surface"
+          <span
+            className={`rounded-md px-2 py-0.5 text-[11px] font-bold ${
+              sizingOn ? 'bg-secondary/15 text-secondary' : 'bg-surface-container text-on-surface-variant'
+            }`}
           >
-            <RotateCcw size={13} /> Reset to defaults
-          </button>
+            Indicator sizing {sizingOn ? 'ON' : 'OFF'}
+          </span>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-5">
-          <Field
+        <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4">
+          <Setting
             label="Interval"
-            hint="Checked 1 min after each boundary, first check 09:16 (15m → 09:16, 09:31, 09:46…). Default 15."
-          >
-            <Segmented
-              options={INTERVALS.map((m) => ({ value: m, label: `${m} mins` }))}
-              value={s.interval}
-              onChange={(v) => update({ interval: v })}
-            />
-          </Field>
-          <Field label="OI basis" hint="Change in OI since yesterday's close, or total open interest.">
-            <Segmented
-              options={[
-                { value: 'chg' as Basis, label: 'Change in OI' },
-                { value: 'total' as Basis, label: 'Total OI' },
-              ]}
-              value={s.basis}
-              onChange={(v) => update({ basis: v })}
-            />
-          </Field>
-          <Field label="Strike range" hint="Strikes each side of ATM counted in Call / Put.">
-            <Segmented options={WINDOWS} value={s.window} onChange={(v) => update({ window: v })} />
-          </Field>
-          <Field label="PCR buy above" hint={`Option Signal = BUY (+1) when PCR > ${s.pcrBuyAbove}.`}>
-            <input
-              type="number"
-              min={0}
-              step={0.05}
-              value={draft.pcrBuyAbove ?? ''}
-              onChange={(e) => update({ pcrBuyAbove: e.target.value === '' ? undefined : Number(e.target.value) })}
-              className={inputClass}
-            />
-          </Field>
-          <Field label="PCR sell below" hint={`Option Signal = SELL (−1) when PCR < ${s.pcrSellBelow}. Between the two = 0.`}>
-            <input
-              type="number"
-              min={0}
-              step={0.05}
-              value={draft.pcrSellBelow ?? ''}
-              onChange={(e) => update({ pcrSellBelow: e.target.value === '' ? undefined : Number(e.target.value) })}
-              className={inputClass}
-            />
-          </Field>
-          <Field label="VWAP neutral band (%)" hint={`VWAP Signal = 0 while the future is within ±${s.vwapBandPct}% of VWAP.`}>
-            <input
-              type="number"
-              min={0}
-              max={5}
-              step={0.01}
-              value={draft.vwapBandPct ?? ''}
-              onChange={(e) => update({ vwapBandPct: e.target.value === '' ? undefined : Number(e.target.value) })}
-              className={inputClass}
-            />
-          </Field>
+            value={`${s.interval} mins`}
+            hint="Checked 1 min after each boundary, first check 09:16."
+          />
+          <Setting
+            label="OI basis"
+            value={s.basis === 'chg' ? 'Change in OI' : 'Total OI'}
+            hint="Change since yesterday's close, or total OI."
+          />
+          <Setting
+            label="Strike range"
+            value={WINDOWS.find((w) => w.value === s.window)?.label ?? `ATM ±${s.window}`}
+            hint="Strikes each side of ATM counted."
+          />
+          <Setting label="PCR buy above" value={String(s.pcrBuyAbove)} hint="Option Signal = BUY (+1) above this." />
+          <Setting label="PCR sell below" value={String(s.pcrSellBelow)} hint="Option Signal = SELL (−1) below this." />
+          <Setting label="VWAP band" value={`±${s.vwapBandPct}%`} hint="VWAP Signal = 0 within this of VWAP." />
         </div>
         <p className="text-[11px] text-on-surface-variant border-t border-outline-variant pt-3">
-          Overall score = Option Signal (+1 BUY / −1 SELL / 0) + VWAP Signal (+1 / −1 / 0), from −2 to +2.
-          Above 0 is BUY, below 0 is SELL, and 0 is NEUTRAL. For display only; it never places or blocks a trade.
+          Overall score = Option Signal (+1 BUY / −1 SELL / 0) + VWAP Signal (+1 / −1 / 0), from −2 to +2. Above 0 is
+          BUY, below 0 is SELL, and 0 is NEUTRAL.{' '}
+          {sizingOn
+            ? 'Indicator sizing is ON: when a Telegram call triggers, the engine reads the card badge (last closed check) — agrees scales the lots up, neutral scales them down, disagrees skips the call.'
+            : 'Indicator sizing is OFF, so this is display only and never places or blocks a trade.'}{' '}
+          These settings are edited in <span className="font-semibold">Settings → Telegram Call Rules</span>.
         </p>
       </div>
 

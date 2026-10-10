@@ -86,5 +86,16 @@
   .mb-safe {
     margin-bottom: max(env(safe-area-inset-bottom), 0.5rem);
   }
+  /* Clears the fixed mobile BottomNavBar: its 3.75rem of tab content plus its
+     .pb-safe padding (the home-indicator inset, at least 0.75rem). A flat 3.5rem
+     left the engine-log bar partly under the nav — fully, on notched iPhones. */
+  .mb-bottom-nav {
+    margin-bottom: calc(3.75rem + max(env(safe-area-inset-bottom), 0.75rem));
+  }
+  @media (width >= 48rem) {
+    .mb-bottom-nav {
+      margin-bottom: 0;
+    }
+  }
 }
 

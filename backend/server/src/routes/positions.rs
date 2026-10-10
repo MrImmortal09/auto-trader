@@ -50,6 +50,10 @@ pub async fn positions_handler(State(state): State<AppState>) -> Json<Vec<Monito
         // the entry buy window is configured (see TradingConfig::entry_window_pct).
         if matches!(p.state, TradeState::WaitingForEntry) {
             p.entry_zone = trading_engine::entry_buy_window(&p.signal, &cfg);
+            // When this call stops being valid if still unbought (see
+            // TradingConfig::call_validity_minutes).
+            p.call_expires_at =
+                shared_domain::entry_gate::call_expires_at(&p.created_at, cfg.call_validity_minutes);
         }
 
         // Try ws_scrip_key first (precise lookup like "nse_fo|51386")

@@ -546,6 +546,30 @@ On `Target1Hit`:
 - Sells `target_1_exit_pct %` of the position
 - Trails the SL to `(avg_buy_price + target_2) / 2`
 
+### Entry Rules: Call Validity & Indicator Sizing
+
+Both are configured under **Settings → Telegram Call Rules** and apply in PAPER and LIVE.
+
+- **Call validity** (`call_validity_minutes`, default **120**): a call that has not been bought within this many
+  minutes of arriving is dropped (`CALL_EXPIRED`). Only unbought calls: an entry already sent to the broker and every
+  open position are untouched. Cancelling a call from the dashboard still works any time. `0` = off (valid until the
+  15:39 no-entry cutoff).
+- **Indicator sizing** (`indicator_sizing`, **off by default**): when a call's entry triggers, the engine reads the last
+  *closed* VWAP + PCR check of its index — the headline badge on the Market Data cards. BANKNIFTY and SENSEX use their
+  own; NIFTY stands in for everything else (FINNIFTY, MIDCPNIFTY, BANKEX, stock options).
+
+  | Indicator vs call | Lots bought |
+  |---|---|
+  | Agrees (BUY reading + `CE`, SELL reading + `PE`) | default lots × `indicator_agree_multiplier` (1.5) |
+  | NEUTRAL, or no fresh reading | default lots × `indicator_neutral_multiplier` (0.5) |
+  | Disagrees | none — the call is skipped (`INDICATOR_SKIP`, with the reading in the log) |
+
+  Lots round to the nearest whole lot with exact halves rounded **down**, never below 1 (1 lot × 1.5 stays 1 lot;
+  2 lots × 1.5 → 3). A manual qty override on a position is never scaled, but is still skipped on disagreement. A reading
+  older than its interval + 2 minutes (Upstox down, server just restarted) counts as no fresh reading. The indicator's
+  settings (interval, OI basis, strike range, PCR thresholds, VWAP band) are the same ones the Market Data page scores
+  with. Logic and tests: `backend/shared_domain/src/entry_gate.rs`.
+
 ### Automatic Opposite Signal Exiting
 Whenever a new trade signal arrives for an instrument (e.g., `SENSEX 80000 PE`), any existing open position for the **same underlying instrument** in the opposite direction (e.g., an active `SENSEX CE` position or opposite side equity trade) is automatically exited with the reason **Opposite Signal Exit**.
 
@@ -587,6 +611,7 @@ The **Daily Reports** page provides an aggregated view of trading performance by
 |---|---|---|
 | `GET` | `/api/portfolio` | Wallet balance + last 100 trades |
 | `GET` | `/api/settings` | Current `TradingConfig` as JSON |
+| `GET` | `/api/market/indicator` | Last closed VWAP + PCR check per index and the CE / PE sizing verdict a call triggering now would get |
 | `POST` | `/api/settings` | Update `TradingConfig` (persisted to DB + in-memory) |
 | `POST` | `/api/webhook/telegram` | Inject a `TradeSignal` JSON manually |
 | `GET` | `/api/logs/stream` | SSE stream of engine log events |

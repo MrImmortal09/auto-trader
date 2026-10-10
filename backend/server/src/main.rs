@@ -147,6 +147,10 @@ pub(crate) struct AppState {
     /// Upstox option-chain analytics for the Market page (read-only, never
     /// consulted by the position monitor).
     pub market: Arc<market_data::MarketDataState>,
+    /// Today's per-minute option-chain aggregates per index, written by the
+    /// Upstox poller and read by the position monitor when an entry triggers
+    /// (VWAP + PCR indicator sizing — see `shared_domain::entry_gate`).
+    pub indicator_feed: shared_domain::entry_gate::IndicatorFeed,
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +796,12 @@ async fn main() {
     }
 
 
+    // 7b. VWAP + PCR indicator feed — filled by the Upstox poller (9b) and read
+    // by the position monitor at the moment an entry triggers. Seeded from
+    // today's oi_snapshots so a mid-session restart keeps its closed checks.
+    let indicator_feed = shared_domain::entry_gate::new_indicator_feed();
+    market_data::seed_indicator_feed(&pool, &indicator_feed).await;
+
     // 8. Position Monitor
     tracing::info!(mode = %trading_cfg.read().await.mode, "Starting position monitor");
     let monitor_write_tx = write_tx.clone();
@@ -805,6 +815,7 @@ async fn main() {
         Arc::clone(&scrip_store),
         Arc::clone(&ws_tx),
         Arc::clone(&kotak_client_opt),
+        Arc::clone(&indicator_feed),
     ));
 
     // 8b. Daily Kotak auto-login. Covers the case where the server was already
@@ -902,7 +913,12 @@ async fn main() {
     };
     let market = Arc::new(market_data::MarketDataState::new(upstox.is_some()));
     if let Some(client) = upstox {
-        tokio::spawn(market_data::run_poller(client, Arc::clone(&market), write_tx.clone()));
+        tokio::spawn(market_data::run_poller(
+            client,
+            Arc::clone(&market),
+            write_tx.clone(),
+            Arc::clone(&indicator_feed),
+        ));
     }
 
     // 10. Router
@@ -925,6 +941,7 @@ async fn main() {
         kotak_login_lock,
         kotak_session_healthy,
         market,
+        indicator_feed,
     };
 
     let app = Router::new()
@@ -936,6 +953,7 @@ async fn main() {
         .route("/api/market/live",                  get(routes::market_live_handler))
         .route("/api/market/intraday-trend",        get(routes::market_trend_handler))
         .route("/api/market/option-chain",          get(routes::market_option_chain_handler))
+        .route("/api/market/indicator",             get(routes::market_indicator_handler))
         .route("/api/positions",                    get(routes::positions_handler))
         .route("/api/prices",                       get(routes::prices_handler))
         .route("/api/scrip/search",                 get(routes::scrip_search_handler))

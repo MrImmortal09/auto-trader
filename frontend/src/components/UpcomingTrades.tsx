@@ -225,6 +225,11 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                           Buy zone: ₹{fmt(p.entry_zone[0])}–₹{fmt(p.entry_zone[1])}
                         </div>
                       )}
+                      {p.call_expires_at && (
+                        <div className="text-[10px] text-on-surface-variant font-normal" title="If not bought by then, this call is dropped (Settings → Telegram Call Rules).">
+                          Valid till {p.call_expires_at}
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2.5 text-error font-mono-code font-semibold">₹{fmt(p.signal.stop_loss)}</td>
                     <td className="px-3 py-2.5">
@@ -266,6 +271,11 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                     {p.entry_zone && (
                       <div className="text-[10px] text-secondary font-normal font-sans">
                         Buy ₹{fmt(p.entry_zone[0])}–₹{fmt(p.entry_zone[1])}
+                      </div>
+                    )}
+                    {p.call_expires_at && (
+                      <div className="text-[10px] text-on-surface-variant font-normal font-sans">
+                        Valid till {p.call_expires_at}
                       </div>
                     )}
                   </div>

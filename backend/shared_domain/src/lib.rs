@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod entry_gate;
+
 /// Underlying index names this app treats as "index" options (vs. stock
 /// options, which fall back to `TradingConfig::other_lots`). Matched against
 /// `TradeSignal::instrument_name.to_uppercase()` with an *exact* match — do
@@ -252,12 +254,106 @@ pub struct TradingConfig {
     /// `[0, 100]` on save, so the window can never reach past target 1.
     #[serde(default)]
     pub entry_window_pct: f64,
+
+    // ── Entry gate (see `entry_gate`) ─────────────────────────────────── //
+
+    /// Size option entries on the VWAP + PCR indicator, read at the moment of
+    /// buying from the parent index's last closed check
+    /// (`entry_gate::indicator_parent` — BANKNIFTY and SENSEX use their own,
+    /// everything else follows NIFTY):
+    ///
+    /// * agrees with the call (BUY CE + BUY reading, BUY PE + SELL reading)
+    ///   → default lots × `indicator_agree_multiplier`
+    /// * NEUTRAL, or no fresh reading → default lots × `indicator_neutral_multiplier`
+    /// * disagrees → the call is skipped, with the reason logged
+    ///
+    /// Lots round to the nearest whole lot with exact halves rounded down,
+    /// never below one (`entry_gate::scale_lots`). A manual per-position qty
+    /// override is never scaled, but a disagreeing reading still skips it.
+    /// Off by default: turning it on is a deliberate change to order sizing.
+    #[serde(default)]
+    pub indicator_sizing: bool,
+    /// Lot multiplier when the indicator agrees with the call. `[0.1, 5]`.
+    #[serde(default = "default_agree_multiplier")]
+    pub indicator_agree_multiplier: f64,
+    /// Lot multiplier when the indicator is neutral or has no fresh reading. `[0.1, 5]`.
+    #[serde(default = "default_neutral_multiplier")]
+    pub indicator_neutral_multiplier: f64,
+    /// Minutes per indicator check — one of `entry_gate::INDICATOR_INTERVALS`.
+    #[serde(default = "default_indicator_interval")]
+    pub indicator_interval_min: i32,
+    /// `"chg"` (change in OI since yesterday's close) or `"total"` (total OI).
+    #[serde(default = "default_indicator_basis")]
+    pub indicator_basis: String,
+    /// Strikes each side of ATM counted — one of `entry_gate::INDICATOR_STRIKE_WINDOWS` (0 = all).
+    #[serde(default = "default_indicator_window")]
+    pub indicator_strike_window: i64,
+    /// Option Signal = BUY when PCR is above this.
+    #[serde(default = "default_pcr_threshold")]
+    pub indicator_pcr_buy_above: f64,
+    /// Option Signal = SELL when PCR is below this (never above `indicator_pcr_buy_above`).
+    #[serde(default = "default_pcr_threshold")]
+    pub indicator_pcr_sell_below: f64,
+    /// VWAP Signal is neutral while the future is within ± this % of VWAP. `[0, 5]`.
+    #[serde(default)]
+    pub indicator_vwap_band_pct: f64,
+    /// A Telegram call that has not been bought within this many minutes of
+    /// arriving is dropped (`CALL_EXPIRED`) instead of waiting until the 15:39
+    /// cutoff. Only calls not yet bought — an entry already sent to the broker
+    /// and every open position are untouched. Applies whether or not
+    /// `indicator_sizing` is on. `0` = off. `[0, 390]`, default 120.
+    #[serde(default = "default_call_validity_minutes")]
+    pub call_validity_minutes: i32,
 }
 
 fn default_entry_mp() -> f64 { 5.0 }
 fn default_trail_factor() -> f64 { 0.5 }
 fn default_pre_t1_arm_pct() -> f64 { 60.0 }
 fn default_extension_factor() -> f64 { 1.0 }
+fn default_agree_multiplier() -> f64 { 1.5 }
+fn default_neutral_multiplier() -> f64 { 0.5 }
+fn default_indicator_interval() -> i32 { 15 }
+fn default_indicator_basis() -> String { "chg".to_string() }
+fn default_indicator_window() -> i64 { 10 }
+fn default_pcr_threshold() -> f64 { 1.0 }
+fn default_call_validity_minutes() -> i32 { 120 }
+
+impl TradingConfig {
+    /// Clamp the entry-gate fields to their documented ranges. Applied both
+    /// when settings are saved and when they are loaded from SQLite, so the
+    /// DB row, the in-memory config and what the engine acts on never differ.
+    pub fn sanitize_entry_gate(&mut self) {
+        let finite_or = |v: f64, d: f64| if v.is_finite() { v } else { d };
+        self.indicator_agree_multiplier =
+            finite_or(self.indicator_agree_multiplier, default_agree_multiplier()).clamp(0.1, 5.0);
+        self.indicator_neutral_multiplier =
+            finite_or(self.indicator_neutral_multiplier, default_neutral_multiplier()).clamp(0.1, 5.0);
+        if !entry_gate::INDICATOR_INTERVALS.iter().any(|&i| i as i32 == self.indicator_interval_min) {
+            self.indicator_interval_min = default_indicator_interval();
+        }
+        self.indicator_basis = if self.indicator_basis.eq_ignore_ascii_case("total") { "total" } else { "chg" }.to_string();
+        if !entry_gate::INDICATOR_STRIKE_WINDOWS.contains(&self.indicator_strike_window) {
+            self.indicator_strike_window = default_indicator_window();
+        }
+        self.indicator_pcr_buy_above = finite_or(self.indicator_pcr_buy_above, default_pcr_threshold()).max(0.0);
+        self.indicator_pcr_sell_below = finite_or(self.indicator_pcr_sell_below, default_pcr_threshold())
+            .clamp(0.0, self.indicator_pcr_buy_above);
+        self.indicator_vwap_band_pct = finite_or(self.indicator_vwap_band_pct, 0.0).clamp(0.0, 5.0);
+        self.call_validity_minutes = self.call_validity_minutes.clamp(0, 390);
+    }
+
+    /// The indicator settings as `entry_gate` takes them.
+    pub fn indicator_params(&self) -> entry_gate::IndicatorParams {
+        entry_gate::IndicatorParams {
+            interval_min: self.indicator_interval_min.max(1) as u32,
+            total_oi: self.indicator_basis.eq_ignore_ascii_case("total"),
+            strike_window: self.indicator_strike_window,
+            pcr_buy_above: self.indicator_pcr_buy_above,
+            pcr_sell_below: self.indicator_pcr_sell_below,
+            vwap_band_pct: self.indicator_vwap_band_pct,
+        }
+    }
+}
 
 // ===========================================================================
 // Trade signal (options-aware)
@@ -479,6 +575,12 @@ pub struct MonitoredPosition {
     /// the row is not awaiting entry. Not meaningfully persisted.
     #[serde(default)]
     pub entry_zone: Option<(f64, f64)>,
+    /// Display-only: IST `HH:MM` this `WaitingForEntry` call stops being valid
+    /// (see [`TradingConfig::call_validity_minutes`]). Populated by the
+    /// positions API just before returning; `None` when the rule is off or the
+    /// row is not awaiting entry. Not meaningfully persisted.
+    #[serde(default)]
+    pub call_expires_at: Option<String>,
 }
 
 /// LIVE mode: hard cap on entry send attempts for one position — see
@@ -840,6 +942,59 @@ mod tests {
 
         let serialized = serde_json::to_string(&cfg).expect("serialize config");
         assert!(serialized.contains(r#""kill_switch_active":true"#));
+    }
+
+    #[test]
+    fn entry_gate_fields_default_to_off_with_a_two_hour_call_window() {
+        // An older frontend / saved JSON that predates these fields.
+        let json_str = r#"{
+            "max_trade_amount_inr": 10000.0,
+            "index_lots": 1,
+            "other_lots": 1,
+            "mode": "LIVE",
+            "brokerage_per_order": 20.0,
+            "target_1_exit_pct": 50.0,
+            "target_2_exit_pct": 100.0
+        }"#;
+        let cfg: TradingConfig = serde_json::from_str(json_str).expect("deserialize config");
+        assert!(!cfg.indicator_sizing);
+        assert_eq!(cfg.indicator_agree_multiplier, 1.5);
+        assert_eq!(cfg.indicator_neutral_multiplier, 0.5);
+        assert_eq!(cfg.call_validity_minutes, 120);
+        assert_eq!(
+            cfg.indicator_params(),
+            entry_gate::IndicatorParams {
+                interval_min: 15,
+                total_oi: false,
+                strike_window: 10,
+                pcr_buy_above: 1.0,
+                pcr_sell_below: 1.0,
+                vwap_band_pct: 0.0,
+            }
+        );
+    }
+
+    #[test]
+    fn sanitize_entry_gate_clamps_every_field() {
+        let mut cfg: TradingConfig = serde_json::from_str(
+            r#"{"max_trade_amount_inr":1,"index_lots":1,"other_lots":1,"mode":"PAPER",
+                "brokerage_per_order":20,"target_1_exit_pct":50,"target_2_exit_pct":100,
+                "indicator_agree_multiplier":99,"indicator_neutral_multiplier":0,
+                "indicator_interval_min":7,"indicator_basis":"TOTAL","indicator_strike_window":3,
+                "indicator_pcr_buy_above":-1,"indicator_pcr_sell_below":2,
+                "indicator_vwap_band_pct":50,"call_validity_minutes":-5}"#,
+        )
+        .expect("deserialize config");
+        cfg.sanitize_entry_gate();
+        assert_eq!(cfg.indicator_agree_multiplier, 5.0);
+        assert_eq!(cfg.indicator_neutral_multiplier, 0.1);
+        assert_eq!(cfg.indicator_interval_min, 15);
+        assert_eq!(cfg.indicator_basis, "total");
+        assert_eq!(cfg.indicator_strike_window, 10);
+        assert_eq!(cfg.indicator_pcr_buy_above, 0.0);
+        assert_eq!(cfg.indicator_pcr_sell_below, 0.0);
+        assert_eq!(cfg.indicator_vwap_band_pct, 5.0);
+        assert_eq!(cfg.call_validity_minutes, 0);
     }
 }
 
