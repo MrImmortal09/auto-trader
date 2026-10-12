@@ -184,7 +184,7 @@ function optionScore(call: number, put: number, s: SignalSettings): Score {
 
 /** +1 BUY when the future trades above VWAP (+ band), -1 below (− band). */
 function vwapScore(price: number | null, vwap: number | null, s: SignalSettings): Score {
-  if (price == null || vwap == null) return 0;
+  if (price == null || vwap == null || price <= 0 || vwap <= 0) return 0;
   const band = (vwap * s.vwapBandPct) / 100;
   if (price > vwap + band) return 1;
   if (price < vwap - band) return -1;

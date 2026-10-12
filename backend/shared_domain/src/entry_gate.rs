@@ -204,8 +204,12 @@ pub fn option_score(call: f64, put: f64, p: &IndicatorParams) -> i32 {
 }
 
 /// +1 BUY when the future trades above VWAP (+ band), −1 below (− band).
+/// A missing or non-positive price / VWAP is bad data, not a signal: 0.
 pub fn vwap_score(price: Option<f64>, vwap: Option<f64>, p: &IndicatorParams) -> i32 {
     let (Some(price), Some(vwap)) = (price, vwap) else { return 0 };
+    if price <= 0.0 || vwap <= 0.0 {
+        return 0;
+    }
     let band = vwap * p.vwap_band_pct / 100.0;
     if price > vwap + band {
         1
@@ -658,6 +662,10 @@ mod tests {
         assert_eq!(vwap_score(Some(100.0), Some(100.0), &p), 0);
         assert_eq!(vwap_score(None, Some(100.0), &p), 0);
         assert_eq!(vwap_score(Some(100.0), None, &p), 0);
+        // A zero / negative VWAP or price is bad data, never a BUY.
+        assert_eq!(vwap_score(Some(100.0), Some(0.0), &p), 0);
+        assert_eq!(vwap_score(Some(100.0), Some(-5.0), &p), 0);
+        assert_eq!(vwap_score(Some(0.0), Some(100.0), &p), 0);
         p.vwap_band_pct = 2.0; // ±2
         assert_eq!(vwap_score(Some(101.5), Some(100.0), &p), 0);
         assert_eq!(vwap_score(Some(102.5), Some(100.0), &p), 1);

@@ -202,6 +202,10 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_oi_snapshots_lookup ON oi_snapshots (underlying, strike_window, ts)",
     ).execute(&pool).await.unwrap();
+    // By-day reads across every index: the startup feed seed and the prune below.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_oi_snapshots_ts ON oi_snapshots (ts)",
+    ).execute(&pool).await.unwrap();
     // ~4.5k rows per trading day; keep a month.
     let cutoff = (shared_domain::now_ist() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
     let _ = sqlx::query("DELETE FROM oi_snapshots WHERE ts < ?").bind(cutoff).execute(&pool).await;

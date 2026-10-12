@@ -423,7 +423,11 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
                 label="PCR buy >"
                 info="Option Signal = BUY (+1) when PCR is above this."
                 value={cfg.indicator_pcr_buy_above}
-                onCommit={(v) => set({ indicator_pcr_buy_above: v })}
+                onCommit={(v) => set({
+                  indicator_pcr_buy_above: v,
+                  // The sell threshold can never sit above the buy one (the server clamps it too).
+                  indicator_pcr_sell_below: Math.min(cfg.indicator_pcr_sell_below, v),
+                })}
                 min={0}
                 max={10}
                 step={0.05}
@@ -435,7 +439,7 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
                 value={cfg.indicator_pcr_sell_below}
                 onCommit={(v) => set({ indicator_pcr_sell_below: v })}
                 min={0}
-                max={10}
+                max={cfg.indicator_pcr_buy_above}
                 step={0.05}
                 disabled={disabled}
               />

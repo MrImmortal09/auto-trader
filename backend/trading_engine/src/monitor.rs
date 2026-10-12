@@ -2172,7 +2172,7 @@ async fn adopt_manual(
         live_halt: None,
         entry_zone: None,
         call_expires_at: None,
-sizing: Default::default(),
+        sizing: Default::default(),
     };
 
     { positions.write().await.push(new_pos); }
@@ -3882,7 +3882,7 @@ pub async fn start_position_monitor(
                                     live_halt: None,
                                     entry_zone: None,
                                     call_expires_at: None,
-sizing: Default::default(),
+                                    sizing: Default::default(),
                                 });
                                 let snapshot = pos_guard.clone();
                                 drop(pos_guard);
@@ -4112,13 +4112,7 @@ sizing: Default::default(),
                             } else {
                                 // Nothing to exit — the only other thing an
                                 // Active position can do is the indicator top-up.
-                                let lot_size = pos
-                                    .resolved_order
-                                    .as_ref()
-                                    .and_then(|o| o.quantity.parse::<i32>().ok())
-                                    .filter(|v| *v > 0)
-                                    .unwrap_or(1);
-                                topup_sizing(pos, lot_size, &cfg, ltp, &gate, entry_cutoff)
+                                topup_sizing(pos, lot_size_of(pos), &cfg, ltp, &gate, entry_cutoff)
                                     .map(|(qty, note)| PosAction::TopUpBuy { qty, note })
                             }
                         }
@@ -4362,7 +4356,7 @@ mod tests {
             live_halt: None,
             entry_zone: None,
             call_expires_at: None,
-sizing: Default::default(),
+            sizing: Default::default(),
         }
     }
 
