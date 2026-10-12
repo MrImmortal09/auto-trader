@@ -18,14 +18,24 @@ fn resolve_bridge_dir() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_dir())
 }
 
+/// Kotak's production market-feed endpoint, used when the login response
+/// carried no `feedUrl` of its own.
+pub const DEFAULT_FEED_URL: &str = "wss://sfeed.kotaksecurities.com/apifeed";
+
+/// Streams live prices into `prices` until `rx` closes. The feed authenticates
+/// with the client code (`ucc`) and the trade session's `sid`.
 pub async fn start_market_data_stream(
-    auth_token: String,
+    feed_url: Option<String>,
+    ucc: String,
     sid: String,
     initial_scrips: String,
-    _channel_num: u32,
     prices: Arc<dashmap::DashMap<String, f64>>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
+    let feed_url = feed_url
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_FEED_URL.to_string());
+
     let mut active_scrips = std::collections::HashSet::new();
     for s in initial_scrips.split(|c| c == ',' || c == '&') {
         let s = s.trim();
@@ -80,7 +90,7 @@ pub async fn start_market_data_stream(
             }
 
             let scrips_str = active_scrips.iter().cloned().collect::<Vec<_>>().join("&");
-            info!("Starting Node.js bridge for Kotak WebSocket with scrips: {}", scrips_str);
+            info!("Starting Node.js bridge for Kotak WebSocket ({}) with scrips: {}", feed_url, scrips_str);
 
             let mut child = match Command::new("bash")
                 .arg("-lc")
@@ -104,8 +114,9 @@ pub async fn start_market_data_stream(
             // Send connection payload
             let connect_payload = serde_json::json!({
                 "action": "connect",
-                "auth": auth_token,
-                "sid": sid,
+                "url": feed_url,
+                "user": ucc,
+                "auth": sid,
                 "scrips": scrips_str
             });
             let mut connect_str = connect_payload.to_string();

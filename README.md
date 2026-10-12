@@ -31,8 +31,8 @@ Signals are scraped from Telegram groups (MTProto userbot), executed via the Kot
 │  kotak_client        │   │  SQLite (WAL)              │
 │  REST: login +       │   │  wallet / paper_trades /   │
 │  place_live_order    │   │  system_logs /             │
-│  WebSocket: HSM LTP  │   │  trading_config            │
-│  feed (mlhsm.*)      │   └────────────────────────────┘
+│  WebSocket: LTP feed │   │  trading_config            │
+│  (sfeed.*)           │   └────────────────────────────┘
 └──────────────────────┘               │
                                        ▼
                            ┌───────────────────────┐

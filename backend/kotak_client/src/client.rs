@@ -13,6 +13,9 @@ pub struct Session {
     pub auth_token: String,
     pub sid: String,
     pub base_url: String,
+    /// Market-data WebSocket endpoint for this account (`feedUrl` in the
+    /// login response). `None` on a restored session — the caller keeps it.
+    pub feed_url: Option<String>,
     #[allow(dead_code)]
     pub data_center: Option<String>,
 }
@@ -40,6 +43,8 @@ struct AuthData {
     sid: String,
     #[serde(rename = "baseUrl", default)]
     base_url: Option<String>,
+    #[serde(rename = "feedUrl", default)]
+    feed_url: Option<String>,
     #[serde(rename = "dataCenter", default)]
     data_center: Option<String>,
 }
@@ -381,6 +386,7 @@ impl KotakClient {
             auth_token,
             sid,
             base_url,
+            feed_url: None,
             data_center: None,
         });
     }
@@ -488,6 +494,7 @@ impl KotakClient {
             auth_token: trade.token,
             sid: trade.sid,
             base_url: trade.base_url.unwrap_or_default(),
+            feed_url: trade.feed_url.filter(|u| !u.trim().is_empty()),
             data_center: trade.data_center,
         });
 
@@ -815,8 +822,30 @@ impl KotakClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_csv_url, KotakPosition};
+    use super::{find_csv_url, KotakPosition, LoginApiResponse};
     use serde_json::json;
+
+    #[test]
+    fn login_response_carries_the_feed_url() {
+        // The market feed is reached at the `feedUrl` the MPIN-validate
+        // response hands back; older responses simply don't have the field.
+        let with_feed: LoginApiResponse = serde_json::from_value(json!({
+            "data": {
+                "token": "t", "sid": "s",
+                "baseUrl": "https://e22.kotaksecurities.com",
+                "feedUrl": "https://sfeed.kotaksecurities.com/apifeed",
+                "rtUrl": "https://e22.kotaksecurities.com/realtime",
+            }
+        })).unwrap();
+        let LoginApiResponse::Success { data } = with_feed else { panic!("expected success") };
+        assert_eq!(data.feed_url.as_deref(), Some("https://sfeed.kotaksecurities.com/apifeed"));
+
+        let without_feed: LoginApiResponse = serde_json::from_value(json!({
+            "data": { "token": "t", "sid": "s" }
+        })).unwrap();
+        let LoginApiResponse::Success { data } = without_feed else { panic!("expected success") };
+        assert_eq!(data.feed_url, None);
+    }
 
     #[test]
     fn net_qty_counts_carried_forward_quantity() {

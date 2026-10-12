@@ -746,7 +746,7 @@ async fn main() {
             // Start WebSocket
             let (initial_ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
             let ws_handle = tokio::spawn(kotak_client::start_market_data_stream(
-                session.auth_token, session.sid, ws_scrips, 1, Arc::clone(&prices), ws_rx,
+                session.feed_url, session.ucc, session.sid, ws_scrips, Arc::clone(&prices), ws_rx,
             ));
             *ws_task.lock().await = Some(ws_handle);
             
