@@ -44,6 +44,10 @@ test('uses the divider from the auth response', () => {
     assert.strictEqual(decodeTick(mini(), dividers).ltp, 12.3456);
 });
 
+test('matches exchange names whatever their case', () => {
+    assert.deepStrictEqual(readDividers({ NSE_FO: { divider: 100 }, Bse_Fo: { divider: 100 } }), { 2: 100, 6: 100 });
+});
+
 test('ignores a zero or missing divider', () => {
     assert.deepStrictEqual(readDividers({ nse_cm: { value: 1, divider: 0 }, nse_fo: {} }), {});
 });

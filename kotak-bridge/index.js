@@ -18,6 +18,10 @@ const MINI_TOUCH_LINE_SIZE = 54;
 const MARKET_PICTURE_FIXED_SIZE = 144;
 const DEFAULT_DIVIDER = 100;
 
+// Liveness: a quiet feed is asked for a snapshot; one left unanswered is dead.
+const QUIET_PROBE_MS = 15000;
+const WATCHDOG_TIMEOUT_MS = 30000;
+
 // exchange_id byte of the binary header -> segment string used in scrip keys.
 const EXCHANGE_BY_ID = {
     1: 'nse_cm', 2: 'nse_fo', 3: 'cde_fo', 4: 'nse_com', 5: 'bse_cm',
@@ -46,7 +50,7 @@ function readDividers(exchanges) {
     const dividers = {};
     for (const [name, info] of Object.entries(exchanges || {})) {
         if (!info || typeof info !== 'object') continue;
-        const id = info.value !== undefined ? info.value : EXCHANGE_ID_BY_NAME[name];
+        const id = info.value !== undefined ? info.value : EXCHANGE_ID_BY_NAME[name.toLowerCase()];
         if (id !== undefined && info.divider > 0) dividers[id] = info.divider;
     }
     return dividers;
@@ -114,6 +118,7 @@ function main() {
     // (1117 / 1119) has been seen, then drained in order.
     let feedReady = false;
     let pendingSubscriptions = [];
+    let subscribedTokens = new Set();
 
     const rl = readline.createInterface({
         input: process.stdin,
@@ -149,6 +154,7 @@ function main() {
                 inputtoken: tokens.join(','),
                 ack_symbol: true
             }));
+            for (const token of tokens) subscribedTokens.add(token);
         } catch (e) {
             console.log(JSON.stringify({ event: "error", message: `subscribe failed: ${e.message}` }));
         }
@@ -162,20 +168,21 @@ function main() {
             return;
         }
 
-        if (msg.message_code === MSG_AUTH_FAILED) {
+        const code = Number(msg.message_code);
+        if (code === MSG_AUTH_FAILED) {
             fail(`feed auth failed: ${msg.message || text}`);
-        } else if (msg.message_code === MSG_AUTH_OK || msg.message_code === MSG_CONNECTED) {
+        } else if (code === MSG_AUTH_OK || code === MSG_CONNECTED) {
             if (msg.format === "native_fallback") {
                 fail("feed downgraded to native_fallback, which this bridge cannot decode");
             }
             if (msg.exchanges) dividers = readDividers(msg.exchanges);
             if (!feedReady) {
                 feedReady = true;
-                console.log(JSON.stringify({ event: "connected", message_code: msg.message_code }));
+                console.log(JSON.stringify({ event: "connected", message_code: code }));
                 for (const scrips of pendingSubscriptions) sendSubscribe(scrips);
                 pendingSubscriptions = [];
             }
-        } else if (msg.message_code === MSG_SUBSCRIBE_ACK) {
+        } else if (code === MSG_SUBSCRIBE_ACK) {
             console.log(JSON.stringify({
                 event: "subscribed",
                 error_code: msg.error_code,
@@ -190,6 +197,7 @@ function main() {
             // Reset state for this new connection
             feedReady = false;
             pendingSubscriptions = msg.scrips ? [msg.scrips] : [];
+            subscribedTokens = new Set();
             dividers = {};
             lastMessageTime = Date.now();
 
@@ -221,12 +229,25 @@ function main() {
                     try { wsClient.ping(); } catch (e) { /* closing — onclose handles it */ }
                 }, 20000);
 
-                // Start watchdog (if no message received for 30 seconds during active connection, restart)
+                // Watchdog. Only real feed messages count as life: a pong proves
+                // the socket is up, not that prices are flowing, and a stalled
+                // feed would leave open positions unmonitored. So when the feed
+                // goes quiet (illiquid contracts, after 15:30, a holiday) ask
+                // for a snapshot — the server answers that even for a contract
+                // that never traded — and restart only if that goes unanswered.
                 if (watchdogInterval) clearInterval(watchdogInterval);
                 watchdogInterval = setInterval(() => {
-                    if (Date.now() - lastMessageTime > 30000) {
+                    const quietFor = Date.now() - lastMessageTime;
+                    if (quietFor > WATCHDOG_TIMEOUT_MS) {
                         console.error("Watchdog timeout: No data received from Kotak WebSocket for 30s. Exiting bridge to force restart...");
                         fail("Watchdog timeout: no data for 30s");
+                    } else if (quietFor > QUIET_PROBE_MS && feedReady && subscribedTokens.size > 0) {
+                        try {
+                            wsClient.send(JSON.stringify({
+                                event: "snapshotScripsLite",
+                                inputtoken: [...subscribedTokens].join(',')
+                            }));
+                        } catch (e) { /* closing — onclose handles it */ }
                     }
                 }, 5000);
             });
