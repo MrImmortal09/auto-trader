@@ -1,5 +1,7 @@
 # NEO WebSocket
 
+> **The HSM market-data feed described below is retired.** Kotak deprecated it on 15 September 2026 and `wss://mlhsm.kotaksecurities.com` no longer accepts connections. Market data now comes from the `feedUrl` in the `tradeApiValidate` response, over a different (binary `native_batch`) protocol — see Kotak's [Market Data WebSocket developer guide](https://www.kotakneo.com/uploads/kotak_neo_market_data_websocket_guide_38e4831feb.pdf) and `kotak-bridge/index.js`. The HSI order-feed section is unaffected.
+
 ---
 
 ## Overview

@@ -29,7 +29,7 @@ The system is organized as a multi-crate Rust workspace backed by a Node.js bina
                 ▼                                ▼
 ┌────────────────────────────────┐   ┌───────────────────────────────────┐
 │ kotak_client & kotak-bridge    │   │ SQLite Database (WAL Mode)        │
-│ Node.js HSM Binary Feed (WS)   │   │ Single-writer channel (db_writer) │
+│ Node.js Binary Market Feed (WS)│   │ Single-writer channel (db_writer) │
 │ Kotak REST API (Login & Exec)  │   │ Wallet, Trades, Logs, Snapshots   │
 └────────────────────────────────┘   └─────────────────┬─────────────────┘
                                                        │
@@ -46,7 +46,7 @@ The system is organized as a multi-crate Rust workspace backed by a Node.js bina
 2. **`backend/telegram_ingester`**: MTProto client connecting as a regular Telegram user, monitoring channels, parsing signals, and extracting reply actions.
 3. **`backend/trading_engine`**: The 50ms stateful OMS (Order Management System), scrip master indexer, position manager, and statutory fee engine.
 4. **`backend/kotak_client`**: Kotak Neo REST API client (login, order placement, order status, cancel/modify) and child process manager for `kotak-bridge`.
-5. **`kotak-bridge/`**: Node.js microservice handling Kotak's binary HSM WebSocket market data feed, streaming clean JSON ticks to Rust.
+5. **`kotak-bridge/`**: Node.js microservice handling Kotak's binary market-data WebSocket feed, streaming clean JSON ticks to Rust.
 6. **`backend/server`**: Axum HTTP API, static SPA server, SSE log streamer, and serialized SQLite DB writer task.
 7. **`frontend/`**: Vite + React 19 + Tailwind dashboard displaying live positions, P&L graphs, configuration, and daily trade analytics.
 
@@ -79,7 +79,7 @@ sequenceDiagram
    - Downloads the full Kotak NSE/BSE equity and derivatives master files.
    - Indexes options by `(Underlying, Expiry, Strike, OptionType)` to immediately resolve exchange tokens (e.g. `nse_fo|42150`) and lot sizes.
 3. **Market Feed Spawning**:
-   - Spawns `kotak-bridge/index.js` using Node.js to establish the HSM binary WebSocket connection.
+   - Spawns `kotak-bridge/index.js` using Node.js to establish the market-data WebSocket connection.
    - Decoded market ticks update the shared in-memory `ltp_map` (`segment|token -> LTP`).
 
 ---

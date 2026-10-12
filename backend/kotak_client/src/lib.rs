@@ -1,9 +1,9 @@
-//! Kotak Neo API client — REST login & order placement + HSM WebSocket feed.
+//! Kotak Neo API client — REST login & order placement + market-feed WebSocket.
 //!
 //! # Modules
 //! - [`error`]     — `KotakError`, `KotakCredentials`
 //! - [`client`]    — `KotakClient` (REST: login, orders, order book, positions, limits)
-//! - [`websocket`] — `start_market_data_stream` (HSM live prices)
+//! - [`websocket`] — `start_market_data_stream` (live prices)
 
 pub mod error;
 pub mod client;

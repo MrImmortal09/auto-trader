@@ -1,176 +1,279 @@
-const fs = require('fs');
 const WebSocket = require('ws');
-const pako = require('pako');
 const readline = require('readline');
 
-// Handle EPIPE gracefully when the Rust parent drops the stdout pipe
-process.stdout.on('error', function(err) {
-    if (err.code === 'EPIPE') {
-        process.exit(0);
-    }
-});
+// Bridge to Kotak Neo's market-data WebSocket ("SFeed", native_batch protocol).
+// Control messages are JSON text frames; ticks arrive as binary frames holding
+// a batch of little-endian packed packets. Protocol reference:
+// https://www.kotakneo.com/uploads/kotak_neo_market_data_websocket_guide_38e4831feb.pdf
 
-// Mock browser globals required by hslib.js
-global.window = global;
-global.WebSocket = WebSocket;
-global.pako = pako;
-global.btoa = (str) => Buffer.from(str, 'binary').toString('base64');
-global.atob = (b64) => Buffer.from(b64, 'base64').toString('binary');
-global.document = {
-    getElementsByTagName: () => [{ appendChild: () => {} }],
-    createElement: () => ({})
+const HEADER_SIZE = 9;
+const MSG_MARKET_PICTURE = 7208;
+const MSG_SUBSCRIBE_ACK = 1109;
+const MSG_AUTH_OK = 1117;
+const MSG_CONNECTED = 1119;
+const MSG_AUTH_FAILED = 1120;
+const LEVEL_MINI_TOUCH_LINE = 1;
+const LEVELS_MARKET_PICTURE = [2, 4, 8];
+const MINI_TOUCH_LINE_SIZE = 54;
+const MARKET_PICTURE_FIXED_SIZE = 144;
+const DEFAULT_DIVIDER = 100;
+
+// exchange_id byte of the binary header -> segment string used in scrip keys.
+const EXCHANGE_BY_ID = {
+    1: 'nse_cm', 2: 'nse_fo', 3: 'cde_fo', 4: 'nse_com', 5: 'bse_cm',
+    6: 'bse_fo', 7: 'bse_cd', 8: 'bse_co', 9: 'mcx_fo', 10: 'ncd_co'
 };
+const EXCHANGE_ID_BY_NAME = Object.fromEntries(
+    Object.entries(EXCHANGE_BY_ID).map(([id, name]) => [name, Number(id)])
+);
 
-// Disable internal logs of hslib to prevent polluting stdout
-global.HSD_Flag = false;
-global.HSID_Flag = false;
-
-// Load the library
-const hslibCode = fs.readFileSync('../kotak-api-docs/Websocket/hslib.js', 'utf8');
-eval(hslibCode);
-
-let wsClient = null;
-let heartbeatInterval = null;
-let watchdogInterval = null;
-let lastMessageTime = Date.now();
-
-// Queue for subscribe messages that arrive before wsClient.onopen fires.
-// Drained immediately once the connection is established.
-let wsOpen = false;
-let pendingSubscriptions = [];
-
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    terminal: false
-});
-
-rl.on('line', (line) => {
-    if (!line.trim()) return;
-    try {
-        const msg = JSON.parse(line);
-        handleMessage(msg);
-    } catch (e) {
-        console.error("Failed to parse JSON line:", e.message);
+// One binary frame is several packets laid end to end; each starts with its
+// own uint16 total length. A truncated tail is dropped.
+function splitBatch(frame) {
+    const packets = [];
+    let offset = 0;
+    while (offset + 2 <= frame.length) {
+        const size = frame.readUInt16LE(offset);
+        if (size < HEADER_SIZE || offset + size > frame.length) break;
+        packets.push(frame.subarray(offset, offset + size));
+        offset += size;
     }
-});
+    return packets;
+}
 
-function handleMessage(msg) {
-    if (msg.action === 'connect') {
-        // Reset state for this new connection
-        wsOpen = false;
+// Per-exchange price dividers from the auth response, keyed by exchange_id.
+function readDividers(exchanges) {
+    const dividers = {};
+    for (const [name, info] of Object.entries(exchanges || {})) {
+        if (!info || typeof info !== 'object') continue;
+        const id = info.value !== undefined ? info.value : EXCHANGE_ID_BY_NAME[name];
+        if (id !== undefined && info.divider > 0) dividers[id] = info.divider;
+    }
+    return dividers;
+}
+
+// Decode one packet into { tk, e, ltp }, or null for anything that is not a
+// price packet we fully understand — an unreadable packet must never turn
+// into a price.
+function decodeTick(packet, dividers) {
+    if (packet.length < HEADER_SIZE) return null;
+    if (packet.readUInt16LE(2) !== MSG_MARKET_PICTURE) return null;
+
+    const exchangeId = packet.readInt8(4);
+    const exchange = EXCHANGE_BY_ID[exchangeId];
+    if (!exchange) return null;
+
+    const level = packet.readUInt8(5);
+    let ltpOffset;
+    if (level === LEVEL_MINI_TOUCH_LINE) {
+        if (packet.length < MINI_TOUCH_LINE_SIZE) return null;
+        ltpOffset = 21;
+    } else if (LEVELS_MARKET_PICTURE.includes(level)) {
+        if (packet.length < MARKET_PICTURE_FIXED_SIZE) return null;
+        ltpOffset = 69;
+    } else {
+        return null;
+    }
+
+    const raw = packet.readUInt32LE(ltpOffset);
+    if (raw === 0) return null;
+
+    const divider = dividers[exchangeId] || DEFAULT_DIVIDER;
+    return { tk: String(packet.readUInt32LE(9)), e: exchange, ltp: raw / divider };
+}
+
+function describeError(err) {
+    if (!err) return "unknown error";
+    const inner = Array.isArray(err.errors)
+        ? err.errors.map((e) => `${e.code || e.message}${e.address ? '@' + e.address : ''}`).join(', ')
+        : '';
+    return [err.code, err.message, inner].filter(Boolean).join(' — ') || String(err);
+}
+
+module.exports = { splitBatch, readDividers, decodeTick };
+
+if (require.main === module) {
+    main();
+}
+
+function main() {
+    // Handle EPIPE gracefully when the Rust parent drops the stdout pipe
+    process.stdout.on('error', function(err) {
+        if (err.code === 'EPIPE') {
+            process.exit(0);
+        }
+    });
+
+    let wsClient = null;
+    let heartbeatInterval = null;
+    let watchdogInterval = null;
+    let lastMessageTime = Date.now();
+    let dividers = {};
+
+    // Subscriptions are held back until the server's first auth response
+    // (1117 / 1119) has been seen, then drained in order.
+    let feedReady = false;
+    let pendingSubscriptions = [];
+
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: false
+    });
+
+    rl.on('line', (line) => {
+        if (!line.trim()) return;
+        try {
+            const msg = JSON.parse(line);
+            handleMessage(msg);
+        } catch (e) {
+            console.error("Failed to parse JSON line:", e.message);
+        }
+    });
+
+    function fail(message) {
+        feedReady = false;
         pendingSubscriptions = [];
-        lastMessageTime = Date.now();
+        console.log(JSON.stringify({ event: "error", message }));
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
+        if (watchdogInterval) clearInterval(watchdogInterval);
+        process.exit(1);
+    }
 
-        const url = "wss://mlhsm.kotaksecurities.com";
-        wsClient = new HSWebSocket(url);
-        
-        wsClient.onopen = function () {
-            wsOpen = true;
-            lastMessageTime = Date.now();
+    function sendSubscribe(scrips) {
+        const tokens = String(scrips).split(/[,&]/).map((s) => s.trim()).filter(Boolean);
+        if (tokens.length === 0) return;
+        try {
+            wsClient.send(JSON.stringify({
+                event: "subscribeScripsLite",
+                inputtoken: tokens.join(','),
+                ack_symbol: true
+            }));
+        } catch (e) {
+            console.log(JSON.stringify({ event: "error", message: `subscribe failed: ${e.message}` }));
+        }
+    }
 
-            // Send connection request
-            let jObj = {
-                "Authorization": msg.auth,
-                "Sid": msg.sid,
-                "type": "cn"
-            };
-            wsClient.send(JSON.stringify(jObj));
-            
-            // Start heartbeat
-            if (heartbeatInterval) clearInterval(heartbeatInterval);
-            heartbeatInterval = setInterval(() => {
-                wsClient.send(JSON.stringify({ type: "ti", scrips: "" }));
-            }, 30000);
+    function handleControlFrame(text) {
+        let msg;
+        try {
+            msg = JSON.parse(text);
+        } catch (e) {
+            return;
+        }
 
-            // Start watchdog (if no message received for 30 seconds during active connection, restart)
-            if (watchdogInterval) clearInterval(watchdogInterval);
-            watchdogInterval = setInterval(() => {
-                if (wsOpen && Date.now() - lastMessageTime > 30000) {
-                    console.error("Watchdog timeout: No data received from Kotak WebSocket for 30s. Exiting bridge to force restart...");
-                    console.log(JSON.stringify({ event: "error", message: "Watchdog timeout: no data for 30s" }));
-                    process.exit(1);
-                }
-            }, 5000);
-
-            // Initially subscribe if scrips are provided
-            if (msg.scrips) {
-                let formattedScrips = String(msg.scrips).replace(/,/g, '&');
-                let subObj = {
-                    "type": "mws",
-                    "scrips": formattedScrips,
-                    "channelnum": 1
-                };
-                wsClient.send(JSON.stringify(subObj));
+        if (msg.message_code === MSG_AUTH_FAILED) {
+            fail(`feed auth failed: ${msg.message || text}`);
+        } else if (msg.message_code === MSG_AUTH_OK || msg.message_code === MSG_CONNECTED) {
+            if (msg.format === "native_fallback") {
+                fail("feed downgraded to native_fallback, which this bridge cannot decode");
             }
-
-            // Drain any subscribe messages that arrived before open
-            if (pendingSubscriptions.length > 0) {
-                console.error(`Draining ${pendingSubscriptions.length} queued subscription(s)`);
-                for (const scrips of pendingSubscriptions) {
-                    let formattedScrips = String(scrips).replace(/,/g, '&');
-                    wsClient.send(JSON.stringify({ type: "mws", scrips: formattedScrips, channelnum: 1 }));
-                }
+            if (msg.exchanges) dividers = readDividers(msg.exchanges);
+            if (!feedReady) {
+                feedReady = true;
+                console.log(JSON.stringify({ event: "connected", message_code: msg.message_code }));
+                for (const scrips of pendingSubscriptions) sendSubscribe(scrips);
                 pendingSubscriptions = [];
             }
-        };
+        } else if (msg.message_code === MSG_SUBSCRIBE_ACK) {
+            console.log(JSON.stringify({
+                event: "subscribed",
+                error_code: msg.error_code,
+                description: msg.description,
+                scrips: Object.keys(msg.data || {})
+            }));
+        }
+    }
 
-        wsClient.onclose = function (event) {
-            wsOpen = false;
-            pendingSubscriptions = [];
-            console.log(JSON.stringify({ event: "closed", code: event ? event.code : null, reason: event ? event.reason : null }));
-            if (heartbeatInterval) clearInterval(heartbeatInterval);
-            if (watchdogInterval) clearInterval(watchdogInterval);
-            process.exit(1);
-        };
-
-        wsClient.onerror = function (err) {
-            wsOpen = false;
-            pendingSubscriptions = [];
-            console.log(JSON.stringify({ event: "error", message: err ? (err.message || err.toString()) : "unknown error" }));
-            if (heartbeatInterval) clearInterval(heartbeatInterval);
-            if (watchdogInterval) clearInterval(watchdogInterval);
-            process.exit(1);
-        };
-
-        wsClient.onmessage = function (data) {
+    function handleMessage(msg) {
+        if (msg.action === 'connect') {
+            // Reset state for this new connection
+            feedReady = false;
+            pendingSubscriptions = msg.scrips ? [msg.scrips] : [];
+            dividers = {};
             lastMessageTime = Date.now();
-            let parsed;
-            if (typeof data === 'string') {
-                try {
-                    parsed = JSON.parse(data);
-                } catch (e) {
-                    parsed = data;
-                }
-            } else {
-                parsed = data;
+
+            // The login API hands the feed endpoint back with an https scheme.
+            const url = String(msg.url || '').trim().replace(/^http(s?):\/\//i, 'ws$1://');
+            if (!url || !msg.user || !msg.auth) {
+                fail("connect needs url, user and auth");
             }
-            console.log(JSON.stringify({ event: "data", data: parsed }));
-        };
-    } else if (msg.action === 'subscribe') {
-        if (wsClient) {
-            let formattedScrips = msg.scrips ? String(msg.scrips).replace(/,/g, '&') : "";
-            let subObj = {
-                "type": "mws",
-                "scrips": formattedScrips,
-                "channelnum": 1
-            };
-            if (wsOpen) {
-                // Connection is live — send immediately
-                try {
-                    wsClient.send(JSON.stringify(subObj));
-                } catch (e) {
-                    console.log(JSON.stringify({ event: "error", message: `subscribe failed: ${e.message}` }));
+
+            wsClient = new WebSocket(url);
+
+            wsClient.on('open', function () {
+                lastMessageTime = Date.now();
+
+                // Authentication is the first application message.
+                wsClient.send(JSON.stringify({
+                    user: msg.user,
+                    auth: msg.auth,
+                    format: "native_batch",
+                    source: "NEOTRADEAPI",
+                    sdk_version: 1.1,
+                    sdk_date: "2026-10-12"
+                }));
+
+                // The feed has no application-level heartbeat; keep-alive is
+                // the WebSocket layer's own ping/pong.
+                if (heartbeatInterval) clearInterval(heartbeatInterval);
+                heartbeatInterval = setInterval(() => {
+                    try { wsClient.ping(); } catch (e) { /* closing — onclose handles it */ }
+                }, 20000);
+
+                // Start watchdog (if no message received for 30 seconds during active connection, restart)
+                if (watchdogInterval) clearInterval(watchdogInterval);
+                watchdogInterval = setInterval(() => {
+                    if (Date.now() - lastMessageTime > 30000) {
+                        console.error("Watchdog timeout: No data received from Kotak WebSocket for 30s. Exiting bridge to force restart...");
+                        fail("Watchdog timeout: no data for 30s");
+                    }
+                }, 5000);
+            });
+
+            wsClient.on('close', function (code, reason) {
+                feedReady = false;
+                pendingSubscriptions = [];
+                console.log(JSON.stringify({ event: "closed", code: code, reason: reason ? reason.toString() : null }));
+                if (heartbeatInterval) clearInterval(heartbeatInterval);
+                if (watchdogInterval) clearInterval(watchdogInterval);
+                process.exit(1);
+            });
+
+            wsClient.on('error', function (err) {
+                fail(describeError(err));
+            });
+
+            wsClient.on('message', function (data, isBinary) {
+                lastMessageTime = Date.now();
+                if (!isBinary) {
+                    handleControlFrame(data.toString());
+                    return;
                 }
-            } else {
-                // Connection not open yet — queue for drain in onopen
-                pendingSubscriptions.push(formattedScrips);
+                const ticks = [];
+                for (const packet of splitBatch(data)) {
+                    const tick = decodeTick(packet, dividers);
+                    if (tick) ticks.push(tick);
+                }
+                if (ticks.length > 0) {
+                    console.log(JSON.stringify({ event: "data", data: ticks }));
+                }
+            });
+        } else if (msg.action === 'subscribe') {
+            if (wsClient && msg.scrips) {
+                if (feedReady) {
+                    // Connection is live — send immediately
+                    sendSubscribe(msg.scrips);
+                } else {
+                    // Not authenticated yet — queue for drain on the auth response
+                    pendingSubscriptions.push(msg.scrips);
+                }
             }
+        } else if (msg.action === 'close') {
+            if (wsClient) {
+                wsClient.close();
+            }
+            process.exit(0);
         }
-    } else if (msg.action === 'close') {
-        if (wsClient) {
-            wsClient.close();
-        }
-        process.exit(0);
     }
 }

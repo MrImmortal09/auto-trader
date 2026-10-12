@@ -168,7 +168,7 @@ impl<'a> KotakLoginDeps<'a> {
     }
 }
 
-/// Authenticate with Kotak, persist the session, (re)start the HSM
+/// Authenticate with Kotak, persist the session, (re)start the market-feed
 /// WebSocket, resubscribe open positions, and kick off a background Scrip
 /// Master refresh. Real money follows a successful call to this function —
 /// every caller (manual login, auto-login route, startup, 09:00 IST retry)
@@ -201,7 +201,7 @@ async fn perform_kotak_login(
     let creds = kotak_client::KotakCredentials {
         access_token: access_token.clone(),
         mobile_number,
-        ucc,
+        ucc: ucc.clone(),
         totp,
         mpin,
     };
@@ -226,7 +226,10 @@ async fn perform_kotak_login(
 
     if let Some((auth, sid)) = client.session_credentials() {
         let base_url = client.session.as_ref().map(|s| s.base_url.clone()).unwrap_or_default();
-        crate::db::save_kotak_session(deps.db_pool, &access_token, auth, sid, &base_url).await;
+        let feed_url = client.session.as_ref().and_then(|s| s.feed_url.clone());
+        crate::db::save_kotak_session(
+            deps.db_pool, &access_token, auth, sid, &base_url, feed_url.as_deref(), &ucc,
+        ).await;
 
         let scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
 
@@ -239,7 +242,7 @@ async fn perform_kotak_login(
 
         let (new_ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
         let new_handle = tokio::spawn(kotak_client::start_market_data_stream(
-            auth.to_owned(), sid.to_owned(), scrips, 1,
+            feed_url, ucc, sid.to_owned(), scrips,
             Arc::clone(deps.prices), ws_rx,
         ));
         *ws_guard = Some(new_handle);
@@ -483,7 +486,7 @@ pub struct KotakLoginReq {
     pub mpin: Option<String>,
 }
 
-/// `POST /api/auth/kotak` — log in and restart the HSM WebSocket. Any field
+/// `POST /api/auth/kotak` — log in and restart the market-feed WebSocket. Any field
 /// left empty falls back to its `KOTAK_*` env var; an empty/omitted `totp`
 /// is generated from the env TOTP secret.
 pub async fn kotak_login_handler(
