@@ -75,6 +75,12 @@ export interface TradingConfig {
   indicator_vwap_band_pct: number;
   /** A call not bought within this many minutes of arriving is dropped. 0 = off. [0, 390]. */
   call_validity_minutes: number;
+  /** 09:16 check always NEUTRAL, then 5-min checks until the first regular check. */
+  indicator_early_checks: boolean;
+  /** Disagreeing indicator: keep the call waiting (true) or drop it (false). */
+  indicator_wait_on_disagree: boolean;
+  /** Top a NEUTRAL-sized position up to the agree size once the indicator agrees. */
+  indicator_topup: boolean;
 }
 
 /** `GET /api/market/indicator` — the engine's own verdicts, right now. */
@@ -93,9 +99,11 @@ export interface IndicatorReading {
   ts: string;
   score: IndicatorScore;
   bias: IndicatorBias;
+  /** The 09:16 opening check under the early-check rule: bias is forced NEUTRAL. */
+  opening?: boolean;
 }
 export interface CallVerdict {
-  action: 'SCALE' | 'SKIP';
+  action: 'SCALE' | 'SKIP' | 'WAIT';
   multiplier: number | null;
   base_lots: number;
   lots: number | null;

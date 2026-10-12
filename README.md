@@ -562,13 +562,34 @@ Both are configured under **Settings → Telegram Call Rules** and apply in PAPE
   |---|---|
   | Agrees (BUY reading + `CE`, SELL reading + `PE`) | default lots × `indicator_agree_multiplier` (1.5) |
   | NEUTRAL, or no fresh reading | default lots × `indicator_neutral_multiplier` (0.5) |
-  | Disagrees | none — the call is skipped (`INDICATOR_SKIP`, with the reading in the log) |
+  | Disagrees | none — the call keeps waiting (`INDICATOR_WAIT`) or is dropped (`INDICATOR_SKIP`), see below |
 
   Lots round to the nearest whole lot with exact halves rounded **down**, never below 1 (1 lot × 1.5 stays 1 lot;
   2 lots × 1.5 → 3). A manual qty override on a position is never scaled, but is still skipped on disagreement. A reading
   older than its interval + 2 minutes (Upstox down, server just restarted) counts as no fresh reading. The indicator's
   settings (interval, OI basis, strike range, PCR thresholds, VWAP band) are the same ones the Market Data page scores
   with. Logic and tests: `backend/shared_domain/src/entry_gate.rs`.
+
+  Three switches refine it; each can be turned on or off at any time and only matters while indicator sizing is on:
+
+  - **Opening checks** (`indicator_early_checks`, default on): the 09:16 check always counts as NEUTRAL. From 09:22
+    the latest closed 5-minute check (09:21, 09:26) is used until the first regular check closes (09:31 on 15 / 30 min,
+    10:01 on 60 min); after that the configured interval takes over. The Market Data cards still show the plain
+    interval reading, so they can differ from the engine before the first regular check; the Settings preview shows
+    what the engine uses.
+  - **Wait on disagreement** (`indicator_wait_on_disagree`, default on): a call that triggers against the indicator is
+    neither bought nor dropped. It is re-read every tick and bought once the indicator turns neutral or agrees while
+    the price is still in the buy range. It still expires with call validity and the 15:39 cutoff. Off: the call is
+    dropped on the spot.
+  - **Aggressive top-up** (`indicator_topup`, **off by default**): a call bought at the reduced NEUTRAL size is topped
+    up to the full agree size if the indicator later agrees while the price is back in the buy range (2 default lots:
+    1 bought at neutral, 2 more added, 3 held). Once per call; only before target 1, while the stop is still at the
+    signal level and the holding is exactly what the entry bought; never past call validity or 15:39; never on a
+    manual qty override. Added lots share the position's stop-loss and targets, and the average buy price is
+    re-weighted. The indicator only ever adds: a reading that turns against an open position changes nothing. In LIVE
+    only the broker's filled quantity is added to the holding; a top-up send with no broker verdict is not tracked
+    and is flagged loudly instead, and a top-up that fills after the position was exited is sold straight back
+    (`TOPUP_AFTER_EXIT`).
 
 ### Automatic Opposite Signal Exiting
 Whenever a new trade signal arrives for an instrument (e.g., `SENSEX 80000 PE`), any existing open position for the **same underlying instrument** in the opposite direction (e.g., an active `SENSEX CE` position or opposite side equity trade) is automatically exited with the reason **Opposite Signal Exit**.

@@ -335,8 +335,10 @@ pub async fn market_indicator_handler(State(state): State<AppState>) -> axum::re
                     lots: Some(entry_gate::scale_lots(base_lots, multiplier)),
                     note,
                 },
+                // Disagreement: the call keeps waiting or is dropped, per
+                // `indicator_wait_on_disagree` — never bought either way.
                 SizingVerdict::Skip { reason } => CallVerdictDto {
-                    action: "SKIP",
+                    action: if cfg.indicator_wait_on_disagree { "WAIT" } else { "SKIP" },
                     multiplier: None,
                     base_lots,
                     lots: None,

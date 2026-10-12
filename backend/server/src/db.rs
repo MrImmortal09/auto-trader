@@ -129,6 +129,11 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         "ALTER TABLE trading_config ADD COLUMN indicator_pcr_sell_below REAL NOT NULL DEFAULT 1.0",
         "ALTER TABLE trading_config ADD COLUMN indicator_vwap_band_pct REAL NOT NULL DEFAULT 0.0",
         "ALTER TABLE trading_config ADD COLUMN call_validity_minutes INTEGER NOT NULL DEFAULT 120",
+        // Opening rule + wait-on-disagree default on (they only matter once
+        // indicator_sizing itself is on); the top-up buys more, so it is opt-in.
+        "ALTER TABLE trading_config ADD COLUMN indicator_early_checks INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE trading_config ADD COLUMN indicator_wait_on_disagree INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE trading_config ADD COLUMN indicator_topup INTEGER NOT NULL DEFAULT 0",
     ] {
         ensure_column(&pool, sql).await;
     }
@@ -237,6 +242,9 @@ struct TradingConfigRow {
     indicator_pcr_sell_below: f64,
     indicator_vwap_band_pct: f64,
     call_validity_minutes: i32,
+    indicator_early_checks: bool,
+    indicator_wait_on_disagree: bool,
+    indicator_topup: bool,
 }
 
 /// Load `TradingConfig` from SQLite, falling back to safe defaults.
@@ -250,7 +258,8 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
                 indicator_sizing, indicator_agree_multiplier, indicator_neutral_multiplier,
                 indicator_interval_min, indicator_basis, indicator_strike_window,
                 indicator_pcr_buy_above, indicator_pcr_sell_below, indicator_vwap_band_pct,
-                call_validity_minutes
+                call_validity_minutes,
+                indicator_early_checks, indicator_wait_on_disagree, indicator_topup
          FROM trading_config WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -290,6 +299,9 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
             indicator_pcr_sell_below: r.indicator_pcr_sell_below,
             indicator_vwap_band_pct: r.indicator_vwap_band_pct,
             call_validity_minutes: r.call_validity_minutes,
+            indicator_early_checks: r.indicator_early_checks,
+            indicator_wait_on_disagree: r.indicator_wait_on_disagree,
+            indicator_topup: r.indicator_topup,
         };
         // Same clamps the settings handler applies, so a hand-edited row
         // can't put an out-of-range value in front of the engine.
@@ -325,6 +337,9 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         indicator_pcr_sell_below: 1.0,
         indicator_vwap_band_pct: 0.0,
         call_validity_minutes: 120,
+        indicator_early_checks: true,
+        indicator_wait_on_disagree: true,
+        indicator_topup: false,
     })
 }
 

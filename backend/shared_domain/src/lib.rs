@@ -304,7 +304,34 @@ pub struct TradingConfig {
     /// `indicator_sizing` is on. `0` = off. `[0, 390]`, default 120.
     #[serde(default = "default_call_validity_minutes")]
     pub call_validity_minutes: i32,
+    /// Opening rule for the indicator (only matters with `indicator_sizing`
+    /// on): the 09:16 check always reads NEUTRAL, and from 09:22 until the
+    /// first regular check the latest closed 5-minute check is used — see
+    /// `entry_gate::last_closed_reading`. Off = the 09:16 check is scored
+    /// like any other and nothing newer is read until the first regular check.
+    #[serde(default = "default_true")]
+    pub indicator_early_checks: bool,
+    /// What a disagreeing indicator does to a call whose entry has triggered
+    /// (only with `indicator_sizing` on). On = the call keeps waiting and is
+    /// re-read every tick, so it is bought once the indicator turns neutral
+    /// or agrees while the price is still in the buy range; it still dies at
+    /// `call_validity_minutes` / the 15:39 cutoff. Off = the call is dropped
+    /// on the spot (`INDICATOR_SKIP`).
+    #[serde(default = "default_true")]
+    pub indicator_wait_on_disagree: bool,
+    /// Aggressive top-up (only with `indicator_sizing` on): a call bought at
+    /// the reduced NEUTRAL size is topped up to the full
+    /// `indicator_agree_multiplier` size if the indicator later agrees while
+    /// the price is back in the buy range. Once per call, only before target
+    /// 1 and before any stop trail or sell, never past `call_validity_minutes`
+    /// or the 15:39 cutoff, never on a manual qty override. The indicator
+    /// only ever adds: it never sells or trims a position.
+    /// Off by default: it buys more than the first entry did.
+    #[serde(default)]
+    pub indicator_topup: bool,
 }
+
+fn default_true() -> bool { true }
 
 fn default_entry_mp() -> f64 { 5.0 }
 fn default_trail_factor() -> f64 { 0.5 }
@@ -351,6 +378,7 @@ impl TradingConfig {
             pcr_buy_above: self.indicator_pcr_buy_above,
             pcr_sell_below: self.indicator_pcr_sell_below,
             vwap_band_pct: self.indicator_vwap_band_pct,
+            early_checks: self.indicator_early_checks,
         }
     }
 }
@@ -581,6 +609,45 @@ pub struct MonitoredPosition {
     /// row is not awaiting entry. Not meaningfully persisted.
     #[serde(default)]
     pub call_expires_at: Option<String>,
+    /// Indicator-sizing bookkeeping for this call — see [`SizingState`].
+    #[serde(default)]
+    pub sizing: SizingState,
+}
+
+/// Per-position state of the indicator entry gate
+/// (`TradingConfig::indicator_sizing`): the wait-on-disagree log marker and
+/// the aggressive top-up's order tracking.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SizingState {
+    /// The disagreeing reading this waiting call was last logged as held back
+    /// by — so `INDICATOR_WAIT` is logged once per check, not once per tick.
+    pub hold_note: Option<String>,
+    /// LIVE: the entry order now at the broker was sized down by a NEUTRAL
+    /// reading, so its fill may be topped up later. Becomes
+    /// `topup_base_qty` when the fill settles.
+    pub topup_eligible: bool,
+    /// The quantity bought at the indicator's reduced NEUTRAL size. A top-up
+    /// is only considered while the holding is still exactly this — any sell
+    /// or broker reconciliation that changes `executed_qty` rules it out.
+    /// Cleared once a top-up has been tried.
+    pub topup_base_qty: Option<i32>,
+    /// LIVE: the top-up buy order currently at the broker. While set the
+    /// position is never closed out from under it — a fill landing afterwards
+    /// would otherwise be an untracked holding.
+    pub topup_order_id: Option<String>,
+    /// LIVE: a cancel was sent for the unfilled remainder of the top-up order.
+    pub topup_cancel_sent: bool,
+    /// LIVE: the whole position was exited while the top-up order was still
+    /// at the broker — whatever that order fills is sold straight back.
+    pub topup_exit_on_fill: bool,
+    /// LIVE: top-up sends so far, capped at [`MAX_ENTRY_ATTEMPTS`].
+    pub topup_attempts: i32,
+    /// LIVE: IST timestamp of the last top-up attempt, for the retry throttle.
+    pub topup_attempt_at: Option<String>,
+    /// LIVE: the market top-up was RMS-rejected; retry as an IOC limit
+    /// (same rule as `MonitoredPosition::entry_retry_as_limit`).
+    pub topup_retry_as_limit: bool,
 }
 
 /// LIVE mode: hard cap on entry send attempts for one position — see
@@ -970,8 +1037,11 @@ mod tests {
                 pcr_buy_above: 1.0,
                 pcr_sell_below: 1.0,
                 vwap_band_pct: 0.0,
+                early_checks: true,
             }
         );
+        assert!(cfg.indicator_wait_on_disagree);
+        assert!(!cfg.indicator_topup, "top-up buys more, so it must be opted into");
     }
 
     #[test]

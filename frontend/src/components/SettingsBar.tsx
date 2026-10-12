@@ -179,6 +179,7 @@ function Segmented<T extends string | number>({ options, value, onChange, disabl
 
 function verdictText(v: CallVerdict): string {
   if (v.action === 'SKIP') return 'Skip';
+  if (v.action === 'WAIT') return 'Wait (no buy)';
   if (v.base_lots <= 0) return 'Not traded (0 lots)';
   return `×${v.multiplier} → ${v.lots} lot${v.lots === 1 ? '' : 's'}`;
 }
@@ -196,7 +197,11 @@ function IndexPreviewRow({ ix }: { ix: IndicatorIndex }) {
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs font-bold text-on-surface">{ix.index}</span>
         <span className={`rounded-md px-2 py-0.5 text-[11px] font-bold tabular-nums whitespace-nowrap ${tone}`}>
-          {r ? `${r.score.overall > 0 ? '+' : ''}${r.score.overall} ${word} · ${r.check_time}` : 'No fresh reading → NEUTRAL'}
+          {!r
+            ? 'No fresh reading → NEUTRAL'
+            : r.opening
+              ? `Opening check → NEUTRAL · ${r.check_time}`
+              : `${r.score.overall > 0 ? '+' : ''}${r.score.overall} ${word} · ${r.check_time}`}
         </span>
       </div>
       <div className="grid grid-cols-2 gap-2">
@@ -205,11 +210,11 @@ function IndexPreviewRow({ ix }: { ix: IndicatorIndex }) {
             key={label}
             title={v.note}
             className={`rounded-md border px-2 py-1.5 min-w-0 ${
-              v.action === 'SKIP' ? 'border-error/40 bg-error/5' : 'border-outline-variant bg-surface-container-lowest'
+              v.action !== 'SCALE' ? 'border-error/40 bg-error/5' : 'border-outline-variant bg-surface-container-lowest'
             }`}
           >
             <div className="text-[10px] font-semibold uppercase tracking-wide text-on-surface-variant">{label}</div>
-            <div className={`text-xs font-bold tabular-nums ${v.action === 'SKIP' ? 'text-error' : 'text-on-surface'}`}>
+            <div className={`text-xs font-bold tabular-nums ${v.action !== 'SCALE' ? 'text-error' : 'text-on-surface'}`}>
               {verdictText(v)}
             </div>
           </div>
@@ -301,7 +306,7 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
           <div className="relative flex flex-col gap-1.5">
             <span className="flex items-center gap-1 min-w-0">
               <label className={FIELD_LABEL}>Indicator Sizing (VWAP + PCR)</label>
-              <InfoTip text="ON: when a call triggers, read the last closed VWAP + PCR check of its index (BANKNIFTY and SENSEX their own; NIFTY for everything else). Agrees with the call (BUY CE + BUY reading, BUY PE + SELL reading) → default lots × the agree multiplier. NEUTRAL or no fresh reading → × the neutral multiplier. Disagrees → the call is skipped and the log says why. A manual qty override is never scaled, but is still skipped on disagreement. OFF: every call is bought at its default lots." />
+              <InfoTip text="ON: when a call triggers, read the last closed VWAP + PCR check of its index (BANKNIFTY and SENSEX their own; NIFTY for everything else). Agrees with the call (BUY CE + BUY reading, BUY PE + SELL reading) → default lots × the agree multiplier. NEUTRAL or no fresh reading → × the neutral multiplier. Disagrees → the call is not bought: it keeps waiting or is dropped, per the switch below, and the log says why. A manual qty override is never scaled, but is still held back on disagreement. OFF: every call is bought at its default lots." />
             </span>
             <Segmented
               options={[{ value: 1, label: 'ON' }, { value: 0, label: 'OFF' }]}
@@ -335,9 +340,44 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
               />
             </div>
             <p className="text-[11px] leading-snug text-on-surface-variant">
-              <span className="font-semibold text-error">Disagrees → skip.</span> Lots round to the nearest whole lot,
-              exact halves down, minimum 1.
+              <span className="font-semibold text-error">
+                Disagrees → {cfg.indicator_wait_on_disagree ? 'wait, no buy' : 'skip'}.
+              </span>{' '}
+              Lots round to the nearest whole lot, exact halves down, minimum 1.
             </p>
+
+            <div className="space-y-3.5 border-t border-outline-variant/60 pt-4">
+              {([
+                {
+                  key: 'indicator_early_checks',
+                  label: 'Opening Checks (09:16 neutral, then 5 min)',
+                  info: 'ON: the 09:16 check always counts as NEUTRAL. From 09:22 the engine uses the latest closed 5-minute check (09:21, 09:26) until the first regular check (09:31 on 15 or 30 min, 10:01 on 60 min), then goes back to the interval below. OFF: the 09:16 check is scored like any other and is the only reading until the first regular check.',
+                },
+                {
+                  key: 'indicator_wait_on_disagree',
+                  label: 'When It Disagrees: Keep Waiting',
+                  info: 'ON: a call whose price is in the buy range while the indicator disagrees is not bought and not dropped. It is re-read continuously and bought as soon as the indicator turns neutral or agrees with the price still in the buy range. It still expires with Call Valid For and the 15:39 cutoff. OFF: the call is dropped the moment it triggers against the indicator.',
+                },
+                {
+                  key: 'indicator_topup',
+                  label: 'Aggressive Top-Up',
+                  info: 'ON: a call bought at the reduced Neutral size is topped up to the full Agrees size if the indicator later agrees while the price is back in the buy range (2 default lots: 1 bought at neutral, 2 more added → 3). Once per call, only before target 1, only while the stop is still at the signal level and nothing has been sold, never after Call Valid For or 15:39, never on a manual qty override. The added lots share the same stop-loss and targets. The indicator never sells: if it turns against an open position nothing happens. OFF: a position keeps the size it was bought at.',
+                },
+              ] as const).map((t) => (
+                <div key={t.key} className="relative flex flex-col gap-1.5">
+                  <span className="flex items-center gap-1 min-w-0">
+                    <label className={FIELD_LABEL}>{t.label}</label>
+                    <InfoTip text={t.info} />
+                  </span>
+                  <Segmented
+                    options={[{ value: 1, label: 'ON' }, { value: 0, label: 'OFF' }]}
+                    value={cfg[t.key] ? 1 : 0}
+                    onChange={(v) => set({ [t.key]: v === 1 })}
+                    disabled={disabled}
+                  />
+                </div>
+              ))}
+            </div>
           </div>
 
           {/* Indicator parameters — also what the Market Data page scores with */}
@@ -486,6 +526,9 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           indicator_pcr_sell_below: cfgData?.indicator_pcr_sell_below ?? 1,
           indicator_vwap_band_pct: cfgData?.indicator_vwap_band_pct ?? 0,
           call_validity_minutes: cfgData?.call_validity_minutes ?? 120,
+          indicator_early_checks: cfgData?.indicator_early_checks ?? true,
+          indicator_wait_on_disagree: cfgData?.indicator_wait_on_disagree ?? true,
+          indicator_topup: cfgData?.indicator_topup ?? false,
         });
         setVirtualBalance(typeof walletData?.balance === 'number' ? walletData.balance : 0);
       })

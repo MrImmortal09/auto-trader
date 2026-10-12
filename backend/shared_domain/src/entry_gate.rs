@@ -163,6 +163,11 @@ pub struct IndicatorParams {
     pub pcr_sell_below: f64,
     /// VWAP Signal is 0 while the future is within ± this % of VWAP.
     pub vwap_band_pct: f64,
+    /// Opening rule (see [`last_closed_reading`]): the 09:16 check always
+    /// reads NEUTRAL, and until the first regular check closes the latest
+    /// closed 5-minute check (09:21, 09:26, …) is used instead.
+    #[serde(default)]
+    pub early_checks: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -255,6 +260,10 @@ pub struct IndicatorReading {
     pub ts: String,
     pub score: Score,
     pub bias: Bias,
+    /// The opening 09:16 check under the early-check rule: `bias` is forced
+    /// to NEUTRAL whatever `score` says.
+    #[serde(default)]
+    pub opening: bool,
 }
 
 impl IndicatorReading {
@@ -266,6 +275,13 @@ impl IndicatorReading {
             None => format!("PCR n/a, Put−Call {}", component_word(s.option)),
         };
         let overall = if s.overall > 0 { format!("+{}", s.overall) } else { s.overall.to_string() };
+        if self.opening {
+            return format!(
+                "opening {} check, always NEUTRAL (raw {overall}: {pcr}, VWAP {})",
+                self.check_time,
+                component_word(s.vwap)
+            );
+        }
         format!(
             "{overall} {} at the {} check ({pcr}, VWAP {})",
             self.bias.word(),
@@ -292,15 +308,69 @@ fn component_word(score: i32) -> &'static str {
 /// newest bucket that is not live wins, provided its snapshot is no older
 /// than `interval + STALE_GRACE_MINUTES` minutes. Only `now_ts`'s date
 /// counts, and only rows for `params.strike_window`.
+///
+/// With `params.early_checks` on, the open is handled separately: the 09:16
+/// check always reads NEUTRAL (one minute of data is not a reading), and
+/// until the first regular check closes (09:31 for 15 / 30 min, 10:01 for
+/// 60 min) the latest closed **5-minute** check — 09:21, 09:26, … — is used
+/// instead, scored exactly the same way. After that the regular interval
+/// takes over.
 pub fn last_closed_reading(
     rows: &[OiMinute],
     index: &str,
     params: &IndicatorParams,
     now_ts: &str,
 ) -> Option<IndicatorReading> {
+    let interval = if INDICATOR_INTERVALS.contains(&params.interval_min) { params.interval_min } else { 15 };
+    let regular = closed_reading(rows, index, params, interval, now_ts);
+    if !params.early_checks {
+        return regular;
+    }
+    let is_opening = |r: &IndicatorReading| r.check_time == hhmm(OPEN_CHECK_MINUTE);
+    if regular.as_ref().is_some_and(|r| !is_opening(r)) {
+        return regular;
+    }
+    // Nothing later than 09:16 has closed on the regular interval. While the
+    // first regular check is still ahead (plus the usual grace for its
+    // snapshot to land), fall back to 5-minute checks.
+    let (_, now_secs) = parse_ts(now_ts)?;
+    let first_regular = check_minute(OPEN_CHECK_MINUTE + 1, interval);
+    let early = if now_secs / 60 <= first_regular + STALE_GRACE_MINUTES {
+        closed_reading(rows, index, params, EARLY_CHECK_INTERVAL, now_ts)
+    } else {
+        None
+    };
+    match early {
+        Some(r) if !is_opening(&r) => Some(r),
+        // Still only the 09:16 check (from either interval): NEUTRAL.
+        Some(mut r) => {
+            r.bias = Bias::Neutral;
+            r.opening = true;
+            Some(r)
+        }
+        None => regular.map(|mut r| {
+            r.bias = Bias::Neutral;
+            r.opening = true;
+            r
+        }),
+    }
+}
+
+/// Interval used between the open and the first regular check when
+/// `IndicatorParams::early_checks` is on.
+pub const EARLY_CHECK_INTERVAL: u32 = 5;
+
+/// The newest closed check on `interval`-minute buckets — see
+/// [`last_closed_reading`].
+fn closed_reading(
+    rows: &[OiMinute],
+    index: &str,
+    params: &IndicatorParams,
+    interval: u32,
+    now_ts: &str,
+) -> Option<IndicatorReading> {
     let (today, now_secs) = parse_ts(now_ts)?;
     let now_minute = now_secs / 60;
-    let interval = if INDICATOR_INTERVALS.contains(&params.interval_min) { params.interval_min } else { 15 };
 
     // label minute → (row, snapshot seconds-of-day); the latest snapshot in
     // each bucket wins, without assuming the rows arrive in time order.
@@ -336,6 +406,7 @@ pub fn last_closed_reading(
             ts: row.ts.clone(),
             score: sc,
             bias: Bias::of_overall(sc.overall),
+            opening: false,
         });
     }
     None
@@ -495,6 +566,7 @@ mod tests {
             pcr_buy_above: 1.0,
             pcr_sell_below: 1.0,
             vwap_band_pct: 0.0,
+            early_checks: false,
         }
     }
 
@@ -533,6 +605,7 @@ mod tests {
             ts: "2026-10-09 11:01:02".into(),
             score: Score { call: 1.0, put: 1.0, ratio: Some(1.0), option: overall / 2, vwap: overall / 2, overall },
             bias,
+            opening: false,
         }
     }
 
@@ -633,6 +706,59 @@ mod tests {
         rows.pop();
         let r = last_closed_reading(&rows, "NIFTY", &params(), "2026-10-09 11:17:10").unwrap();
         assert_eq!((r.check_time.as_str(), r.ts.as_str()), ("11:16", "2026-10-09 11:15:02"));
+    }
+
+    fn early() -> IndicatorParams {
+        IndicatorParams { early_checks: true, ..params() }
+    }
+
+    #[test]
+    fn early_checks_make_the_opening_check_neutral() {
+        // 09:16 has closed and reads +2 BUY; with the opening rule it is NEUTRAL.
+        let rows = vec![bullish("2026-10-09 09:16:02")];
+        let now = "2026-10-09 09:18:00";
+        assert_eq!(last_closed_reading(&rows, "NIFTY", &params(), now).unwrap().bias, Bias::Bullish);
+        let r = last_closed_reading(&rows, "NIFTY", &early(), now).unwrap();
+        assert_eq!((r.bias, r.opening, r.check_time.as_str()), (Bias::Neutral, true, "09:16"));
+        assert!(r.describe().contains("always NEUTRAL"), "{}", r.describe());
+        // Still the opening check at 09:21:30 — the 09:21 snapshot hasn't landed.
+        let r = last_closed_reading(&rows, "NIFTY", &early(), "2026-10-09 09:21:30").unwrap();
+        assert!(r.opening);
+    }
+
+    #[test]
+    fn early_checks_use_five_minute_checks_until_the_first_regular_one() {
+        let mut rows = vec![
+            bullish("2026-10-09 09:16:02"),
+            bearish("2026-10-09 09:20:02"),
+            bearish("2026-10-09 09:21:02"),
+        ];
+        // 09:22: the 09:21 five-minute check has closed and is used as scored.
+        let r = last_closed_reading(&rows, "NIFTY", &early(), "2026-10-09 09:22:00").unwrap();
+        assert_eq!((r.bias, r.opening, r.check_time.as_str()), (Bias::Bearish, false, "09:21"));
+        // Without the rule the 15-minute reading is still the 09:16 check.
+        let r = last_closed_reading(&rows, "NIFTY", &params(), "2026-10-09 09:22:00").unwrap();
+        assert_eq!(r.check_time, "09:16");
+
+        // 09:27: the 09:26 check takes over.
+        rows.push(bullish("2026-10-09 09:26:02"));
+        let r = last_closed_reading(&rows, "NIFTY", &early(), "2026-10-09 09:27:00").unwrap();
+        assert_eq!((r.bias, r.check_time.as_str()), (Bias::Bullish, "09:26"));
+
+        // 09:31 lands: the regular 15-minute check is back in charge, and a
+        // later 5-minute bucket no longer overrides it.
+        rows.push(bearish("2026-10-09 09:31:02"));
+        rows.push(bullish("2026-10-09 09:36:02"));
+        let r = last_closed_reading(&rows, "NIFTY", &early(), "2026-10-09 09:37:00").unwrap();
+        assert_eq!((r.bias, r.opening, r.check_time.as_str()), (Bias::Bearish, false, "09:31"));
+    }
+
+    #[test]
+    fn early_checks_do_not_revive_five_minute_readings_later_in_the_day() {
+        // The poller was down from the open until 11:06. The regular interval
+        // has nothing closed and fresh; a lone 5-minute bucket must not stand in.
+        let rows = vec![bullish("2026-10-09 11:06:02")];
+        assert!(last_closed_reading(&rows, "NIFTY", &early(), "2026-10-09 11:07:00").is_none());
     }
 
     #[test]
