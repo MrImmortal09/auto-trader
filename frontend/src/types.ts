@@ -53,12 +53,18 @@ export interface TradingConfig {
   entry_window_pct: number;
   /** Size option entries on the VWAP + PCR indicator at the moment of buying
    * (parent index's last closed check; BANKNIFTY and SENSEX use their own,
-   * everything else follows NIFTY): agrees → × `indicator_agree_multiplier`,
-   * neutral / no fresh reading → × `indicator_neutral_multiplier`, disagrees →
-   * the call is skipped. Off by default. */
+   * everything else follows NIFTY): strongly agrees (score ±2, PCR and VWAP
+   * both) → × `indicator_strong_agree_multiplier`, agrees (score ±1) →
+   * × `indicator_agree_multiplier`, neutral / no fresh reading →
+   * × `indicator_neutral_multiplier`, disagrees → the call is skipped. Off by
+   * default. */
   indicator_sizing: boolean;
-  /** Lot multiplier when the indicator agrees with the call. [0.1, 5]. */
+  /** Lot multiplier when the indicator agrees with the call on a ±1 score
+   * (one of PCR / VWAP, the other neutral). [0.1, 5]. */
   indicator_agree_multiplier: number;
+  /** Lot multiplier when the indicator strongly agrees with the call: a ±2
+   * score, PCR and VWAP both on its side. [0.1, 5]. */
+  indicator_strong_agree_multiplier: number;
   /** Lot multiplier when the indicator is neutral or has no fresh reading. [0.1, 5]. */
   indicator_neutral_multiplier: number;
   /** Minutes per indicator check: 5, 15, 30 or 60. */
@@ -79,9 +85,18 @@ export interface TradingConfig {
   indicator_early_checks: boolean;
   /** Disagreeing indicator: keep the call waiting (true) or drop it (false). */
   indicator_wait_on_disagree: boolean;
-  /** Top a NEUTRAL-sized position up to the agree size once the indicator agrees. */
+  /** Top a NEUTRAL-sized position up once the indicator agrees — which
+   * reading does it, and to what size, is `indicator_topup_mode`. */
   indicator_topup: boolean;
+  /** The top-up rule while `indicator_topup` is on. */
+  indicator_topup_mode: TopupMode;
 }
+
+/** `strong_to_agree` (default): only a strong agree tops up, to the Agrees
+ * size. `strong_to_strong`: only a strong agree, to the Strong size. `tier`:
+ * any agreement, to that reading's own size. `step`: as `tier`, then once more
+ * to the Strong size when the reading turns strong. */
+export type TopupMode = 'strong_to_agree' | 'strong_to_strong' | 'tier' | 'step';
 
 /** `GET /api/market/indicator` — the engine's own verdicts, right now. */
 export interface IndicatorScore {

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use kotak_client::KotakClient;
-use shared_domain::entry_gate::{self, IndicatorFeed, SizingVerdict};
+use shared_domain::entry_gate::{self, Agreement, IndicatorFeed, SizingVerdict};
 use shared_domain::{
     DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradingConfig,
 };
@@ -19,9 +19,11 @@ use serde_json::json;
 #[derive(Debug, PartialEq)]
 enum PosAction {
     /// `note` explains an indicator-sizing adjustment, logged with the entry.
-    EntryBuy { qty: i32, note: Option<String>, topup_eligible: bool },
-    /// Indicator top-up of an open position — see `topup_sizing`.
-    TopUpBuy { qty: i32, note: String },
+    /// `topup_eligible` / `topup_stepped` — see `EntrySizing::Buy`.
+    EntryBuy { qty: i32, note: Option<String>, topup_eligible: bool, topup_stepped: bool },
+    /// Indicator top-up of an open position — see `topup_sizing`. `rearm`:
+    /// the "step" rule leaves one more top-up to come after this one.
+    TopUpBuy { qty: i32, note: String, rearm: bool },
     /// The entry triggered but the indicator disagrees: keep waiting.
     Hold { reason: String },
     ExitSell {
@@ -247,9 +249,11 @@ impl EntryGate {
 #[derive(Debug, PartialEq)]
 enum EntrySizing {
     /// Buy `qty`. `note` explains an indicator adjustment, for the log.
-    /// `topup_eligible`: the indicator sized this buy down (NEUTRAL / no fresh
-    /// reading), so `TradingConfig::indicator_topup` may add to it later.
-    Buy { qty: i32, note: Option<String>, topup_eligible: bool },
+    /// `topup_eligible`: `TradingConfig::indicator_topup` may add to this buy
+    /// later — the indicator sized it down (NEUTRAL / no fresh reading), or,
+    /// under the "step" top-up rule only, sized it at the plain Agrees size.
+    /// `topup_stepped` marks that second case (`SizingState::topup_stepped`).
+    Buy { qty: i32, note: Option<String>, topup_eligible: bool, topup_stepped: bool },
     /// The indicator disagrees with the call — do not buy now, but keep the
     /// call waiting (`TradingConfig::indicator_wait_on_disagree`).
     Wait { reason: String },
@@ -273,12 +277,13 @@ fn size_entry(
     gate: &EntryGate,
 ) -> EntrySizing {
     let base_qty = compute_entry_qty(&pos.signal, lot_size, pos.override_qty, cfg, Some(ltp));
+    let unscaled = |note| EntrySizing::Buy { qty: base_qty, note, topup_eligible: false, topup_stepped: false };
     if !cfg.indicator_sizing {
-        return EntrySizing::Buy { qty: base_qty, note: None, topup_eligible: false };
+        return unscaled(None);
     }
     // Equity / futures signals are sized on notional and not gated.
     let Some(option_type) = pos.signal.option_type.as_deref() else {
-        return EntrySizing::Buy { qty: base_qty, note: None, topup_eligible: false };
+        return unscaled(None);
     };
     let parent = entry_gate::indicator_parent(&pos.signal.instrument_name);
     let reading = entry_gate::feed_reading(&gate.feed, parent, &cfg.indicator_params(), &gate.now_ts);
@@ -286,26 +291,25 @@ fn size_entry(
         option_type,
         &pos.signal.instrument_name,
         reading.as_ref(),
-        cfg.indicator_agree_multiplier,
-        cfg.indicator_neutral_multiplier,
+        &cfg.indicator_multipliers(),
     ) {
         SizingVerdict::Skip { reason } if cfg.indicator_wait_on_disagree => EntrySizing::Wait { reason },
         SizingVerdict::Skip { reason } => EntrySizing::Skip { reason },
-        SizingVerdict::Scale { multiplier, note, bias_agrees } => {
+        SizingVerdict::Scale { multiplier, note, agreement } => {
             if pos.override_qty.is_some() {
-                return EntrySizing::Buy {
-                    qty: base_qty,
-                    note: Some(format!("{note} — manual qty override kept, multiplier not applied")),
-                    topup_eligible: false,
-                };
+                return unscaled(Some(format!("{note} — manual qty override kept, multiplier not applied")));
             }
             let lot = lot_size.max(1);
             let base_lots = base_qty / lot;
             let lots = entry_gate::scale_lots(base_lots, multiplier);
+            // A buy at the Agrees size has a top-up left only under the
+            // "step" rule; one at the Strong Agrees size never does.
+            let topup_stepped = agreement == Agreement::Agree && cfg.topup_mode().steps();
             EntrySizing::Buy {
                 qty: lots * lot,
                 note: Some(format!("{note}: {base_lots} → {lots} lot(s)")),
-                topup_eligible: !bias_agrees,
+                topup_eligible: agreement == Agreement::Neutral || topup_stepped,
+                topup_stepped,
             }
         }
     }
@@ -314,7 +318,11 @@ fn size_entry(
 /// Aggressive top-up (`TradingConfig::indicator_topup`): how much more to buy
 /// for an open position that was entered at the indicator's reduced NEUTRAL
 /// size, now that the indicator agrees with the call — `(extra qty, log
-/// note)`, or `None` when no top-up is due.
+/// note, rearm)`, or `None` when no top-up is due.
+///
+/// Which reading tops up, and to which tier's size, is
+/// `TradingConfig::indicator_topup_mode` (`entry_gate::TopupMode`): by
+/// default only a strong agree does, and only up to the Agrees size.
 ///
 /// Every condition errs toward not buying. The position must be `Active`
 /// (target 1 not reached), its stop still at the signal's level (not
@@ -322,8 +330,14 @@ fn size_entry(
 /// reconciled away), with no top-up tried before; the call must still be
 /// inside its validity window and the 15:39 cutoff; the kill switch off; and
 /// the price inside the same buy range the first entry used. The extra
-/// quantity brings the holding up to `default lots × agree multiplier` — it is
-/// never more than that, and a manual qty override is never topped up.
+/// quantity brings the holding up to `default lots ×` the target tier's
+/// multiplier — it is never more than that, and a manual qty override is
+/// never topped up.
+///
+/// The "step" rule is the one exception to "no top-up tried before": a
+/// holding at the Agrees size (`SizingState::topup_stepped`) may be topped up
+/// once more, to the Strong Agrees size. `rearm` is true for the top-up that
+/// leaves that second one still to come.
 ///
 /// The indicator never sells: a reading that turns against an open position
 /// changes nothing here.
@@ -334,8 +348,14 @@ fn topup_sizing(
     ltp: f64,
     gate: &EntryGate,
     entry_cutoff: bool,
-) -> Option<(i32, String)> {
+) -> Option<(i32, String, bool)> {
     if !cfg.indicator_sizing || !cfg.indicator_topup || cfg.kill_switch_active || entry_cutoff {
+        return None;
+    }
+    let mode = cfg.topup_mode();
+    // Already at the Agrees size: only the step rule has anything left to
+    // add, even if the rule was switched after this position was bought.
+    if pos.sizing.topup_stepped && !mode.steps() {
         return None;
     }
     if !matches!(pos.state, TradeState::Active)
@@ -358,19 +378,21 @@ fn topup_sizing(
     let option_type = pos.signal.option_type.as_deref()?;
     let parent = entry_gate::indicator_parent(&pos.signal.instrument_name);
     let reading = entry_gate::feed_reading(&gate.feed, parent, &cfg.indicator_params(), &gate.now_ts);
-    let SizingVerdict::Scale { bias_agrees: true, note, .. } = entry_gate::sizing_verdict(
+    let multipliers = cfg.indicator_multipliers();
+    let SizingVerdict::Scale { agreement, note, .. } = entry_gate::sizing_verdict(
         option_type,
         &pos.signal.instrument_name,
         reading.as_ref(),
-        cfg.indicator_agree_multiplier,
-        cfg.indicator_neutral_multiplier,
+        &multipliers,
     ) else {
         return None;
     };
+    let target = mode.target(agreement)?;
+    let target_multiplier = multipliers.of(target);
     let lot = lot_size.max(1);
     let base_qty = compute_entry_qty(&pos.signal, lot_size, None, cfg, Some(ltp));
     let base_lots = base_qty / lot;
-    let target_lots = entry_gate::scale_lots(base_lots, cfg.indicator_agree_multiplier);
+    let target_lots = entry_gate::scale_lots(base_lots, target_multiplier);
     let target_qty = target_lots.checked_mul(lot)?;
     let extra = target_qty - pos.executed_qty;
     if extra <= 0 || extra % lot != 0 {
@@ -379,11 +401,14 @@ fn topup_sizing(
     Some((
         extra,
         format!(
-            "{note}: topping up {} → {} lot(s) (+{} qty)",
+            "{note}: topping up to the {} size (×{target_multiplier}), {} → {} lot(s) (+{} qty)",
+            target.size_name(),
             pos.executed_qty / lot,
             target_lots,
             extra
         ),
+        // Only a step to the Agrees size leaves a higher tier to step to.
+        mode.steps() && target == Agreement::Agree,
     ))
 }
 
@@ -1165,8 +1190,8 @@ async fn reconcile_live_orders(
                             p.entry_order_id = None;
                             p.entry_cancel_sent = false;
                             p.entry_retry_as_limit = false;
-                            // Bought at the reduced NEUTRAL size: remember
-                            // exactly what was filled, for the top-up rule.
+                            // Bought at a size the top-up rule may add to:
+                            // remember exactly what was filled.
                             p.sizing.topup_base_qty = p.sizing.topup_eligible.then_some(filled);
                             p.sizing.topup_eligible = false;
                             p.sizing.hold_note = None;
@@ -1260,7 +1285,14 @@ async fn reconcile_live_orders(
                             p.sizing.topup_order_id = None;
                             p.sizing.topup_cancel_sent = false;
                             p.sizing.topup_retry_as_limit = false;
-                            p.sizing.topup_base_qty = None;
+                            // "Step" rule: a top-up to the Agrees size that
+                            // filled in full leaves the call eligible for one
+                            // more, up to the Strong Agrees size. A partial
+                            // fill ends it here, like every other rule.
+                            let rearm = p.sizing.topup_rearm && ordered > 0 && filled >= ordered;
+                            p.sizing.topup_base_qty = rearm.then_some(total);
+                            p.sizing.topup_stepped = rearm;
+                            p.sizing.topup_rearm = false;
                             // The position was exited while this buy was in
                             // flight. What it bought is not a new trade — sell
                             // it straight back so we end up flat as intended.
@@ -2296,14 +2328,16 @@ enum LiveAction {
         ltp: f64,
         limit_price: Option<f64>,
         sizing_note: Option<String>,
-        /// Sized down by a NEUTRAL reading — see `EntrySizing::Buy`.
+        /// A top-up may add to this buy later — see `EntrySizing::Buy`.
         topup_eligible: bool,
+        topup_stepped: bool,
     },
     /// The entry triggered but the indicator disagrees: keep the call waiting
     /// and log why (once per reading).
     HoldEntry { reason: String },
-    /// Buy `qty` more for an open position — see `topup_sizing`.
-    TopUp { qty: i32, ltp: f64, limit_price: Option<f64>, note: String },
+    /// Buy `qty` more for an open position — see `topup_sizing`. `rearm`:
+    /// the "step" rule leaves one more top-up to come once this one fills.
+    TopUp { qty: i32, ltp: f64, limit_price: Option<f64>, note: String, rearm: bool },
     /// Give up on an entry that will not be taken; cancel it if it is in flight.
     /// `loud` surfaces it as an ERROR the dashboard highlights (the signal
     /// looked wrong) rather than a routine INFO line (e.g. the EOD cutoff).
@@ -2421,8 +2455,8 @@ fn decide_live(
             let lot = lot_size_of(pos);
             // The VWAP + PCR gate is read here, at the moment of buying (and
             // again on any retry), not when the call arrived.
-            let (qty, sizing_note, topup_eligible) = match size_entry(pos, lot, cfg, ltp, gate) {
-                EntrySizing::Buy { qty, note, topup_eligible } => (qty, note, topup_eligible),
+            let (qty, sizing_note, topup_eligible, topup_stepped) = match size_entry(pos, lot, cfg, ltp, gate) {
+                EntrySizing::Buy { qty, note, topup_eligible, topup_stepped } => (qty, note, topup_eligible, topup_stepped),
                 // Nothing is sent. The call stays waiting and is re-read on
                 // every tick; the log line goes out once per reading.
                 EntrySizing::Wait { reason } => {
@@ -2459,7 +2493,7 @@ fn decide_live(
             } else {
                 None
             };
-            Some(LiveAction::PlaceEntry { qty, ltp, limit_price, sizing_note, topup_eligible })
+            Some(LiveAction::PlaceEntry { qty, ltp, limit_price, sizing_note, topup_eligible, topup_stepped })
         }
 
         TradeState::Active | TradeState::Target1Hit => {
@@ -2627,7 +2661,7 @@ fn decide_topup(
     if pos.sizing.topup_attempts >= shared_domain::MAX_ENTRY_ATTEMPTS {
         return None;
     }
-    let (qty, note) = topup_sizing(pos, lot_size_of(pos), cfg, ltp, gate, entry_cutoff)?;
+    let (qty, note, rearm) = topup_sizing(pos, lot_size_of(pos), cfg, ltp, gate, entry_cutoff)?;
     if let Some(elapsed) = secs_since_ist(&pos.sizing.topup_attempt_at) {
         if elapsed < ENTRY_RETRY_THROTTLE.as_secs() as i64 {
             return None;
@@ -2638,7 +2672,7 @@ fn decide_topup(
     } else {
         None
     };
-    Some(LiveAction::TopUp { qty, ltp, limit_price, note })
+    Some(LiveAction::TopUp { qty, ltp, limit_price, note, rearm })
 }
 
 // ---------------------------------------------------------------------------
@@ -2913,13 +2947,14 @@ async fn exec_live_action(
         .filter(|v| *v > 0.0);
 
     match &pending.action {
-        LiveAction::PlaceEntry { qty, ltp, limit_price, sizing_note, topup_eligible } => {
+        LiveAction::PlaceEntry { qty, ltp, limit_price, sizing_note, topup_eligible, topup_stepped } => {
             // Stamp the attempt time first, so decide_live's throttle spaces
             // out the next pre-flight even if this one bails out below.
             with_position(positions, &pending.pos_id, |p| {
                 p.entry_attempt_at = Some(shared_domain::current_ist_timestamp_string());
                 // How this attempt was sized; read when its fill settles.
                 p.sizing.topup_eligible = *topup_eligible;
+                p.sizing.topup_stepped = *topup_stepped;
             }).await;
 
             // Pre-flight funds check. We must be able to pay for the order and
@@ -3093,7 +3128,7 @@ async fn exec_live_action(
             })).await;
         }
 
-        LiveAction::TopUp { qty, ltp, limit_price, note } => {
+        LiveAction::TopUp { qty, ltp, limit_price, note, rearm } => {
             // Every attempt is stamped and counted up front — whatever happens
             // below, a top-up is tried at most MAX_ENTRY_ATTEMPTS times per
             // call and never more often than the retry throttle allows. No
@@ -3101,6 +3136,8 @@ async fn exec_live_action(
             with_position(positions, &pending.pos_id, |p| {
                 p.sizing.topup_attempt_at = Some(shared_domain::current_ist_timestamp_string());
                 p.sizing.topup_attempts += 1;
+                // How this attempt was sized; read when its fill settles.
+                p.sizing.topup_rearm = *rearm;
             }).await;
 
             // Same pre-flight as an entry: pay for the order and keep the buffer.
@@ -4137,8 +4174,8 @@ pub async fn start_position_monitor(
                                     .unwrap_or(1);
 
                                 // VWAP + PCR gate, read at the moment of buying.
-                                let (qty, note, topup_eligible) = match size_entry(pos, lot_size, &cfg, ltp, &gate) {
-                                    EntrySizing::Buy { qty, note, topup_eligible } => (qty, note, topup_eligible),
+                                let (qty, note, topup_eligible, topup_stepped) = match size_entry(pos, lot_size, &cfg, ltp, &gate) {
+                                    EntrySizing::Buy { qty, note, topup_eligible, topup_stepped } => (qty, note, topup_eligible, topup_stepped),
                                     // Keep waiting; Pass 2 logs it once per reading.
                                     EntrySizing::Wait { reason } => return PosAction::Hold { reason },
                                     EntrySizing::Skip { reason } => {
@@ -4151,7 +4188,7 @@ pub async fn start_position_monitor(
                                         reason: format!("Invalid quantity {}, must be positive multiple of lot size {}", qty, lot_size)
                                     }
                                 } else {
-                                    PosAction::EntryBuy { qty, note, topup_eligible }
+                                    PosAction::EntryBuy { qty, note, topup_eligible, topup_stepped }
                                 }
                             })
                         }
@@ -4212,7 +4249,7 @@ pub async fn start_position_monitor(
                                 // Nothing to exit — the only other thing an
                                 // Active position can do is the indicator top-up.
                                 topup_sizing(pos, lot_size_of(pos), &cfg, ltp, &gate, entry_cutoff)
-                                    .map(|(qty, note)| PosAction::TopUpBuy { qty, note })
+                                    .map(|(qty, note, rearm)| PosAction::TopUpBuy { qty, note, rearm })
                             }
                         }
 
@@ -4269,7 +4306,7 @@ pub async fn start_position_monitor(
                             }
                         }
 
-                        PosAction::TopUpBuy { qty, note } => {
+                        PosAction::TopUpBuy { qty, note, rearm } => {
                             let fees = FeeCalculator::calculate(
                                 qty, pa.ltp, "BUY", is_options, cfg.brokerage_per_order,
                             );
@@ -4278,7 +4315,10 @@ pub async fn start_position_monitor(
                             pos.avg_buy_price =
                                 (pos.avg_buy_price * held as f64 + pa.ltp * qty as f64) / total as f64;
                             pos.executed_qty = total;
-                            pos.sizing.topup_base_qty = None;
+                            // "Step" rule: one more top-up may follow, from
+                            // exactly this holding.
+                            pos.sizing.topup_base_qty = rearm.then_some(total);
+                            pos.sizing.topup_stepped = rearm;
                             positions_mutated = true;
 
                             let msg = json!({
@@ -4296,7 +4336,7 @@ pub async fn start_position_monitor(
                             send_log(&db_tx, &log_tx, "INFO", &msg.to_string()).await;
                         }
 
-                        PosAction::EntryBuy { qty, note, topup_eligible } => {
+                        PosAction::EntryBuy { qty, note, topup_eligible, topup_stepped } => {
                             if let Some(note) = note {
                                 let msg = json!({
                                     "event": "INDICATOR_SIZING",
@@ -4314,6 +4354,7 @@ pub async fn start_position_monitor(
                             pos.executed_qty   = qty;
                             pos.state          = TradeState::Active;
                             pos.sizing.topup_base_qty = topup_eligible.then_some(qty);
+                            pos.sizing.topup_stepped = topup_stepped;
                             pos.sizing.hold_note = None;
                             positions_mutated = true;
 
@@ -4559,7 +4600,8 @@ mod tests {
             kill_switch_active: false,
             entry_window_pct: 0.0,
             indicator_sizing: false,
-            indicator_agree_multiplier: 1.5,
+            indicator_agree_multiplier: 1.0,
+            indicator_strong_agree_multiplier: 1.5,
             indicator_neutral_multiplier: 0.5,
             indicator_interval_min: 15,
             indicator_basis: "chg".into(),
@@ -4573,6 +4615,7 @@ mod tests {
             indicator_early_checks: false,
             indicator_wait_on_disagree: false,
             indicator_topup: false,
+            indicator_topup_mode: "strong_to_agree".into(),
         }
     }
 
@@ -5391,8 +5434,15 @@ mod tests {
     /// A gate whose feed holds one closed 11:01 check for `index` (+2 BUY or
     /// −2 SELL) and whose clock reads 11:05 today.
     fn gate_with(index: &str, bullish: bool) -> EntryGate {
+        gate_scored(index, if bullish { 2 } else { -2 })
+    }
+
+    /// As [`gate_with`], for any score: ±2 has PCR and VWAP on the same side
+    /// (strong), ±1 has PCR alone with the future sitting on its VWAP.
+    fn gate_scored(index: &str, score: i32) -> EntryGate {
         let feed = entry_gate::new_indicator_feed();
-        let (call_chg, put_chg, fut) = if bullish { (100.0, 200.0, 25_100.0) } else { (200.0, 100.0, 24_900.0) };
+        let (call_chg, put_chg) = if score > 0 { (100.0, 200.0) } else { (200.0, 100.0) };
+        let fut = 25_000.0 + 100.0 * (score - score.signum()) as f64;
         entry_gate::feed_push(
             &feed,
             index,
@@ -5423,7 +5473,7 @@ mod tests {
         let pos = live_waiting_position(&ltp); // BUY NIFTY CE, lot 75
         assert_eq!(
             size_entry(&pos, 75, &cfg_with_lots(2, 2), 121.0, &gate_with("NIFTY", false)),
-            EntrySizing::Buy { qty: 150, note: None, topup_eligible: false }
+            EntrySizing::Buy { qty: 150, note: None, topup_eligible: false, topup_stepped: false }
         );
     }
 
@@ -5435,10 +5485,25 @@ mod tests {
             EntrySizing::Buy { qty, note, .. } => {
                 assert_eq!(qty, 3 * 75);
                 let note = note.expect("a sizing note");
-                assert!(note.contains("agrees with BUY CE") && note.contains("2 → 3 lot(s)"), "{note}");
+                assert!(note.contains("strongly agrees with BUY CE") && note.contains("2 → 3 lot(s)"), "{note}");
             }
             other => panic!("expected a scaled-up buy, got {other:?}"),
         }
+        // PCR alone (+1) is a plain agree: ×1, the default 2 lots.
+        match size_entry(&pos, 75, &sizing_cfg(2), 121.0, &gate_scored("NIFTY", 1)) {
+            EntrySizing::Buy { qty, note, topup_eligible, .. } => {
+                assert_eq!(qty, 2 * 75);
+                assert!(!topup_eligible, "only the step rule tops up a buy at the Agrees size");
+                let note = note.expect("a sizing note");
+                assert!(note.contains(") agrees with BUY CE, ×1:") && note.contains("2 → 2 lot(s)"), "{note}");
+            }
+            other => panic!("expected a default-size buy, got {other:?}"),
+        }
+        // A mild reading against the call is still a veto.
+        assert!(matches!(
+            size_entry(&pos, 75, &sizing_cfg(2), 121.0, &gate_scored("NIFTY", -1)),
+            EntrySizing::Skip { .. }
+        ));
         // Empty feed → no fresh reading → treated as neutral (0.5×): 2 lots → 1.
         match size_entry(&pos, 75, &sizing_cfg(2), 121.0, &test_gate()) {
             EntrySizing::Buy { qty, note, .. } => {
@@ -5595,27 +5660,123 @@ mod tests {
         pos
     }
 
+    /// 2 default lots: neutral buys 1, agree wants 2, strong agree wants 3.
+    /// The top-up rule is the default — strong agree only, to the Agrees size.
     fn topup_cfg() -> TradingConfig {
-        let mut cfg = sizing_cfg(2); // 2 lots: neutral buys 1, agree wants 3
+        let mut cfg = sizing_cfg(2);
         cfg.indicator_topup = true;
         cfg
     }
 
+    fn topup_cfg_with(mode: &str) -> TradingConfig {
+        let mut cfg = topup_cfg();
+        cfg.indicator_topup_mode = mode.to_string();
+        cfg
+    }
+
     #[test]
-    fn top_up_buys_the_difference_once_the_indicator_agrees() {
+    fn top_up_buys_the_difference_once_the_indicator_strongly_agrees() {
         let ltp = Arc::new(DashMap::new());
         let pos = neutral_sized_position(&ltp);
         let bullish = gate_with("NIFTY", true);
         match decide_live(&pos, &ltp, &topup_cfg(), false, true, &bullish) {
-            Some(LiveAction::TopUp { qty, limit_price, note, .. }) => {
-                assert_eq!(qty, 150, "1 lot held, 3 wanted → 2 more");
+            Some(LiveAction::TopUp { qty, limit_price, note, rearm, .. }) => {
+                assert_eq!(qty, 75, "1 lot held, the Agrees size is 2 → 1 more");
                 assert!(limit_price.is_none());
-                assert!(note.contains("1 → 3 lot(s)"), "{note}");
+                assert!(!rearm);
+                assert!(note.contains("topping up to the Agrees size (×1), 1 → 2 lot(s)"), "{note}");
             }
             other => panic!("expected a top-up, got {other:?}"),
         }
         // The PAPER path sizes it with the very same function.
-        assert_eq!(topup_sizing(&pos, 75, &topup_cfg(), 121.0, &bullish, false).map(|t| t.0), Some(150));
+        assert_eq!(topup_sizing(&pos, 75, &topup_cfg(), 121.0, &bullish, false).map(|t| t.0), Some(75));
+        // A plain agree is not enough under the default rule.
+        assert!(decide_live(&pos, &ltp, &topup_cfg(), false, true, &gate_scored("NIFTY", 1)).is_none());
+    }
+
+    #[test]
+    fn each_top_up_rule_picks_its_own_reading_and_size() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = neutral_sized_position(&ltp); // holds 1 lot of a 2-lot default
+        let extra = |mode: &str, score: i32| {
+            topup_sizing(&pos, 75, &topup_cfg_with(mode), 121.0, &gate_scored("NIFTY", score), false)
+                .map(|(qty, _, rearm)| (qty, rearm))
+        };
+        // (rule, on a plain agree, on a strong agree) as (extra qty, rearm).
+        let cases = [
+            ("strong_to_agree", None, Some((75, false))),   // → 2 lots
+            ("strong_to_strong", None, Some((150, false))), // → 3 lots
+            ("tier", Some((75, false)), Some((150, false))),
+            ("step", Some((75, true)), Some((150, false))),
+        ];
+        for (mode, on_agree, on_strong) in cases {
+            assert_eq!(extra(mode, 1), on_agree, "{mode} on agree");
+            assert_eq!(extra(mode, 2), on_strong, "{mode} on strong agree");
+            // No rule ever buys on a neutral or opposing reading.
+            for score in [-2, -1] {
+                assert_eq!(extra(mode, score), None, "{mode} on {score}");
+            }
+            assert_eq!(
+                topup_sizing(&pos, 75, &topup_cfg_with(mode), 121.0, &test_gate(), false),
+                None,
+                "{mode} with no fresh reading"
+            );
+        }
+        // An unrecognised stored value behaves as the default rule.
+        assert_eq!(extra("whatever", 1), None);
+        assert_eq!(extra("whatever", 2), Some((75, false)));
+    }
+
+    #[test]
+    fn the_step_rule_adds_a_second_top_up_and_no_other_rule_does() {
+        let ltp = Arc::new(DashMap::new());
+        let step = topup_cfg_with("step");
+        let strong = gate_scored("NIFTY", 2);
+        let agree = gate_scored("NIFTY", 1);
+
+        // As left by the first step (1 → 2 lots on a plain agree, re-armed).
+        let mut pos = neutral_sized_position(&ltp);
+        pos.executed_qty = 150;
+        pos.sizing.topup_base_qty = Some(150);
+        pos.sizing.topup_stepped = true;
+
+        // Still a plain agree: already at that size, nothing to add.
+        assert_eq!(topup_sizing(&pos, 75, &step, 121.0, &agree, false), None);
+        // Strong agree: one more lot to the Strong Agrees size, and that is the end.
+        match topup_sizing(&pos, 75, &step, 121.0, &strong, false) {
+            Some((qty, note, rearm)) => {
+                assert_eq!((qty, rearm), (75, false));
+                assert!(note.contains("topping up to the Strong Agrees size (×1.5), 2 → 3 lot(s)"), "{note}");
+            }
+            None => panic!("expected the second step"),
+        }
+        // The rule was switched after the first step: every other rule
+        // treats this call as already topped up.
+        for mode in ["strong_to_agree", "strong_to_strong", "tier"] {
+            assert_eq!(topup_sizing(&pos, 75, &topup_cfg_with(mode), 121.0, &strong, false), None, "{mode}");
+        }
+    }
+
+    #[test]
+    fn only_the_step_rule_tops_up_a_call_bought_at_the_agrees_size() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_waiting_position(&ltp);
+        let agree = gate_scored("NIFTY", 1);
+        let flags = |cfg: &TradingConfig, gate: &EntryGate| match size_entry(&pos, 75, cfg, 121.0, gate) {
+            EntrySizing::Buy { qty, topup_eligible, topup_stepped, .. } => (qty, topup_eligible, topup_stepped),
+            other => panic!("expected a buy, got {other:?}"),
+        };
+        for mode in ["strong_to_agree", "strong_to_strong", "tier"] {
+            assert_eq!(flags(&topup_cfg_with(mode), &agree), (150, false, false), "{mode}");
+        }
+        assert_eq!(flags(&topup_cfg_with("step"), &agree), (150, true, true));
+        // Whatever the rule: a neutral-size buy can be topped up, a
+        // strong-agree one never can.
+        for mode in ["strong_to_agree", "strong_to_strong", "tier", "step"] {
+            let cfg = topup_cfg_with(mode);
+            assert_eq!(flags(&cfg, &test_gate()), (75, true, false), "{mode} neutral");
+            assert_eq!(flags(&cfg, &gate_scored("NIFTY", 2)), (225, false, false), "{mode} strong");
+        }
     }
 
     #[test]
@@ -5687,7 +5848,7 @@ mod tests {
         ltp.insert("nse_fo|999".to_string(), 124.0);
         assert!(matches!(
             decide_live(&pos, &ltp, &cfg, false, true, &bullish),
-            Some(LiveAction::TopUp { qty: 150, .. })
+            Some(LiveAction::TopUp { qty: 75, .. })
         ));
     }
 
@@ -5727,7 +5888,7 @@ mod tests {
         let mut cfg = topup_cfg();
         cfg.entry_window_pct = 25.0; // buy range [120, 125]
         match decide_live(&pos, &ltp, &cfg, false, true, &gate_with("NIFTY", true)) {
-            Some(LiveAction::TopUp { qty: 150, limit_price: Some(lp), .. }) => {
+            Some(LiveAction::TopUp { qty: 75, limit_price: Some(lp), .. }) => {
                 assert!(lp > 121.0 && lp <= 125.0, "limit {lp} must stay inside the buy range");
             }
             other => panic!("expected a limit top-up, got {other:?}"),

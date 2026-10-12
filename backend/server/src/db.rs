@@ -120,7 +120,9 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     // existing database keeps working unchanged — no clearing needed.
     for sql in [
         "ALTER TABLE trading_config ADD COLUMN indicator_sizing INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE trading_config ADD COLUMN indicator_agree_multiplier REAL NOT NULL DEFAULT 1.5",
+        // Fresh databases start at ×1 for a plain agree. An existing row
+        // keeps whatever it has saved (this column is already there).
+        "ALTER TABLE trading_config ADD COLUMN indicator_agree_multiplier REAL NOT NULL DEFAULT 1.0",
         "ALTER TABLE trading_config ADD COLUMN indicator_neutral_multiplier REAL NOT NULL DEFAULT 0.5",
         "ALTER TABLE trading_config ADD COLUMN indicator_interval_min INTEGER NOT NULL DEFAULT 15",
         "ALTER TABLE trading_config ADD COLUMN indicator_basis TEXT NOT NULL DEFAULT 'chg'",
@@ -134,6 +136,10 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         "ALTER TABLE trading_config ADD COLUMN indicator_early_checks INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE trading_config ADD COLUMN indicator_wait_on_disagree INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE trading_config ADD COLUMN indicator_topup INTEGER NOT NULL DEFAULT 0",
+        // Strong-agree tier (score ±2) and the top-up rule. Additive, and the
+        // saved agree / neutral multipliers are left exactly as they are.
+        "ALTER TABLE trading_config ADD COLUMN indicator_strong_agree_multiplier REAL NOT NULL DEFAULT 1.5",
+        "ALTER TABLE trading_config ADD COLUMN indicator_topup_mode TEXT NOT NULL DEFAULT 'strong_to_agree'",
     ] {
         ensure_column(&pool, sql).await;
     }
@@ -258,6 +264,8 @@ struct TradingConfigRow {
     indicator_early_checks: bool,
     indicator_wait_on_disagree: bool,
     indicator_topup: bool,
+    indicator_strong_agree_multiplier: f64,
+    indicator_topup_mode: String,
 }
 
 /// Load `TradingConfig` from SQLite, falling back to safe defaults.
@@ -272,7 +280,8 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
                 indicator_interval_min, indicator_basis, indicator_strike_window,
                 indicator_pcr_buy_above, indicator_pcr_sell_below, indicator_vwap_band_pct,
                 call_validity_minutes,
-                indicator_early_checks, indicator_wait_on_disagree, indicator_topup
+                indicator_early_checks, indicator_wait_on_disagree, indicator_topup,
+                indicator_strong_agree_multiplier, indicator_topup_mode
          FROM trading_config WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -304,6 +313,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
             entry_window_pct: r.entry_window_pct.clamp(0.0, 100.0),
             indicator_sizing: r.indicator_sizing,
             indicator_agree_multiplier: r.indicator_agree_multiplier,
+            indicator_strong_agree_multiplier: r.indicator_strong_agree_multiplier,
             indicator_neutral_multiplier: r.indicator_neutral_multiplier,
             indicator_interval_min: r.indicator_interval_min,
             indicator_basis: r.indicator_basis,
@@ -315,6 +325,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
             indicator_early_checks: r.indicator_early_checks,
             indicator_wait_on_disagree: r.indicator_wait_on_disagree,
             indicator_topup: r.indicator_topup,
+            indicator_topup_mode: r.indicator_topup_mode,
         };
         // Same clamps the settings handler applies, so a hand-edited row
         // can't put an out-of-range value in front of the engine.
@@ -341,7 +352,8 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         kill_switch_active: false,
         entry_window_pct: 0.0,
         indicator_sizing: false,
-        indicator_agree_multiplier: 1.5,
+        indicator_agree_multiplier: 1.0,
+        indicator_strong_agree_multiplier: 1.5,
         indicator_neutral_multiplier: 0.5,
         indicator_interval_min: 15,
         indicator_basis: "chg".into(),
@@ -353,6 +365,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         indicator_early_checks: true,
         indicator_wait_on_disagree: true,
         indicator_topup: false,
+        indicator_topup_mode: "strong_to_agree".into(),
     })
 }
 
@@ -552,5 +565,75 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_domain::entry_gate::{Multipliers, TopupMode};
+
+    /// A throwaway SQLite file, removed (with its WAL files) when dropped.
+    struct TempDb(std::path::PathBuf);
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("auto-trader-{name}-{}.db", std::process::id()));
+            let db = TempDb(path);
+            db.remove();
+            db
+        }
+
+        fn url(&self) -> String {
+            format!("sqlite://{}", self.0.display())
+        }
+
+        fn remove(&self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_database_starts_with_the_three_indicator_tiers() {
+        let db = TempDb::new("fresh");
+        let pool = init_db(&db.url()).await;
+        let cfg = load_config_from_db(&pool).await;
+        assert_eq!(cfg.indicator_multipliers(), Multipliers { strong: 1.5, agree: 1.0, neutral: 0.5 });
+        assert_eq!(cfg.topup_mode(), TopupMode::StrongToAgree);
+        assert!(!cfg.indicator_sizing && !cfg.indicator_topup);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn upgrading_keeps_the_saved_multipliers_and_adds_the_strong_tier() {
+        let db = TempDb::new("upgrade");
+        let pool = init_db(&db.url()).await;
+        // Put the table back to how it looked before the strong-agree tier,
+        // with the settings a running install would have saved.
+        for sql in [
+            "ALTER TABLE trading_config DROP COLUMN indicator_strong_agree_multiplier",
+            "ALTER TABLE trading_config DROP COLUMN indicator_topup_mode",
+            "UPDATE trading_config SET indicator_sizing = 1, indicator_topup = 1,
+                    indicator_agree_multiplier = 1.5, indicator_neutral_multiplier = 0.4",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+
+        let pool = init_db(&db.url()).await;
+        let cfg = load_config_from_db(&pool).await;
+        // Nothing saved is rewritten: a plain agree keeps buying what it did.
+        assert_eq!(cfg.indicator_multipliers(), Multipliers { strong: 1.5, agree: 1.5, neutral: 0.4 });
+        assert_eq!(cfg.topup_mode(), TopupMode::StrongToAgree);
+        assert!(cfg.indicator_sizing && cfg.indicator_topup);
+        pool.close().await;
     }
 }
