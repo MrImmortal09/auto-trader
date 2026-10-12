@@ -16,7 +16,7 @@ use serde_json::json;
 // Internal action types — collected in the read pass, applied after
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum PosAction {
     /// `note` explains an indicator-sizing adjustment, logged with the entry.
     EntryBuy { qty: i32, note: Option<String>, topup_eligible: bool },
@@ -30,6 +30,13 @@ enum PosAction {
         new_sl: Option<f64>,
         exec_price: Option<f64>,
     },
+    /// PAPER dynamic-targeting rung — target 1 itself or any rung after it.
+    /// Trails the stop to `new_sl` and sets the next rung to `next_target`,
+    /// the PAPER counterpart of LIVE's `Target1` / `TrailDynamic`. `sell` is
+    /// the one lot released at target 1; 0 for a one-lot runner
+    /// (`dynamic_targeting_single_lot`) and for every later rung, which only
+    /// trail and extend.
+    DynamicRung { sell: i32, new_sl: f64, next_target: f64, rung_hit: f64 },
     Cancel { reason: String },
     /// Drop a position that is still waiting for its entry and never will take
     /// one (signal cancelled/changed, or the end-of-day entry cutoff).
@@ -85,6 +92,31 @@ async fn send_positions_snapshot(
     if let Ok(json) = serde_json::to_string(positions) {
         let _ = tx.send(DbWriteMessage::PositionsSnapshot { json }).await;
     }
+}
+
+/// Book a PAPER sell of `qty` at `price`: the trade row and its log line.
+/// The caller owns the position's quantity and state.
+async fn book_paper_sell(
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    pos: &MonitoredPosition,
+    cfg: &TradingConfig,
+    qty: i32,
+    price: f64,
+    reason: &str,
+) {
+    let instrument = &pos.signal.instrument_name;
+    let fees = FeeCalculator::calculate(
+        qty, price, "SELL", pos.signal.option_type.is_some(), cfg.brokerage_per_order,
+    );
+    let pnl = fees.net_value - pos.avg_buy_price * qty as f64;
+    let msg = format!(
+        r#"{{"event":"{reason}","instrument":"{instrument}","price":{:.2},"qty":{qty},"pnl":{pnl:.2}}}"#,
+        price
+    );
+    tracing::info!(instrument = %instrument, reason, price, pnl, "Exit executed");
+    send_trade(db_tx, instrument, "SELL", qty, price, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some(reason.to_string()), &cfg.mode).await;
+    send_log(db_tx, log_tx, "INFO", &msg).await;
 }
 
 /// True when `now` is at/after 15:38 IST on this position's *resolved*
@@ -601,6 +633,66 @@ fn tgt1_slice_qty(held: i32, lot_size: i32, pct: f64) -> i32 {
     let raw = held as f64 * pct / 100.0;
     let lots = ((raw / lot as f64).ceil() as i32).max(1);
     (lots * lot).min(held)
+}
+
+/// PAPER target 1 under dynamic targeting — the rule `decide_live` applies to
+/// a LIVE position: sell exactly one lot (not `target_1_exit_pct`), or nothing
+/// at all on a one-lot position when `dynamic_targeting_single_lot` is on,
+/// then trail the stop to `t1 - diff * dynamic_targeting_trail_factor` and
+/// seed the ladder at `t1 + diff * dynamic_targeting_extension_factor`
+/// (`diff = t1 - avg_buy_price`). A position with nothing left to run after
+/// that lot exits in full.
+///
+/// An average price at/above target 1 (`diff <= 0`) also exits in full: the
+/// ladder could not climb from there, so this errs toward being flat. PAPER
+/// never buys at/through target 1 (`entry_past_target1`), so that is only
+/// reachable for a position carried over from LIVE.
+fn paper_dynamic_target1(pos: &MonitoredPosition, t1: f64, cfg: &TradingConfig) -> PosAction {
+    let held = pos.executed_qty;
+    let lot = lot_size_of(pos);
+    let diff = t1 - pos.avg_buy_price;
+    let keep_whole_lot = cfg.dynamic_targeting_single_lot && held <= lot;
+    let sell = if keep_whole_lot { 0 } else { lot.min(held) };
+    if diff <= 0.0 || sell >= held {
+        return PosAction::ExitSell {
+            qty: held,
+            reason: "TGT1_FULL".to_string(),
+            new_sl: None,
+            exec_price: None,
+        };
+    }
+    PosAction::DynamicRung {
+        sell,
+        new_sl: round_down_tick(t1 - diff * cfg.dynamic_targeting_trail_factor, pos.tick_size),
+        next_target: t1 + diff * cfg.dynamic_targeting_extension_factor,
+        rung_hit: t1,
+    }
+}
+
+/// PAPER dynamic runner past target 1: once `ltp` reaches `next_target`, trail
+/// the stop and extend the ladder by one more rung, as LIVE's `TrailDynamic`
+/// does. Never a sell — the runner only exits through the stop check that
+/// runs before this.
+fn paper_dynamic_rung(
+    pos: &MonitoredPosition,
+    next_target: f64,
+    ltp: f64,
+    cfg: &TradingConfig,
+) -> Option<PosAction> {
+    if ltp < next_target {
+        return None;
+    }
+    let t1 = *pos.signal.targets.first()?;
+    let diff = t1 - pos.avg_buy_price;
+    Some(PosAction::DynamicRung {
+        sell: 0,
+        new_sl: round_down_tick(
+            next_target - diff * cfg.dynamic_targeting_trail_factor,
+            pos.tick_size,
+        ),
+        next_target: next_target + diff * cfg.dynamic_targeting_extension_factor,
+        rung_hit: next_target,
+    })
 }
 
 /// Market order (`MKT`). `mp` is Kotak's market-price-protection *percentage*.
@@ -4080,6 +4172,13 @@ pub async fn start_position_monitor(
                                 Some(PosAction::ExitSell {
                                     qty: pos.executed_qty, reason: reason.to_string(), new_sl: None, exec_price: None,
                                 })
+                            } else if cfg.dynamic_targeting
+                                && !pos.signal.targets.is_empty()
+                                && ltp >= pos.signal.targets[0]
+                            {
+                                // Dynamic targeting: one lot off (or none), the
+                                // rest rides the ladder — same rule as LIVE.
+                                Some(paper_dynamic_target1(pos, pos.signal.targets[0], &cfg))
                             } else if !pos.signal.targets.is_empty() && ltp >= pos.signal.targets[0] {
                                 let has_t2 = pos.signal.targets.len() > 1;
                                 let lot_size = pos
@@ -4126,6 +4225,11 @@ pub async fn start_position_monitor(
                                 Some(PosAction::ExitSell {
                                     qty: pos.executed_qty, reason: "TRAIL_SL_HIT".to_string(), new_sl: None, exec_price: None,
                                 })
+                            } else if let Some(next_target) = pos.next_dynamic_target {
+                                // Dynamic runner: never exits at a target, only
+                                // trails and extends. The stop check above is
+                                // its only way out.
+                                paper_dynamic_rung(pos, next_target, ltp, &cfg)
                             } else if pos.signal.targets.len() > 1 && ltp >= pos.signal.targets[1] {
                                 Some(PosAction::ExitSell {
                                     qty: pos.executed_qty, reason: "TGT2_HIT".to_string(), new_sl: None, exec_price: None,
@@ -4224,17 +4328,7 @@ pub async fn start_position_monitor(
 
                         PosAction::ExitSell { qty, reason, new_sl, exec_price } => {
                             let price = exec_price.unwrap_or(pa.ltp);
-                            let fees = FeeCalculator::calculate(
-                                qty, price, "SELL", is_options, cfg.brokerage_per_order,
-                            );
-                            let pnl = fees.net_value - pos.avg_buy_price * qty as f64;
-                            let msg = format!(
-                                r#"{{"event":"{reason}","instrument":"{instrument}","price":{:.2},"qty":{qty},"pnl":{pnl:.2}}}"#,
-                                price
-                            );
-                            tracing::info!(instrument = %instrument, reason, price, pnl, "Exit executed");
-                            send_trade(&db_tx, &instrument, "SELL", qty, price, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some(reason.clone()), &cfg.mode).await;
-                            send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                            book_paper_sell(&db_tx, &log_tx, pos, &cfg, qty, price, &reason).await;
 
                             pos.executed_qty -= qty;
                             match new_sl {
@@ -4248,6 +4342,34 @@ pub async fn start_position_monitor(
                                 None => pos.state = TradeState::Closed,
                             }
                             positions_mutated = true;
+                        }
+
+                        PosAction::DynamicRung { sell, new_sl, next_target, rung_hit } => {
+                            // Only target 1 ever sells, and only when more
+                            // than one lot is held. A one-lot runner and every
+                            // later rung book no trade at all.
+                            if sell > 0 {
+                                book_paper_sell(&db_tx, &log_tx, pos, &cfg, sell, pa.ltp, "TGT1_PARTIAL").await;
+                                pos.executed_qty -= sell;
+                            }
+                            // Target 1 is rung 1; each later rung counts up.
+                            pos.dynamic_rung_number = match pos.state {
+                                TradeState::Target1Hit => pos.dynamic_rung_number + 1,
+                                _ => 1,
+                            };
+                            pos.current_sl = new_sl;
+                            pos.next_dynamic_target = Some(next_target);
+                            pos.last_dynamic_rung = Some(rung_hit);
+                            pos.state = TradeState::Target1Hit;
+                            positions_mutated = true;
+                            tracing::info!(instrument = %instrument, new_sl, next_target, "Dynamic target extended");
+                            send_log(&db_tx, &log_tx, "INFO", &json!({
+                                "event": "SL_TRAILED",
+                                "instrument": instrument,
+                                "new_sl": new_sl,
+                                "next_target": round2(next_target),
+                                "mode": cfg.mode.as_str(),
+                            }).to_string()).await;
                         }
 
                         PosAction::Cancel { reason } => {
@@ -4856,6 +4978,199 @@ mod tests {
             }
             other => panic!("expected TRAIL_SL_HIT, got {other:?}"),
         }
+    }
+
+    fn tgt1_full(qty: i32) -> PosAction {
+        PosAction::ExitSell { qty, reason: "TGT1_FULL".to_string(), new_sl: None, exec_price: None }
+    }
+
+    #[test]
+    fn paper_target1_follows_the_live_dynamic_rule() {
+        let ltp = Arc::new(DashMap::new());
+        let one_lot = live_one_lot_at_target1(&ltp);
+
+        // One lot, sub-option off: the only lot is sold, nothing left to run.
+        assert_eq!(paper_dynamic_target1(&one_lot, 140.0, &dynamic_cfg(false)), tgt1_full(75));
+
+        // One lot, sub-option on: nothing sold, the whole lot rides the ladder
+        // with the stop at 140 - 20*0.5 = 130 and the next rung at 160 — the
+        // same numbers `decide_live` produces for this position.
+        assert_eq!(
+            paper_dynamic_target1(&one_lot, 140.0, &dynamic_cfg(true)),
+            PosAction::DynamicRung { sell: 0, new_sl: 130.0, next_target: 160.0, rung_hit: 140.0 }
+        );
+
+        // Three lots: exactly one lot comes off, whatever target_1_exit_pct
+        // says (50 % here would otherwise release two).
+        let mut three_lots = live_one_lot_at_target1(&ltp);
+        three_lots.executed_qty = 225;
+        for single_lot in [false, true] {
+            assert_eq!(
+                paper_dynamic_target1(&three_lots, 140.0, &dynamic_cfg(single_lot)),
+                PosAction::DynamicRung { sell: 75, new_sl: 130.0, next_target: 160.0, rung_hit: 140.0 }
+            );
+        }
+
+        // The factors move the stop and the next rung: 140 - 20*1.0 = 120
+        // (breakeven) and 140 + 20*0.5 = 150.
+        let mut cfg = dynamic_cfg(false);
+        cfg.dynamic_targeting_trail_factor = 1.0;
+        cfg.dynamic_targeting_extension_factor = 0.5;
+        assert_eq!(
+            paper_dynamic_target1(&three_lots, 140.0, &cfg),
+            PosAction::DynamicRung { sell: 75, new_sl: 120.0, next_target: 150.0, rung_hit: 140.0 }
+        );
+    }
+
+    #[test]
+    fn paper_target1_exits_in_full_when_the_ladder_cannot_climb() {
+        let ltp = Arc::new(DashMap::new());
+        // Average price at/above target 1 (diff <= 0): err toward flat, for a
+        // one-lot runner and a multi-lot position alike.
+        let mut pos = live_one_lot_at_target1(&ltp);
+        pos.avg_buy_price = 140.0;
+        assert_eq!(paper_dynamic_target1(&pos, 140.0, &dynamic_cfg(true)), tgt1_full(75));
+        pos.executed_qty = 225;
+        pos.avg_buy_price = 145.0;
+        assert_eq!(paper_dynamic_target1(&pos, 140.0, &dynamic_cfg(true)), tgt1_full(225));
+    }
+
+    #[test]
+    fn paper_runner_trails_and_extends_without_selling() {
+        let ltp = Arc::new(DashMap::new());
+        let cfg = dynamic_cfg(true);
+        let mut pos = live_one_lot_at_target1(&ltp);
+        pos.state = TradeState::Target1Hit;
+        pos.current_sl = 130.0;
+        pos.next_dynamic_target = Some(160.0);
+
+        // Short of the next rung: hold.
+        assert_eq!(paper_dynamic_rung(&pos, 160.0, 159.95, &cfg), None);
+
+        // At the rung: trail to 160 - 10 = 150, extend to 180 — no sell.
+        assert_eq!(
+            paper_dynamic_rung(&pos, 160.0, 160.0, &cfg),
+            Some(PosAction::DynamicRung { sell: 0, new_sl: 150.0, next_target: 180.0, rung_hit: 160.0 })
+        );
+
+        // A gap through several rungs still climbs one rung per tick.
+        assert_eq!(
+            paper_dynamic_rung(&pos, 160.0, 205.0, &cfg),
+            Some(PosAction::DynamicRung { sell: 0, new_sl: 150.0, next_target: 180.0, rung_hit: 160.0 })
+        );
+    }
+
+    /// The real monitor loop in PAPER mode over one open position, on a
+    /// paused clock. `step` moves the price and lets a couple of 50 ms ticks
+    /// run; `sells` returns the `(qty, price, reason)` of every sell booked
+    /// since the last call.
+    struct PaperRun {
+        ltp: Arc<DashMap<String, f64>>,
+        positions: Arc<RwLock<Vec<MonitoredPosition>>>,
+        db_rx: mpsc::Receiver<DbWriteMessage>,
+        _signal_tx: broadcast::Sender<TradeSignal>,
+    }
+
+    impl PaperRun {
+        fn start(cfg: TradingConfig, held: i32) -> Self {
+            let ltp = Arc::new(DashMap::new());
+            let mut pos = live_one_lot_at_target1(&ltp);
+            pos.executed_qty = held;
+            ltp.insert("nse_fo|999".to_string(), 135.0);
+            let positions = Arc::new(RwLock::new(vec![pos]));
+            let (db_tx, db_rx) = mpsc::channel(1024);
+            let (signal_tx, signal_rx) = broadcast::channel(8);
+            tokio::spawn(start_position_monitor(
+                signal_rx,
+                db_tx,
+                ltp.clone(),
+                Arc::new(RwLock::new(cfg)),
+                positions.clone(),
+                broadcast::channel(1024).0,
+                Arc::new(RwLock::new(None)),
+                Arc::new(tokio::sync::Mutex::new(None)),
+                Arc::new(tokio::sync::Mutex::new(None)),
+                entry_gate::new_indicator_feed(),
+            ));
+            Self { ltp, positions, db_rx, _signal_tx: signal_tx }
+        }
+
+        async fn step(&mut self, price: f64) -> Option<MonitoredPosition> {
+            self.ltp.insert("nse_fo|999".to_string(), price);
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            self.positions.read().await.first().cloned()
+        }
+
+        fn sells(&mut self) -> Vec<(i32, f64, String)> {
+            let mut out = Vec::new();
+            while let Ok(msg) = self.db_rx.try_recv() {
+                if let DbWriteMessage::Trade { action, qty, executed_price, exit_reason, .. } = msg {
+                    if action == "SELL" {
+                        out.push((qty, executed_price, exit_reason.unwrap_or_default()));
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_monitor_runs_a_multi_lot_dynamic_runner() {
+        let mut run = PaperRun::start(dynamic_cfg(false), 150);
+
+        // Below target 1: nothing happens.
+        let pos = run.step(139.95).await.unwrap();
+        assert!(matches!(pos.state, TradeState::Active));
+        assert_eq!(pos.executed_qty, 150);
+        assert!(run.sells().is_empty());
+
+        // Target 1: one lot off, stop to 130, ladder seeded at 160.
+        let pos = run.step(140.0).await.unwrap();
+        assert!(matches!(pos.state, TradeState::Target1Hit));
+        assert_eq!((pos.executed_qty, pos.current_sl), (75, 130.0));
+        assert_eq!((pos.next_dynamic_target, pos.last_dynamic_rung, pos.dynamic_rung_number), (Some(160.0), Some(140.0), 1));
+        assert_eq!(run.sells(), vec![(75, 140.0, "TGT1_PARTIAL".to_string())]);
+
+        // The signal's own target 2 (160) is now just the next rung: no exit,
+        // the stop trails to 150 and the ladder extends to 180.
+        let pos = run.step(160.0).await.unwrap();
+        assert!(matches!(pos.state, TradeState::Target1Hit));
+        assert_eq!((pos.executed_qty, pos.current_sl), (75, 150.0));
+        assert_eq!((pos.next_dynamic_target, pos.last_dynamic_rung, pos.dynamic_rung_number), (Some(180.0), Some(160.0), 2));
+        assert!(run.sells().is_empty());
+
+        // Back through the trailed stop: the runner is sold and the position closes.
+        assert!(run.step(149.95).await.is_none());
+        assert_eq!(run.sells(), vec![(75, 149.95, "TRAIL_SL_HIT".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_monitor_keeps_a_one_lot_runner_without_selling_at_target1() {
+        let mut run = PaperRun::start(dynamic_cfg(true), 75);
+
+        let pos = run.step(140.0).await.unwrap();
+        assert!(matches!(pos.state, TradeState::Target1Hit));
+        assert_eq!((pos.executed_qty, pos.current_sl), (75, 130.0));
+        assert_eq!((pos.next_dynamic_target, pos.dynamic_rung_number), (Some(160.0), 1));
+        assert!(run.sells().is_empty());
+
+        assert!(run.step(130.0).await.is_none());
+        assert_eq!(run.sells(), vec![(75, 130.0, "TRAIL_SL_HIT".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_monitor_without_dynamic_targeting_still_exits_at_target2() {
+        let mut run = PaperRun::start(cfg_with_lots(1, 3), 150);
+
+        // 50 % of two lots off at target 1, stop to the entry/target-1 midpoint.
+        let pos = run.step(140.0).await.unwrap();
+        assert!(matches!(pos.state, TradeState::Target1Hit));
+        assert_eq!((pos.executed_qty, pos.current_sl), (75, 130.0));
+        assert_eq!((pos.next_dynamic_target, pos.dynamic_rung_number), (None, 0));
+        assert_eq!(run.sells(), vec![(75, 140.0, "TGT1_PARTIAL".to_string())]);
+
+        assert!(run.step(160.0).await.is_none());
+        assert_eq!(run.sells(), vec![(75, 160.0, "TGT2_HIT".to_string())]);
     }
 
     #[test]

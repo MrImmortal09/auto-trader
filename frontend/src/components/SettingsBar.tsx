@@ -85,7 +85,7 @@ function FactorSlider({ label, value, min, max, step, enabled, disabled, onChang
       </div>
       {!enabled && (
         <span className="text-[11px] text-on-surface-variant italic">
-          {disabledNote ?? 'Only applies in LIVE mode when Dynamic Targeting is ON — and updates any already-open runner immediately on save.'}
+          {disabledNote ?? 'Only applies when Dynamic Targeting is ON — and updates any already-open runner immediately on save.'}
         </span>
       )}
     </div>
@@ -721,7 +721,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           <div className={`relative flex flex-col gap-1.5 transition-opacity ${cfg.dynamic_targeting ? '' : 'opacity-50'}`}>
             <span className="flex items-center gap-1 min-w-0">
               <label className={FIELD_LABEL}>Dynamic Targeting — 1 Lot</label>
-              <InfoTip text="With Dynamic Targeting ON, a position of only one lot normally sells that lot at target 1 and is done. ON: sell nothing at target 1 — the whole lot becomes the runner, its stop trails up and the next rung extends exactly like a multi-lot runner, and it only exits when price falls back through the trailed stop (which never sits below entry). Positions of 2+ lots are unaffected. LIVE only." />
+              <InfoTip text="With Dynamic Targeting ON, a position of only one lot normally sells that lot at target 1 and is done. ON: sell nothing at target 1 — the whole lot becomes the runner, its stop trails up and the next rung extends exactly like a multi-lot runner, and it only exits when price falls back through the trailed stop (which never sits below entry). Positions of 2+ lots are unaffected. Applies in PAPER and LIVE." />
             </span>
             <div className="flex rounded-lg overflow-hidden border border-outline-variant text-xs font-label-caps">
               {([true, false] as const).map((on) => (

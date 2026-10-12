@@ -170,8 +170,9 @@ pub struct TradingConfig {
     /// `diff * dynamic_targeting_extension_factor` (`diff = target1 - entry`)
     /// and trails the stop to `rung - diff * dynamic_targeting_trail_factor`
     /// — see `decide_live`'s `TradeState::Target1Hit` branch for the exact
-    /// recurrence. Off by default: existing signals keep exiting at their own
-    /// target 2.
+    /// recurrence. Applies in PAPER and LIVE alike (PAPER mirrors it in
+    /// `paper_dynamic_target1` / `paper_dynamic_rung`). Off by default:
+    /// existing signals keep exiting at their own target 2.
     #[serde(default)]
     pub dynamic_targeting: bool,
     /// Multiplier applied to `diff` when trailing the stop under
@@ -180,7 +181,7 @@ pub struct TradingConfig {
     /// only back to the previous rung (loosest — on the first rung that's
     /// breakeven at entry). Clamped to `[0.0, 1.0]` on save so the stop can
     /// never trail below the entry price. Unused unless `dynamic_targeting`
-    /// is on; PAPER mode does not use this — it always trails to the fixed
+    /// is on — with it off, PAPER trails to the fixed
     /// `(entry + target1) / 2` midpoint. Changing this retroactively updates
     /// `current_sl` on every open `Target1Hit` dynamic-targeting position —
     /// see `post_settings_handler`.
@@ -203,7 +204,7 @@ pub struct TradingConfig {
     /// trailed and next rung extended exactly as for a multi-lot runner. The
     /// trailed stop still never sits below entry (trail factor is clamped to
     /// `[0, 1]`). Multi-lot positions are unaffected. Unused unless
-    /// `dynamic_targeting` is on; LIVE only, like the rest of dynamic
+    /// `dynamic_targeting` is on; PAPER and LIVE, like the rest of dynamic
     /// targeting. Off by default.
     #[serde(default)]
     pub dynamic_targeting_single_lot: bool,
