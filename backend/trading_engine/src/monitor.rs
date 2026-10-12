@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use kotak_client::KotakClient;
+use shared_domain::entry_gate::{self, IndicatorFeed, SizingVerdict};
 use shared_domain::{
     DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradingConfig,
 };
@@ -17,7 +18,12 @@ use serde_json::json;
 
 #[derive(Debug)]
 enum PosAction {
-    EntryBuy { qty: i32 },
+    /// `note` explains an indicator-sizing adjustment, logged with the entry.
+    EntryBuy { qty: i32, note: Option<String>, topup_eligible: bool },
+    /// Indicator top-up of an open position — see `topup_sizing`.
+    TopUpBuy { qty: i32, note: String },
+    /// The entry triggered but the indicator disagrees: keep waiting.
+    Hold { reason: String },
     ExitSell {
         qty: i32,
         reason: String,
@@ -149,7 +155,7 @@ fn find_duplicate_open_position<'a>(
 /// class". A bare `index_lots`/`other_lots` of 0 skips every index without an
 /// explicit per-symbol override / every stock option; a signal that resolves
 /// to 0 is dropped at ingestion (`start_position_monitor`).
-fn lots_for_instrument(cfg: &TradingConfig, instrument_name: &str) -> i32 {
+pub fn lots_for_instrument(cfg: &TradingConfig, instrument_name: &str) -> i32 {
     let inst = instrument_name.to_uppercase();
     match shared_domain::INDEX_NAMES.iter().find(|&&idx| inst == idx) {
         Some(&idx) => cfg
@@ -189,6 +195,177 @@ fn compute_entry_qty(
         if multiple == 0 { multiple = lot_size; }
         multiple
     }
+}
+
+/// Per-tick inputs to the entry gate — the indicator feed and "now" — taken
+/// once per tick so the decision functions themselves stay pure.
+struct EntryGate {
+    feed: IndicatorFeed,
+    /// IST `YYYY-MM-DD HH:MM:SS`.
+    now_ts: String,
+}
+
+impl EntryGate {
+    fn new(feed: &IndicatorFeed) -> Self {
+        Self { feed: Arc::clone(feed), now_ts: shared_domain::current_ist_timestamp_string() }
+    }
+}
+
+/// How a triggered entry is to be sized once the indicator has had its say.
+#[derive(Debug, PartialEq)]
+enum EntrySizing {
+    /// Buy `qty`. `note` explains an indicator adjustment, for the log.
+    /// `topup_eligible`: the indicator sized this buy down (NEUTRAL / no fresh
+    /// reading), so `TradingConfig::indicator_topup` may add to it later.
+    Buy { qty: i32, note: Option<String>, topup_eligible: bool },
+    /// The indicator disagrees with the call — do not buy now, but keep the
+    /// call waiting (`TradingConfig::indicator_wait_on_disagree`).
+    Wait { reason: String },
+    /// The indicator disagrees with the call — drop it; `reason` says why.
+    Skip { reason: String },
+}
+
+/// Entry quantity for `pos` at the moment its trigger fires: the usual
+/// [`compute_entry_qty`], then — for an option, with `indicator_sizing` on —
+/// scaled up, scaled down or vetoed by the parent index's last closed VWAP +
+/// PCR check (see `shared_domain::entry_gate`).
+///
+/// A manual per-position qty override is the trader's explicit number, so it
+/// is never scaled — but a disagreeing reading still skips the call, which
+/// errs toward not trading.
+fn size_entry(
+    pos: &MonitoredPosition,
+    lot_size: i32,
+    cfg: &TradingConfig,
+    ltp: f64,
+    gate: &EntryGate,
+) -> EntrySizing {
+    let base_qty = compute_entry_qty(&pos.signal, lot_size, pos.override_qty, cfg, Some(ltp));
+    if !cfg.indicator_sizing {
+        return EntrySizing::Buy { qty: base_qty, note: None, topup_eligible: false };
+    }
+    // Equity / futures signals are sized on notional and not gated.
+    let Some(option_type) = pos.signal.option_type.as_deref() else {
+        return EntrySizing::Buy { qty: base_qty, note: None, topup_eligible: false };
+    };
+    let parent = entry_gate::indicator_parent(&pos.signal.instrument_name);
+    let reading = entry_gate::feed_reading(&gate.feed, parent, &cfg.indicator_params(), &gate.now_ts);
+    match entry_gate::sizing_verdict(
+        option_type,
+        &pos.signal.instrument_name,
+        reading.as_ref(),
+        cfg.indicator_agree_multiplier,
+        cfg.indicator_neutral_multiplier,
+    ) {
+        SizingVerdict::Skip { reason } if cfg.indicator_wait_on_disagree => EntrySizing::Wait { reason },
+        SizingVerdict::Skip { reason } => EntrySizing::Skip { reason },
+        SizingVerdict::Scale { multiplier, note, bias_agrees } => {
+            if pos.override_qty.is_some() {
+                return EntrySizing::Buy {
+                    qty: base_qty,
+                    note: Some(format!("{note} — manual qty override kept, multiplier not applied")),
+                    topup_eligible: false,
+                };
+            }
+            let lot = lot_size.max(1);
+            let base_lots = base_qty / lot;
+            let lots = entry_gate::scale_lots(base_lots, multiplier);
+            EntrySizing::Buy {
+                qty: lots * lot,
+                note: Some(format!("{note}: {base_lots} → {lots} lot(s)")),
+                topup_eligible: !bias_agrees,
+            }
+        }
+    }
+}
+
+/// Aggressive top-up (`TradingConfig::indicator_topup`): how much more to buy
+/// for an open position that was entered at the indicator's reduced NEUTRAL
+/// size, now that the indicator agrees with the call — `(extra qty, log
+/// note)`, or `None` when no top-up is due.
+///
+/// Every condition errs toward not buying. The position must be `Active`
+/// (target 1 not reached), its stop still at the signal's level (not
+/// trailed), still holding exactly what the entry bought (nothing sold or
+/// reconciled away), with no top-up tried before; the call must still be
+/// inside its validity window and the 15:39 cutoff; the kill switch off; and
+/// the price inside the same buy range the first entry used. The extra
+/// quantity brings the holding up to `default lots × agree multiplier` — it is
+/// never more than that, and a manual qty override is never topped up.
+///
+/// The indicator never sells: a reading that turns against an open position
+/// changes nothing here.
+fn topup_sizing(
+    pos: &MonitoredPosition,
+    lot_size: i32,
+    cfg: &TradingConfig,
+    ltp: f64,
+    gate: &EntryGate,
+    entry_cutoff: bool,
+) -> Option<(i32, String)> {
+    if !cfg.indicator_sizing || !cfg.indicator_topup || cfg.kill_switch_active || entry_cutoff {
+        return None;
+    }
+    if !matches!(pos.state, TradeState::Active)
+        || pos.override_qty.is_some()
+        || pos.force_exit.is_some()
+        || pos.manual_sell_qty.is_some()
+        || pos.sizing.topup_order_id.is_some()
+        || pos.executed_qty <= 0
+        || pos.sizing.topup_base_qty != Some(pos.executed_qty)
+        || pos.current_sl > pos.signal.stop_loss
+    {
+        return None;
+    }
+    if call_expired_reason(pos, cfg, &gate.now_ts).is_some() {
+        return None;
+    }
+    if !entry_triggered(&pos.signal, ltp, cfg) || entry_past_target1(&pos.signal, ltp).is_some() {
+        return None;
+    }
+    let option_type = pos.signal.option_type.as_deref()?;
+    let parent = entry_gate::indicator_parent(&pos.signal.instrument_name);
+    let reading = entry_gate::feed_reading(&gate.feed, parent, &cfg.indicator_params(), &gate.now_ts);
+    let SizingVerdict::Scale { bias_agrees: true, note, .. } = entry_gate::sizing_verdict(
+        option_type,
+        &pos.signal.instrument_name,
+        reading.as_ref(),
+        cfg.indicator_agree_multiplier,
+        cfg.indicator_neutral_multiplier,
+    ) else {
+        return None;
+    };
+    let lot = lot_size.max(1);
+    let base_qty = compute_entry_qty(&pos.signal, lot_size, None, cfg, Some(ltp));
+    let base_lots = base_qty / lot;
+    let target_lots = entry_gate::scale_lots(base_lots, cfg.indicator_agree_multiplier);
+    let target_qty = target_lots.checked_mul(lot)?;
+    let extra = target_qty - pos.executed_qty;
+    if extra <= 0 || extra % lot != 0 {
+        return None;
+    }
+    Some((
+        extra,
+        format!(
+            "{note}: topping up {} → {} lot(s) (+{} qty)",
+            pos.executed_qty / lot,
+            target_lots,
+            extra
+        ),
+    ))
+}
+
+/// `Some(reason)` once a call still waiting for its entry has outlived
+/// `TradingConfig::call_validity_minutes` (counted from `created_at`, when the
+/// engine received it).
+fn call_expired_reason(pos: &MonitoredPosition, cfg: &TradingConfig, now_ts: &str) -> Option<String> {
+    entry_gate::call_expired(&pos.created_at, cfg.call_validity_minutes, now_ts).then(|| {
+        format!(
+            "CALL_EXPIRED — not bought within {} min of the call (received {})",
+            cfg.call_validity_minutes,
+            pos.created_at.get(11..16).unwrap_or("?")
+        )
+    })
 }
 
 /// Target-1 level when `ltp` is already at or through it — the move the signal
@@ -709,6 +886,12 @@ struct LiveLeg {
     pending_exit_order_id: Option<String>,
     pending_exit_qty: i32,
     pending_exit_reason: Option<String>,
+    /// Indicator top-up buy in flight (`SizingState::topup_order_id`).
+    topup_order_id: Option<String>,
+    topup_cancel_sent: bool,
+    topup_retry_as_limit: bool,
+    /// Whole seconds since the top-up was sent.
+    topup_attempt_secs: Option<i64>,
 }
 
 /// Settle every tracked order against the broker's order book.
@@ -731,6 +914,7 @@ async fn reconcile_live_orders(
                     || p.entry_send_uncertain
                     || p.sl_order_id.is_some()
                     || p.pending_exit_order_id.is_some()
+                    || p.sizing.topup_order_id.is_some()
             })
             .map(|p| LiveLeg {
                 pos_id: p.id.clone(),
@@ -756,12 +940,19 @@ async fn reconcile_live_orders(
                 pending_exit_order_id: p.pending_exit_order_id.clone(),
                 pending_exit_qty: p.pending_exit_qty,
                 pending_exit_reason: p.pending_exit_reason.clone(),
+                topup_order_id: p.sizing.topup_order_id.clone(),
+                topup_cancel_sent: p.sizing.topup_cancel_sent,
+                topup_retry_as_limit: p.sizing.topup_retry_as_limit,
+                topup_attempt_secs: secs_since_ist(&p.sizing.topup_attempt_at),
             })
             .collect();
         // Every entry order number the engine already owns — the uncertain-entry
         // hunt below must not adopt an order that belongs to another position.
+        // A top-up buy is a buy on the same symbol too, and just as much not
+        // some other position's entry.
         let claimed = g.iter()
-            .filter_map(|p| p.entry_order_id.clone())
+            .flat_map(|p| [p.entry_order_id.clone(), p.sizing.topup_order_id.clone()])
+            .flatten()
             .filter(|s| !s.trim().is_empty())
             .collect();
         (legs, claimed)
@@ -882,6 +1073,11 @@ async fn reconcile_live_orders(
                             p.entry_order_id = None;
                             p.entry_cancel_sent = false;
                             p.entry_retry_as_limit = false;
+                            // Bought at the reduced NEUTRAL size: remember
+                            // exactly what was filled, for the top-up rule.
+                            p.sizing.topup_base_qty = p.sizing.topup_eligible.then_some(filled);
+                            p.sizing.topup_eligible = false;
+                            p.sizing.hold_note = None;
                         }).await;
 
                         let fees = FeeCalculator::calculate(filled, avg, "BUY", leg.is_options, brokerage);
@@ -945,6 +1141,137 @@ async fn reconcile_live_orders(
             }
         }
 
+        // ── Indicator top-up leg ─────────────────────────────────────── //
+        // Settled before the sell legs below, so a top-up fill and an exit
+        // fill landing in the same poll are netted in the right order. Only
+        // the broker's filled quantity is ever added to the holding.
+        if let Some(oid) = leg.topup_order_id.clone() {
+            if let Some(ord) = book.iter().find(|o| o.order_no.trim() == oid.trim()) {
+                if ord.is_terminal() {
+                    let filled = ord.filled_qty();
+                    let ordered = ord.ordered_qty();
+                    let mut avg = ord.avg_price();
+                    if filled > 0 {
+                        if avg <= 0.0 {
+                            avg = leg.entry_price;
+                            loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                                "top-up order {oid} filled {filled} but the broker reported no average price — booking it at the signal entry {avg:.2}, verify against the contract note"
+                            )).await;
+                        }
+                        let mut total = filled;
+                        with_position(positions, &leg.pos_id, |p| {
+                            let held = p.executed_qty.max(0);
+                            total = held + filled;
+                            p.avg_buy_price =
+                                (p.avg_buy_price * held as f64 + avg * filled as f64) / total as f64;
+                            p.executed_qty = total;
+                            p.sizing.topup_order_id = None;
+                            p.sizing.topup_cancel_sent = false;
+                            p.sizing.topup_retry_as_limit = false;
+                            p.sizing.topup_base_qty = None;
+                            // The position was exited while this buy was in
+                            // flight. What it bought is not a new trade — sell
+                            // it straight back so we end up flat as intended.
+                            if (held == 0 || p.sizing.topup_exit_on_fill) && p.force_exit.is_none() {
+                                p.force_exit = Some("TOPUP_AFTER_EXIT".to_string());
+                            }
+                            p.sizing.topup_exit_on_fill = false;
+                        }).await;
+
+                        let fees = FeeCalculator::calculate(filled, avg, "BUY", leg.is_options, brokerage);
+                        tracing::info!(instrument = %leg.instrument, price = avg, qty = filled, "LIVE top-up filled");
+                        send_trade(
+                            db_tx, &leg.instrument, "BUY", filled, avg, &fees,
+                            leg.signal_id.clone(), leg.raw_message.clone(),
+                            Some("TOPUP".to_string()), "LIVE",
+                        ).await;
+                        live_info(db_tx, log_tx, json!({
+                            "event": "TOPUP",
+                            "instrument": leg.instrument,
+                            "price": round2(avg),
+                            "qty": filled,
+                            "holding": total,
+                            "net_cost": round2(fees.net_value),
+                            "mode": "LIVE",
+                        })).await;
+                        if ordered > 0 && filled < ordered {
+                            loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                                "top-up order {oid} filled only {filled} of {ordered} — running the position on the filled quantity"
+                            )).await;
+                        }
+                    } else {
+                        // Nothing bought. An IOC limit that expired is a miss
+                        // decide_live may retry (within its attempt cap); any
+                        // other outcome ends the top-up for this call. Either
+                        // way the position itself is untouched — unless every
+                        // lot was sold while this order was in flight, in which
+                        // case there is now nothing left to hold it open.
+                        let retry = leg.topup_retry_as_limit && ord.is_cancelled();
+                        with_position(positions, &leg.pos_id, |p| {
+                            p.sizing.topup_order_id = None;
+                            p.sizing.topup_cancel_sent = false;
+                            p.sizing.topup_exit_on_fill = false;
+                            if !retry {
+                                p.sizing.topup_base_qty = None;
+                                p.sizing.topup_retry_as_limit = false;
+                            }
+                            if p.executed_qty <= 0
+                                && p.pending_exit_order_id.is_none()
+                                && p.sl_order_id.is_none()
+                                && !matches!(p.state, TradeState::WaitingForEntry)
+                            {
+                                p.state = TradeState::Closed;
+                                p.force_exit = None;
+                            }
+                        }).await;
+                        if retry {
+                            tracing::info!(instrument = %leg.instrument, %oid, "LIVE top-up IOC limit expired unfilled — may retry");
+                        } else {
+                            loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                                "top-up order {oid} came back {} ({}) with nothing filled — no top-up, the position is unchanged",
+                                ord.status, ord.reject_reason
+                            )).await;
+                        }
+                    }
+                    mutated = true;
+                } else if ord.filled_qty() > 0 && !leg.topup_cancel_sent {
+                    // Partly filled: keep what we got, release the rest.
+                    if let Err(e) = kotak_cancel(kotak, &oid, &leg.trading_symbol).await {
+                        loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                            "could not cancel the unfilled remainder of top-up order {oid}: {e}"
+                        )).await;
+                    }
+                    with_position(positions, &leg.pos_id, |p| p.sizing.topup_cancel_sent = true).await;
+                    mutated = true;
+                }
+            } else if leg.topup_attempt_secs.unwrap_or(0) >= UNCERTAIN_ENTRY_GRACE.as_secs() as i64 {
+                // The broker accepted this order but it never showed up in a
+                // cleanly-read book. Stop waiting on it — a position must not
+                // be held open (or kept from closing) by an order we cannot
+                // see. Nothing is added to the holding, so the engine can only
+                // ever under-count here, never sell more than it holds.
+                with_position(positions, &leg.pos_id, |p| {
+                    p.sizing.topup_order_id = None;
+                    p.sizing.topup_cancel_sent = false;
+                    p.sizing.topup_exit_on_fill = false;
+                    p.sizing.topup_retry_as_limit = false;
+                    p.sizing.topup_base_qty = None;
+                    if p.executed_qty <= 0
+                        && p.pending_exit_order_id.is_none()
+                        && p.sl_order_id.is_none()
+                        && !matches!(p.state, TradeState::WaitingForEntry)
+                    {
+                        p.state = TradeState::Closed;
+                        p.force_exit = None;
+                    }
+                }).await;
+                loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                    "top-up order {oid} is not in the broker's order book — no longer tracking it and nothing was added to the position. Check the broker app for that order"
+                )).await;
+                mutated = true;
+            }
+        }
+
         // ── Stop-loss leg ────────────────────────────────────────────── //
         if let Some(oid) = leg.sl_order_id.clone() {
             if let Some(ord) = book.iter().find(|o| o.order_no.trim() == oid.trim()) {
@@ -962,7 +1289,12 @@ async fn reconcile_live_orders(
                     with_position(positions, &leg.pos_id, |p| {
                         p.executed_qty = (p.executed_qty - filled).max(0);
                         forget_stop(p);
-                        if p.executed_qty <= 0 && p.pending_exit_order_id.is_none() {
+                        // A top-up buy still at the broker could yet fill;
+                        // its own leg closes the position once it settles.
+                        if p.executed_qty <= 0
+                            && p.pending_exit_order_id.is_none()
+                            && p.sizing.topup_order_id.is_none()
+                        {
                             p.state = TradeState::Closed;
                             p.force_exit = None;
                         }
@@ -1024,9 +1356,14 @@ async fn reconcile_live_orders(
                         p.pending_exit_order_id = None;
                         p.pending_exit_qty = 0;
                         p.pending_exit_reason = None;
-                        if p.executed_qty <= 0 {
+                        if p.executed_qty <= 0 && p.sizing.topup_order_id.is_none() {
                             p.state = TradeState::Closed;
                             p.force_exit = None;
+                            now_closed = true;
+                        } else if p.executed_qty <= 0 {
+                            // Fully sold, but a top-up buy is still at the
+                            // broker and could yet fill: stay open until its
+                            // leg settles it (that leg then closes this).
                             now_closed = true;
                         } else if shortfall > 0 && !was_cancelled {
                             // Hard reject with qty still outstanding: force an
@@ -1124,6 +1461,35 @@ async fn reconcile_on_startup(
     //    while we were down is recorded as a real trade rather than inferred
     //    from a quantity difference below.
     reconcile_live_orders(positions, kotak, db_tx, log_tx, brokerage).await;
+
+    // 1b. A top-up buy that step 1 could not settle (still open, or not in
+    //     today's book) is let go of here: the broker's positions decide the
+    //     holding below, and adding this order's fill on top of that later
+    //     would count the same lots twice — which ends in selling more than
+    //     we hold. Cancel it (best effort) and stop tracking it.
+    let stray_topups: Vec<(String, String, String, String)> = {
+        let mut g = positions.write().await;
+        g.iter_mut()
+            .filter_map(|p| {
+                let oid = p.sizing.topup_order_id.take()?;
+                p.sizing.topup_cancel_sent = false;
+                p.sizing.topup_retry_as_limit = false;
+                p.sizing.topup_base_qty = None;
+                let ts = p.resolved_order.as_ref().map(|o| o.trading_symbol.clone()).unwrap_or_default();
+                Some((p.id.clone(), p.signal.instrument_name.clone(), ts, oid))
+            })
+            .collect()
+    };
+    for (_, instrument, trading_symbol, oid) in &stray_topups {
+        let cancel = kotak_cancel(kotak, oid, trading_symbol).await;
+        loud_error(db_tx, log_tx, instrument, &format!(
+            "top-up order {oid} was still unsettled at startup — no longer tracking it ({}). The holding is taken from the broker's positions; check the broker app for that order",
+            match cancel {
+                Ok(()) => "cancel sent".to_string(),
+                Err(e) => format!("cancel failed: {e}"),
+            }
+        )).await;
+    }
 
     struct Tracked {
         pos_id: String,
@@ -1805,6 +2171,8 @@ async fn adopt_manual(
         entry_retry_as_limit: false,
         live_halt: None,
         entry_zone: None,
+        call_expires_at: None,
+        sizing: Default::default(),
     };
 
     { positions.write().await.push(new_pos); }
@@ -1830,7 +2198,20 @@ enum LiveAction {
     /// that triggered it, used to size the funds check. `limit_price` is `None`
     /// for the normal market buy; `Some(p)` when a prior market send was
     /// RMS-rejected and the retry must go in as an IOC limit at `p`.
-    PlaceEntry { qty: i32, ltp: f64, limit_price: Option<f64> },
+    /// `sizing_note` explains an indicator-sizing adjustment to `qty`, for the log.
+    PlaceEntry {
+        qty: i32,
+        ltp: f64,
+        limit_price: Option<f64>,
+        sizing_note: Option<String>,
+        /// Sized down by a NEUTRAL reading — see `EntrySizing::Buy`.
+        topup_eligible: bool,
+    },
+    /// The entry triggered but the indicator disagrees: keep the call waiting
+    /// and log why (once per reading).
+    HoldEntry { reason: String },
+    /// Buy `qty` more for an open position — see `topup_sizing`.
+    TopUp { qty: i32, ltp: f64, limit_price: Option<f64>, note: String },
     /// Give up on an entry that will not be taken; cancel it if it is in flight.
     /// `loud` surfaces it as an ERROR the dashboard highlights (the signal
     /// looked wrong) rather than a routine INFO line (e.g. the EOD cutoff).
@@ -1876,6 +2257,7 @@ fn decide_live(
     cfg: &TradingConfig,
     entry_cutoff: bool,
     retry_window: bool,
+    gate: &EntryGate,
 ) -> Option<LiveAction> {
     if pos.live_halt.is_some() || pos.resolved_order.is_none() {
         return None;
@@ -1915,6 +2297,12 @@ fn decide_live(
                 // In flight — the order book decides what happened.
                 return None;
             }
+            // The call has outlived its validity window without being bought.
+            // Checked only once nothing is in flight: an entry already sent was
+            // triggered inside the window, and is the order book's to settle.
+            if let Some(reason) = call_expired_reason(pos, cfg, &gate.now_ts) {
+                return Some(LiveAction::AbandonEntry { reason, loud: false });
+            }
             // Every send of this entry failed before the broker gave a verdict
             // and every follow-up hunt came up empty. Stop trying.
             if pos.entry_attempts >= shared_domain::MAX_ENTRY_ATTEMPTS {
@@ -1939,7 +2327,23 @@ fn decide_live(
                 });
             }
             let lot = lot_size_of(pos);
-            let qty = compute_entry_qty(&pos.signal, lot, pos.override_qty, cfg, Some(ltp));
+            // The VWAP + PCR gate is read here, at the moment of buying (and
+            // again on any retry), not when the call arrived.
+            let (qty, sizing_note, topup_eligible) = match size_entry(pos, lot, cfg, ltp, gate) {
+                EntrySizing::Buy { qty, note, topup_eligible } => (qty, note, topup_eligible),
+                // Nothing is sent. The call stays waiting and is re-read on
+                // every tick; the log line goes out once per reading.
+                EntrySizing::Wait { reason } => {
+                    return (pos.sizing.hold_note.as_deref() != Some(reason.as_str()))
+                        .then_some(LiveAction::HoldEntry { reason });
+                }
+                EntrySizing::Skip { reason } => {
+                    return Some(LiveAction::AbandonEntry {
+                        reason: format!("INDICATOR_SKIP — {reason}"),
+                        loud: false,
+                    });
+                }
+            };
             if qty <= 0 || qty % lot != 0 {
                 return Some(LiveAction::AbandonEntry {
                     reason: format!("invalid quantity {qty} for lot size {lot}"),
@@ -1963,7 +2367,7 @@ fn decide_live(
             } else {
                 None
             };
-            Some(LiveAction::PlaceEntry { qty, ltp, limit_price })
+            Some(LiveAction::PlaceEntry { qty, ltp, limit_price, sizing_note, topup_eligible })
         }
 
         TradeState::Active | TradeState::Target1Hit => {
@@ -2030,7 +2434,10 @@ fn decide_live(
                 TradeState::Active => {
                     let t1 = *pos.signal.targets.first()?;
                     if ltp < t1 {
-                        return None;
+                        // Nothing to exit. The only other thing an Active
+                        // position can do is the indicator top-up — reached
+                        // only after every exit check above came up empty.
+                        return decide_topup(pos, cfg, ltp, gate, entry_cutoff);
                     }
                     let lot = lot_size_of(pos);
                     // One-lot runner: selling one lot at target 1 would leave
@@ -2115,6 +2522,33 @@ fn decide_live(
     }
 }
 
+/// LIVE side of the indicator top-up: [`topup_sizing`] plus the send limits —
+/// at most [`shared_domain::MAX_ENTRY_ATTEMPTS`] sends per call, spaced by
+/// [`ENTRY_RETRY_THROTTLE`], as an IOC limit once a market send was refused.
+fn decide_topup(
+    pos: &MonitoredPosition,
+    cfg: &TradingConfig,
+    ltp: f64,
+    gate: &EntryGate,
+    entry_cutoff: bool,
+) -> Option<LiveAction> {
+    if pos.sizing.topup_attempts >= shared_domain::MAX_ENTRY_ATTEMPTS {
+        return None;
+    }
+    let (qty, note) = topup_sizing(pos, lot_size_of(pos), cfg, ltp, gate, entry_cutoff)?;
+    if let Some(elapsed) = secs_since_ist(&pos.sizing.topup_attempt_at) {
+        if elapsed < ENTRY_RETRY_THROTTLE.as_secs() as i64 {
+            return None;
+        }
+    }
+    let limit_price = if pos.sizing.topup_retry_as_limit {
+        entry_retry_limit_price(&pos.signal, cfg, ltp, pos.tick_size)
+    } else {
+        None
+    };
+    Some(LiveAction::TopUp { qty, ltp, limit_price, note })
+}
+
 // ---------------------------------------------------------------------------
 // LIVE mode — execution pass
 // ---------------------------------------------------------------------------
@@ -2127,6 +2561,9 @@ struct LiveCtx {
     entry_order_id: Option<String>,
     entry_cancel_sent: bool,
     sl_order_id: Option<String>,
+    /// Indicator top-up buy still at the broker, if any.
+    topup_order_id: Option<String>,
+    topup_cancel_sent: bool,
     executed_qty: i32,
     tick_size: f64,
     /// LTP-map key, for pricing an IOC limit fallback when a market order is
@@ -2161,6 +2598,24 @@ async fn exec_exit_all(
 ) {
     if qty <= 0 {
         return;
+    }
+
+    // A top-up buy still at the broker must not outlive a full exit. Ask for
+    // it to be cancelled (once), and mark it so that whatever it has filled or
+    // still fills is squared off as soon as the order book settles it. This
+    // never delays the sell below: a buy can only add to what we hold.
+    if let Some(topup_id) = &ctx.topup_order_id {
+        with_position(positions, pos_id, |p| {
+            p.sizing.topup_exit_on_fill = true;
+            p.sizing.topup_cancel_sent = true;
+        }).await;
+        if !ctx.topup_cancel_sent {
+            if let Err(e) = kotak_cancel(kotak, topup_id, &ctx.trading_symbol).await {
+                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    "could not cancel in-flight top-up order {topup_id} before the {reason} exit ({e}) — anything it fills will be sold as soon as it settles"
+                )).await;
+            }
+        }
     }
 
     if let Some(sl_id) = &ctx.sl_order_id {
@@ -2350,6 +2805,8 @@ async fn exec_live_action(
             entry_order_id: p.entry_order_id.clone(),
             entry_cancel_sent: p.entry_cancel_sent,
             sl_order_id: p.sl_order_id.clone(),
+            topup_order_id: p.sizing.topup_order_id.clone(),
+            topup_cancel_sent: p.sizing.topup_cancel_sent,
             executed_qty: p.executed_qty,
             tick_size: p.tick_size,
             ws_key: p.ws_scrip_key.clone(),
@@ -2364,11 +2821,13 @@ async fn exec_live_action(
         .filter(|v| *v > 0.0);
 
     match &pending.action {
-        LiveAction::PlaceEntry { qty, ltp, limit_price } => {
+        LiveAction::PlaceEntry { qty, ltp, limit_price, sizing_note, topup_eligible } => {
             // Stamp the attempt time first, so decide_live's throttle spaces
             // out the next pre-flight even if this one bails out below.
             with_position(positions, &pending.pos_id, |p| {
                 p.entry_attempt_at = Some(shared_domain::current_ist_timestamp_string());
+                // How this attempt was sized; read when its fill settles.
+                p.sizing.topup_eligible = *topup_eligible;
             }).await;
 
             // Pre-flight funds check. We must be able to pay for the order and
@@ -2448,6 +2907,7 @@ async fn exec_live_action(
                                 "qty": qty,
                                 "order_type": "IOC_LIMIT",
                                 "limit_price": round2(*lp),
+                                "sizing": sizing_note,
                                 "mode": "LIVE",
                             })).await;
                         }
@@ -2458,6 +2918,7 @@ async fn exec_live_action(
                                 "instrument": ctx.instrument,
                                 "order_id": order_id,
                                 "qty": qty,
+                                "sizing": sizing_note,
                                 "mode": "LIVE",
                             })).await;
                         }
@@ -2522,6 +2983,111 @@ async fn exec_live_action(
                             "entry limit buy for {qty} was rejected: {e} — retrying (attempt {attempts})"
                         )).await;
                     }
+                }
+            }
+        }
+
+        LiveAction::HoldEntry { reason } => {
+            // Nothing is sent to the broker: the call simply keeps waiting.
+            with_position(positions, &pending.pos_id, |p| {
+                p.sizing.hold_note = Some(reason.clone());
+            }).await;
+            tracing::info!(instrument = %ctx.instrument, reason, "LIVE entry held back by the indicator");
+            live_info(db_tx, log_tx, json!({
+                "event": "INDICATOR_WAIT",
+                "instrument": ctx.instrument,
+                "reason": format!("{reason} — still waiting, will buy if the indicator turns while the price is in the buy range"),
+                "mode": "LIVE",
+            })).await;
+        }
+
+        LiveAction::TopUp { qty, ltp, limit_price, note } => {
+            // Every attempt is stamped and counted up front — whatever happens
+            // below, a top-up is tried at most MAX_ENTRY_ATTEMPTS times per
+            // call and never more often than the retry throttle allows. No
+            // failure here touches the position that is already open.
+            with_position(positions, &pending.pos_id, |p| {
+                p.sizing.topup_attempt_at = Some(shared_domain::current_ist_timestamp_string());
+                p.sizing.topup_attempts += 1;
+            }).await;
+
+            // Same pre-flight as an entry: pay for the order and keep the buffer.
+            let price_for_funds = limit_price.unwrap_or(*ltp);
+            let order_value = *qty as f64 * price_for_funds;
+            let required = order_value + FUNDS_BUFFER_INR;
+            match kotak_limits(kotak).await {
+                Ok(limits) if limits.net < required => {
+                    with_position(positions, &pending.pos_id, |p| p.sizing.topup_base_qty = None).await;
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "not enough funds to top up {qty} @ ~₹{ltp:.2}: needs ₹{required:.2} (₹{order_value:.2} order + ₹{FUNDS_BUFFER_INR:.0} buffer) but only ₹{:.2} is available — no top-up, the position is unchanged",
+                        limits.net
+                    )).await;
+                    return true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "could not verify funds before the top-up ({e}) — nothing bought, the position is unchanged"
+                    )).await;
+                    return true;
+                }
+            }
+
+            let order = match limit_price {
+                Some(lp) => build_ioc_limit_order(&ctx.base, shared_domain::TransactionType::Buy, *qty, *lp),
+                None => build_market_order(
+                    &ctx.base, shared_domain::TransactionType::Buy, *qty,
+                    cfg.entry_market_protection,
+                ),
+            };
+            match kotak_place(kotak, &order).await {
+                Ok(order_id) => {
+                    with_position(positions, &pending.pos_id, |p| {
+                        p.sizing.topup_order_id = Some(order_id.clone());
+                        p.sizing.topup_cancel_sent = false;
+                        p.sizing.topup_exit_on_fill = false;
+                    }).await;
+                    tracing::info!(instrument = %ctx.instrument, %order_id, qty, "LIVE top-up buy placed");
+                    live_info(db_tx, log_tx, json!({
+                        "event": "LIVE_TOPUP_PLACED",
+                        "instrument": ctx.instrument,
+                        "order_id": order_id,
+                        "qty": qty,
+                        "order_type": if limit_price.is_some() { "IOC_LIMIT" } else { "MARKET" },
+                        "limit_price": limit_price.map(round2),
+                        "sizing": note,
+                        "mode": "LIVE",
+                    })).await;
+                }
+                Err(e) if e.is_session_expired() => {
+                    // Provably not placed. May be retried within the cap.
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "top-up order not sent — Kotak session expired ({e}); nothing bought, the position is unchanged"
+                    )).await;
+                }
+                Err(e) if e.is_ambiguous() => {
+                    // No verdict: the buy MAY be live. The engine does not
+                    // guess — it keeps managing exactly the quantity it knows
+                    // it holds (so it can never sell more than that) and makes
+                    // no further top-up attempt for this call.
+                    with_position(positions, &pending.pos_id, |p| p.sizing.topup_base_qty = None).await;
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "top-up buy of {qty} got no broker verdict ({e}) — it MAY have been bought at Kotak. The engine is NOT tracking it: it still manages {} and will not sell the extra. Check your broker app now and square off or adopt any extra quantity yourself",
+                        ctx.executed_qty
+                    )).await;
+                }
+                Err(e) if limit_price.is_none() => {
+                    // Market buy refused by the RMS (the post-open `Not_Ok`):
+                    // any retry goes in as an IOC limit inside the buy range.
+                    with_position(positions, &pending.pos_id, |p| p.sizing.topup_retry_as_limit = true).await;
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "top-up market buy for {qty} was rejected: {e} — nothing bought; any retry will be an IOC limit inside the buy range"
+                    )).await;
+                }
+                Err(e) => {
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "top-up limit buy for {qty} was rejected: {e} — nothing bought, the position is unchanged"
+                    )).await;
                 }
             }
         }
@@ -2703,6 +3269,7 @@ async fn live_tick(
     ltp_map: &Arc<DashMap<String, f64>>,
     cfg: &TradingConfig,
     last_poll: &mut Instant,
+    gate: &EntryGate,
 ) {
     let mut mutated = false;
 
@@ -2755,7 +3322,7 @@ async fn live_tick(
         let g = positions.read().await;
         g.iter()
             .filter_map(|p| {
-                decide_live(p, ltp_map, cfg, entry_cutoff, poll_due)
+                decide_live(p, ltp_map, cfg, entry_cutoff, poll_due, gate)
                     .map(|action| LivePending { pos_id: p.id.clone(), action })
             })
             .collect()
@@ -2776,7 +3343,7 @@ async fn live_tick(
                 .as_ref()
                 .map(|o| o.trading_symbol.clone())
                 .unwrap_or_default();
-            for oid in [&p.entry_order_id, &p.sl_order_id, &p.pending_exit_order_id]
+            for oid in [&p.entry_order_id, &p.sl_order_id, &p.pending_exit_order_id, &p.sizing.topup_order_id]
                 .into_iter()
                 .flatten()
             {
@@ -2835,6 +3402,7 @@ pub async fn start_position_monitor(
     scrip_store: Arc<RwLock<Option<crate::scrip_master::ScripStore>>>,
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
     kotak: Arc<tokio::sync::Mutex<Option<KotakClient>>>,
+    indicator_feed: IndicatorFeed,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3313,6 +3881,8 @@ pub async fn start_position_monitor(
                                     entry_retry_as_limit: false,
                                     live_halt: None,
                                     entry_zone: None,
+                                    call_expires_at: None,
+                                    sizing: Default::default(),
                                 });
                                 let snapshot = pos_guard.clone();
                                 drop(pos_guard);
@@ -3361,7 +3931,8 @@ pub async fn start_position_monitor(
                     // instead of silently trading blind.
                     if !startup_reconciled { continue; }
                     if positions.read().await.is_empty() { continue; }
-                    live_tick(&positions, &kotak, &db_tx, &log_tx, &ltp_map, &cfg, &mut last_live_poll).await;
+                    let gate = EntryGate::new(&indicator_feed);
+                    live_tick(&positions, &kotak, &db_tx, &log_tx, &ltp_map, &cfg, &mut last_live_poll, &gate).await;
                     continue;
                 }
 
@@ -3370,6 +3941,7 @@ pub async fn start_position_monitor(
 
                 let cfg = config.read().await;
                 let entry_cutoff = is_entry_cutoff_passed();
+                let gate = EntryGate::new(&indicator_feed);
                 let mut pending: Vec<Pending> = Vec::new();
                 let mut positions_mutated = false;
 
@@ -3421,6 +3993,10 @@ pub async fn start_position_monitor(
                             });
                             continue;
                         }
+                        if let Some(reason) = call_expired_reason(pos, &cfg, &gate.now_ts) {
+                            pending.push(Pending { idx: i, ltp: 0.0, action: PosAction::Expire { reason } });
+                            continue;
+                        }
                     }
 
                     let lookup_key = pos.ws_scrip_key.as_ref().unwrap_or(&pos.signal.instrument_name);
@@ -3468,14 +4044,22 @@ pub async fn start_position_monitor(
                                     .filter(|v| *v > 0)
                                     .unwrap_or(1);
 
-                                let qty = compute_entry_qty(&pos.signal, lot_size, pos.override_qty, &cfg, Some(ltp));
+                                // VWAP + PCR gate, read at the moment of buying.
+                                let (qty, note, topup_eligible) = match size_entry(pos, lot_size, &cfg, ltp, &gate) {
+                                    EntrySizing::Buy { qty, note, topup_eligible } => (qty, note, topup_eligible),
+                                    // Keep waiting; Pass 2 logs it once per reading.
+                                    EntrySizing::Wait { reason } => return PosAction::Hold { reason },
+                                    EntrySizing::Skip { reason } => {
+                                        return PosAction::Expire { reason: format!("INDICATOR_SKIP — {reason}") };
+                                    }
+                                };
 
                                 if qty <= 0 || qty % lot_size != 0 {
                                     PosAction::Cancel {
                                         reason: format!("Invalid quantity {}, must be positive multiple of lot size {}", qty, lot_size)
                                     }
                                 } else {
-                                    PosAction::EntryBuy { qty }
+                                    PosAction::EntryBuy { qty, note, topup_eligible }
                                 }
                             })
                         }
@@ -3525,7 +4109,12 @@ pub async fn start_position_monitor(
                                     new_sl,
                                     exec_price: None,
                                 })
-                            } else { None }
+                            } else {
+                                // Nothing to exit — the only other thing an
+                                // Active position can do is the indicator top-up.
+                                topup_sizing(pos, lot_size_of(pos), &cfg, ltp, &gate, entry_cutoff)
+                                    .map(|(qty, note)| PosAction::TopUpBuy { qty, note })
+                            }
                         }
 
                         TradeState::Target1Hit => {
@@ -3562,13 +4151,66 @@ pub async fn start_position_monitor(
                     let instrument = pos.signal.instrument_name.clone();
 
                     match pa.action {
-                        PosAction::EntryBuy { qty } => {
+                        PosAction::Hold { reason } => {
+                            if pos.sizing.hold_note.as_deref() != Some(reason.as_str()) {
+                                let msg = json!({
+                                    "event": "INDICATOR_WAIT",
+                                    "instrument": instrument,
+                                    "reason": format!("{reason} — still waiting, will buy if the indicator turns while the price is in the buy range"),
+                                    "mode": cfg.mode.as_str(),
+                                });
+                                pos.sizing.hold_note = Some(reason);
+                                positions_mutated = true;
+                                send_log(&db_tx, &log_tx, "INFO", &msg.to_string()).await;
+                            }
+                        }
+
+                        PosAction::TopUpBuy { qty, note } => {
+                            let fees = FeeCalculator::calculate(
+                                qty, pa.ltp, "BUY", is_options, cfg.brokerage_per_order,
+                            );
+                            let held = pos.executed_qty;
+                            let total = held + qty;
+                            pos.avg_buy_price =
+                                (pos.avg_buy_price * held as f64 + pa.ltp * qty as f64) / total as f64;
+                            pos.executed_qty = total;
+                            pos.sizing.topup_base_qty = None;
+                            positions_mutated = true;
+
+                            let msg = json!({
+                                "event": "TOPUP",
+                                "instrument": instrument,
+                                "price": round2(pa.ltp),
+                                "qty": qty,
+                                "holding": total,
+                                "net_cost": round2(fees.net_value),
+                                "note": note,
+                                "mode": cfg.mode.as_str(),
+                            });
+                            tracing::info!(instrument = %instrument, price = pa.ltp, qty, total, "Top-up executed");
+                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some("TOPUP".to_string()), &cfg.mode).await;
+                            send_log(&db_tx, &log_tx, "INFO", &msg.to_string()).await;
+                        }
+
+                        PosAction::EntryBuy { qty, note, topup_eligible } => {
+                            if let Some(note) = note {
+                                let msg = json!({
+                                    "event": "INDICATOR_SIZING",
+                                    "instrument": instrument,
+                                    "qty": qty,
+                                    "note": note,
+                                    "mode": cfg.mode.as_str(),
+                                });
+                                send_log(&db_tx, &log_tx, "INFO", &msg.to_string()).await;
+                            }
                             let fees = FeeCalculator::calculate(
                                 qty, pa.ltp, "BUY", is_options, cfg.brokerage_per_order,
                             );
                             pos.avg_buy_price = pa.ltp;
                             pos.executed_qty   = qty;
                             pos.state          = TradeState::Active;
+                            pos.sizing.topup_base_qty = topup_eligible.then_some(qty);
+                            pos.sizing.hold_note = None;
                             positions_mutated = true;
 
                             let msg = format!(
@@ -3622,10 +4264,14 @@ pub async fn start_position_monitor(
                         PosAction::Expire { reason } => {
                             pos.state = TradeState::Closed;
                             positions_mutated = true;
-                            let msg = format!(
-                                r#"{{"event":"ENTRY_ABANDONED","instrument":"{}","reason":"{}"}}"#,
-                                instrument, reason
-                            );
+                            // Built with json! so a reason containing quotes
+                            // (indicator / expiry explanations) stays valid JSON.
+                            let msg = json!({
+                                "event": "ENTRY_ABANDONED",
+                                "instrument": instrument,
+                                "reason": reason,
+                            })
+                            .to_string();
                             tracing::info!(instrument = %instrument, reason = %reason, "Waiting position dropped");
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
                         }
@@ -3709,6 +4355,8 @@ mod tests {
             entry_retry_as_limit: false,
             live_halt: None,
             entry_zone: None,
+            call_expires_at: None,
+            sizing: Default::default(),
         }
     }
 
@@ -3788,7 +4436,27 @@ mod tests {
             pre_t1_trail_factor: 0.5,
             kill_switch_active: false,
             entry_window_pct: 0.0,
+            indicator_sizing: false,
+            indicator_agree_multiplier: 1.5,
+            indicator_neutral_multiplier: 0.5,
+            indicator_interval_min: 15,
+            indicator_basis: "chg".into(),
+            indicator_strike_window: 10,
+            indicator_pcr_buy_above: 1.0,
+            indicator_pcr_sell_below: 1.0,
+            indicator_vwap_band_pct: 0.0,
+            // Off in the shared helper so the older tests keep testing exactly
+            // what they did; the call-validity tests switch it on themselves.
+            call_validity_minutes: 0,
+            indicator_early_checks: false,
+            indicator_wait_on_disagree: false,
+            indicator_topup: false,
         }
+    }
+
+    /// An entry gate with an empty indicator feed at the real current time.
+    fn test_gate() -> EntryGate {
+        EntryGate::new(&entry_gate::new_indicator_feed())
     }
 
     #[test]
@@ -3939,7 +4607,7 @@ mod tests {
         let ltp = Arc::new(DashMap::new());
         let pos = live_waiting_position(&ltp);
         assert!(matches!(
-            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true),
+            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true, &test_gate()),
             Some(LiveAction::PlaceEntry { .. })
         ));
     }
@@ -4000,7 +4668,7 @@ mod tests {
         let mut pos = live_waiting_position(&ltp);
         pos.entry_send_uncertain = true;
         pos.force_exit = Some("USER_EXIT".to_string());
-        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), true, true).is_none());
+        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), true, true, &test_gate()).is_none());
     }
 
     #[test]
@@ -4009,14 +4677,14 @@ mod tests {
         let mut pos = live_waiting_position(&ltp);
         // An attempt a moment ago blocks another on this tick.
         pos.entry_attempt_at = Some(shared_domain::current_ist_timestamp_string());
-        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true).is_none());
+        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true, &test_gate()).is_none());
         // One from well before the throttle window does not.
         let stale = (shared_domain::now_ist() - chrono::Duration::seconds(10))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         pos.entry_attempt_at = Some(stale);
         assert!(matches!(
-            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true),
+            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true, &test_gate()),
             Some(LiveAction::PlaceEntry { .. })
         ));
     }
@@ -4026,7 +4694,7 @@ mod tests {
         let ltp = Arc::new(DashMap::new());
         let mut pos = live_waiting_position(&ltp);
         pos.entry_attempts = shared_domain::MAX_ENTRY_ATTEMPTS;
-        match decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true) {
+        match decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true, &test_gate()) {
             Some(LiveAction::AbandonEntry { loud, .. }) => assert!(loud),
             other => panic!("expected a loud AbandonEntry, got {other:?}"),
         }
@@ -4058,14 +4726,14 @@ mod tests {
         let cfg = cfg_with_lots(1, 3);
 
         // Normal first attempt is a plain market buy.
-        match decide_live(&pos, &ltp, &cfg, false, true) {
+        match decide_live(&pos, &ltp, &cfg, false, true, &test_gate()) {
             Some(LiveAction::PlaceEntry { limit_price, .. }) => assert_eq!(limit_price, None),
             other => panic!("expected a market PlaceEntry, got {other:?}"),
         }
 
         // After a market rejection the retry carries an IOC limit price.
         pos.entry_retry_as_limit = true;
-        match decide_live(&pos, &ltp, &cfg, false, true) {
+        match decide_live(&pos, &ltp, &cfg, false, true, &test_gate()) {
             Some(LiveAction::PlaceEntry { limit_price: Some(p), .. }) => {
                 assert!((p - 127.05).abs() < 1e-6, "got {p}");
             }
@@ -4075,7 +4743,7 @@ mod tests {
         // A price that no longer satisfies the trigger stops the retries —
         // decide_live re-checks entry_triggered before every limit send.
         ltp.insert("nse_fo|999".to_string(), 119.0);
-        assert!(decide_live(&pos, &ltp, &cfg, false, true).is_none());
+        assert!(decide_live(&pos, &ltp, &cfg, false, true, &test_gate()).is_none());
     }
 
     /// A LIVE position holding one 75-lot at avg 120 with LTP at target 1
@@ -4102,7 +4770,7 @@ mod tests {
         let pos = live_one_lot_at_target1(&ltp);
 
         // Default: dynamic targeting sells its one lot, leaving nothing to run.
-        match decide_live(&pos, &ltp, &dynamic_cfg(false), false, true) {
+        match decide_live(&pos, &ltp, &dynamic_cfg(false), false, true, &test_gate()) {
             Some(LiveAction::ExitAll { qty, reason }) => {
                 assert_eq!(qty, 75);
                 assert_eq!(reason, "TGT1_FULL");
@@ -4113,7 +4781,7 @@ mod tests {
         // Opted in: nothing is sold, the whole lot rides the ladder with the
         // stop at 140 - 20*0.5 = 130 and the next rung at 140 + 20*1.0 = 160.
         assert_eq!(
-            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true),
+            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true, &test_gate()),
             Some(LiveAction::Target1 {
                 slice: 0,
                 keep: 75,
@@ -4127,7 +4795,7 @@ mod tests {
         let mut cfg = dynamic_cfg(true);
         cfg.dynamic_targeting = false;
         assert!(matches!(
-            decide_live(&pos, &ltp, &cfg, false, true),
+            decide_live(&pos, &ltp, &cfg, false, true, &test_gate()),
             Some(LiveAction::ExitAll { .. })
         ));
     }
@@ -4139,7 +4807,7 @@ mod tests {
         // Two lots: still sells exactly one lot at target 1, as before.
         let mut pos = live_one_lot_at_target1(&ltp);
         pos.executed_qty = 150;
-        match decide_live(&pos, &ltp, &dynamic_cfg(true), false, true) {
+        match decide_live(&pos, &ltp, &dynamic_cfg(true), false, true, &test_gate()) {
             Some(LiveAction::Target1 { slice, keep, .. }) => {
                 assert_eq!((slice, keep), (75, 75));
             }
@@ -4151,7 +4819,7 @@ mod tests {
         let mut pos = live_one_lot_at_target1(&ltp);
         pos.avg_buy_price = 140.0;
         assert!(matches!(
-            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true),
+            decide_live(&pos, &ltp, &dynamic_cfg(true), false, true, &test_gate()),
             Some(LiveAction::ExitAll { .. })
         ));
     }
@@ -4170,18 +4838,18 @@ mod tests {
 
         // Between the stop and the next rung: hold.
         ltp.insert("nse_fo|999".to_string(), 150.0);
-        assert!(decide_live(&pos, &ltp, &cfg, false, true).is_none());
+        assert!(decide_live(&pos, &ltp, &cfg, false, true, &test_gate()).is_none());
 
         // Next rung: trail to 150, extend to 180 — no sell.
         ltp.insert("nse_fo|999".to_string(), 160.0);
         assert_eq!(
-            decide_live(&pos, &ltp, &cfg, false, true),
+            decide_live(&pos, &ltp, &cfg, false, true, &test_gate()),
             Some(LiveAction::TrailDynamic { new_sl: 150.0, next_target: 180.0, rung_hit: 160.0 })
         );
 
         // Back through the trailed stop: sell the whole lot.
         ltp.insert("nse_fo|999".to_string(), 129.0);
-        match decide_live(&pos, &ltp, &cfg, false, true) {
+        match decide_live(&pos, &ltp, &cfg, false, true, &test_gate()) {
             Some(LiveAction::ExitAll { qty, reason }) => {
                 assert_eq!(qty, 75);
                 assert_eq!(reason, "TRAIL_SL_HIT");
@@ -4350,7 +5018,7 @@ mod tests {
         let ltp_map = Arc::new(DashMap::new());
         ltp_map.insert("NIFTY".to_string(), 125.0);
 
-        let action = decide_live(&pos, &ltp_map, &cfg, false, false);
+        let action = decide_live(&pos, &ltp_map, &cfg, false, false, &test_gate());
         assert_eq!(
             action,
             Some(LiveAction::AbandonEntry {
@@ -4374,7 +5042,7 @@ mod tests {
         let ltp_map = Arc::new(DashMap::new());
         ltp_map.insert("NIFTY".to_string(), 125.0);
 
-        let action = decide_live(&pos, &ltp_map, &cfg, false, false);
+        let action = decide_live(&pos, &ltp_map, &cfg, false, false, &test_gate());
         assert!(matches!(action, Some(LiveAction::PlaceEntry { .. })));
     }
 
@@ -4389,7 +5057,7 @@ mod tests {
         let ltp_map = Arc::new(DashMap::new());
         ltp_map.insert("NIFTY".to_string(), 130.0);
 
-        let action = decide_live(&pos, &ltp_map, &cfg, false, false);
+        let action = decide_live(&pos, &ltp_map, &cfg, false, false, &test_gate());
         assert_eq!(
             action,
             Some(LiveAction::ExitAll {
@@ -4397,5 +5065,357 @@ mod tests {
                 reason: "KILL_SWITCH".to_string(),
             })
         );
+    }
+
+    // ── Entry gate: indicator sizing + call validity ─────────────────── //
+
+    fn ist_today() -> String {
+        shared_domain::today_ist().format("%Y-%m-%d").to_string()
+    }
+
+    /// A gate whose feed holds one closed 11:01 check for `index` (+2 BUY or
+    /// −2 SELL) and whose clock reads 11:05 today.
+    fn gate_with(index: &str, bullish: bool) -> EntryGate {
+        let feed = entry_gate::new_indicator_feed();
+        let (call_chg, put_chg, fut) = if bullish { (100.0, 200.0, 25_100.0) } else { (200.0, 100.0, 24_900.0) };
+        entry_gate::feed_push(
+            &feed,
+            index,
+            vec![entry_gate::OiMinute {
+                ts: format!("{} 11:01:02", ist_today()),
+                strike_window: 10,
+                call_oi: 1_000.0,
+                put_oi: 1_000.0,
+                call_oi_chg: call_chg,
+                put_oi_chg: put_chg,
+                spot: 25_000.0,
+                fut_ltp: Some(fut),
+                fut_vwap: Some(25_000.0),
+            }],
+        );
+        EntryGate { feed, now_ts: format!("{} 11:05:00", ist_today()) }
+    }
+
+    fn sizing_cfg(lots: i32) -> TradingConfig {
+        let mut cfg = cfg_with_lots(lots, lots);
+        cfg.indicator_sizing = true;
+        cfg
+    }
+
+    #[test]
+    fn indicator_sizing_off_leaves_the_quantity_untouched() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_waiting_position(&ltp); // BUY NIFTY CE, lot 75
+        assert_eq!(
+            size_entry(&pos, 75, &cfg_with_lots(2, 2), 121.0, &gate_with("NIFTY", false)),
+            EntrySizing::Buy { qty: 150, note: None, topup_eligible: false }
+        );
+    }
+
+    #[test]
+    fn indicator_agreeing_scales_up_and_no_reading_scales_down() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_waiting_position(&ltp); // BUY NIFTY CE
+        match size_entry(&pos, 75, &sizing_cfg(2), 121.0, &gate_with("NIFTY", true)) {
+            EntrySizing::Buy { qty, note, .. } => {
+                assert_eq!(qty, 3 * 75);
+                let note = note.expect("a sizing note");
+                assert!(note.contains("agrees with BUY CE") && note.contains("2 → 3 lot(s)"), "{note}");
+            }
+            other => panic!("expected a scaled-up buy, got {other:?}"),
+        }
+        // Empty feed → no fresh reading → treated as neutral (0.5×): 2 lots → 1.
+        match size_entry(&pos, 75, &sizing_cfg(2), 121.0, &test_gate()) {
+            EntrySizing::Buy { qty, note, .. } => {
+                assert_eq!(qty, 75);
+                assert!(note.expect("a sizing note").contains("no fresh reading"));
+            }
+            other => panic!("expected a scaled-down buy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indicator_disagreeing_skips_the_call_and_says_why() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_waiting_position(&ltp); // BUY NIFTY CE
+        let bearish = gate_with("NIFTY", false);
+        match decide_live(&pos, &ltp, &sizing_cfg(1), false, true, &bearish) {
+            Some(LiveAction::AbandonEntry { reason, loud }) => {
+                assert!(!loud);
+                assert!(reason.starts_with("INDICATOR_SKIP"), "{reason}");
+                assert!(reason.contains("-2 SELL at the 11:01 check"), "{reason}");
+                assert!(reason.contains("disagrees with BUY CE"), "{reason}");
+            }
+            other => panic!("expected the call to be skipped, got {other:?}"),
+        }
+        // The same bearish reading agrees with a PE call: 2 lots × 1.5 → 3.
+        let mut put = pos.clone();
+        put.signal.option_type = Some("PE".to_string());
+        assert!(matches!(
+            decide_live(&put, &ltp, &sizing_cfg(2), false, true, &bearish),
+            Some(LiveAction::PlaceEntry { qty: 225, .. })
+        ));
+    }
+
+    #[test]
+    fn a_manual_override_is_never_scaled_but_still_skipped_on_disagreement() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        pos.override_qty = Some(4);
+        match size_entry(&pos, 75, &sizing_cfg(1), 121.0, &gate_with("NIFTY", true)) {
+            EntrySizing::Buy { qty, note, .. } => {
+                assert_eq!(qty, 4 * 75);
+                assert!(note.expect("a sizing note").contains("manual qty override kept"));
+            }
+            other => panic!("expected the override untouched, got {other:?}"),
+        }
+        assert!(matches!(
+            size_entry(&pos, 75, &sizing_cfg(1), 121.0, &gate_with("NIFTY", false)),
+            EntrySizing::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn other_names_follow_nifty_but_banknifty_reads_its_own_index() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        let nifty_bearish = gate_with("NIFTY", false);
+        for name in ["RELIANCE", "FINNIFTY", "BANKEX"] {
+            pos.signal.instrument_name = name.to_string();
+            assert!(
+                matches!(size_entry(&pos, 75, &sizing_cfg(1), 121.0, &nifty_bearish), EntrySizing::Skip { .. }),
+                "{name} should follow NIFTY"
+            );
+        }
+        // BANKNIFTY has no data in this feed → no fresh reading → neutral, 1 lot.
+        pos.signal.instrument_name = "BANKNIFTY".to_string();
+        assert!(matches!(
+            size_entry(&pos, 75, &sizing_cfg(1), 121.0, &nifty_bearish),
+            EntrySizing::Buy { qty: 75, .. }
+        ));
+    }
+
+    #[test]
+    fn an_unbought_call_expires_after_its_validity_window() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        pos.created_at = format!("{} 09:30:00", ist_today());
+        let mut cfg = cfg_with_lots(1, 1);
+        cfg.call_validity_minutes = 120;
+        let at = |hms: &str| EntryGate {
+            feed: entry_gate::new_indicator_feed(),
+            now_ts: format!("{} {hms}", ist_today()),
+        };
+
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &at("11:29:59")),
+            Some(LiveAction::PlaceEntry { .. })
+        ));
+        match decide_live(&pos, &ltp, &cfg, false, true, &at("11:30:00")) {
+            Some(LiveAction::AbandonEntry { reason, loud: false }) => {
+                assert!(reason.starts_with("CALL_EXPIRED"), "{reason}");
+                assert!(reason.contains("received 09:30"), "{reason}");
+            }
+            other => panic!("expected the call to expire, got {other:?}"),
+        }
+        // An entry already sent to the broker was triggered inside the window:
+        // never abandoned by it — the order book settles it.
+        pos.entry_order_id = Some("240101000000001".to_string());
+        assert!(decide_live(&pos, &ltp, &cfg, false, true, &at("12:00:00")).is_none());
+        // 0 switches the rule off.
+        pos.entry_order_id = None;
+        cfg.call_validity_minutes = 0;
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &at("15:00:00")),
+            Some(LiveAction::PlaceEntry { .. })
+        ));
+    }
+
+    // ── Entry gate: wait on disagreement + aggressive top-up ─────────── //
+
+    #[test]
+    fn a_disagreeing_indicator_keeps_the_call_waiting_when_asked_to() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp); // BUY NIFTY CE, in range at 121
+        let mut cfg = sizing_cfg(2);
+        cfg.indicator_wait_on_disagree = true;
+        let bearish = gate_with("NIFTY", false);
+
+        // Nothing is bought and nothing is dropped; the reason is logged once.
+        let reason = match decide_live(&pos, &ltp, &cfg, false, true, &bearish) {
+            Some(LiveAction::HoldEntry { reason }) => reason,
+            other => panic!("expected the call to be held, got {other:?}"),
+        };
+        assert!(reason.contains("disagrees with BUY CE"), "{reason}");
+        pos.sizing.hold_note = Some(reason);
+        assert!(decide_live(&pos, &ltp, &cfg, false, true, &bearish).is_none());
+
+        // The reading turns: the same waiting call is now bought, at ×1.5.
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &gate_with("NIFTY", true)),
+            Some(LiveAction::PlaceEntry { qty: 225, topup_eligible: false, .. })
+        ));
+        // ...or at ×0.5 once it is merely neutral (no fresh reading here).
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &test_gate()),
+            Some(LiveAction::PlaceEntry { qty: 75, topup_eligible: true, .. })
+        ));
+        // A held call still dies with its validity window.
+        cfg.call_validity_minutes = 120;
+        pos.created_at = format!("{} 09:00:00", ist_today());
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &bearish),
+            Some(LiveAction::AbandonEntry { .. })
+        ));
+    }
+
+    /// An open BUY NIFTY CE (entry 120, SL 100, T1 140) holding one 75-lot
+    /// bought at the NEUTRAL size, with the price back in the buy range.
+    fn neutral_sized_position(ltp_map: &Arc<DashMap<String, f64>>) -> MonitoredPosition {
+        let mut pos = live_waiting_position(ltp_map);
+        pos.state = TradeState::Active;
+        pos.executed_qty = 75;
+        pos.avg_buy_price = 121.0;
+        pos.sizing.topup_base_qty = Some(75);
+        pos
+    }
+
+    fn topup_cfg() -> TradingConfig {
+        let mut cfg = sizing_cfg(2); // 2 lots: neutral buys 1, agree wants 3
+        cfg.indicator_topup = true;
+        cfg
+    }
+
+    #[test]
+    fn top_up_buys_the_difference_once_the_indicator_agrees() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = neutral_sized_position(&ltp);
+        let bullish = gate_with("NIFTY", true);
+        match decide_live(&pos, &ltp, &topup_cfg(), false, true, &bullish) {
+            Some(LiveAction::TopUp { qty, limit_price, note, .. }) => {
+                assert_eq!(qty, 150, "1 lot held, 3 wanted → 2 more");
+                assert!(limit_price.is_none());
+                assert!(note.contains("1 → 3 lot(s)"), "{note}");
+            }
+            other => panic!("expected a top-up, got {other:?}"),
+        }
+        // The PAPER path sizes it with the very same function.
+        assert_eq!(topup_sizing(&pos, 75, &topup_cfg(), 121.0, &bullish, false).map(|t| t.0), Some(150));
+    }
+
+    #[test]
+    fn top_up_is_refused_whenever_anything_is_off() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = neutral_sized_position(&ltp);
+        let bullish = gate_with("NIFTY", true);
+        let none = |pos: &MonitoredPosition, cfg: &TradingConfig, gate: &EntryGate, cutoff: bool, why: &str| {
+            assert!(decide_live(pos, &ltp, cfg, cutoff, true, gate).is_none(), "{why}");
+        };
+
+        // Switched off (either switch), kill switch, 15:39 cutoff.
+        let mut cfg = topup_cfg();
+        cfg.indicator_topup = false;
+        none(&pos, &cfg, &bullish, false, "top-up switch off");
+        let mut cfg = topup_cfg();
+        cfg.indicator_sizing = false;
+        none(&pos, &cfg, &bullish, false, "indicator sizing off");
+        let mut cfg = topup_cfg();
+        cfg.kill_switch_active = true;
+        none(&pos, &cfg, &bullish, false, "kill switch");
+        none(&pos, &topup_cfg(), &bullish, true, "past the entry cutoff");
+
+        // The indicator is still neutral — or has turned against the call.
+        // Against is the important one: it must never sell, only not buy.
+        none(&pos, &topup_cfg(), &test_gate(), false, "still neutral");
+        none(&pos, &topup_cfg(), &gate_with("NIFTY", false), false, "indicator against an open position");
+
+        // The call outlived its validity window.
+        let mut cfg = topup_cfg();
+        cfg.call_validity_minutes = 120;
+        let mut old = pos.clone();
+        old.created_at = format!("{} 09:00:00", ist_today()); // gate clock is 11:05
+        none(&old, &cfg, &bullish, false, "call past its validity");
+
+        // Position not in the state the rule requires.
+        let mut p = pos.clone();
+        p.sizing.topup_base_qty = None;
+        none(&p, &topup_cfg(), &bullish, false, "not bought at the neutral size / already topped up");
+        let mut p = pos.clone();
+        p.executed_qty = 150;
+        none(&p, &topup_cfg(), &bullish, false, "holding changed since the entry");
+        let mut p = pos.clone();
+        p.current_sl = 110.0;
+        none(&p, &topup_cfg(), &bullish, false, "stop already trailed");
+        let mut p = pos.clone();
+        p.override_qty = Some(1);
+        none(&p, &topup_cfg(), &bullish, false, "manual qty override");
+        let mut p = pos.clone();
+        p.sizing.topup_order_id = Some("1".to_string());
+        none(&p, &topup_cfg(), &bullish, false, "a top-up order is already in flight");
+        let mut p = pos.clone();
+        p.sizing.topup_attempts = shared_domain::MAX_ENTRY_ATTEMPTS;
+        none(&p, &topup_cfg(), &bullish, false, "attempt cap reached");
+        let mut p = pos.clone();
+        p.sizing.topup_attempt_at = Some(shared_domain::current_ist_timestamp_string());
+        none(&p, &topup_cfg(), &bullish, false, "retry throttle");
+        let mut p = pos.clone();
+        p.state = TradeState::Target1Hit;
+        none(&p, &topup_cfg(), &bullish, false, "after target 1");
+
+        // Price outside the buy range: below the trigger, or past a window's far edge.
+        ltp.insert("nse_fo|999".to_string(), 119.0);
+        none(&pos, &topup_cfg(), &bullish, false, "below the entry trigger");
+        let mut cfg = topup_cfg();
+        cfg.entry_window_pct = 25.0; // buy range [120, 125]
+        ltp.insert("nse_fo|999".to_string(), 126.0);
+        none(&pos, &cfg, &bullish, false, "past the buy window");
+        ltp.insert("nse_fo|999".to_string(), 124.0);
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &bullish),
+            Some(LiveAction::TopUp { qty: 150, .. })
+        ));
+    }
+
+    #[test]
+    fn exits_always_come_before_a_top_up() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = neutral_sized_position(&ltp);
+        let bullish = gate_with("NIFTY", true);
+        // Stop hit: sell what we hold, whatever the indicator says.
+        ltp.insert("nse_fo|999".to_string(), 99.0);
+        assert!(matches!(
+            decide_live(&pos, &ltp, &topup_cfg(), false, true, &bullish),
+            Some(LiveAction::ExitAll { qty: 75, .. })
+        ));
+        // Target 1 reached: the normal target handling, not a buy.
+        ltp.insert("nse_fo|999".to_string(), 141.0);
+        assert!(!matches!(
+            decide_live(&pos, &ltp, &topup_cfg(), false, true, &bullish),
+            Some(LiveAction::TopUp { .. }) | None
+        ));
+        // A forced exit wins too.
+        ltp.insert("nse_fo|999".to_string(), 121.0);
+        let mut p = pos.clone();
+        p.force_exit = Some("MANUAL_CLOSE".to_string());
+        assert!(matches!(
+            decide_live(&p, &ltp, &topup_cfg(), false, true, &bullish),
+            Some(LiveAction::ExitAll { qty: 75, .. })
+        ));
+    }
+
+    #[test]
+    fn a_refused_market_top_up_retries_as_a_limit_inside_the_buy_range() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = neutral_sized_position(&ltp);
+        pos.sizing.topup_retry_as_limit = true;
+        pos.sizing.topup_attempts = 1;
+        let mut cfg = topup_cfg();
+        cfg.entry_window_pct = 25.0; // buy range [120, 125]
+        match decide_live(&pos, &ltp, &cfg, false, true, &gate_with("NIFTY", true)) {
+            Some(LiveAction::TopUp { qty: 150, limit_price: Some(lp), .. }) => {
+                assert!(lp > 121.0 && lp <= 125.0, "limit {lp} must stay inside the buy range");
+            }
+            other => panic!("expected a limit top-up, got {other:?}"),
+        }
     }
 }

@@ -51,6 +51,76 @@ export interface TradingConfig {
    * `entry ± pct% * (target1 - entry)` and waits for a pull-back into that
    * window. Clamped to [0, 100] on save. */
   entry_window_pct: number;
+  /** Size option entries on the VWAP + PCR indicator at the moment of buying
+   * (parent index's last closed check; BANKNIFTY and SENSEX use their own,
+   * everything else follows NIFTY): agrees → × `indicator_agree_multiplier`,
+   * neutral / no fresh reading → × `indicator_neutral_multiplier`, disagrees →
+   * the call is skipped. Off by default. */
+  indicator_sizing: boolean;
+  /** Lot multiplier when the indicator agrees with the call. [0.1, 5]. */
+  indicator_agree_multiplier: number;
+  /** Lot multiplier when the indicator is neutral or has no fresh reading. [0.1, 5]. */
+  indicator_neutral_multiplier: number;
+  /** Minutes per indicator check: 5, 15, 30 or 60. */
+  indicator_interval_min: number;
+  /** "chg" (change in OI since yesterday's close) or "total" (total OI). */
+  indicator_basis: 'chg' | 'total';
+  /** Strikes each side of ATM counted: 5, 10, 20, or 0 = all. */
+  indicator_strike_window: number;
+  /** Option Signal = BUY when PCR is above this. */
+  indicator_pcr_buy_above: number;
+  /** Option Signal = SELL when PCR is below this. */
+  indicator_pcr_sell_below: number;
+  /** VWAP Signal is neutral within ± this % of VWAP. [0, 5]. */
+  indicator_vwap_band_pct: number;
+  /** A call not bought within this many minutes of arriving is dropped. 0 = off. [0, 390]. */
+  call_validity_minutes: number;
+  /** 09:16 check always NEUTRAL, then 5-min checks until the first regular check. */
+  indicator_early_checks: boolean;
+  /** Disagreeing indicator: keep the call waiting (true) or drop it (false). */
+  indicator_wait_on_disagree: boolean;
+  /** Top a NEUTRAL-sized position up to the agree size once the indicator agrees. */
+  indicator_topup: boolean;
+}
+
+/** `GET /api/market/indicator` — the engine's own verdicts, right now. */
+export interface IndicatorScore {
+  call: number;
+  put: number;
+  ratio: number | null;
+  option: number;
+  vwap: number;
+  overall: number;
+}
+export type IndicatorBias = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+export interface IndicatorReading {
+  index: string;
+  check_time: string;
+  ts: string;
+  score: IndicatorScore;
+  bias: IndicatorBias;
+  /** The 09:16 opening check under the early-check rule: bias is forced NEUTRAL. */
+  opening?: boolean;
+}
+export interface CallVerdict {
+  action: 'SCALE' | 'SKIP' | 'WAIT';
+  multiplier: number | null;
+  base_lots: number;
+  lots: number | null;
+  note: string;
+}
+export interface IndicatorIndex {
+  index: string;
+  reading: IndicatorReading | null;
+  bias: IndicatorBias;
+  ce: CallVerdict;
+  pe: CallVerdict;
+}
+export interface IndicatorPreview {
+  configured: boolean;
+  enabled: boolean;
+  now: string;
+  indices: IndicatorIndex[];
 }
 
 export interface PaperTrade {
@@ -162,6 +232,8 @@ export interface MonitoredPosition {
   /** `[low, high]` premium window the engine will buy a WaitingForEntry row in,
    * from the live `entry_window_pct` config. Absent when the feature is off. */
   entry_zone?: [number, number] | null;
+  /** IST `HH:MM` this still-unbought call stops being valid (call validity window). */
+  call_expires_at?: string | null;
 }
 
 export interface KotakForm {

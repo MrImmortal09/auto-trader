@@ -115,6 +115,28 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         &pool,
         "ALTER TABLE trading_config ADD COLUMN dynamic_targeting_single_lot INTEGER NOT NULL DEFAULT 0",
     ).await;
+    // Entry gate: VWAP + PCR indicator sizing (off by default) and the
+    // Telegram call validity window. Additive columns with defaults, so an
+    // existing database keeps working unchanged — no clearing needed.
+    for sql in [
+        "ALTER TABLE trading_config ADD COLUMN indicator_sizing INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE trading_config ADD COLUMN indicator_agree_multiplier REAL NOT NULL DEFAULT 1.5",
+        "ALTER TABLE trading_config ADD COLUMN indicator_neutral_multiplier REAL NOT NULL DEFAULT 0.5",
+        "ALTER TABLE trading_config ADD COLUMN indicator_interval_min INTEGER NOT NULL DEFAULT 15",
+        "ALTER TABLE trading_config ADD COLUMN indicator_basis TEXT NOT NULL DEFAULT 'chg'",
+        "ALTER TABLE trading_config ADD COLUMN indicator_strike_window INTEGER NOT NULL DEFAULT 10",
+        "ALTER TABLE trading_config ADD COLUMN indicator_pcr_buy_above REAL NOT NULL DEFAULT 1.0",
+        "ALTER TABLE trading_config ADD COLUMN indicator_pcr_sell_below REAL NOT NULL DEFAULT 1.0",
+        "ALTER TABLE trading_config ADD COLUMN indicator_vwap_band_pct REAL NOT NULL DEFAULT 0.0",
+        "ALTER TABLE trading_config ADD COLUMN call_validity_minutes INTEGER NOT NULL DEFAULT 120",
+        // Opening rule + wait-on-disagree default on (they only matter once
+        // indicator_sizing itself is on); the top-up buys more, so it is opt-in.
+        "ALTER TABLE trading_config ADD COLUMN indicator_early_checks INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE trading_config ADD COLUMN indicator_wait_on_disagree INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE trading_config ADD COLUMN indicator_topup INTEGER NOT NULL DEFAULT 0",
+    ] {
+        ensure_column(&pool, sql).await;
+    }
 
     ensure_column(
         &pool,
@@ -189,6 +211,10 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_oi_snapshots_lookup ON oi_snapshots (underlying, strike_window, ts)",
     ).execute(&pool).await.unwrap();
+    // By-day reads across every index: the startup feed seed and the prune below.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_oi_snapshots_ts ON oi_snapshots (ts)",
+    ).execute(&pool).await.unwrap();
     // ~4.5k rows per trading day; keep a month.
     let cutoff = (shared_domain::now_ist() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
     let _ = sqlx::query("DELETE FROM oi_snapshots WHERE ts < ?").bind(cutoff).execute(&pool).await;
@@ -219,6 +245,19 @@ struct TradingConfigRow {
     pre_t1_trail_factor: f64,
     entry_window_pct: f64,
     dynamic_targeting_single_lot: bool,
+    indicator_sizing: bool,
+    indicator_agree_multiplier: f64,
+    indicator_neutral_multiplier: f64,
+    indicator_interval_min: i32,
+    indicator_basis: String,
+    indicator_strike_window: i64,
+    indicator_pcr_buy_above: f64,
+    indicator_pcr_sell_below: f64,
+    indicator_vwap_band_pct: f64,
+    call_validity_minutes: i32,
+    indicator_early_checks: bool,
+    indicator_wait_on_disagree: bool,
+    indicator_topup: bool,
 }
 
 /// Load `TradingConfig` from SQLite, falling back to safe defaults.
@@ -228,35 +267,59 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
                 target_1_exit_pct, target_2_exit_pct, entry_market_protection, dynamic_targeting,
                 index_lots_by_symbol, dynamic_targeting_trail_factor, dynamic_targeting_extension_factor,
                 pre_t1_trailing, pre_t1_trail_arm_pct, pre_t1_trail_factor, entry_window_pct,
-                dynamic_targeting_single_lot
+                dynamic_targeting_single_lot,
+                indicator_sizing, indicator_agree_multiplier, indicator_neutral_multiplier,
+                indicator_interval_min, indicator_basis, indicator_strike_window,
+                indicator_pcr_buy_above, indicator_pcr_sell_below, indicator_vwap_band_pct,
+                call_validity_minutes,
+                indicator_early_checks, indicator_wait_on_disagree, indicator_topup
          FROM trading_config WHERE id = 1",
     )
     .fetch_optional(pool)
     .await
     .ok()
     .flatten()
-    .map(|r| TradingConfig {
-        max_trade_amount_inr: r.max_trade_amount_inr,
-        // 0 is allowed — it means "don't auto-trade this class" (an index with
-        // no per-symbol override / every stock option). Only guard against a
-        // negative slipping in from a hand-edited row.
-        index_lots: r.index_lots.max(0),
-        other_lots: r.other_lots.max(0),
-        mode: r.mode,
-        brokerage_per_order: r.brokerage_per_order,
-        target_1_exit_pct: r.target_1_exit_pct,
-        target_2_exit_pct: r.target_2_exit_pct,
-        entry_market_protection: r.entry_market_protection,
-        dynamic_targeting: r.dynamic_targeting,
-        index_lots_by_symbol: serde_json::from_str(&r.index_lots_by_symbol).unwrap_or_default(),
-        dynamic_targeting_trail_factor: r.dynamic_targeting_trail_factor.clamp(0.0, 1.0),
-        dynamic_targeting_extension_factor: r.dynamic_targeting_extension_factor.clamp(0.05, 5.0),
-        dynamic_targeting_single_lot: r.dynamic_targeting_single_lot,
-        pre_t1_trailing: r.pre_t1_trailing,
-        pre_t1_trail_arm_pct: r.pre_t1_trail_arm_pct.clamp(0.0, 100.0),
-        pre_t1_trail_factor: r.pre_t1_trail_factor.clamp(0.0, 1.0),
-        kill_switch_active: false,
-        entry_window_pct: r.entry_window_pct.clamp(0.0, 100.0),
+    .map(|r| {
+        let mut cfg = TradingConfig {
+            max_trade_amount_inr: r.max_trade_amount_inr,
+            // 0 is allowed — it means "don't auto-trade this class" (an index with
+            // no per-symbol override / every stock option). Only guard against a
+            // negative slipping in from a hand-edited row.
+            index_lots: r.index_lots.max(0),
+            other_lots: r.other_lots.max(0),
+            mode: r.mode,
+            brokerage_per_order: r.brokerage_per_order,
+            target_1_exit_pct: r.target_1_exit_pct,
+            target_2_exit_pct: r.target_2_exit_pct,
+            entry_market_protection: r.entry_market_protection,
+            dynamic_targeting: r.dynamic_targeting,
+            index_lots_by_symbol: serde_json::from_str(&r.index_lots_by_symbol).unwrap_or_default(),
+            dynamic_targeting_trail_factor: r.dynamic_targeting_trail_factor.clamp(0.0, 1.0),
+            dynamic_targeting_extension_factor: r.dynamic_targeting_extension_factor.clamp(0.05, 5.0),
+            dynamic_targeting_single_lot: r.dynamic_targeting_single_lot,
+            pre_t1_trailing: r.pre_t1_trailing,
+            pre_t1_trail_arm_pct: r.pre_t1_trail_arm_pct.clamp(0.0, 100.0),
+            pre_t1_trail_factor: r.pre_t1_trail_factor.clamp(0.0, 1.0),
+            kill_switch_active: false,
+            entry_window_pct: r.entry_window_pct.clamp(0.0, 100.0),
+            indicator_sizing: r.indicator_sizing,
+            indicator_agree_multiplier: r.indicator_agree_multiplier,
+            indicator_neutral_multiplier: r.indicator_neutral_multiplier,
+            indicator_interval_min: r.indicator_interval_min,
+            indicator_basis: r.indicator_basis,
+            indicator_strike_window: r.indicator_strike_window,
+            indicator_pcr_buy_above: r.indicator_pcr_buy_above,
+            indicator_pcr_sell_below: r.indicator_pcr_sell_below,
+            indicator_vwap_band_pct: r.indicator_vwap_band_pct,
+            call_validity_minutes: r.call_validity_minutes,
+            indicator_early_checks: r.indicator_early_checks,
+            indicator_wait_on_disagree: r.indicator_wait_on_disagree,
+            indicator_topup: r.indicator_topup,
+        };
+        // Same clamps the settings handler applies, so a hand-edited row
+        // can't put an out-of-range value in front of the engine.
+        cfg.sanitize_entry_gate();
+        cfg
     })
     .unwrap_or_else(|| TradingConfig {
         max_trade_amount_inr: 10_000.0,
@@ -277,6 +340,19 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         pre_t1_trail_factor: 0.5,
         kill_switch_active: false,
         entry_window_pct: 0.0,
+        indicator_sizing: false,
+        indicator_agree_multiplier: 1.5,
+        indicator_neutral_multiplier: 0.5,
+        indicator_interval_min: 15,
+        indicator_basis: "chg".into(),
+        indicator_strike_window: 10,
+        indicator_pcr_buy_above: 1.0,
+        indicator_pcr_sell_below: 1.0,
+        indicator_vwap_band_pct: 0.0,
+        call_validity_minutes: 120,
+        indicator_early_checks: true,
+        indicator_wait_on_disagree: true,
+        indicator_topup: false,
     })
 }
 

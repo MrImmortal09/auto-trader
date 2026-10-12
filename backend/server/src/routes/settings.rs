@@ -65,6 +65,12 @@ pub async fn post_settings_handler(
     // on the next engine tick — decide_live / Pass-1 read the live config, so no
     // retroactive recompute of WaitingForEntry rows is needed.
     cfg.entry_window_pct = cfg.entry_window_pct.clamp(0.0, 100.0);
+    // VWAP + PCR indicator sizing and the call validity window — ranges are
+    // documented on the TradingConfig fields. Like the entry window above,
+    // these are read live by the engine at the moment an entry triggers, so no
+    // retroactive recompute is needed; a WaitingForEntry call simply picks up
+    // the new validity on its next tick.
+    cfg.sanitize_entry_gate();
 
     let index_lots_by_symbol_json = serde_json::to_string(&cfg.index_lots_by_symbol)
         .unwrap_or_else(|_| "{}".to_string());
@@ -75,7 +81,12 @@ pub async fn post_settings_handler(
              target_1_exit_pct=?, target_2_exit_pct=?, entry_market_protection=?, dynamic_targeting=?,
              index_lots_by_symbol=?, dynamic_targeting_trail_factor=?, dynamic_targeting_extension_factor=?,
              pre_t1_trailing=?, pre_t1_trail_arm_pct=?, pre_t1_trail_factor=?, entry_window_pct=?,
-             dynamic_targeting_single_lot=?
+             dynamic_targeting_single_lot=?,
+             indicator_sizing=?, indicator_agree_multiplier=?, indicator_neutral_multiplier=?,
+             indicator_interval_min=?, indicator_basis=?, indicator_strike_window=?,
+             indicator_pcr_buy_above=?, indicator_pcr_sell_below=?, indicator_vwap_band_pct=?,
+             call_validity_minutes=?,
+             indicator_early_checks=?, indicator_wait_on_disagree=?, indicator_topup=?
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
@@ -95,6 +106,19 @@ pub async fn post_settings_handler(
     .bind(cfg.pre_t1_trail_factor)
     .bind(cfg.entry_window_pct)
     .bind(cfg.dynamic_targeting_single_lot)
+    .bind(cfg.indicator_sizing)
+    .bind(cfg.indicator_agree_multiplier)
+    .bind(cfg.indicator_neutral_multiplier)
+    .bind(cfg.indicator_interval_min)
+    .bind(&cfg.indicator_basis)
+    .bind(cfg.indicator_strike_window)
+    .bind(cfg.indicator_pcr_buy_above)
+    .bind(cfg.indicator_pcr_sell_below)
+    .bind(cfg.indicator_vwap_band_pct)
+    .bind(cfg.call_validity_minutes)
+    .bind(cfg.indicator_early_checks)
+    .bind(cfg.indicator_wait_on_disagree)
+    .bind(cfg.indicator_topup)
     .execute(&state.db_pool)
     .await
     {
@@ -108,10 +132,20 @@ pub async fn post_settings_handler(
     recompute_open_dynamic_runners(&state, &cfg).await;
 
     let _ = state.log_tx.send(format!(
-        r#"{{"event":"CONFIG_UPDATED","mode":"{}","max_trade":{:.2},"index_lots":{},"other_lots":{}}}"#,
-        cfg.mode, cfg.max_trade_amount_inr, cfg.index_lots, cfg.other_lots
+        r#"{{"event":"CONFIG_UPDATED","mode":"{}","max_trade":{:.2},"index_lots":{},"other_lots":{},"indicator_sizing":{},"agree_x":{},"neutral_x":{},"call_validity_min":{},"early_checks":{},"wait_on_disagree":{},"topup":{}}}"#,
+        cfg.mode, cfg.max_trade_amount_inr, cfg.index_lots, cfg.other_lots,
+        cfg.indicator_sizing, cfg.indicator_agree_multiplier, cfg.indicator_neutral_multiplier, cfg.call_validity_minutes,
+        cfg.indicator_early_checks, cfg.indicator_wait_on_disagree, cfg.indicator_topup
     ));
-    tracing::info!(mode = %cfg.mode, max_trade = cfg.max_trade_amount_inr, index_lots = cfg.index_lots, other_lots = cfg.other_lots, "Config updated");
+    tracing::info!(
+        mode = %cfg.mode,
+        max_trade = cfg.max_trade_amount_inr,
+        index_lots = cfg.index_lots,
+        other_lots = cfg.other_lots,
+        indicator_sizing = cfg.indicator_sizing,
+        call_validity_minutes = cfg.call_validity_minutes,
+        "Config updated"
+    );
     StatusCode::OK
 }
 

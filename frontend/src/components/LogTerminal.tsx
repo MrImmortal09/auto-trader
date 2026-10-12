@@ -9,7 +9,12 @@ export function LogTerminal({ serverBase, height = 220 }: { serverBase: string; 
   const [logs, setLogs] = useState<{ id: number, text: string, time: string, isError: boolean }[]>([]);
   const [filter, setFilter] = useState<'ALL' | 'ERROR'>('ALL');
   const [connected, setConnected] = useState(false);
-  const [isOpen, setIsOpen] = useState(true);
+  // Collapsed by default on phones: open, it takes ~220px of an ~840px screen
+  // on every page (the Settings page was left with half the screen). One tap
+  // on the header bar opens it.
+  const [isOpen, setIsOpen] = useState(
+    () => typeof window === 'undefined' || !window.matchMedia('(max-width: 767px)').matches
+  );
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll on new log
@@ -83,35 +88,42 @@ export function LogTerminal({ serverBase, height = 220 }: { serverBase: string; 
   return (
     <div className="flex flex-col border-t border-outline-variant bg-surface-container-lowest transition-all duration-300" style={{ height: isOpen ? height : 37 }}>
       {/* Header bar */}
-      <div className="flex items-center gap-2 bg-surface-container-low px-4 py-2 border-b border-outline-variant shrink-0">
+      <div className="flex items-center gap-2 bg-surface-container-low px-3 sm:px-4 py-2 border-b border-outline-variant shrink-0 min-w-0">
         <button
           onClick={() => setIsOpen(!isOpen)}
-          className="text-on-surface-variant hover:text-on-surface transition-colors p-0.5 rounded hover:bg-surface-container"
+          aria-label={isOpen ? 'Collapse engine log' : 'Expand engine log'}
+          className="text-on-surface-variant hover:text-on-surface transition-colors p-0.5 rounded hover:bg-surface-container shrink-0"
         >
           {isOpen ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
         </button>
-        <div className={`w-2 h-2 rounded-full ${connected ? 'bg-secondary' : 'bg-error'}`} />
+        <div className={`w-2 h-2 rounded-full shrink-0 ${connected ? 'bg-secondary' : 'bg-error'}`} />
         {connected
-          ? <Wifi size={13} className="text-secondary" />
-          : <WifiOff size={13} className="text-error" />}
-        <span className="text-xs text-on-surface-variant font-mono-code font-semibold">
-          Live Engine Log — /api/logs/stream
-        </span>
-        <div className="ml-4 flex gap-1 bg-surface rounded p-0.5 border border-outline-variant">
+          ? <Wifi size={13} className="text-secondary shrink-0" />
+          : <WifiOff size={13} className="text-error shrink-0" />}
+        <button
+          type="button"
+          onClick={() => setIsOpen(!isOpen)}
+          className="min-w-0 truncate text-left text-xs text-on-surface-variant font-mono-code font-semibold"
+        >
+          <span className="sm:hidden">Engine Log</span>
+          <span className="hidden sm:inline">Live Engine Log — /api/logs/stream</span>
+        </button>
+        <div className="ml-auto sm:ml-4 flex gap-1 bg-surface rounded p-0.5 border border-outline-variant shrink-0">
           <button
             onClick={() => setFilter('ALL')}
             className={`px-2 py-0.5 rounded text-[10px] uppercase font-bold transition-colors ${filter === 'ALL' ? 'bg-primary text-on-primary shadow-sm' : 'text-on-surface-variant hover:text-on-surface'}`}
-          >All Logs</button>
+          ><span className="sm:hidden">All</span><span className="hidden sm:inline">All Logs</span></button>
           <button
             onClick={() => setFilter('ERROR')}
             className={`px-2 py-0.5 rounded text-[10px] uppercase font-bold transition-colors ${filter === 'ERROR' ? 'bg-error text-on-error shadow-sm' : 'text-on-surface-variant hover:text-on-surface'}`}
-          >Error Logs</button>
+          ><span className="sm:hidden">Errors</span><span className="hidden sm:inline">Error Logs</span></button>
         </div>
         <button
           onClick={() => setLogs([])}
-          className="ml-auto text-xs text-on-surface-variant hover:text-on-surface transition-colors font-medium"
+          className="sm:ml-auto shrink-0 whitespace-nowrap text-xs text-on-surface-variant hover:text-on-surface transition-colors font-medium"
         >
-          Clear UI Logs
+          <span className="sm:hidden">Clear</span>
+          <span className="hidden sm:inline">Clear UI Logs</span>
         </button>
         <button
           onClick={async () => {
@@ -130,7 +142,7 @@ export function LogTerminal({ serverBase, height = 220 }: { serverBase: string; 
               }
             }
           }}
-          className="ml-4 text-xs text-error hover:text-error/80 transition-colors font-semibold"
+          className="ml-1 sm:ml-4 shrink-0 whitespace-nowrap text-xs text-error hover:text-error/80 transition-colors font-semibold"
         >
           Clear DB
         </button>

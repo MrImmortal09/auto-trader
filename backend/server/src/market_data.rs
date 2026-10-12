@@ -1,11 +1,18 @@
 //! Upstox option-chain analytics — NIFTY, BANKNIFTY, SENSEX.
 //!
 //! **Data only.** Nothing here reads or writes the Kotak client, its mutex, the
-//! price map, or positions; it cannot influence order placement. It polls
+//! price map, or positions, and it never places or cancels an order. It polls
 //! Upstox once a minute during market hours with a read-only Analytics Token
 //! (`UPSTOX_ANALYTICS_TOKEN`), keeps the latest chain in memory for the Market
 //! page, and writes one aggregated row per (index, strike window) per minute to
 //! `oi_snapshots` for the intraday-trend table.
+//!
+//! The same per-minute rows are also appended to the shared
+//! [`IndicatorFeed`], which the position monitor reads **when an entry
+//! triggers** to size it on the VWAP + PCR indicator
+//! (`TradingConfig::indicator_sizing`, off by default). If this poller stalls,
+//! the indicator reading goes stale and the engine treats it as NEUTRAL —
+//! it never blocks or delays order placement.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{Datelike, NaiveDate, Timelike};
 use serde::Serialize;
+use shared_domain::entry_gate::{self, IndicatorFeed, OiMinute};
 use shared_domain::DbWriteMessage;
 use tokio::sync::{mpsc, RwLock};
 use upstox_client::{FutureContract, OptionChainStrike, UpstoxClient};
@@ -175,7 +183,7 @@ pub fn aggregate(rows: &[StrikeRow], spot: f64, window: i64) -> WindowAgg {
 
 const POLL_START_MINUTE: u32 = 9 * 60 + 15;
 /// Through 15:31 so the closing "boundary + 1 minute" check (see
-/// `routes::market::check_minute`) has a snapshot.
+/// `entry_gate::check_minute`) has a snapshot.
 const POLL_END_MINUTE: u32 = 15 * 60 + 31;
 /// Instruments files are fetched from 09:00, before the open, so the multi-MB
 /// download and parse do not land on top of the 09:15 open on the small VM.
@@ -244,6 +252,7 @@ pub async fn run_poller(
     client: UpstoxClient,
     state: Arc<MarketDataState>,
     db_tx: mpsc::Sender<DbWriteMessage>,
+    feed: IndicatorFeed,
 ) {
     let mut expiries: HashMap<&'static str, (NaiveDate, NaiveDate)> = HashMap::new();
     let mut futures: HashMap<String, FutureContract> = HashMap::new();
@@ -288,8 +297,20 @@ pub async fn run_poller(
                     // Queue DB writes before taking the state lock: if the
                     // shared writer channel is full, only this poller waits,
                     // not the /api/market/* readers.
+                    let mut minutes = Vec::with_capacity(STRIKE_WINDOWS.len());
                     for w in STRIKE_WINDOWS {
                         let agg = aggregate(&rows, spot, w);
+                        minutes.push(OiMinute {
+                            ts: ts.clone(),
+                            strike_window: w,
+                            call_oi: agg.call_oi,
+                            put_oi: agg.put_oi,
+                            call_oi_chg: agg.call_oi_chg,
+                            put_oi_chg: agg.put_oi_chg,
+                            spot,
+                            fut_ltp,
+                            fut_vwap,
+                        });
                         let _ = db_tx
                             .send(DbWriteMessage::OiSnapshot {
                                 ts: ts.clone(),
@@ -306,6 +327,8 @@ pub async fn run_poller(
                             })
                             .await;
                     }
+                    // Synchronous, tiny, and never held across an await.
+                    entry_gate::feed_push(&feed, spec.id, minutes);
                     let mut guard = state.indices.write().await;
                     let live = guard.entry(spec.id).or_default();
                     live.atm_strike = atm_index(&rows, spot).map(|i| rows[i].strike);
@@ -336,6 +359,65 @@ pub async fn run_poller(
             }
         }
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct SeedRow {
+    ts: String,
+    underlying: String,
+    strike_window: i64,
+    call_oi: f64,
+    put_oi: f64,
+    call_oi_chg: f64,
+    put_oi_chg: f64,
+    spot: f64,
+    fut_ltp: Option<f64>,
+    fut_vwap: Option<f64>,
+}
+
+/// Reload today's minutes from `oi_snapshots` into the indicator feed at
+/// startup, so a restart mid-session does not leave the engine without a
+/// closed check (i.e. sizing every entry as NEUTRAL) until the next check
+/// comes round. A failed read just logs: the poller refills the feed anyway.
+pub async fn seed_indicator_feed(pool: &sqlx::sqlite::SqlitePool, feed: &IndicatorFeed) {
+    let today = shared_domain::today_ist().format("%Y-%m-%d").to_string();
+    let rows = match sqlx::query_as::<_, SeedRow>(
+        "SELECT ts, underlying, strike_window, call_oi, put_oi, call_oi_chg, put_oi_chg, spot, fut_ltp, fut_vwap
+         FROM oi_snapshots
+         WHERE ts >= ? AND ts <= ?
+         ORDER BY ts ASC",
+    )
+    .bind(format!("{today} 00:00:00"))
+    .bind(format!("{today} 23:59:59"))
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not seed the indicator feed from oi_snapshots");
+            return;
+        }
+    };
+
+    let mut by_index: HashMap<String, Vec<OiMinute>> = HashMap::new();
+    for r in rows {
+        by_index.entry(r.underlying).or_default().push(OiMinute {
+            ts: r.ts,
+            strike_window: r.strike_window,
+            call_oi: r.call_oi,
+            put_oi: r.put_oi,
+            call_oi_chg: r.call_oi_chg,
+            put_oi_chg: r.put_oi_chg,
+            spot: r.spot,
+            fut_ltp: r.fut_ltp,
+            fut_vwap: r.fut_vwap,
+        });
+    }
+    let total: usize = by_index.values().map(Vec::len).sum();
+    for (index, minutes) in by_index {
+        entry_gate::feed_push(feed, &index, minutes);
+    }
+    tracing::info!(rows = total, "Indicator feed seeded from today's oi_snapshots");
 }
 
 async fn poll_index(

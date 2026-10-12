@@ -24,6 +24,15 @@ export function TopNavBar({
     portfolio: 'Portfolio Performance & Reports',
     settings: 'Configurations & System Settings',
   };
+  // Phones only have room for a word or two next to the action buttons.
+  const shortTitles: Record<ScreenId, string> = {
+    dashboard: 'Dashboard',
+    positions: 'Positions',
+    analytics: 'Analytics',
+    market: 'Market Data',
+    portfolio: 'Portfolio',
+    settings: 'Settings',
+  };
 
   const handleExecuteClick = () => {
     if (!hasWriteAccess) {
@@ -41,7 +50,10 @@ export function TopNavBar({
             AT
           </div>
         </div>
-        <h1 className="text-base sm:text-lg font-bold tracking-tight text-on-surface truncate">{titles[activeScreen]}</h1>
+        <h1 className="text-base sm:text-lg font-bold tracking-tight text-on-surface truncate">
+          <span className="sm:hidden">{shortTitles[activeScreen]}</span>
+          <span className="hidden sm:inline">{titles[activeScreen]}</span>
+        </h1>
         <div className="hidden md:flex items-center gap-4 text-xs font-semibold text-on-surface-variant">
           <span className="cursor-pointer hover:text-primary transition-colors">Portfolio</span>
           <span className="cursor-pointer hover:text-primary transition-colors">Watchlist</span>
