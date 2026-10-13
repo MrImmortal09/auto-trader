@@ -560,7 +560,8 @@ Both are configured under **Settings → Telegram Call Rules** and apply in PAPE
 
   | Indicator vs call | Lots bought |
   |---|---|
-  | Agrees (BUY reading + `CE`, SELL reading + `PE`) | default lots × `indicator_agree_multiplier` (1.5) |
+  | Strongly agrees: PCR and VWAP both on the call's side (+2 reading + `CE`, −2 reading + `PE`) | default lots × `indicator_strong_agree_multiplier` (1.5) |
+  | Agrees: one of them on the call's side, the other neutral (+1 reading + `CE`, −1 reading + `PE`) | default lots × `indicator_agree_multiplier` (1.0) |
   | NEUTRAL, or no fresh reading | default lots × `indicator_neutral_multiplier` (0.5) |
   | Disagrees | none — the call keeps waiting (`INDICATOR_WAIT`) or is dropped (`INDICATOR_SKIP`), see below |
 
@@ -569,6 +570,10 @@ Both are configured under **Settings → Telegram Call Rules** and apply in PAPE
   older than its interval + 2 minutes (Upstox down, server just restarted) counts as no fresh reading. The indicator's
   settings (interval, OI basis, strike range, PCR thresholds, VWAP band) are the same ones the Market Data page scores
   with. Logic and tests: `backend/shared_domain/src/entry_gate.rs`.
+
+  The multipliers in brackets are the defaults of a new database. A database from before the strong-agree tier keeps
+  its saved `indicator_agree_multiplier` (1.5 unless it was changed), so a plain agree keeps buying at that size until
+  it is set to 1 under Settings.
 
   Three switches refine it; each can be turned on or off at any time and only matters while indicator sizing is on:
 
@@ -582,10 +587,21 @@ Both are configured under **Settings → Telegram Call Rules** and apply in PAPE
     the price is still in the buy range. It still expires with call validity and the 15:39 cutoff. Off: the call is
     dropped on the spot.
   - **Aggressive top-up** (`indicator_topup`, **off by default**): a call bought at the reduced NEUTRAL size is topped
-    up to the full agree size if the indicator later agrees while the price is back in the buy range (2 default lots:
-    1 bought at neutral, 2 more added, 3 held). Once per call; only before target 1, while the stop is still at the
-    signal level and the holding is exactly what the entry bought; never past call validity or 15:39; never on a
-    manual qty override. Added lots share the position's stop-loss and targets, and the average buy price is
+    up if the indicator later agrees while the price is back in the buy range. Which reading does it, and up to which
+    size, is the **Top-Up Rule** (`indicator_topup_mode`); sizes are default lots × the multipliers above:
+
+    | Rule | Tops up on | Up to | Top-ups per call |
+    |---|---|---|---|
+    | `strong_to_agree` (default) | strong agree only | the agree size | 1 |
+    | `strong_to_strong` | strong agree only | the strong-agree size | 1 |
+    | `tier` | any agreement | that reading's own size | 1 |
+    | `step` | any agreement | that reading's own size, then once more to the strong-agree size when the reading turns strong; a call bought at the agree size steps up too | up to 2 |
+
+    With 2 default lots (1 bought at neutral): the default rule adds 1 on a strong agree and holds 2; `strong_to_strong`
+    adds 2 and holds 3. Under every rule: only before target 1, while the stop is still at the
+    signal level and the holding is exactly what the last buy left; never past call validity or 15:39; never on a
+    manual qty override. A partly filled top-up ends it, and both steps of `step` share the three-send cap. Added lots
+    share the position's stop-loss and targets, and the average buy price is
     re-weighted. The indicator only ever adds: a reading that turns against an open position changes nothing. In LIVE
     only the broker's filled quantity is added to the holding; a top-up send with no broker verdict is not tracked
     and is flagged loudly instead, and a top-up that fills after the position was exited is sold straight back

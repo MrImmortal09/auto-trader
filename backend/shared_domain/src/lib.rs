@@ -170,8 +170,9 @@ pub struct TradingConfig {
     /// `diff * dynamic_targeting_extension_factor` (`diff = target1 - entry`)
     /// and trails the stop to `rung - diff * dynamic_targeting_trail_factor`
     /// — see `decide_live`'s `TradeState::Target1Hit` branch for the exact
-    /// recurrence. Off by default: existing signals keep exiting at their own
-    /// target 2.
+    /// recurrence. Applies in PAPER and LIVE alike (PAPER mirrors it in
+    /// `paper_dynamic_target1` / `paper_dynamic_rung`). Off by default:
+    /// existing signals keep exiting at their own target 2.
     #[serde(default)]
     pub dynamic_targeting: bool,
     /// Multiplier applied to `diff` when trailing the stop under
@@ -180,7 +181,7 @@ pub struct TradingConfig {
     /// only back to the previous rung (loosest — on the first rung that's
     /// breakeven at entry). Clamped to `[0.0, 1.0]` on save so the stop can
     /// never trail below the entry price. Unused unless `dynamic_targeting`
-    /// is on; PAPER mode does not use this — it always trails to the fixed
+    /// is on — with it off, PAPER trails to the fixed
     /// `(entry + target1) / 2` midpoint. Changing this retroactively updates
     /// `current_sl` on every open `Target1Hit` dynamic-targeting position —
     /// see `post_settings_handler`.
@@ -203,7 +204,7 @@ pub struct TradingConfig {
     /// trailed and next rung extended exactly as for a multi-lot runner. The
     /// trailed stop still never sits below entry (trail factor is clamped to
     /// `[0, 1]`). Multi-lot positions are unaffected. Unused unless
-    /// `dynamic_targeting` is on; LIVE only, like the rest of dynamic
+    /// `dynamic_targeting` is on; PAPER and LIVE, like the rest of dynamic
     /// targeting. Off by default.
     #[serde(default)]
     pub dynamic_targeting_single_lot: bool,
@@ -262,8 +263,11 @@ pub struct TradingConfig {
     /// (`entry_gate::indicator_parent` — BANKNIFTY and SENSEX use their own,
     /// everything else follows NIFTY):
     ///
-    /// * agrees with the call (BUY CE + BUY reading, BUY PE + SELL reading)
-    ///   → default lots × `indicator_agree_multiplier`
+    /// * strongly agrees with the call — PCR and VWAP both on its side, score
+    ///   ±2 (BUY CE + a +2 reading, BUY PE + a −2 reading)
+    ///   → default lots × `indicator_strong_agree_multiplier`
+    /// * agrees with the call — one of them on its side, the other neutral,
+    ///   score ±1 → default lots × `indicator_agree_multiplier`
     /// * NEUTRAL, or no fresh reading → default lots × `indicator_neutral_multiplier`
     /// * disagrees → the call is skipped, with the reason logged
     ///
@@ -273,9 +277,14 @@ pub struct TradingConfig {
     /// Off by default: turning it on is a deliberate change to order sizing.
     #[serde(default)]
     pub indicator_sizing: bool,
-    /// Lot multiplier when the indicator agrees with the call. `[0.1, 5]`.
+    /// Lot multiplier when the indicator agrees with the call on a ±1 score
+    /// (one of PCR / VWAP, the other neutral). `[0.1, 5]`.
     #[serde(default = "default_agree_multiplier")]
     pub indicator_agree_multiplier: f64,
+    /// Lot multiplier when the indicator strongly agrees with the call: a ±2
+    /// score, PCR and VWAP both on its side. `[0.1, 5]`.
+    #[serde(default = "default_strong_agree_multiplier")]
+    pub indicator_strong_agree_multiplier: f64,
     /// Lot multiplier when the indicator is neutral or has no fresh reading. `[0.1, 5]`.
     #[serde(default = "default_neutral_multiplier")]
     pub indicator_neutral_multiplier: f64,
@@ -320,15 +329,29 @@ pub struct TradingConfig {
     #[serde(default = "default_true")]
     pub indicator_wait_on_disagree: bool,
     /// Aggressive top-up (only with `indicator_sizing` on): a call bought at
-    /// the reduced NEUTRAL size is topped up to the full
-    /// `indicator_agree_multiplier` size if the indicator later agrees while
-    /// the price is back in the buy range. Once per call, only before target
-    /// 1 and before any stop trail or sell, never past `call_validity_minutes`
-    /// or the 15:39 cutoff, never on a manual qty override. The indicator
-    /// only ever adds: it never sells or trims a position.
+    /// the reduced NEUTRAL size is topped up if the indicator later agrees
+    /// while the price is back in the buy range — which reading does it, and
+    /// up to which size, is `indicator_topup_mode`. Only before target 1 and
+    /// before any stop trail or sell, never past `call_validity_minutes` or
+    /// the 15:39 cutoff, never on a manual qty override. The indicator only
+    /// ever adds: it never sells or trims a position.
     /// Off by default: it buys more than the first entry did.
     #[serde(default)]
     pub indicator_topup: bool,
+    /// The top-up rule while `indicator_topup` is on — one of
+    /// `entry_gate::TopupMode`'s names:
+    ///
+    /// * `"strong_to_agree"` (default) — only a strong agree tops up, and
+    ///   only to the Agrees size. Once per call.
+    /// * `"strong_to_strong"` — only a strong agree tops up, straight to the
+    ///   Strong Agrees size. Once per call.
+    /// * `"tier"` — any agreement tops up, to that reading's own size. Once
+    ///   per call.
+    /// * `"step"` — as `"tier"`, but a call at the Agrees size (bought
+    ///   there, or topped up to it) is topped up once more, to the Strong
+    ///   Agrees size, when the reading turns strong. At most two top-ups.
+    #[serde(default = "default_topup_mode")]
+    pub indicator_topup_mode: String,
 }
 
 fn default_true() -> bool { true }
@@ -337,8 +360,10 @@ fn default_entry_mp() -> f64 { 5.0 }
 fn default_trail_factor() -> f64 { 0.5 }
 fn default_pre_t1_arm_pct() -> f64 { 60.0 }
 fn default_extension_factor() -> f64 { 1.0 }
-fn default_agree_multiplier() -> f64 { 1.5 }
+fn default_agree_multiplier() -> f64 { 1.0 }
+fn default_strong_agree_multiplier() -> f64 { 1.5 }
 fn default_neutral_multiplier() -> f64 { 0.5 }
+fn default_topup_mode() -> String { entry_gate::TopupMode::StrongToAgree.as_str().to_string() }
 fn default_indicator_interval() -> i32 { 15 }
 fn default_indicator_basis() -> String { "chg".to_string() }
 fn default_indicator_window() -> i64 { 10 }
@@ -353,6 +378,9 @@ impl TradingConfig {
         let finite_or = |v: f64, d: f64| if v.is_finite() { v } else { d };
         self.indicator_agree_multiplier =
             finite_or(self.indicator_agree_multiplier, default_agree_multiplier()).clamp(0.1, 5.0);
+        self.indicator_strong_agree_multiplier =
+            finite_or(self.indicator_strong_agree_multiplier, default_strong_agree_multiplier()).clamp(0.1, 5.0);
+        self.indicator_topup_mode = self.topup_mode().as_str().to_string();
         self.indicator_neutral_multiplier =
             finite_or(self.indicator_neutral_multiplier, default_neutral_multiplier()).clamp(0.1, 5.0);
         if !entry_gate::INDICATOR_INTERVALS.iter().any(|&i| i as i32 == self.indicator_interval_min) {
@@ -380,6 +408,20 @@ impl TradingConfig {
             vwap_band_pct: self.indicator_vwap_band_pct,
             early_checks: self.indicator_early_checks,
         }
+    }
+
+    /// The lot multiplier of each agreement tier, as `entry_gate` takes them.
+    pub fn indicator_multipliers(&self) -> entry_gate::Multipliers {
+        entry_gate::Multipliers {
+            strong: self.indicator_strong_agree_multiplier,
+            agree: self.indicator_agree_multiplier,
+            neutral: self.indicator_neutral_multiplier,
+        }
+    }
+
+    /// `indicator_topup_mode`, parsed — an unknown value is the default rule.
+    pub fn topup_mode(&self) -> entry_gate::TopupMode {
+        entry_gate::TopupMode::parse(&self.indicator_topup_mode)
     }
 }
 
@@ -623,15 +665,25 @@ pub struct SizingState {
     /// The disagreeing reading this waiting call was last logged as held back
     /// by — so `INDICATOR_WAIT` is logged once per check, not once per tick.
     pub hold_note: Option<String>,
-    /// LIVE: the entry order now at the broker was sized down by a NEUTRAL
-    /// reading, so its fill may be topped up later. Becomes
+    /// LIVE: the entry order now at the broker was sized below the top tier
+    /// (see `topup_base_qty`), so its fill may be topped up later. Becomes
     /// `topup_base_qty` when the fill settles.
     pub topup_eligible: bool,
-    /// The quantity bought at the indicator's reduced NEUTRAL size. A top-up
-    /// is only considered while the holding is still exactly this — any sell
-    /// or broker reconciliation that changes `executed_qty` rules it out.
-    /// Cleared once a top-up has been tried.
+    /// The quantity a top-up may still add to: what was bought at the
+    /// indicator's reduced NEUTRAL size — or, under the `"step"` top-up rule
+    /// only, at the Agrees size (see `topup_stepped`). A top-up is only
+    /// considered while the holding is still exactly this — any sell or
+    /// broker reconciliation that changes `executed_qty` rules it out.
+    /// Cleared once a top-up has been tried, unless the step rule re-arms it.
     pub topup_base_qty: Option<i32>,
+    /// The holding is already at the Agrees size — bought there, or topped
+    /// up to it — so the only top-up left is the `"step"` rule's second one,
+    /// to the Strong Agrees size. Every other rule ignores such a position.
+    pub topup_stepped: bool,
+    /// LIVE: the top-up order now at the broker was sized to the Agrees size
+    /// under the `"step"` rule — a complete fill re-arms `topup_base_qty`
+    /// (with `topup_stepped`) for the step to the Strong Agrees size.
+    pub topup_rearm: bool,
     /// LIVE: the top-up buy order currently at the broker. While set the
     /// position is never closed out from under it — a fill landing afterwards
     /// would otherwise be an untracked holding.
@@ -641,7 +693,8 @@ pub struct SizingState {
     /// LIVE: the whole position was exited while the top-up order was still
     /// at the broker — whatever that order fills is sold straight back.
     pub topup_exit_on_fill: bool,
-    /// LIVE: top-up sends so far, capped at [`MAX_ENTRY_ATTEMPTS`].
+    /// LIVE: top-up sends so far, capped at [`MAX_ENTRY_ATTEMPTS`] per call —
+    /// both steps of the `"step"` rule share the one cap.
     pub topup_attempts: i32,
     /// LIVE: IST timestamp of the last top-up attempt, for the retry throttle.
     pub topup_attempt_at: Option<String>,
@@ -1025,8 +1078,11 @@ mod tests {
         }"#;
         let cfg: TradingConfig = serde_json::from_str(json_str).expect("deserialize config");
         assert!(!cfg.indicator_sizing);
-        assert_eq!(cfg.indicator_agree_multiplier, 1.5);
-        assert_eq!(cfg.indicator_neutral_multiplier, 0.5);
+        assert_eq!(
+            cfg.indicator_multipliers(),
+            entry_gate::Multipliers { strong: 1.5, agree: 1.0, neutral: 0.5 }
+        );
+        assert_eq!(cfg.topup_mode(), entry_gate::TopupMode::StrongToAgree);
         assert_eq!(cfg.call_validity_minutes, 120);
         assert_eq!(
             cfg.indicator_params(),
@@ -1050,6 +1106,7 @@ mod tests {
             r#"{"max_trade_amount_inr":1,"index_lots":1,"other_lots":1,"mode":"PAPER",
                 "brokerage_per_order":20,"target_1_exit_pct":50,"target_2_exit_pct":100,
                 "indicator_agree_multiplier":99,"indicator_neutral_multiplier":0,
+                "indicator_strong_agree_multiplier":-3,"indicator_topup_mode":"ALWAYS",
                 "indicator_interval_min":7,"indicator_basis":"TOTAL","indicator_strike_window":3,
                 "indicator_pcr_buy_above":-1,"indicator_pcr_sell_below":2,
                 "indicator_vwap_band_pct":50,"call_validity_minutes":-5}"#,
@@ -1058,6 +1115,8 @@ mod tests {
         cfg.sanitize_entry_gate();
         assert_eq!(cfg.indicator_agree_multiplier, 5.0);
         assert_eq!(cfg.indicator_neutral_multiplier, 0.1);
+        assert_eq!(cfg.indicator_strong_agree_multiplier, 0.1);
+        assert_eq!(cfg.indicator_topup_mode, "strong_to_agree");
         assert_eq!(cfg.indicator_interval_min, 15);
         assert_eq!(cfg.indicator_basis, "total");
         assert_eq!(cfg.indicator_strike_window, 10);

@@ -5,8 +5,9 @@
 //!    put/call ratio (+1 / −1 / 0) plus VWAP Signal from the index future vs
 //!    its VWAP (+1 / −1 / 0), read at the last *closed* check. When it agrees
 //!    with the call (BUY CE + bullish, BUY PE + bearish) the default lot count
-//!    is scaled up; when it is neutral — or there is no fresh reading — it is
-//!    scaled down; when it disagrees the call is skipped.
+//!    takes the agree multiplier — or the strong-agree one when PCR and VWAP
+//!    both agree (±2); when it is neutral — or there is no fresh reading — it
+//!    takes the neutral multiplier; when it disagrees the call is skipped.
 //! 2. **Call validity.** A call that has not triggered within N minutes of
 //!    arriving is dropped instead of waiting until the 15:39 cutoff.
 //!
@@ -432,11 +433,54 @@ pub fn indicator_parent(instrument: &str) -> &'static str {
     }
 }
 
+/// How firmly the indicator backs a call it does not veto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agreement {
+    /// NEUTRAL, or no fresh reading.
+    Neutral,
+    /// Score ±1 in the call's direction: one of PCR / VWAP agrees and the
+    /// other is neutral.
+    Agree,
+    /// Score ±2 in the call's direction: PCR and VWAP both agree — the
+    /// reading the Market Data page shows as a solid badge.
+    Strong,
+}
+
+impl Agreement {
+    /// The name the Settings page gives this tier's lot size.
+    pub fn size_name(self) -> &'static str {
+        match self {
+            Agreement::Neutral => "Neutral",
+            Agreement::Agree => "Agrees",
+            Agreement::Strong => "Strong Agrees",
+        }
+    }
+}
+
+/// Lot multiplier for each [`Agreement`] tier (stored on `TradingConfig`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Multipliers {
+    pub strong: f64,
+    pub agree: f64,
+    pub neutral: f64,
+}
+
+impl Multipliers {
+    pub fn of(&self, tier: Agreement) -> f64 {
+        match tier {
+            Agreement::Neutral => self.neutral,
+            Agreement::Agree => self.agree,
+            Agreement::Strong => self.strong,
+        }
+    }
+}
+
 /// What the indicator says about buying a call right now.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SizingVerdict {
-    /// Buy, with the default lot count scaled by `multiplier`.
-    Scale { multiplier: f64, bias_agrees: bool, note: String },
+    /// Buy, with the default lot count scaled by `multiplier` — the
+    /// [`Multipliers`] entry for `agreement`.
+    Scale { multiplier: f64, agreement: Agreement, note: String },
     /// Do not buy; `reason` says why, for the log.
     Skip { reason: String },
 }
@@ -448,8 +492,7 @@ pub fn sizing_verdict(
     option_type: &str,
     instrument: &str,
     reading: Option<&IndicatorReading>,
-    agree_multiplier: f64,
-    neutral_multiplier: f64,
+    multipliers: &Multipliers,
 ) -> SizingVerdict {
     let opt = option_type.trim().to_uppercase();
     let call_bias = match opt.as_str() {
@@ -470,28 +513,98 @@ pub fn sizing_verdict(
         format!("{parent} indicator (parent of {})", instrument.trim().to_uppercase())
     };
 
+    let neutral = multipliers.neutral;
     let Some(reading) = reading else {
         return SizingVerdict::Scale {
-            multiplier: neutral_multiplier,
-            bias_agrees: false,
-            note: format!("{source} has no fresh reading — treated as NEUTRAL, ×{neutral_multiplier}"),
+            multiplier: neutral,
+            agreement: Agreement::Neutral,
+            note: format!("{source} has no fresh reading — treated as NEUTRAL, ×{neutral}"),
         };
     };
     let desc = reading.describe();
     match reading.bias {
         Bias::Neutral => SizingVerdict::Scale {
-            multiplier: neutral_multiplier,
-            bias_agrees: false,
-            note: format!("{source} {desc} — NEUTRAL, ×{neutral_multiplier}"),
+            multiplier: neutral,
+            agreement: Agreement::Neutral,
+            note: format!("{source} {desc} — NEUTRAL, ×{neutral}"),
         },
-        b if b == call_bias => SizingVerdict::Scale {
-            multiplier: agree_multiplier,
-            bias_agrees: true,
-            note: format!("{source} {desc} agrees with BUY {opt}, ×{agree_multiplier}"),
-        },
+        // `bias` is the sign of the score, so ±2 here is PCR and VWAP both
+        // on the call's side; ±1 is one of them with the other neutral.
+        b if b == call_bias && reading.score.overall.abs() >= 2 => {
+            let m = multipliers.strong;
+            SizingVerdict::Scale {
+                multiplier: m,
+                agreement: Agreement::Strong,
+                note: format!("{source} {desc} strongly agrees with BUY {opt}, ×{m}"),
+            }
+        }
+        b if b == call_bias => {
+            let m = multipliers.agree;
+            SizingVerdict::Scale {
+                multiplier: m,
+                agreement: Agreement::Agree,
+                note: format!("{source} {desc} agrees with BUY {opt}, ×{m}"),
+            }
+        }
         _ => SizingVerdict::Skip {
             reason: format!("{source} {desc} disagrees with BUY {opt} — call skipped"),
         },
+    }
+}
+
+/// Which reading tops up an open call, and up to which tier's size
+/// (`TradingConfig::indicator_topup_mode`). Only consulted while
+/// `TradingConfig::indicator_topup` is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopupMode {
+    /// Only a STRONG agree tops up, and only to the Agrees size. The default,
+    /// and the rule that buys least.
+    StrongToAgree,
+    /// Only a STRONG agree tops up, straight to the Strong Agrees size.
+    StrongToStrong,
+    /// Any agreement tops up, to that reading's own size. Once per call.
+    ToTier,
+    /// As [`TopupMode::ToTier`], but a call sitting at the Agrees size —
+    /// bought there, or topped up to it — is topped up once more to the
+    /// Strong Agrees size when the reading turns strong.
+    Step,
+}
+
+impl TopupMode {
+    pub const ALL: [TopupMode; 4] =
+        [TopupMode::StrongToAgree, TopupMode::StrongToStrong, TopupMode::ToTier, TopupMode::Step];
+
+    /// The stored / wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TopupMode::StrongToAgree => "strong_to_agree",
+            TopupMode::StrongToStrong => "strong_to_strong",
+            TopupMode::ToTier => "tier",
+            TopupMode::Step => "step",
+        }
+    }
+
+    /// Anything unrecognised is the default — the rule that buys least.
+    pub fn parse(s: &str) -> Self {
+        let s = s.trim();
+        Self::ALL.into_iter().find(|m| m.as_str().eq_ignore_ascii_case(s)).unwrap_or(TopupMode::StrongToAgree)
+    }
+
+    /// The tier whose size a top-up brings the holding up to when the
+    /// indicator currently reads `now`; `None` = this reading tops up nothing.
+    pub fn target(self, now: Agreement) -> Option<Agreement> {
+        match (self, now) {
+            (_, Agreement::Neutral) => None,
+            (TopupMode::StrongToAgree, Agreement::Strong) => Some(Agreement::Agree),
+            (TopupMode::StrongToStrong, Agreement::Strong) => Some(Agreement::Strong),
+            (TopupMode::StrongToAgree | TopupMode::StrongToStrong, Agreement::Agree) => None,
+            (TopupMode::ToTier | TopupMode::Step, tier) => Some(tier),
+        }
+    }
+
+    /// True for the one rule that may top the same call up twice.
+    pub fn steps(self) -> bool {
+        matches!(self, TopupMode::Step)
     }
 }
 
@@ -598,20 +711,29 @@ mod tests {
     }
 
     fn reading_of(bias: Bias) -> IndicatorReading {
-        let overall = match bias {
+        scored(match bias {
             Bias::Bullish => 2,
             Bias::Bearish => -2,
             Bias::Neutral => 0,
-        };
+        })
+    }
+
+    /// A reading with the given overall score: ±2 is PCR and VWAP together,
+    /// ±1 is PCR alone with VWAP neutral.
+    fn scored(overall: i32) -> IndicatorReading {
+        let option = overall.signum();
         IndicatorReading {
             index: "NIFTY".into(),
             check_time: "11:01".into(),
             ts: "2026-10-09 11:01:02".into(),
-            score: Score { call: 1.0, put: 1.0, ratio: Some(1.0), option: overall / 2, vwap: overall / 2, overall },
-            bias,
+            score: Score { call: 1.0, put: 1.0, ratio: Some(1.0), option, vwap: overall - option, overall },
+            bias: Bias::of_overall(overall),
             opening: false,
         }
     }
+
+    /// The requested tiers: strong ×1.5, agree ×1, neutral ×0.5.
+    const MULTS: Multipliers = Multipliers { strong: 1.5, agree: 1.0, neutral: 0.5 };
 
     // ── check_minute (moved from routes/market.rs, same cases) ───────────
 
@@ -832,28 +954,50 @@ mod tests {
     // ── verdicts ─────────────────────────────────────────────────────────
 
     #[test]
-    fn agree_scales_up_neutral_scales_down_conflict_skips() {
-        let bull = reading_of(Bias::Bullish);
-        let bear = reading_of(Bias::Bearish);
-        let flat = reading_of(Bias::Neutral);
-        let up = |v: SizingVerdict| match v {
-            SizingVerdict::Scale { multiplier, .. } => Some(multiplier),
+    fn strong_agree_agree_neutral_and_conflict_each_get_their_own_size() {
+        let up = |opt: &str, overall: i32| match sizing_verdict(opt, "NIFTY", Some(&scored(overall)), &MULTS) {
+            SizingVerdict::Scale { multiplier, agreement, .. } => Some((multiplier, agreement)),
             SizingVerdict::Skip { .. } => None,
         };
-        assert_eq!(up(sizing_verdict("CE", "NIFTY", Some(&bull), 1.5, 0.5)), Some(1.5));
-        assert_eq!(up(sizing_verdict("PE", "NIFTY", Some(&bear), 1.5, 0.5)), Some(1.5));
-        assert_eq!(up(sizing_verdict("CE", "NIFTY", Some(&flat), 1.5, 0.5)), Some(0.5));
-        assert_eq!(up(sizing_verdict("PE", "NIFTY", Some(&flat), 1.5, 0.5)), Some(0.5));
-        assert_eq!(up(sizing_verdict("CE", "NIFTY", Some(&bear), 1.5, 0.5)), None);
-        assert_eq!(up(sizing_verdict("PE", "NIFTY", Some(&bull), 1.5, 0.5)), None);
-        assert_eq!(up(sizing_verdict("ce", "NIFTY", Some(&bull), 1.5, 0.5)), Some(1.5));
+        // BUY CE wants a bullish reading, BUY PE a bearish one.
+        for (opt, side) in [("CE", 1), ("PE", -1)] {
+            assert_eq!(up(opt, 2 * side), Some((1.5, Agreement::Strong)), "{opt} strong agree");
+            assert_eq!(up(opt, side), Some((1.0, Agreement::Agree)), "{opt} agree");
+            assert_eq!(up(opt, 0), Some((0.5, Agreement::Neutral)), "{opt} neutral");
+            // Against the call — mildly or strongly — is never bought.
+            assert_eq!(up(opt, -side), None, "{opt} disagree");
+            assert_eq!(up(opt, -2 * side), None, "{opt} strong disagree");
+        }
+        assert_eq!(up("ce", 2), Some((1.5, Agreement::Strong)));
+    }
+
+    #[test]
+    fn the_note_names_the_tier_and_its_multiplier() {
+        let note = |overall: i32| match sizing_verdict("CE", "NIFTY", Some(&scored(overall)), &MULTS) {
+            SizingVerdict::Scale { note, .. } => note,
+            v => panic!("expected a scale, got {v:?}"),
+        };
+        assert!(note(2).ends_with("strongly agrees with BUY CE, ×1.5"), "{}", note(2));
+        assert!(note(1).ends_with(") agrees with BUY CE, ×1"), "{}", note(1));
+        assert!(note(0).ends_with("NEUTRAL, ×0.5"), "{}", note(0));
+    }
+
+    #[test]
+    fn an_opening_check_is_neutral_however_strong_its_raw_score() {
+        let mut opening = scored(2);
+        opening.bias = Bias::Neutral;
+        opening.opening = true;
+        assert!(matches!(
+            sizing_verdict("CE", "NIFTY", Some(&opening), &MULTS),
+            SizingVerdict::Scale { agreement: Agreement::Neutral, .. }
+        ));
     }
 
     #[test]
     fn no_fresh_reading_counts_as_neutral() {
-        match sizing_verdict("CE", "NIFTY", None, 1.5, 0.5) {
-            SizingVerdict::Scale { multiplier, bias_agrees, note } => {
-                assert_eq!((multiplier, bias_agrees), (0.5, false));
+        match sizing_verdict("CE", "NIFTY", None, &MULTS) {
+            SizingVerdict::Scale { multiplier, agreement, note } => {
+                assert_eq!((multiplier, agreement), (0.5, Agreement::Neutral));
                 assert!(note.contains("no fresh reading"), "{note}");
             }
             v => panic!("expected neutral scale, got {v:?}"),
@@ -861,8 +1005,32 @@ mod tests {
     }
 
     #[test]
+    fn top_up_rules_pick_the_reading_and_the_size() {
+        use Agreement::{Agree, Neutral, Strong};
+        // (rule, on a plain agree, on a strong agree)
+        let cases = [
+            (TopupMode::StrongToAgree, None, Some(Agree)),
+            (TopupMode::StrongToStrong, None, Some(Strong)),
+            (TopupMode::ToTier, Some(Agree), Some(Strong)),
+            (TopupMode::Step, Some(Agree), Some(Strong)),
+        ];
+        for (mode, on_agree, on_strong) in cases {
+            assert_eq!(mode.target(Neutral), None, "{mode:?} never tops up on neutral");
+            assert_eq!(mode.target(Agree), on_agree, "{mode:?} on agree");
+            assert_eq!(mode.target(Strong), on_strong, "{mode:?} on strong agree");
+            assert_eq!(TopupMode::parse(mode.as_str()), mode);
+            assert_eq!(mode.steps(), mode == TopupMode::Step);
+        }
+        // Unknown / empty / hand-edited values fall back to the rule that buys least.
+        for junk in ["", "STEP ", "always", "strong"] {
+            let want = if junk.trim().eq_ignore_ascii_case("step") { TopupMode::Step } else { TopupMode::StrongToAgree };
+            assert_eq!(TopupMode::parse(junk), want, "{junk:?}");
+        }
+    }
+
+    #[test]
     fn a_skip_says_why() {
-        match sizing_verdict("CE", "FINNIFTY", Some(&reading_of(Bias::Bearish)), 1.5, 0.5) {
+        match sizing_verdict("CE", "FINNIFTY", Some(&reading_of(Bias::Bearish)), &MULTS) {
             SizingVerdict::Skip { reason } => {
                 assert!(reason.contains("NIFTY indicator (parent of FINNIFTY)"), "{reason}");
                 assert!(reason.contains("-2 SELL at the 11:01 check"), "{reason}");
@@ -870,7 +1038,7 @@ mod tests {
             }
             v => panic!("expected skip, got {v:?}"),
         }
-        assert!(matches!(sizing_verdict("FUT", "NIFTY", None, 1.5, 0.5), SizingVerdict::Skip { .. }));
+        assert!(matches!(sizing_verdict("FUT", "NIFTY", None, &MULTS), SizingVerdict::Skip { .. }));
     }
 
     #[test]

@@ -325,8 +325,7 @@ pub async fn market_indicator_handler(State(state): State<AppState>) -> axum::re
                 option_type,
                 index,
                 reading.as_ref(),
-                cfg.indicator_agree_multiplier,
-                cfg.indicator_neutral_multiplier,
+                &cfg.indicator_multipliers(),
             ) {
                 SizingVerdict::Scale { multiplier, note, .. } => CallVerdictDto {
                     action: "SCALE",

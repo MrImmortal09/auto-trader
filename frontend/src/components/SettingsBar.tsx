@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Save, Settings, Sliders, Wallet, Layers3, Info, AlertTriangle, KeyRound, Lock, Gauge } from 'lucide-react';
-import type { CallVerdict, IndicatorIndex, IndicatorPreview, TradingConfig } from '../types';
+import type { CallVerdict, IndicatorIndex, IndicatorPreview, TopupMode, TradingConfig } from '../types';
 import { apiFetch } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import { INDEX_LOT_REFERENCE } from '../lib/indexLots';
@@ -85,7 +85,7 @@ function FactorSlider({ label, value, min, max, step, enabled, disabled, onChang
       </div>
       {!enabled && (
         <span className="text-[11px] text-on-surface-variant italic">
-          {disabledNote ?? 'Only applies in LIVE mode when Dynamic Targeting is ON — and updates any already-open runner immediately on save.'}
+          {disabledNote ?? 'Only applies when Dynamic Targeting is ON — and updates any already-open runner immediately on save.'}
         </span>
       )}
     </div>
@@ -186,10 +186,13 @@ function verdictText(v: CallVerdict): string {
 
 function IndexPreviewRow({ ix }: { ix: IndicatorIndex }) {
   const r = ix.reading;
+  // A strong (±2) reading is solid, as on the Market Data page — it is the
+  // one that sizes a call at the Strong multiplier.
+  const strong = !!r && !r.opening && Math.abs(r.score.overall) >= 2;
   const tone = ix.bias === 'BULLISH'
-    ? 'bg-secondary/15 text-secondary'
+    ? strong ? 'bg-secondary text-on-secondary' : 'bg-secondary/15 text-secondary'
     : ix.bias === 'BEARISH'
-      ? 'bg-error/15 text-error'
+      ? strong ? 'bg-error text-on-error' : 'bg-error/15 text-error'
       : 'bg-surface-container text-on-surface-variant';
   const word = ix.bias === 'BULLISH' ? 'BUY' : ix.bias === 'BEARISH' ? 'SELL' : 'NEUTRAL';
   return (
@@ -257,6 +260,29 @@ function IndicatorPreviewPanel({ preview }: { preview: IndicatorPreview }) {
 }
 
 const INDICATOR_INTERVALS = [5, 15, 30, 60];
+/** The Aggressive Top-Up rules, least buying first (backend `entry_gate::TopupMode`). */
+const TOPUP_RULES: { value: TopupMode; label: string; detail: string }[] = [
+  {
+    value: 'strong_to_agree',
+    label: 'Strong agree → Agrees size',
+    detail: 'Only a strong agree (+2 / −2) tops up, and only to the Agrees size. Once per call. Buys the least.',
+  },
+  {
+    value: 'strong_to_strong',
+    label: 'Strong agree → Strong size',
+    detail: 'Only a strong agree tops up, straight to the Strong size. Once per call.',
+  },
+  {
+    value: 'tier',
+    label: 'Any agree → its own size',
+    detail: 'A plain agree tops up to the Agrees size, a strong agree to the Strong size — whichever reads first. Once per call.',
+  },
+  {
+    value: 'step',
+    label: 'Step up',
+    detail: 'As above, then once more to the Strong size if the reading later turns strong. A call bought at the Agrees size steps up too. Up to two top-ups per call.',
+  },
+];
 const INDICATOR_WINDOWS = [
   { value: 5, label: '±5' },
   { value: 10, label: '±10' },
@@ -306,7 +332,7 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
           <div className="relative flex flex-col gap-1.5">
             <span className="flex items-center gap-1 min-w-0">
               <label className={FIELD_LABEL}>Indicator Sizing (VWAP + PCR)</label>
-              <InfoTip text="ON: when a call triggers, read the last closed VWAP + PCR check of its index (BANKNIFTY and SENSEX their own; NIFTY for everything else). Agrees with the call (BUY CE + BUY reading, BUY PE + SELL reading) → default lots × the agree multiplier. NEUTRAL or no fresh reading → × the neutral multiplier. Disagrees → the call is not bought: it keeps waiting or is dropped, per the switch below, and the log says why. A manual qty override is never scaled, but is still held back on disagreement. OFF: every call is bought at its default lots." />
+              <InfoTip text="ON: when a call triggers, read the last closed VWAP + PCR check of its index (BANKNIFTY and SENSEX their own; NIFTY for everything else). Strongly agrees with the call — PCR and VWAP both on its side, +2 for BUY CE or −2 for BUY PE → default lots × the strong multiplier. Agrees — one of them on its side and the other neutral, +1 / −1 → × the agree multiplier. NEUTRAL or no fresh reading → × the neutral multiplier. Disagrees → the call is not bought: it keeps waiting or is dropped, per the switch below, and the log says why. A manual qty override is never scaled, but is still held back on disagreement. OFF: every call is bought at its default lots." />
             </span>
             <Segmented
               options={[{ value: 1, label: 'ON' }, { value: 0, label: 'OFF' }]}
@@ -317,10 +343,20 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
           </div>
 
           <div className={`space-y-4 transition-opacity ${on ? '' : 'opacity-50'}`}>
-            <div className="grid grid-cols-2 gap-3.5">
+            <div className="grid grid-cols-3 gap-2.5">
+              <NumberField
+                label="Strong ×"
+                info="Lot multiplier when the indicator strongly agrees with the call: PCR and VWAP both on its side (+2 for BUY CE, −2 for BUY PE). Lots round to the nearest whole lot (exact halves round down), never below 1 — so 1 lot × 1.5 stays 1 lot, 2 lots × 1.5 → 3."
+                value={cfg.indicator_strong_agree_multiplier}
+                onCommit={(v) => set({ indicator_strong_agree_multiplier: v })}
+                min={0.1}
+                max={5}
+                step={0.1}
+                disabled={disabled}
+              />
               <NumberField
                 label="Agrees ×"
-                info="Lot multiplier when the indicator agrees with the call. Lots round to the nearest whole lot (exact halves round down), never below 1 — so 1 lot × 1.5 stays 1 lot, 2 lots × 1.5 → 3."
+                info="Lot multiplier when the indicator agrees with the call on one signal only: PCR or VWAP on its side, the other neutral (+1 for BUY CE, −1 for BUY PE). Set 1 to buy the default lots. Same rounding, never below 1 lot."
                 value={cfg.indicator_agree_multiplier}
                 onCommit={(v) => set({ indicator_agree_multiplier: v })}
                 min={0.1}
@@ -361,7 +397,7 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
                 {
                   key: 'indicator_topup',
                   label: 'Aggressive Top-Up',
-                  info: 'ON: a call bought at the reduced Neutral size is topped up to the full Agrees size if the indicator later agrees while the price is back in the buy range (2 default lots: 1 bought at neutral, 2 more added → 3). Once per call, only before target 1, only while the stop is still at the signal level and nothing has been sold, never after Call Valid For or 15:39, never on a manual qty override. The added lots share the same stop-loss and targets. The indicator never sells: if it turns against an open position nothing happens. OFF: a position keeps the size it was bought at.',
+                  info: 'ON: a call bought at the reduced Neutral size is topped up if the indicator later agrees while the price is back in the buy range. Which reading does it, and up to what size, is the Top-Up Rule below. Only before target 1, only while the stop is still at the signal level and nothing has been sold, never after Call Valid For or 15:39, never on a manual qty override. The added lots share the same stop-loss and targets. The indicator never sells: if it turns against an open position nothing happens. OFF: a position keeps the size it was bought at.',
                 },
               ] as const).map((t) => (
                 <div key={t.key} className="relative flex flex-col gap-1.5">
@@ -377,6 +413,44 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
                   />
                 </div>
               ))}
+
+              {/* Sub-option of Aggressive Top-Up: which reading tops up, and how far. */}
+              <div className={`relative flex flex-col gap-1.5 transition-opacity ${cfg.indicator_topup ? '' : 'opacity-50'}`}>
+                <span className="flex items-center gap-1 min-w-0">
+                  <label className={FIELD_LABEL}>Top-Up Rule</label>
+                  <InfoTip text="Which indicator reading tops up a call bought at the Neutral size, and up to which size. Sizes are the default lots × the multipliers above: Agrees size = × Agrees, Strong size = × Strong. Every rule keeps the other top-up limits: before target 1, stop untouched, nothing sold, inside Call Valid For and 15:39." />
+                </span>
+                <div className="flex flex-col gap-1.5">
+                  {TOPUP_RULES.map((r) => {
+                    const selected = cfg.indicator_topup_mode === r.value;
+                    const locked = disabled || !cfg.indicator_topup;
+                    return (
+                      <button
+                        key={r.value}
+                        type="button"
+                        aria-pressed={selected}
+                        disabled={locked}
+                        onClick={() => set({ indicator_topup_mode: r.value })}
+                        className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                          selected
+                            ? 'border-secondary bg-secondary/10'
+                            : 'border-outline-variant bg-surface hover:bg-surface-container'
+                        } ${locked ? 'cursor-not-allowed' : ''}`}
+                      >
+                        <span className={`block text-xs font-semibold ${selected ? 'text-secondary' : 'text-on-surface'}`}>
+                          {r.label}
+                        </span>
+                        <span className="block text-[11px] leading-snug text-on-surface-variant">{r.detail}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {!cfg.indicator_topup && (
+                  <span className="text-[11px] text-on-surface-variant italic">
+                    Only applies when Aggressive Top-Up is ON.
+                  </span>
+                )}
+              </div>
             </div>
           </div>
 
@@ -521,7 +595,8 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           pre_t1_trail_factor: cfgData?.pre_t1_trail_factor ?? 0.5,
           entry_window_pct: cfgData?.entry_window_pct ?? 0,
           indicator_sizing: cfgData?.indicator_sizing ?? false,
-          indicator_agree_multiplier: cfgData?.indicator_agree_multiplier ?? 1.5,
+          indicator_agree_multiplier: cfgData?.indicator_agree_multiplier ?? 1.0,
+          indicator_strong_agree_multiplier: cfgData?.indicator_strong_agree_multiplier ?? 1.5,
           indicator_neutral_multiplier: cfgData?.indicator_neutral_multiplier ?? 0.5,
           indicator_interval_min: cfgData?.indicator_interval_min ?? 15,
           indicator_basis: cfgData?.indicator_basis === 'total' ? 'total' : 'chg',
@@ -533,6 +608,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           indicator_early_checks: cfgData?.indicator_early_checks ?? true,
           indicator_wait_on_disagree: cfgData?.indicator_wait_on_disagree ?? true,
           indicator_topup: cfgData?.indicator_topup ?? false,
+          indicator_topup_mode: cfgData?.indicator_topup_mode ?? 'strong_to_agree',
         });
         setVirtualBalance(typeof walletData?.balance === 'number' ? walletData.balance : 0);
       })
@@ -721,7 +797,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           <div className={`relative flex flex-col gap-1.5 transition-opacity ${cfg.dynamic_targeting ? '' : 'opacity-50'}`}>
             <span className="flex items-center gap-1 min-w-0">
               <label className={FIELD_LABEL}>Dynamic Targeting — 1 Lot</label>
-              <InfoTip text="With Dynamic Targeting ON, a position of only one lot normally sells that lot at target 1 and is done. ON: sell nothing at target 1 — the whole lot becomes the runner, its stop trails up and the next rung extends exactly like a multi-lot runner, and it only exits when price falls back through the trailed stop (which never sits below entry). Positions of 2+ lots are unaffected. LIVE only." />
+              <InfoTip text="With Dynamic Targeting ON, a position of only one lot normally sells that lot at target 1 and is done. ON: sell nothing at target 1 — the whole lot becomes the runner, its stop trails up and the next rung extends exactly like a multi-lot runner, and it only exits when price falls back through the trailed stop (which never sits below entry). Positions of 2+ lots are unaffected. Applies in PAPER and LIVE." />
             </span>
             <div className="flex rounded-lg overflow-hidden border border-outline-variant text-xs font-label-caps">
               {([true, false] as const).map((on) => (
