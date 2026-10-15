@@ -429,7 +429,7 @@ export function SystemPulseScreen({ serverBase, realizedPnl, liveMtmPnl, tradesT
           Waiting for the first sample from the backend…
         </div>
       ) : (
-        <div className={`space-y-4 transition-opacity ${stale ? 'opacity-60' : ''}`}>
+        <div className="space-y-4">
           <KpiRow s={s} />
 
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
