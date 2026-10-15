@@ -47,7 +47,7 @@ pub(crate) async fn run_event_loop(
     };
 
     tracing::info!(chats = target_chat_ids.len(), "[telegram] Event loop running");
-    telemetry::TELEGRAM_CONNECTED.set(1);
+    let _listening = telemetry::TelegramLoopGuard::enter();
 
     loop {
         let update = match stream.next().await {
@@ -159,7 +159,6 @@ pub(crate) async fn run_event_loop(
         }
     }
 
-    telemetry::TELEGRAM_CONNECTED.set(0);
     tracing::info!("[telegram] Event loop exited");
 }
 

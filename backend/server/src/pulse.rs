@@ -32,6 +32,8 @@ const HISTORY_LEN: usize = 450;
 const RATE_WINDOW: Duration = Duration::from_secs(10);
 /// Window for p50 / p95 latencies.
 const QUANTILE_WINDOW: Duration = Duration::from_secs(30);
+/// Per-scrip last-tick entries older than this are dropped (clears overnight).
+const SCRIP_TICK_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
 
 /// The charted subset of a sample — what the history ring keeps.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -584,7 +586,7 @@ pub fn spawn_sampler(state: AppState) {
                 feed_subscriptions: telemetry::FEED_SUBSCRIPTIONS.get(),
                 feed_ticks_total: cur.feed_ticks,
                 feed_bridge_restarts_total: telemetry::FEED_BRIDGE_RESTARTS.get(),
-                telegram_connected: telemetry::TELEGRAM_CONNECTED.get() == 1,
+                telegram_connected: telemetry::TELEGRAM_CONNECTED.get() > 0,
                 telegram_messages_total: telemetry::counter_total(&telemetry::TELEGRAM_MESSAGES),
                 telegram_parse: by(&telemetry::TELEGRAM_PARSE, "result"),
                 db_queue_capacity: db_capacity,
@@ -603,6 +605,7 @@ pub fn spawn_sampler(state: AppState) {
                 sse_clients: log_clients + pulse_clients,
             };
             state.pulse.publish(sample);
+            telemetry::prune_scrip_ticks(SCRIP_TICK_MAX_AGE);
 
             readings.push_back(cur);
             while readings

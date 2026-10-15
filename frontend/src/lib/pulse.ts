@@ -38,13 +38,17 @@ export function worst(...levels: Level[]): Level {
   return 'neutral';
 }
 
+/** IST is a fixed UTC+05:30 (no DST), so plain offset arithmetic is exact —
+ * no locale-string round trip through the browser's own time zone. */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60_000;
+
 /** Weekday 09:15–15:30 IST. Holidays aren't known here — this only decides
  * whether a silent price feed is suspicious or just the market being shut. */
 export function isMarketHoursIST(now: Date = new Date()): boolean {
-  const ist = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-  const day = ist.getDay();
+  const ist = new Date(now.getTime() + IST_OFFSET_MS);
+  const day = ist.getUTCDay();
   if (day === 0 || day === 6) return false;
-  const mins = ist.getHours() * 60 + ist.getMinutes();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
 }
 

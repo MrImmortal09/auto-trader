@@ -3614,6 +3614,9 @@ pub async fn start_position_monitor(
                                     tracing::warn!(id=?sig_id, new_sl = signal.stop_loss, "SL update matched no position");
                                     telemetry::signal(SignalOutcome::SlUnmatched);
                                 }
+                            } else {
+                                // No replied-to message id: nothing can match.
+                                telemetry::signal(SignalOutcome::SlUnmatched);
                             }
                             continue;
                         }
@@ -3659,6 +3662,9 @@ pub async fn start_position_monitor(
                                     tracing::error!(id=?sig_id, price=signal.entry_price, "EXIT_AT matched no position");
                                     telemetry::signal(SignalOutcome::ExitUnmatched);
                                 }
+                            } else {
+                                // No replied-to message id: nothing can match.
+                                telemetry::signal(SignalOutcome::ExitUnmatched);
                             }
                             continue;
                         }

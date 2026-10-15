@@ -431,12 +431,24 @@ pub fn scrip_last_tick(scrip: &str) -> Option<f64> {
     SCRIP_LAST_TICK.lock().ok().and_then(|m| m.get(scrip).copied())
 }
 
+/// Forget scrips that haven't ticked for `max_age` — tokens change daily, so
+/// without this the map grows for the life of the process.
+pub fn prune_scrip_ticks(max_age: Duration) {
+    prune_scrip_ticks_at(unix_now(), max_age);
+}
+
+fn prune_scrip_ticks_at(now: f64, max_age: Duration) {
+    if let Ok(mut m) = SCRIP_LAST_TICK.lock() {
+        m.retain(|_, t| now - *t <= max_age.as_secs_f64());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Telegram
 // ---------------------------------------------------------------------------
 
 pub static TELEGRAM_CONNECTED: LazyLock<IntGauge> = LazyLock::new(|| int_gauge(
-    "telegram_connected", "1 while the Telegram update loop is running",
+    "telegram_connected", "Telegram update loops currently running (0 = not listening)",
 ));
 pub static TELEGRAM_MESSAGES: LazyLock<IntCounterVec> = LazyLock::new(|| counter_vec(
     "telegram_messages_total", "Messages from watched chats", &["kind"],
@@ -463,6 +475,24 @@ impl ParseResult {
             Self::Exit => "exit",
             Self::Unparsed => "unparsed",
         }
+    }
+}
+
+/// Held for the life of one Telegram update loop. A count rather than a 0/1
+/// flag, since the env ingester and a dashboard login can each run a loop;
+/// the decrement is in `Drop` so a panic or an aborted task still clears it.
+pub struct TelegramLoopGuard;
+
+impl TelegramLoopGuard {
+    pub fn enter() -> Self {
+        TELEGRAM_CONNECTED.inc();
+        TelegramLoopGuard
+    }
+}
+
+impl Drop for TelegramLoopGuard {
+    fn drop(&mut self) {
+        TELEGRAM_CONNECTED.dec();
     }
 }
 
@@ -997,6 +1027,31 @@ mod tests {
         let r = reading(&bounds, &[3, 4], 0.2);
         assert_eq!(quantile_between(&r, &r, 0.95), None);
         assert_eq!(quantile_between(&Buckets::default(), &Buckets::default(), 0.5), None);
+    }
+
+    #[test]
+    fn prune_drops_only_stale_scrips() {
+        // Written directly, not via `feed_tick`, so the shared tick counter
+        // the export test asserts on stays untouched.
+        let now = unix_now();
+        if let Ok(mut m) = SCRIP_LAST_TICK.lock() {
+            m.insert("prune|fresh".into(), now - 60.0);
+            m.insert("prune|stale".into(), now - 7200.0);
+        }
+        prune_scrip_ticks_at(now, Duration::from_secs(3600));
+        assert!(scrip_last_tick("prune|fresh").is_some());
+        assert!(scrip_last_tick("prune|stale").is_none());
+    }
+
+    #[test]
+    fn telegram_guard_counts_running_loops() {
+        let before = TELEGRAM_CONNECTED.get();
+        {
+            let _a = TelegramLoopGuard::enter();
+            let _b = TelegramLoopGuard::enter();
+            assert_eq!(TELEGRAM_CONNECTED.get(), before + 2);
+        }
+        assert_eq!(TELEGRAM_CONNECTED.get(), before);
     }
 
     #[test]
