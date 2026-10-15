@@ -73,4 +73,17 @@ impl KotakError {
     pub fn is_ambiguous(&self) -> bool {
         matches!(self, KotakError::Http(_) | KotakError::Json(_))
     }
+
+    /// Order-outcome metric label — one of `shared_domain::telemetry::ORDER_RESULTS`.
+    pub fn metric_label(&self) -> &'static str {
+        if self.is_ambiguous() {
+            "ambiguous"
+        } else if self.is_session_expired() {
+            "session_expired"
+        } else if matches!(self, KotakError::OrderRejected { .. }) {
+            "rejected"
+        } else {
+            "error"
+        }
+    }
 }

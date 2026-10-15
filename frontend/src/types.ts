@@ -336,6 +336,130 @@ export interface ReconcileApplyItem {
   action: ReconcileAction;
 }
 
-export type ScreenId = 'dashboard' | 'positions' | 'analytics' | 'market' | 'portfolio' | 'settings';
+export type ScreenId = 'dashboard' | 'positions' | 'analytics' | 'market' | 'portfolio' | 'system' | 'settings';
 
 export type TgStep = 'idle' | 'code' | 'twofa' | 'chats' | 'running';
+
+// ---------------------------------------------------------------------------
+// System pulse (GET /api/telemetry/snapshot, SSE /api/telemetry/stream) —
+// mirrors `backend/server/src/pulse.rs`.
+// ---------------------------------------------------------------------------
+
+/** The charted subset of a sample; the backend keeps 15 minutes of these. */
+export interface TelemetryPoint {
+  /** Unix seconds. */
+  ts: number;
+  process_cpu_pct: number;
+  host_cpu_pct: number;
+  process_rss_mb: number;
+  host_available_mb: number;
+  tick_p95_ms: number | null;
+  ticks_per_sec: number;
+  feed_ticks_per_sec: number;
+  http_req_per_sec: number;
+  http_p95_ms: number | null;
+  kotak_p95_ms: number | null;
+  db_queue_depth: number;
+  signals_per_min: number;
+}
+
+export interface TelemetryEndpointStat {
+  endpoint: string;
+  total: number;
+  errors: number;
+  p95_ms: number | null;
+}
+
+export interface TelemetryPositionRow {
+  id: string;
+  instrument: string;
+  strike: number | null;
+  option_type: string | null;
+  state: 'waiting' | 'active' | 'target1' | 'closed';
+  qty: number;
+  avg_price: number;
+  entry_price: number;
+  current_sl: number;
+  ltp: number | null;
+  mtm: number | null;
+  ltp_age_secs: number | null;
+  halted: boolean;
+}
+
+export interface TelemetrySample extends TelemetryPoint {
+  mode: 'live' | 'paper' | 'other';
+  kill_switch: boolean;
+
+  process_uptime_secs: number;
+  process_virtual_mb: number;
+  host_memory_total_mb: number;
+  host_swap_total_mb: number;
+  host_swap_used_mb: number;
+  load_average: [number, number, number];
+  cpu_cores: number;
+  tokio_workers: number;
+  tokio_alive_tasks: number;
+  tokio_global_queue: number;
+
+  engine_heartbeat_age_secs: number | null;
+  tick_p50_ms: number | null;
+  tick_overruns_total: number;
+  tick_overruns_window: number;
+  live_startup_reconciled: boolean;
+  live_errors_total: number;
+  live_halts_total: number;
+  /** null when the engine held the positions lock at sample time. */
+  positions: { waiting: number; active: number; target1: number; closed: number } | null;
+  unrealized_mtm: number | null;
+  positions_table: TelemetryPositionRow[] | null;
+  trades: Record<string, number>;
+
+  signals_received_total: number;
+  signal_outcomes: Record<string, number>;
+  signals_lagged_total: number;
+
+  orders_by_result: Record<string, number>;
+  orders_by_side: Record<string, number>;
+  order_cancels: Record<string, number>;
+  order_book_poll_failures_total: number;
+  kotak_mutex_wait_p95_ms: number | null;
+  kotak_connected: boolean;
+  kotak_session_healthy: boolean;
+  kotak_requests_total: number;
+  kotak_errors_total: number;
+  kotak_endpoints: TelemetryEndpointStat[];
+  kotak_relogins: Record<string, number>;
+
+  feed_connected: boolean;
+  feed_last_tick_age_secs: number | null;
+  feed_subscriptions: number;
+  feed_ticks_total: number;
+  feed_bridge_restarts_total: number;
+
+  telegram_connected: boolean;
+  telegram_messages_total: number;
+  telegram_parse: Record<string, number>;
+
+  db_queue_capacity: number;
+  db_write_p95_ms: number | null;
+  db_write_errors_total: number;
+  db_pool_size: number;
+  db_pool_idle: number;
+
+  upstox_configured: boolean;
+  upstox_last_success_age_secs: number | null;
+  upstox_errors_total: number;
+
+  http_requests_total: number;
+  http_4xx_pct: number | null;
+  http_5xx_pct: number | null;
+  http_in_flight: number;
+  http_routes: TelemetryEndpointStat[];
+  sse_clients: number;
+}
+
+export interface TelemetrySnapshot {
+  latest: TelemetrySample | null;
+  history: TelemetryPoint[];
+  sample_every_secs: number;
+}

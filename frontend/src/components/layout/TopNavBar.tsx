@@ -22,6 +22,7 @@ export function TopNavBar({
     analytics: 'Trade Analytics & Order Flow Deep Dive',
     market: 'Market Data — OI, PCR & VWAP Trend',
     portfolio: 'Portfolio Performance & Reports',
+    system: 'System Pulse — Engine, Broker & Server Stats',
     settings: 'Configurations & System Settings',
   };
   // Phones only have room for a word or two next to the action buttons.
@@ -31,6 +32,7 @@ export function TopNavBar({
     analytics: 'Analytics',
     market: 'Market Data',
     portfolio: 'Portfolio',
+    system: 'System',
     settings: 'Settings',
   };
 

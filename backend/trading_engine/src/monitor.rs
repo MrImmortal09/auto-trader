@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use kotak_client::KotakClient;
 use shared_domain::entry_gate::{self, Agreement, IndicatorFeed, SizingVerdict};
+use shared_domain::telemetry::{self, SignalOutcome};
 use shared_domain::{
     DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradingConfig,
 };
@@ -67,6 +68,7 @@ async fn send_trade(
     exit_reason: Option<String>,
     mode: &str,
 ) {
+    telemetry::trade_booked(mode, action);
     let _ = tx.send(DbWriteMessage::Trade {
         ticker: ticker.to_owned(), action: action.to_owned(), qty,
         executed_price: price,
@@ -788,6 +790,14 @@ fn entry_retry_limit_price(
 
 type KotakHandle = Arc<tokio::sync::Mutex<Option<KotakClient>>>;
 
+/// `kotak.lock()`, recording how long the engine waited for the shared client.
+async fn lock_kotak(kotak: &KotakHandle) -> tokio::sync::MutexGuard<'_, Option<KotakClient>> {
+    let started = Instant::now();
+    let guard = kotak.lock().await;
+    telemetry::kotak_mutex_wait(started.elapsed());
+    guard
+}
+
 /// Places an order and returns the broker error unflattened, so the entry path
 /// can tell a hard rejection (`OrderRejected`) apart from a send that never got
 /// a verdict (`is_ambiguous`) or a dead session (`is_session_expired`).
@@ -795,24 +805,28 @@ async fn kotak_place(
     kotak: &KotakHandle,
     order: &shared_domain::OrderRequest,
 ) -> Result<String, kotak_client::KotakError> {
-    let guard = kotak.lock().await;
+    let guard = lock_kotak(kotak).await;
     let client = guard.as_ref().ok_or(kotak_client::KotakError::NotAuthenticated)?;
-    client.place_live_order(order).await.map(|e| e.order_id)
+    let result = client.place_live_order(order).await.map(|e| e.order_id);
+    telemetry::order_sent(order, result.as_ref().map_or_else(|e| e.metric_label(), |_| "ok"));
+    result
 }
 
 async fn kotak_limits(
     kotak: &KotakHandle,
 ) -> Result<kotak_client::KotakLimits, kotak_client::KotakError> {
-    let guard = kotak.lock().await;
+    let guard = lock_kotak(kotak).await;
     let client = guard.as_ref().ok_or(kotak_client::KotakError::NotAuthenticated)?;
     client.get_limits().await
 }
 
 async fn kotak_cancel(kotak: &KotakHandle, order_no: &str, trading_symbol: &str) -> Result<(), String> {
-    let guard = kotak.lock().await;
+    let guard = lock_kotak(kotak).await;
     let client = guard.as_ref().ok_or_else(|| "no Kotak session".to_string())?;
     let ts = (!trading_symbol.is_empty()).then_some(trading_symbol);
-    client.cancel_order(order_no, ts).await.map(|_| ()).map_err(|e| e.to_string())
+    let result = client.cancel_order(order_no, ts).await.map(|_| ()).map_err(|e| e.to_string());
+    telemetry::order_cancel(result.is_ok());
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +842,7 @@ async fn loud_error(
     message: &str,
 ) {
     tracing::error!(instrument = %instrument, "LIVE: {message}");
+    telemetry::ENGINE_LIVE_ERRORS.inc();
     let payload = json!({
         "event": "LIVE_ERROR",
         "instrument": instrument,
@@ -887,6 +902,7 @@ async fn bump_exit_attempts(
         }
     }
     if halted {
+        telemetry::LIVE_HALTS.inc();
         loud_error(db_tx, log_tx, instrument, &format!(
             "giving up after {MAX_EXIT_ATTEMPTS} failed exit attempts — no further orders will be sent for this position, square it off manually"
         )).await;
@@ -1079,7 +1095,7 @@ async fn reconcile_live_orders(
     }
 
     let book = {
-        let g = kotak.lock().await;
+        let g = lock_kotak(kotak).await;
         match g.as_ref() {
             Some(c) => c.get_order_book().await,
             None => return false,
@@ -1090,6 +1106,7 @@ async fn reconcile_live_orders(
         Err(e) => {
             // Transient: the next poll retries. Not loud — a flaky poll must not
             // drown out the errors that need a human.
+            telemetry::ORDER_BOOK_POLL_FAILURES.inc();
             tracing::warn!("LIVE order-book poll failed: {e}");
             return false;
         }
@@ -1652,7 +1669,7 @@ async fn reconcile_on_startup(
 
     // 2. Broker truth.
     let (broker_positions, book) = {
-        let guard = kotak.lock().await;
+        let guard = lock_kotak(kotak).await;
         let Some(client) = guard.as_ref() else {
             tracing::warn!("LIVE startup reconciliation skipped — no Kotak session");
             return false;
@@ -1907,7 +1924,7 @@ pub async fn preview_reconciliation(
     };
 
     let broker_positions = {
-        let guard = kotak.lock().await;
+        let guard = lock_kotak(kotak).await;
         let Some(client) = guard.as_ref() else {
             return Err("no Kotak session".to_string());
         };
@@ -2077,7 +2094,7 @@ pub async fn apply_reconciliation(
         matches!(i.action, ReconcileAction::AdoptQty | ReconcileAction::AdoptManual { .. })
     });
     let broker_positions = if needs_broker_truth {
-        let guard = kotak.lock().await;
+        let guard = lock_kotak(kotak).await;
         let Some(client) = guard.as_ref() else {
             return Err("no Kotak session".to_string());
         };
@@ -2747,7 +2764,7 @@ async fn exec_exit_all(
     if let Some(sl_id) = &ctx.sl_order_id {
         if let Err(e) = kotak_cancel(kotak, sl_id, &ctx.trading_symbol).await {
             let still_open = {
-                let guard = kotak.lock().await;
+                let guard = lock_kotak(kotak).await;
                 match guard.as_ref() {
                     Some(client) => client
                         .get_order_book()
@@ -3557,6 +3574,7 @@ pub async fn start_position_monitor(
                             entry = signal.entry_price,
                             "Signal queued"
                         );
+                        telemetry::signal_received(&signal.action);
 
                         if signal.action == "UPDATE_SL" {
                             if let Some(ref sig_id) = signal.signal_id {
@@ -3580,6 +3598,7 @@ pub async fn start_position_monitor(
                                     let snapshot = { positions.read().await.clone() };
                                     send_positions_snapshot(&db_tx, &snapshot).await;
                                     tracing::info!(id=?sig_id, "Updated SL via reply");
+                                    telemetry::signal(SignalOutcome::SlUpdated);
                                 } else {
                                     // Never drop this silently: an unmatched
                                     // SL update means a reply landed on a
@@ -3593,7 +3612,11 @@ pub async fn start_position_monitor(
                                     );
                                     send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                                     tracing::warn!(id=?sig_id, new_sl = signal.stop_loss, "SL update matched no position");
+                                    telemetry::signal(SignalOutcome::SlUnmatched);
                                 }
+                            } else {
+                                // No replied-to message id: nothing can match.
+                                telemetry::signal(SignalOutcome::SlUnmatched);
                             }
                             continue;
                         }
@@ -3625,6 +3648,7 @@ pub async fn start_position_monitor(
                                     let snapshot = { positions.read().await.clone() };
                                     send_positions_snapshot(&db_tx, &snapshot).await;
                                     tracing::info!(id=?sig_id, price=signal.entry_price, "Triggered EXIT_AT via reply");
+                                    telemetry::signal(SignalOutcome::ExitApplied);
                                 } else {
                                     // Louder than the SL case on purpose: an
                                     // exit that matched nothing means someone
@@ -3636,7 +3660,11 @@ pub async fn start_position_monitor(
                                     );
                                     send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                                     tracing::error!(id=?sig_id, price=signal.entry_price, "EXIT_AT matched no position");
+                                    telemetry::signal(SignalOutcome::ExitUnmatched);
                                 }
+                            } else {
+                                // No replied-to message id: nothing can match.
+                                telemetry::signal(SignalOutcome::ExitUnmatched);
                             }
                             continue;
                         }
@@ -3678,6 +3706,7 @@ pub async fn start_position_monitor(
                                 let snapshot = { positions.read().await.clone() };
                                 send_positions_snapshot(&db_tx, &snapshot).await;
                                 tracing::info!(id=?sig_id, "Updated existing signal");
+                                telemetry::signal(SignalOutcome::EditApplied);
                                 continue;
                             }
                         }
@@ -3726,6 +3755,7 @@ pub async fn start_position_monitor(
                                         instrument = %signal.instrument_name,
                                         "Resend of an already-tracked contract carried a revised SL/target — applied in place instead of opening a duplicate"
                                     );
+                                    telemetry::signal(SignalOutcome::DuplicateRevised);
                                 } else {
                                     let msg = format!(
                                         r#"{{"event":"DUPLICATE_SIGNAL_SKIPPED","message":"Signal skipped — an open or waiting position already exists for this exact contract and entry","instrument":"{}"}}"#,
@@ -3738,6 +3768,7 @@ pub async fn start_position_monitor(
                                         entry = signal.entry_price,
                                         "Duplicate BUY signal skipped — identical contract + entry already tracked"
                                     );
+                                    telemetry::signal(SignalOutcome::DuplicateSkipped);
                                 }
                                 continue;
                             }
@@ -3756,6 +3787,7 @@ pub async fn start_position_monitor(
                                     instrument = %signal.instrument_name,
                                     "Signal discarded — missing target"
                                 );
+                                telemetry::signal(SignalOutcome::RejectedNoTarget);
                                 continue;
                             }
 
@@ -3796,6 +3828,7 @@ pub async fn start_position_monitor(
                                             expiry = %expiry_str, 
                                             "Signal discarded — expiry in past"
                                         );
+                                        telemetry::signal(SignalOutcome::RejectedExpired);
                                         continue;
                                     }
                                 }
@@ -3809,6 +3842,7 @@ pub async fn start_position_monitor(
                                 );
                                 send_log(&db_tx, &log_tx, "WARN", &msg).await;
                                 tracing::warn!(instrument = %signal.instrument_name, "Signal dropped — kill switch is active");
+                                telemetry::signal(SignalOutcome::RejectedKillSwitch);
                                 continue;
                             }
 
@@ -3827,6 +3861,7 @@ pub async fn start_position_monitor(
                                     );
                                     send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                                     tracing::info!(instrument = %signal.instrument_name, "Signal skipped — lot count is 0");
+                                    telemetry::signal(SignalOutcome::RejectedZeroLots);
                                     continue;
                                 }
                             }
@@ -3885,6 +3920,7 @@ pub async fn start_position_monitor(
                                     );
                                     send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                                     tracing::error!(instrument = %signal.instrument_name, "Signal discarded — Scrip Master not loaded");
+                                    telemetry::signal(SignalOutcome::RejectedNoScripMaster);
                                     continue;
                                 }
 
@@ -3896,6 +3932,7 @@ pub async fn start_position_monitor(
                                     );
                                     send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                                     tracing::error!(instrument = %signal.instrument_name, "Signal discarded — not found in Scrip Master");
+                                    telemetry::signal(SignalOutcome::RejectedUnresolved);
                                     continue;
                                 }
 
@@ -3921,6 +3958,7 @@ pub async fn start_position_monitor(
                                                 );
                                                 send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                                                 tracing::error!(instrument = %signal.instrument_name, price = px, tgt1 = t1, "Signal discarded — already at target 1");
+                                                telemetry::signal(SignalOutcome::RejectedAtTarget);
                                                 continue;
                                             }
                                         }
@@ -4013,6 +4051,7 @@ pub async fn start_position_monitor(
                                     call_expires_at: None,
                                     sizing: Default::default(),
                                 });
+                                telemetry::signal(SignalOutcome::Accepted);
                                 let snapshot = pos_guard.clone();
                                 drop(pos_guard);
                                 send_positions_snapshot(&db_tx, &snapshot).await;
@@ -4022,10 +4061,12 @@ pub async fn start_position_monitor(
                                 instrument = %signal.instrument_name,
                                 "SELL/short signals not yet implemented"
                             );
+                            telemetry::signal(SignalOutcome::RejectedUnsupported);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("Signal receiver lagged — dropped {n}");
+                        telemetry::SIGNALS_LAGGED.inc_by(n);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::info!("Signal channel closed — monitor exiting");
@@ -4035,6 +4076,9 @@ pub async fn start_position_monitor(
             }
 
             _ = tick.tick() => {
+                // Records duration / overrun / heartbeat when the tick ends,
+                // through whichever `continue` ends it.
+                let _tick = telemetry::TickTimer::start();
                 // LIVE runs its own state machine end to end — real orders, real
                 // fills, no simulated prices anywhere. PAPER keeps the original
                 // two-pass loop below untouched.
@@ -4049,11 +4093,12 @@ pub async fn start_position_monitor(
                     // starts, or flips PAPER → LIVE mid-day.
                     if !startup_reconciled && last_reconcile_attempt.elapsed() >= LIVE_POLL_INTERVAL {
                         last_reconcile_attempt = Instant::now();
-                        let has_session = { kotak.lock().await.is_some() };
+                        let has_session = { lock_kotak(&kotak).await.is_some() };
                         if has_session {
                             startup_reconciled = reconcile_on_startup(&positions, &kotak, &db_tx, &log_tx, cfg.brokerage_per_order).await;
                         }
                     }
+                    telemetry::LIVE_STARTUP_RECONCILED.set(startup_reconciled as i64);
                     // Never trade on unverified state: if reconciliation hasn't
                     // succeeded yet (no session, or the broker call failed), skip
                     // live_tick this tick and retry reconciliation on the next one

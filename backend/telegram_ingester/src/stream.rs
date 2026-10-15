@@ -5,6 +5,7 @@ use grammers_client::sender::{SenderPool, SenderPoolRunner};
 use grammers_client::update::Update;
 use grammers_client::{Client, SignInError};
 use grammers_session::updates::UpdatesLike;
+use shared_domain::telemetry::{self, ParseResult};
 use shared_domain::TradeSignal;
 use tokio::sync::{broadcast, mpsc};
 
@@ -46,6 +47,7 @@ pub(crate) async fn run_event_loop(
     };
 
     tracing::info!(chats = target_chat_ids.len(), "[telegram] Event loop running");
+    let _listening = telemetry::TelegramLoopGuard::enter();
 
     loop {
         let update = match stream.next().await {
@@ -76,6 +78,7 @@ pub(crate) async fn run_event_loop(
         }
 
         tracing::info!(chat_id, msg_id = msg.id(), "[telegram] Received message: {}", text);
+        telemetry::telegram_message(is_edit);
 
         let msg_id_str = msg.id().to_string();
 
@@ -110,6 +113,7 @@ pub(crate) async fn run_event_loop(
                     raw_message: Some(text.to_owned()),
                 };
                 tracing::info!(new_sl, "Reply parsed as SL update — broadcasting");
+                telemetry::telegram_parsed(ParseResult::SlUpdate);
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — update dropped");
                 }
@@ -130,6 +134,7 @@ pub(crate) async fn run_event_loop(
                     raw_message: Some(text.to_owned()),
                 };
                 tracing::info!(exit_price, "Reply parsed as EXIT_AT — broadcasting");
+                telemetry::telegram_parsed(ParseResult::Exit);
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — update dropped");
                 }
@@ -144,9 +149,12 @@ pub(crate) async fn run_event_loop(
                     action = %signal.action,
                     "Signal parsed — broadcasting"
                 );
+                telemetry::telegram_parsed(ParseResult::Signal);
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — signal dropped");
                 }
+            } else {
+                telemetry::telegram_parsed(ParseResult::Unparsed);
             }
         }
     }

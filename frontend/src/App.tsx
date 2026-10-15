@@ -10,20 +10,20 @@ import { TopNavBar } from './components/layout/TopNavBar';
 import { BottomNavBar } from './components/layout/BottomNavBar';
 
 // Components
-import { Info, Plug, SlidersHorizontal, Activity, AlertOctagon } from 'lucide-react';
+import { Info, Plug, SlidersHorizontal, AlertOctagon } from 'lucide-react';
 import { LogTerminal } from './components/LogTerminal';
 import { UpcomingTrades } from './components/UpcomingTrades';
 import { TelegramFeed } from './components/TelegramFeed';
 import { PortfolioSection } from './components/PortfolioSection';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { SettingsBar } from './components/SettingsBar';
-import { HealthPage } from './components/HealthPage';
 import { KillSwitchModal } from './components/KillSwitchModal';
 
 // Screens
 import { TradeAnalyticsScreen } from './screens/TradeAnalyticsScreen';
 import { PortfolioPerformanceScreen } from './screens/PortfolioPerformanceScreen';
 import { MarketDataScreen } from './screens/MarketDataScreen';
+import { SystemPulseScreen } from './screens/SystemPulseScreen';
 
 export default function App() {
   const [logHeight, setLogHeight] = useState(220);
@@ -36,7 +36,8 @@ export default function App() {
     if (typeof window !== 'undefined') {
       const p = window.location.pathname;
       if (p.startsWith('/reports') || p.startsWith('/portfolio')) return 'portfolio';
-      if (p.startsWith('/health') || p.startsWith('/settings')) return 'settings';
+      if (p.startsWith('/system') || p.startsWith('/health')) return 'system';
+      if (p.startsWith('/settings')) return 'settings';
       if (p.startsWith('/analytics')) return 'analytics';
       if (p.startsWith('/market')) return 'market';
       if (p.startsWith('/positions')) return 'positions';
@@ -91,6 +92,7 @@ export default function App() {
         analytics: '/analytics',
         market: '/market',
         portfolio: '/portfolio',
+        system: '/system',
         settings: '/settings',
       };
       window.history.pushState(null, '', paths[screen]);
@@ -208,6 +210,15 @@ export default function App() {
             <PortfolioPerformanceScreen serverBase={serverBase} />
           )}
 
+          {activeScreen === 'system' && (
+            <SystemPulseScreen
+              serverBase={serverBase}
+              realizedPnl={realizedPnl}
+              liveMtmPnl={liveMtmPnl}
+              tradesToday={totalTradesToday}
+            />
+          )}
+
           {activeScreen === 'settings' && (
             <div className="space-y-10">
               <section className="space-y-4">
@@ -222,13 +233,6 @@ export default function App() {
                   <SlidersHorizontal size={18} className="text-primary" /> Trading Configuration
                 </h2>
                 <SettingsBar serverBase={serverBase} />
-              </section>
-
-              <section className="space-y-4">
-                <h2 className="flex items-center gap-2 text-lg font-bold text-on-surface">
-                  <Activity size={18} className="text-primary" /> System Health
-                </h2>
-                <HealthPage serverBase={serverBase} />
               </section>
             </div>
           )}
