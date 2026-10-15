@@ -4,6 +4,7 @@ use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod entry_gate;
+pub mod telemetry;
 
 /// Underlying index names this app treats as "index" options (vs. stock
 /// options, which fall back to `TradingConfig::other_lots`). Matched against

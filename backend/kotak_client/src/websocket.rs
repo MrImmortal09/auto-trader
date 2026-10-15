@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use shared_domain::telemetry;
 use tracing::{error, info, warn};
 
 fn resolve_bridge_dir() -> Option<PathBuf> {
@@ -55,6 +56,8 @@ pub async fn start_market_data_stream(
     let mut close_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        telemetry::FEED_SUBSCRIPTIONS.set(active_scrips.len() as i64);
+
         // If child is dead or not started, start it
         if current_stdin.is_none() {
             if !shared_domain::is_market_open() {
@@ -102,6 +105,7 @@ pub async fn start_market_data_stream(
             {
                 Ok(c) => c,
                 Err(e) => {
+                    telemetry::FEED_BRIDGE_RESTARTS.inc();
                     error!("Failed to start Node.js bridge. Retrying in 10s... {}", e);
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     continue;
@@ -147,12 +151,17 @@ pub async fn start_market_data_stream(
                                 for item in arr {
                                     if let (Some(tk), Some(e)) = (item["tk"].as_str(), item["e"].as_str()) {
                                         if let Some(ltp) = item["ltp"].as_f64().or_else(|| item["ltp"].as_str().and_then(|s| s.parse::<f64>().ok())) {
-                                            prices_clone.insert(format!("{}|{}", e.to_ascii_lowercase(), tk.trim()), ltp);
+                                            let key = format!("{}|{}", e.to_ascii_lowercase(), tk.trim());
+                                            telemetry::feed_tick(&key);
+                                            prices_clone.insert(key, ltp);
                                         }
                                     }
                                 }
                             }
+                        } else if parsed["event"] == "connected" {
+                            telemetry::FEED_CONNECTED.set(1);
                         } else if parsed["event"] == "closed" {
+                            telemetry::FEED_CONNECTED.set(0);
                             warn!("Node bridge reported WebSocket closed.");
                             break;
                         } else if parsed["event"] == "error" {
@@ -160,6 +169,7 @@ pub async fn start_market_data_stream(
                         }
                     }
                 }
+                telemetry::FEED_CONNECTED.set(0);
                 warn!("Node bridge stdout closed.");
             });
 
@@ -205,6 +215,8 @@ pub async fn start_market_data_stream(
                     std::future::pending().await
                 }
             } => {
+                telemetry::FEED_BRIDGE_RESTARTS.inc();
+                telemetry::FEED_CONNECTED.set(0);
                 warn!("Node bridge child process exited with {:?}", res);
                 current_stdin = None;
                 child_opt = None;
@@ -218,6 +230,7 @@ pub async fn start_market_data_stream(
                     std::future::pending().await
                 }
             } => {
+                telemetry::FEED_CONNECTED.set(0);
                 warn!("Market close (15:40:00 IST) reached — closing WebSocket sharply and clearing LTPs.");
                 if let Some(mut child) = child_opt.take() { let _ = child.kill().await; }
                 current_stdin = None;

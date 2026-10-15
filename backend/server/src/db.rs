@@ -1,6 +1,6 @@
 use shared_domain::{current_ist_timestamp_string, DbWriteMessage, MonitoredPosition};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
-use shared_domain::TradingConfig;
+use shared_domain::{telemetry, TradingConfig};
 use std::str::FromStr;
 use tokio::sync::mpsc;
 
@@ -466,6 +466,7 @@ pub async fn load_kotak_session(pool: &SqlitePool) -> Option<KotakSessionRow> {
 /// eliminating "database is locked" errors from concurrent writers.
 pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool) {
     while let Some(msg) = rx.recv().await {
+        let _timer = telemetry::DbWriteTimer::start(msg.metric_kind());
         match msg {
             DbWriteMessage::Trade {
                 ticker, action, qty, executed_price,
@@ -478,6 +479,7 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                     Ok(t) => t,
                     Err(e) => {
                         tracing::error!("DB begin tx: {e}");
+                        telemetry::db_write_error("trade");
                         continue;
                     }
                 };
@@ -497,6 +499,7 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 .execute(&mut *tx).await
                 {
                     tracing::error!("DB trade insert: {e}");
+                    telemetry::db_write_error("trade");
                     let _ = tx.rollback().await;
                     continue;
                 }
@@ -513,12 +516,14 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                     .await
                 {
                     tracing::error!("DB wallet update: {e}");
+                    telemetry::db_write_error("trade");
                     let _ = tx.rollback().await;
                     continue;
                 }
 
                 if let Err(e) = tx.commit().await {
                     tracing::error!("DB commit tx: {e}");
+                    telemetry::db_write_error("trade");
                 }
             }
             DbWriteMessage::Log { level, message } => {
@@ -529,6 +534,7 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 .bind(&level).bind(&message).bind(&timestamp).execute(&pool).await
                 {
                     tracing::error!("DB log insert: {e}");
+                    telemetry::db_write_error("log");
                 }
             }
             DbWriteMessage::PositionsSnapshot { json } => {
@@ -542,6 +548,7 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 .await
                 {
                     tracing::error!("DB positions snapshot update: {e}");
+                    telemetry::db_write_error("positions_snapshot");
                 }
             }
             DbWriteMessage::OiSnapshot {
@@ -562,6 +569,7 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 .await
                 {
                     tracing::error!("DB oi snapshot insert: {e}");
+                    telemetry::db_write_error("oi_snapshot");
                 }
             }
         }

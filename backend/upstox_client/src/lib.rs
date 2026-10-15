@@ -19,6 +19,7 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate};
 use serde::de::{DeserializeOwned, DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use shared_domain::telemetry;
 
 const API_BASE: &str = "https://api.upstox.com/v2";
 /// Per-request budget for the small JSON API calls.
@@ -43,6 +44,16 @@ pub enum UpstoxError {
     Api { status: u16, body: String },
     #[error("decode error: {0}")]
     Decode(String),
+}
+
+/// Fixed metric label for an API path (the paths are literals in this file).
+fn endpoint_label(path: &str) -> &'static str {
+    match path {
+        "/option/contract" => "option_contract",
+        "/option/chain" => "option_chain",
+        "/market-quote/quotes" => "quotes",
+        _ => "other",
+    }
 }
 
 impl UpstoxError {
@@ -181,6 +192,23 @@ impl UpstoxClient {
     }
 
     async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<T, UpstoxError> {
+        let started = std::time::Instant::now();
+        let res = self.get_json_inner(path, params).await;
+        let result = match &res {
+            Ok(_) => "ok",
+            Err(UpstoxError::Api { status, .. }) => telemetry::status_class(*status),
+            Err(UpstoxError::Decode(_)) => "decode_error",
+            Err(_) => "transport_error",
+        };
+        telemetry::upstox_request(endpoint_label(path), result, started.elapsed().as_secs_f64());
+        res
+    }
+
+    async fn get_json_inner<T: DeserializeOwned>(
         &self,
         path: &str,
         params: &[(&str, &str)],

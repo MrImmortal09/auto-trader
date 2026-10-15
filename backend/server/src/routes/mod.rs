@@ -23,3 +23,5 @@ pub mod market;
 pub use market::{market_indicator_handler, market_live_handler, market_option_chain_handler, market_trend_handler};
 pub mod kill_switch;
 pub use kill_switch::{post_kill_switch_handler, post_kill_switch_reset_handler, get_kill_switch_status_handler};
+pub mod telemetry;
+pub use telemetry::{metrics_handler, telemetry_snapshot_handler, telemetry_stream_handler};

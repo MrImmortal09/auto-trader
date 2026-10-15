@@ -1,6 +1,6 @@
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
-use shared_domain::{ExecutionResult, OrderRequest};
+use shared_domain::{telemetry, ExecutionResult, OrderRequest};
 
 use crate::{KotakCredentials, KotakError, AUTH_BASE_URL, NEO_FIN_KEY};
 
@@ -329,6 +329,27 @@ fn find_csv_url(val: &serde_json::Value, segment: &str) -> Option<String> {
 // KotakClient
 // ---------------------------------------------------------------------------
 
+/// `RequestBuilder::send` that also records the call's latency (to response
+/// headers) and HTTP outcome under `endpoint`. The response or error is passed
+/// through untouched, so callers' error handling is unchanged.
+trait SendTimed {
+    async fn send_timed(self, endpoint: &'static str) -> reqwest::Result<reqwest::Response>;
+}
+
+impl SendTimed for reqwest::RequestBuilder {
+    async fn send_timed(self, endpoint: &'static str) -> reqwest::Result<reqwest::Response> {
+        let started = std::time::Instant::now();
+        let res = self.send().await;
+        let result = match &res {
+            Ok(r) => telemetry::status_class(r.status().as_u16()),
+            Err(e) if e.is_timeout() => "timeout",
+            Err(_) => "transport_error",
+        };
+        telemetry::kotak_request(endpoint, result, started.elapsed().as_secs_f64());
+        res
+    }
+}
+
 /// Map an authenticated-endpoint response to [`KotakError::SessionExpired`] when
 /// the broker rejects the session token / sid with HTTP 401 or 403, otherwise
 /// pass the response straight through.
@@ -406,7 +427,7 @@ impl KotakClient {
             .header("neo-fin-key", NEO_FIN_KEY)
             .header(header::CONTENT_TYPE, "application/json")
             .json(&payload)
-            .send()
+            .send_timed("login_totp")
             .await?;
         let status = resp.status();
         let body = resp.text().await?;
@@ -442,7 +463,7 @@ impl KotakClient {
             .header("Auth", view_token)
             .header(header::CONTENT_TYPE, "application/json")
             .json(&payload)
-            .send()
+            .send_timed("login_mpin")
             .await?;
         let status = resp.status();
         let body = resp.text().await?;
@@ -508,7 +529,7 @@ impl KotakClient {
         let url = format!("{}/script-details/1.0/masterscrip/file-paths", sess.base_url);
         let resp: serde_json::Value = self.http.get(&url)
             .header("Authorization", self.access_token.trim())
-            .send()
+            .send_timed("scrip_master_paths")
             .await?
             .json()
             .await?;
@@ -516,7 +537,7 @@ impl KotakClient {
         let csv_url = find_csv_url(&resp, segment)
             .ok_or_else(|| KotakError::OrderRejected { status_code: 404, message: format!("CSV URL not found for {}", segment) })?;
 
-        let csv_text = self.http.get(&csv_url).send().await?.text().await?;
+        let csv_text = self.http.get(&csv_url).send_timed("scrip_master_csv").await?.text().await?;
         Ok(csv_text)
     }
 
@@ -542,7 +563,7 @@ impl KotakClient {
         }
 
         let raw = check_session_status(
-            req.form(&[("jData", j_data.as_str())]).send().await?,
+            req.form(&[("jData", j_data.as_str())]).send_timed("place_order").await?,
         )?
         .json::<KotakOrderResponse>()
         .await?;
@@ -610,7 +631,7 @@ impl KotakClient {
         }
 
         let raw = check_session_status(
-            req.form(&[("jData", j_data.as_str())]).send().await?,
+            req.form(&[("jData", j_data.as_str())]).send_timed("modify_order").await?,
         )?
         .json::<KotakOrderResponse>()
         .await?;
@@ -666,7 +687,7 @@ impl KotakClient {
         }
 
         let raw = check_session_status(
-            req.form(&[("jData", j_data.as_str())]).send().await?,
+            req.form(&[("jData", j_data.as_str())]).send_timed("cancel_order").await?,
         )?
         .json::<KotakOrderResponse>()
         .await?;
@@ -711,7 +732,7 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = check_session_status(req.send().await?)?
+        let raw = check_session_status(req.send_timed("positions").await?)?
             .json::<KotakPositionsResponse>()
             .await?;
 
@@ -752,7 +773,7 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = check_session_status(req.send().await?)?
+        let raw = check_session_status(req.send_timed("order_book").await?)?
             .json::<KotakOrderBookResponse>()
             .await?;
 
@@ -791,7 +812,7 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = check_session_status(req.form(&[("jData", j_data)]).send().await?)?
+        let raw = check_session_status(req.form(&[("jData", j_data)]).send_timed("limits").await?)?
             .json::<KotakLimitsResponse>()
             .await?;
 

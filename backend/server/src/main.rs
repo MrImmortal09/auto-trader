@@ -6,6 +6,7 @@
 
 mod db;
 mod market_data;
+mod pulse;
 mod routes;
 
 use std::sync::Arc;
@@ -151,6 +152,8 @@ pub(crate) struct AppState {
     /// Upstox poller and read by the position monitor when an entry triggers
     /// (VWAP + PCR indicator sizing — see `shared_domain::entry_gate`).
     pub indicator_feed: shared_domain::entry_gate::IndicatorFeed,
+    /// Live stats for the System screen — see `pulse`.
+    pub pulse: Arc<pulse::PulseHub>,
 }
 
 // ---------------------------------------------------------------------------
@@ -608,9 +611,11 @@ async fn run_kotak_session_watchdog(
         match routes::try_env_auto_login(handles.as_deps(), "session watchdog").await {
             Ok(()) => {
                 healthy.store(true, Ordering::Relaxed);
+                shared_domain::telemetry::kotak_relogin(true);
                 tracing::info!("Kotak session watchdog — re-login succeeded");
             }
             Err(e) => {
+                shared_domain::telemetry::kotak_relogin(false);
                 tracing::error!(reason = %e, "Kotak session watchdog — re-login failed; retrying after the 5-minute gap");
             }
         }
@@ -639,6 +644,9 @@ async fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // Register every metric up front — see `shared_domain::telemetry::init`.
+    shared_domain::telemetry::init();
 
     // Check PASSKEY status
     if let Some(val) = std::env::var("PASSKEY").ok().or_else(|| option_env!("PASSKEY").map(String::from)) {
@@ -942,7 +950,9 @@ async fn main() {
         kotak_session_healthy,
         market,
         indicator_feed,
+        pulse: Arc::new(pulse::PulseHub::new()),
     };
+    pulse::spawn_sampler(state.clone());
 
     let app = Router::new()
         .route("/api/webhook/telegram",            post(routes::webhook_handler))
@@ -950,6 +960,9 @@ async fn main() {
         .route("/api/logs/history",                 get(routes::logs_history_handler))
         .route("/api/portfolio",                    get(routes::portfolio_handler))
         .route("/api/health",                       get(routes::health_handler))
+        .route("/metrics",                          get(routes::metrics_handler))
+        .route("/api/telemetry/snapshot",           get(routes::telemetry_snapshot_handler))
+        .route("/api/telemetry/stream",             get(routes::telemetry_stream_handler))
         .route("/api/market/live",                  get(routes::market_live_handler))
         .route("/api/market/intraday-trend",        get(routes::market_trend_handler))
         .route("/api/market/option-chain",          get(routes::market_option_chain_handler))
@@ -992,6 +1005,8 @@ async fn main() {
         .route("/api/auth/session",                 get(routes::session_status_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
         .layer(middleware::from_fn(auth_middleware))
+        // Outside auth, so rejected requests are counted too.
+        .layer(middleware::from_fn(routes::telemetry::http_metrics))
         .with_state(state)
         .layer(CorsLayer::permissive());
 

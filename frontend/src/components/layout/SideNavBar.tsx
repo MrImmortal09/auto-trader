@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import {
+  Activity,
   BarChart2,
   Gauge,
   LayoutDashboard,
@@ -139,6 +140,14 @@ export function SideNavBar({
         >
           <TrendingUp size={isCollapsed ? 20 : 18} className="shrink-0" />
           {!isCollapsed && <span>Portfolio</span>}
+        </div>
+        <div
+          onClick={() => onSelectScreen('system')}
+          title="System"
+          className={itemClass(activeScreen === 'system')}
+        >
+          <Activity size={isCollapsed ? 20 : 18} className="shrink-0" />
+          {!isCollapsed && <span>System</span>}
         </div>
         <div
           onClick={() => onSelectScreen('settings')}

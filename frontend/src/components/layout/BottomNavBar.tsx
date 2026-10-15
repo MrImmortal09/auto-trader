@@ -1,4 +1,5 @@
 import {
+  Activity,
   BarChart2,
   Gauge,
   LayoutDashboard,
@@ -16,7 +17,7 @@ export function BottomNavBar({
   onSelectScreen: (screen: ScreenId) => void;
 }) {
   const itemClass = (active: boolean) =>
-    `flex flex-col items-center justify-center py-1.5 px-2 rounded-xl transition-all select-none cursor-pointer ${
+    `flex flex-col items-center justify-center py-1.5 px-1 sm:px-2 rounded-xl transition-all select-none cursor-pointer ${
       active
         ? 'text-primary font-bold'
         : 'text-on-surface-variant hover:text-on-surface'
@@ -58,6 +59,13 @@ export function BottomNavBar({
       >
         <TrendingUp size={20} className={activeScreen === 'portfolio' ? 'scale-110 transition-transform' : ''} />
         <span className="text-[10px] mt-1 font-medium">Portfolio</span>
+      </div>
+      <div
+        onClick={() => onSelectScreen('system')}
+        className={itemClass(activeScreen === 'system')}
+      >
+        <Activity size={20} className={activeScreen === 'system' ? 'scale-110 transition-transform' : ''} />
+        <span className="text-[10px] mt-1 font-medium">System</span>
       </div>
       <div
         onClick={() => onSelectScreen('settings')}
