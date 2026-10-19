@@ -25,6 +25,8 @@ cargo test -p telegram_ingester    # run one crate's tests (also: kotak_client, 
 cargo test -p telegram_ingester parses_basic_signal   # run a single test by name
 ```
 
+CI (`.github/workflows/tests.yml`) runs `cargo test --workspace` on every push to main and every PR. Every Telegram call format the channels post — and how each message is routed (trade / SL update / exit / ignored) — is pinned in `backend/telegram_ingester/tests/signal_formats.rs`; add a new format there before supporting it, and never delete the old ones.
+
 Run the server from the **repo root**, not from `backend/`: it resolves `trades.db`, `session.json`, `../frontend/dist`, and `kotak-bridge/` relative to the working directory.
 
 **Always run `cargo build` (or `cargo check`) after any Rust change to verify it compiles before finishing a task.**
