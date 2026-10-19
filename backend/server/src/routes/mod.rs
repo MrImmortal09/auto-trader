@@ -16,6 +16,7 @@ pub use auth_telegram::{
     telegram_request_code_handler, telegram_submit_code_handler,
     telegram_submit_2fa_handler, telegram_status_handler,
     telegram_chats_handler, telegram_start_handler, disconnect_telegram,
+    resume_saved_telegram,
 };
 pub use health::health_handler;
 pub use auth_passkey::{verify_passkey_handler, session_status_handler, verify_token};

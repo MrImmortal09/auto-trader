@@ -282,12 +282,10 @@ pub async fn post_update_server_handler(
     *state.kotak.lock().await = None;
     let _ = sqlx::query("DELETE FROM kotak_session").execute(&state.db_pool).await;
 
-    // 2. Disconnect Telegram
-    {
-        let mut mgr = state.telegram.lock().await;
-        *mgr = telegram_ingester::TelegramManager::new();
-    }
-    let _ = std::fs::remove_file("session.json");
+    // 2. Telegram is left alone. Its login (session.json) and saved chats
+    //    (`telegram_resume`) let the new server reconnect by itself
+    //    (`routes::resume_saved_telegram`); update.sh stops this server before
+    //    starting the new one, so the login is never used by two at once.
 
     // 3. Trigger update.sh in a NEW session (setsid) so it survives this server
     //    being stopped — the script sends C-c to our own tmux pane. The binary

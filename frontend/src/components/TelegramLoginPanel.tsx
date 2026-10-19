@@ -17,22 +17,34 @@ export function TelegramLoginPanel({ serverBase }: { serverBase: string }) {
   const [err, setErr]         = useState('');
 
   useEffect(() => {
+    let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     async function checkState() {
       try {
         const res = await apiFetch(serverBase, '/api/auth/telegram/status');
+        if (cancelled) return;
         if (res.ok) {
           const data = await res.json();
+          if (cancelled) return;
           if (data.state === 'running') {
             setStep('running');
             if (Array.isArray(data.chat_ids)) {
               setSelected(new Set(data.chat_ids));
             }
           }
+          // The server is reconnecting by itself after a restart: wait for it
+          // rather than offer a login that would race it.
+          else if (data.state === 'resuming') {
+            setStep('resuming');
+            retry = setTimeout(checkState, 3000);
+          }
           else if (data.state === 'authenticated') loadChats();
+          else setStep('idle');
         }
       } catch (e) {}
     }
     checkState();
+    return () => { cancelled = true; clearTimeout(retry); };
   }, [serverBase]);
 
   useEffect(() => { localStorage.setItem('tg_api_id', apiId); }, [apiId]);
@@ -97,6 +109,25 @@ export function TelegramLoginPanel({ serverBase }: { serverBase: string }) {
     const data = await post('/api/auth/telegram/start', { chat_ids: [...selected] });
     if (data.error) { setErr(data.error); return; }
     setStep('running');
+  }
+
+  // Stops the server's listener and forgets the saved login, so the next
+  // restart does not reconnect either. Resetting only this panel would leave
+  // the server listening, and a new login would then handle every message twice.
+  async function disconnect() {
+    if (!hasWriteAccess) {
+      openUnlockModal('Telegram operations require Write Access');
+      return;
+    }
+    setErr('');
+    try {
+      const res = await apiFetch(serverBase, '/api/auth/telegram/disconnect', { method: 'DELETE' });
+      if (!res.ok) { setErr(`Disconnect failed (HTTP ${res.status})`); return; }
+    } catch {
+      setErr('Disconnect failed — server unreachable');
+      return;
+    }
+    setStep('idle'); setSelected(new Set()); setChats([]);
   }
 
   const kindIcon = (k: string) =>
@@ -203,11 +234,18 @@ export function TelegramLoginPanel({ serverBase }: { serverBase: string }) {
       {step === 'running' && (
         <div className="flex items-center gap-3 text-xs">
           <span className="text-secondary font-semibold">● Monitoring {selected.size} chat(s)</span>
-          <button onClick={() => { setStep('idle'); setSelected(new Set()); setChats([]); }}
+          <button onClick={disconnect}
             className="btn-sm bg-surface-container hover:bg-surface-container-high text-on-surface font-medium">
             Disconnect
           </button>
         </div>
+      )}
+
+      {/* Resuming — the server is reconnecting with the saved login after a restart */}
+      {step === 'resuming' && (
+        <p className="text-xs text-on-surface-variant">
+          Reconnecting with the saved login after a restart — no code needed…
+        </p>
       )}
 
       {err && <p className="text-xs text-error font-medium">{err}</p>}

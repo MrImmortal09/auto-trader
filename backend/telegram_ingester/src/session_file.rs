@@ -42,6 +42,11 @@ struct DcOptionSnapshot {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// True when `SESSION_FILE` exists — a login saved by an earlier run.
+pub fn has_saved_session() -> bool {
+    std::path::Path::new(SESSION_FILE).exists()
+}
+
 /// Load a `MemorySession` from `SESSION_FILE`, or return a default one.
 pub fn load_session() -> Arc<MemorySession> {
     match std::fs::read_to_string(SESSION_FILE) {

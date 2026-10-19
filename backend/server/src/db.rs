@@ -201,6 +201,19 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         "ALTER TABLE kotak_session ADD COLUMN ucc TEXT",
     ).await;
 
+    // What Telegram needs to reconnect by itself after a restart (see
+    // `routes::resume_saved_telegram`); the login itself stays in
+    // session.json. New table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS telegram_resume (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            api_id INTEGER NOT NULL,
+            api_hash TEXT NOT NULL,
+            chat_ids TEXT NOT NULL,
+            updated_at DATETIME NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+
     // Upstox option-chain analytics (see `market_data.rs`). New table, so this
     // is backward compatible with existing databases.
     sqlx::query(
@@ -467,6 +480,58 @@ pub async fn load_kotak_session(pool: &SqlitePool) -> Option<KotakSessionRow> {
     })
 }
 
+/// The Telegram app credentials and monitored chats saved by the last Start.
+pub struct TelegramResume {
+    pub api_id: i32,
+    pub api_hash: String,
+    pub chat_ids: Vec<i64>,
+}
+
+/// Save what Telegram needs to reconnect after a restart. Called on every
+/// successful Start, so it always reflects the chats last chosen.
+pub async fn save_telegram_resume(pool: &SqlitePool, api_id: i32, api_hash: &str, chat_ids: &[i64]) {
+    let chat_ids = serde_json::to_string(chat_ids).unwrap_or_else(|_| "[]".to_string());
+    if let Err(e) = sqlx::query(
+        "INSERT INTO telegram_resume (id, api_id, api_hash, chat_ids, updated_at)
+         VALUES (1, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+         api_id = excluded.api_id,
+         api_hash = excluded.api_hash,
+         chat_ids = excluded.chat_ids,
+         updated_at = excluded.updated_at",
+    )
+    .bind(api_id)
+    .bind(api_hash)
+    .bind(&chat_ids)
+    .bind(shared_domain::current_ist_timestamp_string())
+    .execute(pool)
+    .await
+    {
+        tracing::error!("save telegram_resume: {e}");
+    }
+}
+
+/// `None` when nothing is saved, or the row is unreadable.
+pub async fn load_telegram_resume(pool: &SqlitePool) -> Option<TelegramResume> {
+    let (api_id, api_hash, chat_ids) = sqlx::query_as::<_, (i32, String, String)>(
+        "SELECT api_id, api_hash, chat_ids FROM telegram_resume WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    let chat_ids = serde_json::from_str(&chat_ids).ok()?;
+    Some(TelegramResume { api_id, api_hash, chat_ids })
+}
+
+/// Forget the saved Telegram credentials — an explicit Disconnect or Reset
+/// must not be undone by the next restart.
+pub async fn clear_telegram_resume(pool: &SqlitePool) {
+    if let Err(e) = sqlx::query("DELETE FROM telegram_resume").execute(pool).await {
+        tracing::error!("clear telegram_resume: {e}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sequential writer task
 // ---------------------------------------------------------------------------
@@ -662,6 +727,23 @@ mod tests {
         assert_eq!(cfg.indicator_multipliers(), Multipliers { strong: 1.5, agree: 1.5, neutral: 0.4 });
         assert_eq!(cfg.topup_mode(), TopupMode::StrongToAgree);
         assert!(cfg.indicator_sizing && cfg.indicator_topup);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn telegram_resume_round_trips_and_clears() {
+        let db = TempDb::new("tg-resume");
+        let pool = init_db(&db.url()).await;
+        assert!(load_telegram_resume(&pool).await.is_none());
+
+        save_telegram_resume(&pool, 123, "hash-a", &[-1001, -1002]).await;
+        // A later Start replaces the row, it never adds a second one.
+        save_telegram_resume(&pool, 456, "hash-b", &[-1003]).await;
+        let saved = load_telegram_resume(&pool).await.expect("saved");
+        assert_eq!((saved.api_id, saved.api_hash.as_str(), saved.chat_ids), (456, "hash-b", vec![-1003]));
+
+        clear_telegram_resume(&pool).await;
+        assert!(load_telegram_resume(&pool).await.is_none());
         pool.close().await;
     }
 }

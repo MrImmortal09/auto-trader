@@ -967,6 +967,9 @@ async fn main() {
         balance,
     };
     pulse::spawn_sampler(state.clone());
+    // Reconnect Telegram from the last Start, so a restart or an update needs
+    // no login code. Nothing missed while down is replayed.
+    tokio::spawn(routes::resume_saved_telegram(state.clone()));
 
     let app = Router::new()
         .route("/api/webhook/telegram",            post(routes::webhook_handler))

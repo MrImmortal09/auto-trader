@@ -50,7 +50,7 @@ struct ResolvedKotakLogin {
 /// Payloads are built with `serde_json` rather than `format!` so a broker
 /// error string containing quotes can't produce malformed JSON in the UI.
 /// Never put the TOTP code, MPIN, access token, or TOTP secret in here.
-async fn send_log(
+pub(crate) async fn send_log(
     db_tx: &mpsc::Sender<shared_domain::DbWriteMessage>,
     log_tx: &broadcast::Sender<String>,
     level: &str,
@@ -620,6 +620,7 @@ pub async fn kotak_status_handler(State(state): State<AppState>) -> Json<serde_j
 
 pub async fn reset_creds(State(state): State<AppState>) -> impl IntoResponse {
     let _ = std::fs::remove_file("session.json");
+    crate::db::clear_telegram_resume(&state.db_pool).await;
     let _ = sqlx::query("DELETE FROM kotak_session").execute(&state.db_pool).await;
     
     // Spawn a task to exit after a short delay so the HTTP response goes through

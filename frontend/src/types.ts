@@ -343,7 +343,7 @@ export interface ReconcileApplyItem {
 
 export type ScreenId = 'dashboard' | 'positions' | 'analytics' | 'market' | 'portfolio' | 'system' | 'settings';
 
-export type TgStep = 'idle' | 'code' | 'twofa' | 'chats' | 'running';
+export type TgStep = 'idle' | 'resuming' | 'code' | 'twofa' | 'chats' | 'running';
 
 // ---------------------------------------------------------------------------
 // System pulse (GET /api/telemetry/snapshot, SSE /api/telemetry/stream) —

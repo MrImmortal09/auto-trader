@@ -56,6 +56,9 @@ pub enum TelegramAuthError {
 /// 3. `submit_2fa(password)` — only when step 2 returned `false`
 /// 4. `list_dialogs()` — returns all chats with names + IDs
 /// 5. `start_monitoring(chat_ids, signal_tx)` — spawns the ingester loop
+///
+/// After a restart, `resume(api_id, api_hash)` replaces steps 1–3 when
+/// `session.json` still holds a valid login.
 pub struct TelegramManager {
     client:         Option<Client>,
     session:        Option<Arc<MemorySession>>,
@@ -65,10 +68,26 @@ pub struct TelegramManager {
     /// Human-readable state exposed by `/api/auth/telegram/status`.
     pub state: String,
     pub monitored_chats: Vec<i64>,
+    /// API credentials of the last `request_code` / `resume`, so the server
+    /// can save them for reconnecting after a restart.
+    api_id:   Option<i32>,
+    api_hash: Option<String>,
+    /// The running signal loop. It holds its own clone of the client, so
+    /// dropping the manager alone would leave it processing messages next to
+    /// any new one — it is aborted on drop instead.
+    event_loop: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for TelegramManager {
     fn default() -> Self { Self::new() }
+}
+
+impl Drop for TelegramManager {
+    fn drop(&mut self) {
+        if let Some(handle) = self.event_loop.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl TelegramManager {
@@ -78,7 +97,75 @@ impl TelegramManager {
             login_token: None, password_token: None,
             state: "idle".into(),
             monitored_chats: Vec::new(),
+            api_id: None, api_hash: None,
+            event_loop: None,
         }
+    }
+
+    /// True while the signal loop started by `start_monitoring` is running.
+    pub fn is_listening(&self) -> bool {
+        self.event_loop.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// `(api_id, api_hash)` of the last `request_code` / `resume`.
+    pub fn api_credentials(&self) -> Option<(i32, String)> {
+        Some((self.api_id?, self.api_hash.clone()?))
+    }
+
+    /// Drop any half-finished login and open a fresh connection from
+    /// `session.json`. Refused while a signal loop is running: a second
+    /// login would start a second loop and every message would be handled
+    /// twice.
+    fn connect(
+        &mut self, api_id: i32, api_hash: &str,
+    ) -> Result<(Client, Arc<MemorySession>, mpsc::UnboundedReceiver<UpdatesLike>), TelegramAuthError> {
+        if self.is_listening() {
+            return Err(TelegramAuthError::WrongState(self.state.clone()));
+        }
+        self.client = None; self.session = None; self.updates_rx = None;
+        self.login_token = None; self.password_token = None;
+        self.api_id = Some(api_id);
+        self.api_hash = Some(api_hash.to_owned());
+
+        let session = session_file::load_session();
+
+        let pool   = SenderPool::new(Arc::clone(&session), api_id);
+        let client = Client::new(pool.handle.clone());
+        let updates_rx: mpsc::UnboundedReceiver<UpdatesLike> = pool.updates;
+        let runner = pool.runner;
+
+        // Exits by itself once every client handle is dropped.
+        tokio::spawn(async move {
+            runner.run().await;
+            tracing::warn!("[telegram] SenderPool runner exited");
+        });
+        Ok((client, session, updates_rx))
+    }
+
+    // ── Resume ──────────────────────────────────────────────────────────── //
+
+    /// Reconnect with the login saved in `session.json` — no code, no
+    /// password — e.g. after a server restart. `Ok(true)`: logged in, ready
+    /// for `start_monitoring`. `Ok(false)`: Telegram no longer accepts the
+    /// saved login (logged out elsewhere, revoked), so a fresh login is
+    /// needed. `Err`: couldn't tell — a timeout or network error, worth
+    /// retrying.
+    pub async fn resume(&mut self, api_id: i32, api_hash: &str) -> Result<bool, TelegramAuthError> {
+        let (client, session, updates_rx) = self.connect(api_id, api_hash)?;
+        let authorized = tokio::time::timeout(TG_TIMEOUT, client.is_authorized())
+            .await
+            .map_err(|_| TelegramAuthError::Timeout)?
+            .map_err(TelegramAuthError::Grammers)?;
+        if !authorized {
+            self.state = "idle".into();
+            return Ok(false);
+        }
+        tracing::info!("[telegram] Saved session still valid — resumed without a login code");
+        self.client     = Some(client);
+        self.session    = Some(session);
+        self.updates_rx = Some(updates_rx);
+        self.state      = "authenticated".into();
+        Ok(true)
     }
 
     // ── Step 1 ──────────────────────────────────────────────────────────── //
@@ -89,20 +176,7 @@ impl TelegramManager {
     pub async fn request_code(
         &mut self, api_id: i32, api_hash: &str, phone: &str,
     ) -> Result<(), TelegramAuthError> {
-        self.client = None; self.session = None; self.updates_rx = None;
-        self.login_token = None; self.password_token = None;
-
-        let session = session_file::load_session();
-
-        let pool   = SenderPool::new(Arc::clone(&session), api_id);
-        let client = Client::new(pool.handle.clone());
-        let updates_rx: mpsc::UnboundedReceiver<UpdatesLike> = pool.updates;
-        let runner = pool.runner;
-
-        tokio::spawn(async move {
-            runner.run().await;
-            tracing::warn!("[telegram] SenderPool runner exited");
-        });
+        let (client, session, updates_rx) = self.connect(api_id, api_hash)?;
 
         if tokio::time::timeout(TG_TIMEOUT, client.is_authorized())
             .await
@@ -253,7 +327,7 @@ impl TelegramManager {
             .ok_or_else(|| TelegramAuthError::WrongState(self.state.clone()))?;
 
         self.monitored_chats = chat_ids.clone();
-        tokio::spawn(run_event_loop(client, updates_rx, chat_ids, signal_tx, log_tx));
+        self.event_loop = Some(tokio::spawn(run_event_loop(client, updates_rx, chat_ids, signal_tx, log_tx)));
         self.state = "running".into();
         Ok(())
     }
@@ -265,5 +339,29 @@ impl TelegramManager {
         if let Some(session) = &self.session {
             session_file::save_session(session).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_the_manager_stops_its_signal_loop() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut mgr = TelegramManager::new();
+        assert!(!mgr.is_listening());
+        assert!(mgr.api_credentials().is_none());
+        // Stands in for `run_event_loop`: runs until aborted.
+        mgr.event_loop = Some(tokio::spawn(async move {
+            let _alive = tx;
+            std::future::pending::<()>().await;
+        }));
+        assert!(mgr.is_listening());
+        // A second login while listening would start a second loop.
+        assert!(matches!(mgr.connect(1, "hash"), Err(TelegramAuthError::WrongState(_))));
+
+        drop(mgr); // what Disconnect does, by replacing the manager
+        assert!(rx.await.is_err(), "the loop was aborted, dropping its sender");
     }
 }
