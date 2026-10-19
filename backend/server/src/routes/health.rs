@@ -54,6 +54,21 @@ struct HealthDto {
     auth_secret_configured: bool,
 }
 
+/// The release this binary was built as, e.g. `0.1.115`. CI stamps
+/// `SERVER_RELEASE_VERSION` at build time (see release-server.yml) because the
+/// crate's own `Cargo.toml` version stays `0.1.0` — CI derives the patch from
+/// the run number. Local builds fall back to the crate version with `-dev`.
+pub const SERVER_VERSION: &str = match option_env!("SERVER_RELEASE_VERSION") {
+    Some(v) => v,
+    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
+
+/// `GET /api/version` — deliberately cheap (no locks, no sysinfo scan) so the
+/// sidebar can poll it without touching the trading loop's resources.
+pub async fn version_handler() -> impl IntoResponse {
+    Json(serde_json::json!({ "version": SERVER_VERSION }))
+}
+
 fn auth_secret_configured() -> bool {
     crate::resolve_auth_secret().is_some()
 }

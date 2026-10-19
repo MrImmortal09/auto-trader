@@ -50,6 +50,8 @@ jobs:
         env:
           PASSKEY: ${{ secrets.PASSKEY }}
           AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+          # Baked into the binary so GET /api/version reports the real release.
+          SERVER_RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
         run: cargo build --release -p server --target "$TARGET_TRIPLE"
 
       - name: Prepare release asset

@@ -110,6 +110,7 @@ export default function App() {
         activeScreen={activeScreen}
         onSelectScreen={handleSelectScreen}
         mode={mode}
+        serverBase={serverBase}
       />
 
       {/* Main Content Area */}

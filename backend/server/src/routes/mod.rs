@@ -18,7 +18,7 @@ pub use auth_telegram::{
     telegram_chats_handler, telegram_start_handler, disconnect_telegram,
     resume_saved_telegram,
 };
-pub use health::health_handler;
+pub use health::{health_handler, version_handler};
 pub use auth_passkey::{verify_passkey_handler, session_status_handler, verify_token};
 pub mod market;
 pub use market::{market_indicator_handler, market_live_handler, market_option_chain_handler, market_trend_handler};

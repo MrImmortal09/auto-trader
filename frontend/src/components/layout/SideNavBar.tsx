@@ -6,23 +6,47 @@ import {
   LayoutDashboard,
   PanelLeftClose,
   PanelLeftOpen,
-  Plus,
   Settings,
   TrendingUp,
   Wallet,
 } from 'lucide-react';
 import type { ScreenId } from '../../types';
+import { apiFetch } from '../../lib/api';
 
 export function SideNavBar({
   activeScreen,
   onSelectScreen,
-  mode
+  mode,
+  serverBase
 }: {
   activeScreen: ScreenId;
   onSelectScreen: (screen: ScreenId) => void;
   mode: string;
+  serverBase: string;
 }) {
   const [isCollapsed, setIsCollapsed] = useState(false);
+  const [backendVersion, setBackendVersion] = useState<string | null>(null);
+
+  // Re-polled so a server update done outside this tab still shows up here.
+  useEffect(() => {
+    let cancelled = false;
+    function loadVersion() {
+      apiFetch(serverBase, '/api/version')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (!cancelled) setBackendVersion(typeof data?.version === 'string' ? data.version : null);
+        })
+        .catch(() => {
+          if (!cancelled) setBackendVersion(null);
+        });
+    }
+    loadVersion();
+    const timer = setInterval(loadVersion, 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [serverBase]);
 
   useEffect(() => {
     try {
@@ -187,15 +211,15 @@ export function SideNavBar({
           </div>
         )}
 
-        <button
-          onClick={() => onSelectScreen('positions')}
-          title="New Trade"
-          className={`w-full bg-primary-container hover:bg-primary text-on-primary font-bold py-2 rounded-lg transition-colors text-sm shadow-sm flex items-center justify-center gap-2 ${
-            isCollapsed ? 'px-0 py-2.5' : 'px-4'
+        <div
+          title={backendVersion ? `Backend version ${backendVersion}` : 'Backend version unavailable'}
+          className={`w-full bg-surface-container border border-outline-variant text-on-surface-variant py-2 rounded-lg text-xs font-mono flex items-center justify-center gap-1.5 ${
+            isCollapsed ? 'px-0 py-2.5 text-[10px]' : 'px-4'
           }`}
         >
-          {isCollapsed ? <Plus size={20} /> : <span>New Trade</span>}
-        </button>
+          {!isCollapsed && <span className="font-sans font-semibold uppercase tracking-wider text-[11px]">Backend</span>}
+          <span className="font-bold text-on-surface truncate">{backendVersion ? `v${backendVersion}` : '—'}</span>
+        </div>
       </div>
     </aside>
   );

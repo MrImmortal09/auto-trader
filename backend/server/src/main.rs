@@ -977,6 +977,7 @@ async fn main() {
         .route("/api/logs/history",                 get(routes::logs_history_handler))
         .route("/api/portfolio",                    get(routes::portfolio_handler))
         .route("/api/health",                       get(routes::health_handler))
+        .route("/api/version",                      get(routes::version_handler))
         .route("/metrics",                          get(routes::metrics_handler))
         .route("/api/telemetry/snapshot",           get(routes::telemetry_snapshot_handler))
         .route("/api/telemetry/stream",             get(routes::telemetry_stream_handler))
