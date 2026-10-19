@@ -140,6 +140,8 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         // saved agree / neutral multipliers are left exactly as they are.
         "ALTER TABLE trading_config ADD COLUMN indicator_strong_agree_multiplier REAL NOT NULL DEFAULT 1.5",
         "ALTER TABLE trading_config ADD COLUMN indicator_topup_mode TEXT NOT NULL DEFAULT 'strong_to_agree'",
+        // Lower-SL gate: opt-in, it changes how stops are moved.
+        "ALTER TABLE trading_config ADD COLUMN indicator_sl_lower_gate INTEGER NOT NULL DEFAULT 0",
     ] {
         ensure_column(&pool, sql).await;
     }
@@ -266,6 +268,7 @@ struct TradingConfigRow {
     indicator_topup: bool,
     indicator_strong_agree_multiplier: f64,
     indicator_topup_mode: String,
+    indicator_sl_lower_gate: bool,
 }
 
 /// Load `TradingConfig` from SQLite, falling back to safe defaults.
@@ -281,7 +284,8 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
                 indicator_pcr_buy_above, indicator_pcr_sell_below, indicator_vwap_band_pct,
                 call_validity_minutes,
                 indicator_early_checks, indicator_wait_on_disagree, indicator_topup,
-                indicator_strong_agree_multiplier, indicator_topup_mode
+                indicator_strong_agree_multiplier, indicator_topup_mode,
+                indicator_sl_lower_gate
          FROM trading_config WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -326,6 +330,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
             indicator_wait_on_disagree: r.indicator_wait_on_disagree,
             indicator_topup: r.indicator_topup,
             indicator_topup_mode: r.indicator_topup_mode,
+            indicator_sl_lower_gate: r.indicator_sl_lower_gate,
         };
         // Same clamps the settings handler applies, so a hand-edited row
         // can't put an out-of-range value in front of the engine.
@@ -366,6 +371,7 @@ pub async fn load_config_from_db(pool: &SqlitePool) -> TradingConfig {
         indicator_wait_on_disagree: true,
         indicator_topup: false,
         indicator_topup_mode: "strong_to_agree".into(),
+        indicator_sl_lower_gate: false,
     })
 }
 

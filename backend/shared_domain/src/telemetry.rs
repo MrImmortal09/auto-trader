@@ -242,6 +242,8 @@ pub enum SignalOutcome {
     DuplicateSkipped,
     SlUpdated,
     SlUnmatched,
+    /// A lower stop held back by `TradingConfig::indicator_sl_lower_gate`.
+    SlLowerRefused,
     ExitApplied,
     ExitUnmatched,
     RejectedNoTarget,
@@ -255,9 +257,9 @@ pub enum SignalOutcome {
 }
 
 impl SignalOutcome {
-    pub const ALL: [SignalOutcome; 16] = [
+    pub const ALL: [SignalOutcome; 17] = [
         Self::Accepted, Self::EditApplied, Self::DuplicateRevised, Self::DuplicateSkipped,
-        Self::SlUpdated, Self::SlUnmatched, Self::ExitApplied, Self::ExitUnmatched,
+        Self::SlUpdated, Self::SlUnmatched, Self::SlLowerRefused, Self::ExitApplied, Self::ExitUnmatched,
         Self::RejectedNoTarget, Self::RejectedExpired, Self::RejectedKillSwitch,
         Self::RejectedZeroLots, Self::RejectedNoScripMaster, Self::RejectedUnresolved,
         Self::RejectedAtTarget, Self::RejectedUnsupported,
@@ -271,6 +273,7 @@ impl SignalOutcome {
             Self::DuplicateSkipped => "duplicate_skipped",
             Self::SlUpdated => "sl_updated",
             Self::SlUnmatched => "sl_unmatched",
+            Self::SlLowerRefused => "sl_lower_refused",
             Self::ExitApplied => "exit_applied",
             Self::ExitUnmatched => "exit_unmatched",
             Self::RejectedNoTarget => "rejected_no_target",

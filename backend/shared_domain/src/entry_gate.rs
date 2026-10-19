@@ -495,23 +495,12 @@ pub fn sizing_verdict(
     multipliers: &Multipliers,
 ) -> SizingVerdict {
     let opt = option_type.trim().to_uppercase();
-    let call_bias = match opt.as_str() {
-        "CE" => Bias::Bullish,
-        "PE" => Bias::Bearish,
-        // Never expected (the parser only emits CE / PE), but an option the
-        // indicator can't be matched against is not traded on a guess.
-        _ => {
-            return SizingVerdict::Skip {
-                reason: format!("unknown option type '{}' — cannot match it against the indicator", option_type.trim()),
-            }
-        }
+    // Never expected (the parser only emits CE / PE), but an option the
+    // indicator can't be matched against is not traded on a guess.
+    let Some(call_bias) = call_bias(&opt) else {
+        return SizingVerdict::Skip { reason: unknown_option_type(option_type) };
     };
-    let parent = indicator_parent(instrument);
-    let source = if instrument.trim().eq_ignore_ascii_case(parent) {
-        format!("{parent} indicator")
-    } else {
-        format!("{parent} indicator (parent of {})", instrument.trim().to_uppercase())
-    };
+    let source = indicator_source(instrument);
 
     let neutral = multipliers.neutral;
     let Some(reading) = reading else {
@@ -549,6 +538,63 @@ pub fn sizing_verdict(
         _ => SizingVerdict::Skip {
             reason: format!("{source} {desc} disagrees with BUY {opt} — call skipped"),
         },
+    }
+}
+
+/// The bias a `BUY <opt>` call needs (`opt` already upper-cased): bullish
+/// for CE, bearish for PE, `None` for anything else.
+fn call_bias(opt: &str) -> Option<Bias> {
+    match opt {
+        "CE" => Some(Bias::Bullish),
+        "PE" => Some(Bias::Bearish),
+        _ => None,
+    }
+}
+
+fn unknown_option_type(option_type: &str) -> String {
+    format!("unknown option type '{}' — cannot match it against the indicator", option_type.trim())
+}
+
+/// `"NIFTY indicator"`, or `"NIFTY indicator (parent of FINNIFTY)"` when
+/// `instrument` follows another index's reading.
+fn indicator_source(instrument: &str) -> String {
+    let parent = indicator_parent(instrument);
+    if instrument.trim().eq_ignore_ascii_case(parent) {
+        format!("{parent} indicator")
+    } else {
+        format!("{parent} indicator (parent of {})", instrument.trim().to_uppercase())
+    }
+}
+
+/// Whether the indicator lets a Telegram instruction **lower** the stop on a
+/// `BUY <option_type>` call (`TradingConfig::indicator_sl_lower_gate`).
+///
+/// A lower stop is more risk on a position we hold, so only a strong agree
+/// allows it: score +2 for BUY CE, −2 for BUY PE, PCR and VWAP both on the
+/// call's side. Anything less refuses and the stop stays where it is: a
+/// plain ±1 agree, NEUTRAL, the opening 09:16 check (always NEUTRAL under
+/// the early-check rule), no fresh reading, or a reading against the call.
+///
+/// `Ok(note)` when the lower stop may be applied, `Err(reason)` when not —
+/// both for the log.
+pub fn sl_lower_verdict(
+    option_type: &str,
+    instrument: &str,
+    reading: Option<&IndicatorReading>,
+) -> Result<String, String> {
+    let opt = option_type.trim().to_uppercase();
+    let Some(call_bias) = call_bias(&opt) else {
+        return Err(unknown_option_type(option_type));
+    };
+    let source = indicator_source(instrument);
+    let Some(reading) = reading else {
+        return Err(format!("{source} has no fresh reading — a lower stop needs a strong agree with BUY {opt}"));
+    };
+    let desc = reading.describe();
+    if reading.bias == call_bias && reading.score.overall.abs() >= 2 {
+        Ok(format!("{source} {desc} strongly agrees with BUY {opt}"))
+    } else {
+        Err(format!("{source} {desc} — a lower stop needs a strong agree with BUY {opt}"))
     }
 }
 
@@ -980,6 +1026,34 @@ mod tests {
         assert!(note(2).ends_with("strongly agrees with BUY CE, ×1.5"), "{}", note(2));
         assert!(note(1).ends_with(") agrees with BUY CE, ×1"), "{}", note(1));
         assert!(note(0).ends_with("NEUTRAL, ×0.5"), "{}", note(0));
+    }
+
+    #[test]
+    fn only_a_strong_agree_lets_the_stop_go_lower() {
+        let allowed = |opt: &str, overall: i32| sl_lower_verdict(opt, "NIFTY", Some(&scored(overall))).is_ok();
+        for (opt, side) in [("CE", 1), ("PE", -1)] {
+            assert!(allowed(opt, 2 * side), "{opt} strong agree");
+            assert!(!allowed(opt, side), "{opt} plain agree is not enough");
+            assert!(!allowed(opt, 0), "{opt} neutral");
+            assert!(!allowed(opt, -side), "{opt} disagree");
+            assert!(!allowed(opt, -2 * side), "{opt} strong disagree");
+        }
+        assert!(allowed("ce", 2));
+        assert!(sl_lower_verdict("FUT", "NIFTY", Some(&scored(2))).is_err(), "unknown option type");
+        let err = sl_lower_verdict("CE", "NIFTY", None).unwrap_err();
+        assert!(err.contains("no fresh reading"), "{err}");
+        let ok = sl_lower_verdict("CE", "FINNIFTY", Some(&scored(2))).unwrap();
+        assert!(ok.starts_with("NIFTY indicator (parent of FINNIFTY) +2 BUY"), "{ok}");
+    }
+
+    #[test]
+    fn the_opening_check_never_lets_the_stop_go_lower() {
+        // Raw +2, but the 09:16 check reads NEUTRAL under the opening rule.
+        let mut opening = scored(2);
+        opening.bias = Bias::Neutral;
+        opening.opening = true;
+        let err = sl_lower_verdict("CE", "NIFTY", Some(&opening)).unwrap_err();
+        assert!(err.contains("always NEUTRAL"), "{err}");
     }
 
     #[test]

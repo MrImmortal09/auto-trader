@@ -90,6 +90,9 @@ export interface TradingConfig {
   indicator_topup: boolean;
   /** The top-up rule while `indicator_topup` is on. */
   indicator_topup_mode: TopupMode;
+  /** A Telegram instruction that lowers a call's stop is applied only on a
+   * strong indicator agree (+2 CE / −2 PE); raising is always applied. */
+  indicator_sl_lower_gate: boolean;
 }
 
 /** `strong_to_agree` (default): only a strong agree tops up, to the Agrees

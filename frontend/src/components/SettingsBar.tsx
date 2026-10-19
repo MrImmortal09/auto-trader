@@ -454,6 +454,25 @@ function CallRulesCard({ cfg, setCfg, disabled, preview }: {
             </div>
           </div>
 
+          {/* Lower-SL gate — independent of the Indicator Sizing toggle */}
+          <div className="relative flex flex-col gap-1.5">
+            <span className="flex items-center gap-1 min-w-0">
+              <label className={FIELD_LABEL}>Lower SL Only on Strong Indicator</label>
+              <InfoTip text="ON: when the channel moves a call's stop-loss lower (a 'move SL to …' reply, an edited call or a resent call with a lower SL), the engine reads the call's index indicator at that moment. The lower SL is applied only if the indicator strongly agrees with the call: +2 for BUY CE, −2 for BUY PE (PCR and VWAP both on its side). Anything less (+1, NEUTRAL, the 09:16 opening check, no fresh reading, or against the call) and the stop stays where it is, logged as SL_LOWER_REFUSED. It is not re-checked later. Moving the stop up is always applied. Works whether Indicator Sizing is ON or OFF, using the indicator settings below. OFF: every SL move from the channel is applied, as before." />
+            </span>
+            <Segmented
+              options={[{ value: 1, label: 'ON' }, { value: 0, label: 'OFF' }]}
+              value={cfg.indicator_sl_lower_gate ? 1 : 0}
+              onChange={(v) => set({ indicator_sl_lower_gate: v === 1 })}
+              disabled={disabled}
+            />
+            <p className="text-[11px] leading-snug text-on-surface-variant">
+              {cfg.indicator_sl_lower_gate
+                ? 'A lower SL needs +2 for CE / −2 for PE, otherwise the stop is kept. A higher SL is always applied.'
+                : 'Every SL move from the channel is applied.'}
+            </p>
+          </div>
+
           {/* Indicator parameters — also what the Market Data page scores with */}
           <div className="space-y-3.5 rounded-lg border border-outline-variant p-3.5">
             <div className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-on-surface-variant">
@@ -609,6 +628,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           indicator_wait_on_disagree: cfgData?.indicator_wait_on_disagree ?? true,
           indicator_topup: cfgData?.indicator_topup ?? false,
           indicator_topup_mode: cfgData?.indicator_topup_mode ?? 'strong_to_agree',
+          indicator_sl_lower_gate: cfgData?.indicator_sl_lower_gate ?? false,
         });
         setVirtualBalance(typeof walletData?.balance === 'number' ? walletData.balance : 0);
       })

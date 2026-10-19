@@ -414,6 +414,85 @@ fn topup_sizing(
     ))
 }
 
+/// What the lower-SL gate says about a Telegram instruction that would move
+/// a position's live stop (`current_sl`) to a new level.
+#[derive(Debug, PartialEq)]
+enum SlChange {
+    /// Move the stop. `note` explains why a *lower* stop was let through.
+    Apply { note: Option<String> },
+    /// Leave the stop where it is; `reason` says why, for the log.
+    Refuse { reason: String },
+}
+
+/// The lower-SL gate (`TradingConfig::indicator_sl_lower_gate`) for moving
+/// `pos`'s live stop to `new_sl`. Raising the stop, or leaving it where it
+/// is, is always applied, and with the switch off so is lowering it. With it
+/// on, a lower stop needs the parent index's indicator to strongly agree with
+/// the call right now (`entry_gate::sl_lower_verdict`). A position with no
+/// option type can't be matched against the indicator, so its stop is not
+/// lowered either — that errs toward the tighter stop.
+fn sl_change_verdict(pos: &MonitoredPosition, new_sl: f64, cfg: &TradingConfig, gate: &EntryGate) -> SlChange {
+    if !cfg.indicator_sl_lower_gate || new_sl >= pos.current_sl {
+        return SlChange::Apply { note: None };
+    }
+    let option_type = pos.signal.option_type.as_deref().unwrap_or("");
+    let parent = entry_gate::indicator_parent(&pos.signal.instrument_name);
+    let reading = entry_gate::feed_reading(&gate.feed, parent, &cfg.indicator_params(), &gate.now_ts);
+    match entry_gate::sl_lower_verdict(option_type, &pos.signal.instrument_name, reading.as_ref()) {
+        Ok(note) => SlChange::Apply { note: Some(note) },
+        Err(reason) => SlChange::Refuse { reason },
+    }
+}
+
+/// Apply the stop from an edited or resent call to `p`. The live stop only
+/// moves while target 1 hasn't hit, and a lower one has to get past the
+/// lower-SL gate ([`sl_change_verdict`]). Refused, both the live stop and the
+/// signal's SL stay as they were: `Err((kept_sl, reason))`. Otherwise
+/// `Ok(note)`, the gate's note when it let a lower stop through.
+fn apply_revised_sl(
+    p: &mut MonitoredPosition,
+    new_sl: f64,
+    cfg: &TradingConfig,
+    gate: &EntryGate,
+) -> Result<Option<String>, (f64, String)> {
+    let mut note = None;
+    if matches!(p.state, TradeState::WaitingForEntry | TradeState::Active) {
+        match sl_change_verdict(p, new_sl, cfg, gate) {
+            SlChange::Refuse { reason } => return Err((p.current_sl, reason)),
+            SlChange::Apply { note: n } => {
+                note = n;
+                p.current_sl = new_sl;
+            }
+        }
+    }
+    p.signal.stop_loss = new_sl;
+    Ok(note)
+}
+
+/// The `SIGNAL_UPDATED` log line, with the lower-SL gate's note when it let
+/// a lower stop through.
+fn sl_updated_msg(instrument: &str, new_sl: f64, note: Option<&str>) -> String {
+    let mut msg = json!({ "event": "SIGNAL_UPDATED", "instrument": instrument, "new_sl": new_sl });
+    if let Some(note) = note {
+        msg["indicator"] = json!(note);
+    }
+    msg.to_string()
+}
+
+/// The `SL_LOWER_REFUSED` log line: `source` (the reply, edit or resend)
+/// asked for `requested_sl` and the stop stayed at `kept_sl`.
+fn sl_refused_msg(instrument: &str, source: &str, kept_sl: f64, requested_sl: f64, reason: &str) -> String {
+    json!({
+        "event": "SL_LOWER_REFUSED",
+        "level": "WARN",
+        "instrument": instrument,
+        "current_sl": kept_sl,
+        "requested_sl": requested_sl,
+        "reason": format!("{source} asked for SL {requested_sl:.2}: {reason} — stop kept at {kept_sl:.2}"),
+    })
+    .to_string()
+}
+
 /// `Some(reason)` once a call still waiting for its entry has outlived
 /// `TradingConfig::call_validity_minutes` (counted from `created_at`, when the
 /// engine received it).
@@ -3578,41 +3657,55 @@ pub async fn start_position_monitor(
 
                         if signal.action == "UPDATE_SL" {
                             if let Some(ref sig_id) = signal.signal_id {
+                                // Read before the positions lock, never under it.
+                                let cfg = config.read().await.clone();
+                                let gate = EntryGate::new(&indicator_feed);
                                 let mut write_guard = positions.write().await;
-                                let mut updated = false;
+                                // (instrument, stop before the reply, verdict)
+                                let mut matched = None;
                                 for p in write_guard.iter_mut() {
                                     if p.signal.signal_id.as_ref() == Some(sig_id) {
-                                        p.current_sl = signal.stop_loss;
-                                        p.signal.stop_loss = signal.stop_loss;
-                                        updated = true;
+                                        let verdict = sl_change_verdict(p, signal.stop_loss, &cfg, &gate);
+                                        let before = p.current_sl;
+                                        if matches!(verdict, SlChange::Apply { .. }) {
+                                            p.current_sl = signal.stop_loss;
+                                            p.signal.stop_loss = signal.stop_loss;
+                                        }
+                                        matched = Some((p.signal.instrument_name.clone(), before, verdict));
                                         break;
                                     }
                                 }
-                                if updated {
-                                    drop(write_guard);
-                                    let msg = format!(
-                                        r#"{{"event":"SIGNAL_UPDATED","instrument":"{}","new_sl":{}}}"#,
-                                        "UPDATE", signal.stop_loss
-                                    );
-                                    send_log(&db_tx, &log_tx, "INFO", &msg).await;
-                                    let snapshot = { positions.read().await.clone() };
-                                    send_positions_snapshot(&db_tx, &snapshot).await;
-                                    tracing::info!(id=?sig_id, "Updated SL via reply");
-                                    telemetry::signal(SignalOutcome::SlUpdated);
-                                } else {
-                                    // Never drop this silently: an unmatched
-                                    // SL update means a reply landed on a
-                                    // message the engine holds no position
-                                    // for, and the trader believes their stop
-                                    // moved when nothing did.
-                                    drop(write_guard);
-                                    let msg = format!(
-                                        r#"{{"event":"ERROR","message":"SL update ignored — no open position for the replied-to signal (new_sl {:.2})","instrument":"UPDATE"}}"#,
-                                        signal.stop_loss
-                                    );
-                                    send_log(&db_tx, &log_tx, "ERROR", &msg).await;
-                                    tracing::warn!(id=?sig_id, new_sl = signal.stop_loss, "SL update matched no position");
-                                    telemetry::signal(SignalOutcome::SlUnmatched);
+                                drop(write_guard);
+                                match matched {
+                                    Some((instrument, kept_sl, SlChange::Refuse { reason })) => {
+                                        // Nothing changed, so no snapshot to persist.
+                                        let msg = sl_refused_msg(&instrument, "move-SL reply", kept_sl, signal.stop_loss, &reason);
+                                        send_log(&db_tx, &log_tx, "WARN", &msg).await;
+                                        tracing::warn!(id=?sig_id, %instrument, kept_sl, new_sl = signal.stop_loss, reason, "SL lowering refused by the indicator");
+                                        telemetry::signal(SignalOutcome::SlLowerRefused);
+                                    }
+                                    Some((_, _, SlChange::Apply { note })) => {
+                                        let msg = sl_updated_msg("UPDATE", signal.stop_loss, note.as_deref());
+                                        send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                                        let snapshot = { positions.read().await.clone() };
+                                        send_positions_snapshot(&db_tx, &snapshot).await;
+                                        tracing::info!(id=?sig_id, "Updated SL via reply");
+                                        telemetry::signal(SignalOutcome::SlUpdated);
+                                    }
+                                    None => {
+                                        // Never drop this silently: an unmatched
+                                        // SL update means a reply landed on a
+                                        // message the engine holds no position
+                                        // for, and the trader believes their stop
+                                        // moved when nothing did.
+                                        let msg = format!(
+                                            r#"{{"event":"ERROR","message":"SL update ignored — no open position for the replied-to signal (new_sl {:.2})","instrument":"UPDATE"}}"#,
+                                            signal.stop_loss
+                                        );
+                                        send_log(&db_tx, &log_tx, "ERROR", &msg).await;
+                                        tracing::warn!(id=?sig_id, new_sl = signal.stop_loss, "SL update matched no position");
+                                        telemetry::signal(SignalOutcome::SlUnmatched);
+                                    }
                                 }
                             } else {
                                 // No replied-to message id: nothing can match.
@@ -3671,8 +3764,13 @@ pub async fn start_position_monitor(
 
                         // If the signal has an ID (e.g. edited Telegram message), try to update existing
                         if let Some(ref sig_id) = signal.signal_id {
+                            // Read before the positions lock, never under it.
+                            let cfg = config.read().await.clone();
+                            let gate = EntryGate::new(&indicator_feed);
                             let mut write_guard = positions.write().await;
                             let mut updated = false;
+                            // `None` when the edit changed the entry (force-exited below).
+                            let mut sl_result = None;
                             for p in write_guard.iter_mut() {
                                 if p.signal.signal_id.as_ref() == Some(sig_id) {
                                     if p.signal.entry_price != signal.entry_price || p.signal.entry_condition != signal.entry_condition {
@@ -3681,32 +3779,40 @@ pub async fn start_position_monitor(
                                         break;
                                     }
 
-                                    p.signal.stop_loss = signal.stop_loss;
                                     p.signal.targets = signal.targets.clone();
                                     p.signal.entry_price = signal.entry_price;
-                                    
-                                    // Update active trailing SL if not hit TGT1 yet
-                                    if matches!(p.state, TradeState::WaitingForEntry | TradeState::Active) {
-                                        p.current_sl = signal.stop_loss;
-                                    }
-                                    
-                                    // Can't await inside sync context? Wait, we are in an async loop and write_guard is across await point!
-                                    // So let's drop guard first.
+                                    // Moves the live stop only if target 1 hasn't hit,
+                                    // and a lower one only past the lower-SL gate.
+                                    sl_result = Some(apply_revised_sl(p, signal.stop_loss, &cfg, &gate));
                                     updated = true;
                                     break;
                                 }
                             }
                             if updated {
                                 drop(write_guard);
-                                let msg = format!(
-                                    r#"{{"event":"SIGNAL_UPDATED","instrument":"{}","new_sl":{}}}"#,
-                                    signal.instrument_name, signal.stop_loss
-                                );
-                                send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                                match sl_result {
+                                    Some(Err((kept_sl, reason))) => {
+                                        let msg = sl_refused_msg(
+                                            &signal.instrument_name,
+                                            "edited call (its other changes applied)",
+                                            kept_sl,
+                                            signal.stop_loss,
+                                            &reason,
+                                        );
+                                        send_log(&db_tx, &log_tx, "WARN", &msg).await;
+                                        tracing::warn!(id=?sig_id, kept_sl, new_sl = signal.stop_loss, reason, "Edited signal's lower SL refused by the indicator");
+                                        telemetry::signal(SignalOutcome::SlLowerRefused);
+                                    }
+                                    sl_result => {
+                                        let note = sl_result.and_then(Result::ok).flatten();
+                                        let msg = sl_updated_msg(&signal.instrument_name, signal.stop_loss, note.as_deref());
+                                        send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                                        tracing::info!(id=?sig_id, "Updated existing signal");
+                                        telemetry::signal(SignalOutcome::EditApplied);
+                                    }
+                                }
                                 let snapshot = { positions.read().await.clone() };
                                 send_positions_snapshot(&db_tx, &snapshot).await;
-                                tracing::info!(id=?sig_id, "Updated existing signal");
-                                telemetry::signal(SignalOutcome::EditApplied);
                                 continue;
                             }
                         }
@@ -3728,26 +3834,44 @@ pub async fn start_position_monitor(
                             };
                             if let Some(dup_id) = dup_id {
                                 let mut revised = false;
+                                let mut sl_result = Ok(None);
                                 {
+                                    // Read before the positions lock, never under it.
+                                    let cfg = config.read().await.clone();
+                                    let gate = EntryGate::new(&indicator_feed);
                                     let mut g = positions.write().await;
                                     if let Some(p) = g.iter_mut().find(|p| p.id == dup_id) {
                                         if (p.signal.stop_loss - signal.stop_loss).abs() > f64::EPSILON
                                             || p.signal.targets != signal.targets
                                         {
-                                            p.signal.stop_loss = signal.stop_loss;
                                             p.signal.targets = signal.targets.clone();
-                                            if matches!(p.state, TradeState::WaitingForEntry | TradeState::Active) {
-                                                p.current_sl = signal.stop_loss;
-                                            }
+                                            sl_result = apply_revised_sl(p, signal.stop_loss, &cfg, &gate);
                                             revised = true;
                                         }
                                     }
                                 }
-                                if revised {
-                                    let msg = format!(
-                                        r#"{{"event":"SIGNAL_UPDATED","instrument":"{}","new_sl":{}}}"#,
-                                        signal.instrument_name, signal.stop_loss
+                                if let Err((kept_sl, reason)) = &sl_result {
+                                    let msg = sl_refused_msg(
+                                        &signal.instrument_name,
+                                        "resent call (its other changes applied)",
+                                        *kept_sl,
+                                        signal.stop_loss,
+                                        reason,
                                     );
+                                    send_log(&db_tx, &log_tx, "WARN", &msg).await;
+                                    let snapshot = { positions.read().await.clone() };
+                                    send_positions_snapshot(&db_tx, &snapshot).await;
+                                    tracing::warn!(
+                                        instrument = %signal.instrument_name,
+                                        kept_sl,
+                                        new_sl = signal.stop_loss,
+                                        reason,
+                                        "Resend's lower SL refused by the indicator"
+                                    );
+                                    telemetry::signal(SignalOutcome::SlLowerRefused);
+                                } else if revised {
+                                    let note = sl_result.ok().flatten();
+                                    let msg = sl_updated_msg(&signal.instrument_name, signal.stop_loss, note.as_deref());
                                     send_log(&db_tx, &log_tx, "INFO", &msg).await;
                                     let snapshot = { positions.read().await.clone() };
                                     send_positions_snapshot(&db_tx, &snapshot).await;
@@ -4661,6 +4785,7 @@ mod tests {
             indicator_wait_on_disagree: false,
             indicator_topup: false,
             indicator_topup_mode: "strong_to_agree".into(),
+            indicator_sl_lower_gate: false,
         }
     }
 
@@ -5510,6 +5635,131 @@ mod tests {
         let mut cfg = cfg_with_lots(lots, lots);
         cfg.indicator_sizing = true;
         cfg
+    }
+
+    // ── Lower-SL gate ─────────────────────────────────────────────────── //
+
+    fn sl_gate_cfg() -> TradingConfig {
+        let mut cfg = cfg_with_lots(1, 1);
+        cfg.indicator_sl_lower_gate = true;
+        cfg
+    }
+
+    fn sl_refused(pos: &MonitoredPosition, new_sl: f64, cfg: &TradingConfig, gate: &EntryGate) -> bool {
+        matches!(sl_change_verdict(pos, new_sl, cfg, gate), SlChange::Refuse { .. })
+    }
+
+    #[test]
+    fn a_lower_stop_needs_a_strong_agree_when_the_gate_is_on() {
+        let mut pos = position_created_at(""); // BUY NIFTY CE, stop 100
+        pos.state = TradeState::Active;
+        // Switch off: lowered as before, without asking the indicator.
+        assert_eq!(sl_change_verdict(&pos, 80.0, &cfg_with_lots(1, 1), &test_gate()), SlChange::Apply { note: None });
+
+        let cfg = sl_gate_cfg();
+        // Raising the stop, or leaving it, is always applied.
+        assert_eq!(sl_change_verdict(&pos, 110.0, &cfg, &test_gate()), SlChange::Apply { note: None });
+        assert_eq!(sl_change_verdict(&pos, 100.0, &cfg, &test_gate()), SlChange::Apply { note: None });
+        // Lowering it takes +2 for a CE.
+        match sl_change_verdict(&pos, 80.0, &cfg, &gate_with("NIFTY", true)) {
+            SlChange::Apply { note: Some(note) } => assert!(note.contains("+2 BUY") && note.contains("strongly agrees with BUY CE"), "{note}"),
+            other => panic!("expected the lower stop to be let through, got {other:?}"),
+        }
+        assert!(sl_refused(&pos, 80.0, &cfg, &gate_scored("NIFTY", 1)), "a plain agree is not enough");
+        assert!(sl_refused(&pos, 80.0, &cfg, &gate_scored("NIFTY", -1)));
+        assert!(sl_refused(&pos, 80.0, &cfg, &gate_with("NIFTY", false)));
+        assert!(sl_refused(&pos, 80.0, &cfg, &test_gate()), "no fresh reading");
+        // It reads the call's own parent index, not just any.
+        assert!(sl_refused(&pos, 80.0, &cfg, &gate_with("SENSEX", true)));
+
+        // Measured against the live stop: a trailed 110 → 105 is lowering,
+        // even though 105 is above the signal's 100.
+        pos.current_sl = 110.0;
+        assert!(sl_refused(&pos, 105.0, &cfg, &gate_scored("NIFTY", 1)));
+        pos.current_sl = 100.0;
+
+        // A PE wants −2.
+        pos.signal.option_type = Some("PE".into());
+        assert!(!sl_refused(&pos, 80.0, &cfg, &gate_with("NIFTY", false)));
+        assert!(sl_refused(&pos, 80.0, &cfg, &gate_with("NIFTY", true)));
+        // No option type to match against the indicator: not lowered.
+        pos.signal.option_type = None;
+        assert!(sl_refused(&pos, 80.0, &cfg, &gate_with("NIFTY", true)));
+    }
+
+    #[test]
+    fn a_refused_revision_leaves_both_stops_alone() {
+        let cfg = sl_gate_cfg();
+        let mut pos = position_created_at(""); // stop 100
+        pos.state = TradeState::Active;
+        assert!(matches!(
+            apply_revised_sl(&mut pos, 80.0, &cfg, &gate_scored("NIFTY", 1)),
+            Err((kept, _)) if kept == 100.0
+        ));
+        assert_eq!((pos.current_sl, pos.signal.stop_loss), (100.0, 100.0));
+
+        assert!(apply_revised_sl(&mut pos, 80.0, &cfg, &gate_with("NIFTY", true)).unwrap().is_some());
+        assert_eq!((pos.current_sl, pos.signal.stop_loss), (80.0, 80.0));
+
+        // After target 1 an edit never moved the live stop, so the gate has
+        // nothing to guard: only the signal's SL changes, as before.
+        pos.state = TradeState::Target1Hit;
+        pos.current_sl = 130.0;
+        assert_eq!(apply_revised_sl(&mut pos, 70.0, &cfg, &test_gate()), Ok(None));
+        assert_eq!((pos.current_sl, pos.signal.stop_loss), (130.0, 70.0));
+    }
+
+    /// A "move SL" reply through the real monitor loop. The loop reads the
+    /// indicator at the real time of day, so only the empty feed (no fresh
+    /// reading → refused) is time-proof here; the strong-agree path is the
+    /// unit test above.
+    #[tokio::test(start_paused = true)]
+    async fn a_move_sl_reply_goes_through_the_lower_sl_gate() {
+        // (gate on, requested SL, stop afterwards)
+        for (gate_on, new_sl, expect) in [(false, 90.0, 90.0), (true, 90.0, 100.0), (true, 110.0, 110.0)] {
+            let mut cfg = cfg_with_lots(1, 1);
+            cfg.indicator_sl_lower_gate = gate_on;
+            let ltp = Arc::new(DashMap::new());
+            let mut pos = live_one_lot_at_target1(&ltp); // Active, stop 100
+            pos.signal.signal_id = Some("42".into());
+            ltp.insert("nse_fo|999".to_string(), 135.0);
+            let positions = Arc::new(RwLock::new(vec![pos.clone()]));
+            let (db_tx, mut db_rx) = mpsc::channel(1024);
+            let (signal_tx, signal_rx) = broadcast::channel(8);
+            tokio::spawn(start_position_monitor(
+                signal_rx,
+                db_tx,
+                ltp.clone(),
+                Arc::new(RwLock::new(cfg)),
+                positions.clone(),
+                broadcast::channel(1024).0,
+                Arc::new(RwLock::new(None)),
+                Arc::new(tokio::sync::Mutex::new(None)),
+                Arc::new(tokio::sync::Mutex::new(None)),
+                entry_gate::new_indicator_feed(),
+            ));
+
+            let mut reply = pos.signal.clone();
+            reply.action = "UPDATE_SL".into();
+            reply.stop_loss = new_sl;
+            signal_tx.send(reply).unwrap();
+            tokio::time::sleep(Duration::from_millis(120)).await;
+
+            let p = positions.read().await[0].clone();
+            let case = format!("gate {gate_on}, SL 100 → {new_sl}");
+            assert_eq!((p.current_sl, p.signal.stop_loss), (expect, expect), "{case}");
+            let mut logged_refusal = false;
+            while let Ok(msg) = db_rx.try_recv() {
+                if let DbWriteMessage::Log { level, message } = msg {
+                    if message.contains("SL_LOWER_REFUSED") {
+                        assert_eq!(level, "WARN");
+                        assert!(message.contains("stop kept at 100.00"), "{message}");
+                        logged_refusal = true;
+                    }
+                }
+            }
+            assert_eq!(logged_refusal, expect != new_sl, "{case}");
+        }
     }
 
     #[test]

@@ -353,6 +353,18 @@ pub struct TradingConfig {
     ///   Agrees size, when the reading turns strong. At most two top-ups.
     #[serde(default = "default_topup_mode")]
     pub indicator_topup_mode: String,
+    /// Stop-loss lowering gate. On = a Telegram instruction that would lower
+    /// a call's stop — a "move SL" reply, an edited call or a resend with a
+    /// lower SL — is applied only if the parent index's indicator strongly
+    /// agrees with the call at that moment: +2 for BUY CE, −2 for BUY PE
+    /// (`entry_gate::sl_lower_verdict`). Anything less — a plain agree,
+    /// NEUTRAL, the opening 09:16 check, no fresh reading — and the stop stays
+    /// where it is, logged as `SL_LOWER_REFUSED`; the instruction is not
+    /// retried later. Raising the stop is always applied. Works whether or not
+    /// `indicator_sizing` is on, scored with the same indicator settings.
+    /// Off by default: turning it on changes how stops are moved.
+    #[serde(default)]
+    pub indicator_sl_lower_gate: bool,
 }
 
 fn default_true() -> bool { true }
@@ -1099,6 +1111,7 @@ mod tests {
         );
         assert!(cfg.indicator_wait_on_disagree);
         assert!(!cfg.indicator_topup, "top-up buys more, so it must be opted into");
+        assert!(!cfg.indicator_sl_lower_gate, "changes how stops move, so it must be opted into");
     }
 
     #[test]

@@ -87,7 +87,8 @@ pub async fn post_settings_handler(
              indicator_pcr_buy_above=?, indicator_pcr_sell_below=?, indicator_vwap_band_pct=?,
              call_validity_minutes=?,
              indicator_early_checks=?, indicator_wait_on_disagree=?, indicator_topup=?,
-             indicator_strong_agree_multiplier=?, indicator_topup_mode=?
+             indicator_strong_agree_multiplier=?, indicator_topup_mode=?,
+             indicator_sl_lower_gate=?
          WHERE id=1",
     )
     .bind(cfg.max_trade_amount_inr)
@@ -122,6 +123,7 @@ pub async fn post_settings_handler(
     .bind(cfg.indicator_topup)
     .bind(cfg.indicator_strong_agree_multiplier)
     .bind(&cfg.indicator_topup_mode)
+    .bind(cfg.indicator_sl_lower_gate)
     .execute(&state.db_pool)
     .await
     {
@@ -135,11 +137,12 @@ pub async fn post_settings_handler(
     recompute_open_dynamic_runners(&state, &cfg).await;
 
     let _ = state.log_tx.send(format!(
-        r#"{{"event":"CONFIG_UPDATED","mode":"{}","max_trade":{:.2},"index_lots":{},"other_lots":{},"indicator_sizing":{},"strong_agree_x":{},"agree_x":{},"neutral_x":{},"call_validity_min":{},"early_checks":{},"wait_on_disagree":{},"topup":{},"topup_mode":"{}"}}"#,
+        r#"{{"event":"CONFIG_UPDATED","mode":"{}","max_trade":{:.2},"index_lots":{},"other_lots":{},"indicator_sizing":{},"strong_agree_x":{},"agree_x":{},"neutral_x":{},"call_validity_min":{},"early_checks":{},"wait_on_disagree":{},"topup":{},"topup_mode":"{}","sl_lower_gate":{}}}"#,
         cfg.mode, cfg.max_trade_amount_inr, cfg.index_lots, cfg.other_lots,
         cfg.indicator_sizing, cfg.indicator_strong_agree_multiplier, cfg.indicator_agree_multiplier,
         cfg.indicator_neutral_multiplier, cfg.call_validity_minutes,
-        cfg.indicator_early_checks, cfg.indicator_wait_on_disagree, cfg.indicator_topup, cfg.indicator_topup_mode
+        cfg.indicator_early_checks, cfg.indicator_wait_on_disagree, cfg.indicator_topup, cfg.indicator_topup_mode,
+        cfg.indicator_sl_lower_gate
     ));
     tracing::info!(
         mode = %cfg.mode,
