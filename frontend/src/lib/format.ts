@@ -34,6 +34,15 @@ export function balanceLabel(source?: string): string {
   return 'Virtual Balance';
 }
 
+/** When the LIVE balance was read from Kotak ("as of 10:05", with the date if
+ * not today), or '' — the server refreshes it hourly and after every trade. */
+export function balanceAsOf(updatedAt?: string | null): string {
+  if (!updatedAt) return '';
+  const time = updatedAt.slice(11, 16);
+  const day = updatedAt.slice(0, 10);
+  return day === todayIsoIST() ? `as of ${time}` : `as of ${day} ${time}`;
+}
+
 export function formatExitReason(reason?: string): string {
   if (!reason || reason === 'ENTRY') return '';
   switch (reason) {

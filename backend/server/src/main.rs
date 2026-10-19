@@ -4,6 +4,7 @@
 //! - [`db`]     — SQLite init, WAL, writer task, config loader
 //! - [`routes`] — Axum route handlers (portfolio, settings, auth)
 
+mod balance;
 mod db;
 mod market_data;
 mod pulse;
@@ -154,6 +155,9 @@ pub(crate) struct AppState {
     pub indicator_feed: shared_domain::entry_gate::IndicatorFeed,
     /// Live stats for the System screen — see `pulse`.
     pub pulse: Arc<pulse::PulseHub>,
+    /// Kotak balance for `/api/portfolio`, refreshed in the background — see
+    /// `balance`. The page never calls Kotak itself.
+    pub balance: Arc<balance::BalanceCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -680,8 +684,10 @@ async fn main() {
     let (log_tx, _)            = broadcast::channel::<String>(1000);
     let (write_tx, write_rx)   = mpsc::channel::<DbWriteMessage>(1000);
 
-    // 5. DB writer task
-    tokio::spawn(db::db_writer(write_rx, pool.clone()));
+    // 5. DB writer task. It also nudges the balance refresher after every
+    // recorded LIVE trade.
+    let balance = Arc::new(balance::BalanceCache::new());
+    tokio::spawn(db::db_writer(write_rx, pool.clone(), Arc::clone(&balance)));
 
     // 6. Telegram ingester (optional — requires TELEGRAM_API_ID env var)
     if let Ok(raw_id) = std::env::var("TELEGRAM_API_ID") {
@@ -929,6 +935,13 @@ async fn main() {
         ));
     }
 
+    // 9c. Kotak balance for the dashboard: hourly and after every LIVE trade,
+    // read with a cloned client so it never holds the Kotak mutex.
+    tokio::spawn(balance::run_balance_refresher(
+        Arc::clone(&kotak_client_opt),
+        Arc::clone(&balance),
+    ));
+
     // 10. Router
     let state = AppState {
         signal_tx,
@@ -951,6 +964,7 @@ async fn main() {
         market,
         indicator_feed,
         pulse: Arc::new(pulse::PulseHub::new()),
+        balance,
     };
     pulse::spawn_sampler(state.clone());
 

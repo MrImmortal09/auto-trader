@@ -365,6 +365,15 @@ fn check_session_status(resp: reqwest::Response) -> Result<reqwest::Response, Ko
     }
 }
 
+/// Timeout for the read-only calls (order book, positions, limits), in place
+/// of the client's 30 s. Kotak answers these in ~50 ms, occasionally 1-2 s;
+/// past that it has hung and will not answer at all. The position monitor
+/// makes these reads inline in its tick, so a hung read used to freeze every
+/// position's stop-loss watch for 30 s (90 s across the three pre-entry funds
+/// checks). Order placement and cancels keep the full 30 s: giving up on a
+/// send early only turns it into an ambiguous outcome.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Async HTTP client for the Kotak Neo Trade API.
 #[derive(Clone)]
 pub struct KotakClient {
@@ -724,6 +733,7 @@ impl KotakClient {
         let mut req = self
             .http
             .get(format!("{}/quick/user/positions", session.base_url))
+            .timeout(READ_TIMEOUT)
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);
@@ -765,6 +775,7 @@ impl KotakClient {
         let mut req = self
             .http
             .get(format!("{}/quick/user/orders", session.base_url))
+            .timeout(READ_TIMEOUT)
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);
@@ -804,6 +815,7 @@ impl KotakClient {
         let mut req = self
             .http
             .post(format!("{}/quick/user/limits", session.base_url))
+            .timeout(READ_TIMEOUT)
             .header("Sid", &session.sid)
             .header("Auth", &session.auth_token)
             .header("neo-fin-key", NEO_FIN_KEY);

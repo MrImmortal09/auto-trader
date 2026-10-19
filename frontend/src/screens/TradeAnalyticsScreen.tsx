@@ -1,6 +1,6 @@
 import { CheckCircle2, Info, Shield } from 'lucide-react';
 import { usePortfolioSnapshot } from '../hooks/usePortfolioSnapshot';
-import { balanceLabel, fmt, formatExitReason, instrumentLabel, todayIsoIST } from '../lib/format';
+import { balanceAsOf, balanceLabel, fmt, formatExitReason, instrumentLabel, todayIsoIST } from '../lib/format';
 
 export function TradeAnalyticsScreen({ serverBase }: { serverBase: string }) {
   const { portfolio, positions, realizedPnl, liveMtmPnl } = usePortfolioSnapshot(serverBase);
@@ -20,6 +20,9 @@ export function TradeAnalyticsScreen({ serverBase }: { serverBase: string }) {
           <span className="text-xl font-bold text-on-surface tabular-nums mt-1">
             {portfolio?.balance_source === 'LIVE_UNAVAILABLE' ? '—' : `₹${fmt(portfolio?.balance ?? 0)}`}
           </span>
+          {balanceAsOf(portfolio?.balance_updated_at) && (
+            <span className="text-[10px] text-on-surface-variant">{balanceAsOf(portfolio?.balance_updated_at)}</span>
+          )}
         </div>
         <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-4 shadow-sm flex flex-col justify-between">
           <div className="flex items-center justify-between text-xs text-on-surface-variant font-semibold uppercase tracking-wider">

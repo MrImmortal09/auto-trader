@@ -49,10 +49,13 @@ pub struct Portfolio {
     pub balance: f64,
     /// `"LIVE"` — `balance` is the real Kotak account's net available funds.
     /// `"PAPER"` — `balance` is the simulated wallet.
-    /// `"LIVE_UNAVAILABLE"` — in LIVE mode but the broker balance could not be
-    /// read (no session, or the call failed); `balance` is `0.0` and must not
-    /// be presented as real money.
+    /// `"LIVE_UNAVAILABLE"` — in LIVE mode but the broker balance has not been
+    /// read yet (no session since startup, or every read failed); `balance` is
+    /// `0.0` and must not be presented as real money.
     pub balance_source: String,
+    /// IST `YYYY-MM-DD HH:MM:SS` of the Kotak read behind a `"LIVE"` balance
+    /// (refreshed hourly and after every LIVE trade); `None` otherwise.
+    pub balance_updated_at: Option<String>,
     pub trades: Vec<PaperTrade>,
 }
 
@@ -92,22 +95,19 @@ pub async fn sse_logs_handler(
 /// LIVE and PAPER are never blended: trades are filtered to whichever mode is
 /// active right now, and the balance shown is the real Kotak account balance
 /// in LIVE (never the simulated wallet) or the simulated wallet in PAPER.
+///
+/// The LIVE balance is the background cache (`crate::balance`), never a Kotak
+/// call: this route is polled every few seconds from every open tab, and it
+/// must not touch the Kotak client the engine places orders with.
 pub async fn portfolio_handler(
     State(state): State<AppState>,
 ) -> Result<Json<Portfolio>, StatusCode> {
     let mode = state.trading_cfg.read().await.mode.clone();
 
-    let (balance, balance_source) = if mode == "LIVE" {
-        let guard = state.kotak.lock().await;
-        match guard.as_ref() {
-            Some(client) => match client.get_limits().await {
-                Ok(limits) => (limits.net, "LIVE".to_string()),
-                Err(e) => {
-                    tracing::warn!("LIVE balance: could not read broker limits ({e})");
-                    (0.0, "LIVE_UNAVAILABLE".to_string())
-                }
-            },
-            None => (0.0, "LIVE_UNAVAILABLE".to_string()),
+    let (balance, balance_source, balance_updated_at) = if mode == "LIVE" {
+        match state.balance.latest().await {
+            Some(b) => (b.net, "LIVE".to_string(), Some(b.fetched_at)),
+            None => (0.0, "LIVE_UNAVAILABLE".to_string(), None),
         }
     } else {
         let balance: f64 = sqlx::query("SELECT balance FROM wallet WHERE id = 1")
@@ -115,7 +115,7 @@ pub async fn portfolio_handler(
             .await
             .map_err(|e| { tracing::error!("wallet: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?
             .get::<f64, _>(0);
-        (balance, "PAPER".to_string())
+        (balance, "PAPER".to_string(), None)
     };
 
     let trades: Vec<PaperTrade> = sqlx::query_as(
@@ -130,7 +130,7 @@ pub async fn portfolio_handler(
     .await
     .map_err(|e| { tracing::error!("trades: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    Ok(Json(Portfolio { balance, balance_source, trades }))
+    Ok(Json(Portfolio { balance, balance_source, balance_updated_at, trades }))
 }
 
 /// `GET /api/logs/history` — Fetch recent logs from DB

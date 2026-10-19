@@ -863,8 +863,9 @@ fn entry_retry_limit_price(
 // ---------------------------------------------------------------------------
 // LIVE mode — broker call wrappers
 //
-// Each takes the Kotak mutex only for the duration of the call. The positions
-// lock is never held across any of these.
+// Each clones the client out of the Kotak mutex and makes the call with the
+// mutex released (see `current_kotak`). The positions lock is never held across
+// any of these.
 // ---------------------------------------------------------------------------
 
 type KotakHandle = Arc<tokio::sync::Mutex<Option<KotakClient>>>;
@@ -877,6 +878,19 @@ async fn lock_kotak(kotak: &KotakHandle) -> tokio::sync::MutexGuard<'_, Option<K
     guard
 }
 
+/// The current Kotak client, cloned out so no broker call holds the mutex.
+///
+/// The mutex only guards swapping the session in and out (login, re-login,
+/// the daily clear). Held across a request, one slow call made every other
+/// call wait behind it, orders included: on 2026-10-19 a SENSEX stop-loss sell
+/// waited ~10 s behind the dashboard's hung balance read and filled 22 points
+/// under its stop. Orders are still sent one at a time — this monitor is the
+/// only task that places or cancels them. The clone is cheap (the HTTP client
+/// inside is reference-counted).
+async fn current_kotak(kotak: &KotakHandle) -> Option<KotakClient> {
+    lock_kotak(kotak).await.clone()
+}
+
 /// Places an order and returns the broker error unflattened, so the entry path
 /// can tell a hard rejection (`OrderRejected`) apart from a send that never got
 /// a verdict (`is_ambiguous`) or a dead session (`is_session_expired`).
@@ -884,8 +898,7 @@ async fn kotak_place(
     kotak: &KotakHandle,
     order: &shared_domain::OrderRequest,
 ) -> Result<String, kotak_client::KotakError> {
-    let guard = lock_kotak(kotak).await;
-    let client = guard.as_ref().ok_or(kotak_client::KotakError::NotAuthenticated)?;
+    let client = current_kotak(kotak).await.ok_or(kotak_client::KotakError::NotAuthenticated)?;
     let result = client.place_live_order(order).await.map(|e| e.order_id);
     telemetry::order_sent(order, result.as_ref().map_or_else(|e| e.metric_label(), |_| "ok"));
     result
@@ -894,14 +907,12 @@ async fn kotak_place(
 async fn kotak_limits(
     kotak: &KotakHandle,
 ) -> Result<kotak_client::KotakLimits, kotak_client::KotakError> {
-    let guard = lock_kotak(kotak).await;
-    let client = guard.as_ref().ok_or(kotak_client::KotakError::NotAuthenticated)?;
+    let client = current_kotak(kotak).await.ok_or(kotak_client::KotakError::NotAuthenticated)?;
     client.get_limits().await
 }
 
 async fn kotak_cancel(kotak: &KotakHandle, order_no: &str, trading_symbol: &str) -> Result<(), String> {
-    let guard = lock_kotak(kotak).await;
-    let client = guard.as_ref().ok_or_else(|| "no Kotak session".to_string())?;
+    let client = current_kotak(kotak).await.ok_or_else(|| "no Kotak session".to_string())?;
     let ts = (!trading_symbol.is_empty()).then_some(trading_symbol);
     let result = client.cancel_order(order_no, ts).await.map(|_| ()).map_err(|e| e.to_string());
     telemetry::order_cancel(result.is_ok());
@@ -1173,12 +1184,9 @@ async fn reconcile_live_orders(
         return false;
     }
 
-    let book = {
-        let g = lock_kotak(kotak).await;
-        match g.as_ref() {
-            Some(c) => c.get_order_book().await,
-            None => return false,
-        }
+    let book = match current_kotak(kotak).await {
+        Some(c) => c.get_order_book().await,
+        None => return false,
     };
     let book = match book {
         Ok(b) => b,
@@ -1748,8 +1756,7 @@ async fn reconcile_on_startup(
 
     // 2. Broker truth.
     let (broker_positions, book) = {
-        let guard = lock_kotak(kotak).await;
-        let Some(client) = guard.as_ref() else {
+        let Some(client) = current_kotak(kotak).await else {
             tracing::warn!("LIVE startup reconciliation skipped — no Kotak session");
             return false;
         };
@@ -2003,8 +2010,7 @@ pub async fn preview_reconciliation(
     };
 
     let broker_positions = {
-        let guard = lock_kotak(kotak).await;
-        let Some(client) = guard.as_ref() else {
+        let Some(client) = current_kotak(kotak).await else {
             return Err("no Kotak session".to_string());
         };
         client.get_positions().await.map_err(|e| e.to_string())?
@@ -2173,8 +2179,7 @@ pub async fn apply_reconciliation(
         matches!(i.action, ReconcileAction::AdoptQty | ReconcileAction::AdoptManual { .. })
     });
     let broker_positions = if needs_broker_truth {
-        let guard = lock_kotak(kotak).await;
-        let Some(client) = guard.as_ref() else {
+        let Some(client) = current_kotak(kotak).await else {
             return Err("no Kotak session".to_string());
         };
         Some(client.get_positions().await.map_err(|e| e.to_string())?)
@@ -2842,17 +2847,14 @@ async fn exec_exit_all(
 
     if let Some(sl_id) = &ctx.sl_order_id {
         if let Err(e) = kotak_cancel(kotak, sl_id, &ctx.trading_symbol).await {
-            let still_open = {
-                let guard = lock_kotak(kotak).await;
-                match guard.as_ref() {
-                    Some(client) => client
-                        .get_order_book()
-                        .await
-                        .ok()
-                        .map(|book| book.iter().any(|o| o.order_no.trim() == sl_id.trim() && !o.is_terminal()))
-                        .unwrap_or(true), // couldn't check — stay conservative
-                    None => true,
-                }
+            let still_open = match current_kotak(kotak).await {
+                Some(client) => client
+                    .get_order_book()
+                    .await
+                    .ok()
+                    .map(|book| book.iter().any(|o| o.order_no.trim() == sl_id.trim() && !o.is_terminal()))
+                    .unwrap_or(true), // couldn't check — stay conservative
+                None => true,
             };
             if still_open {
                 loud_error(db_tx, log_tx, &ctx.instrument, &format!(

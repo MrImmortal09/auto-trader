@@ -2,7 +2,10 @@ use shared_domain::{current_ist_timestamp_string, DbWriteMessage, MonitoredPosit
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use shared_domain::{telemetry, TradingConfig};
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+
+use crate::balance::BalanceCache;
 
 async fn ensure_column(pool: &SqlitePool, sql: &str) {
     if let Err(e) = sqlx::query(sql).execute(pool).await {
@@ -469,8 +472,14 @@ pub async fn load_kotak_session(pool: &SqlitePool) -> Option<KotakSessionRow> {
 // ---------------------------------------------------------------------------
 
 /// Dedicated SQLite writer — processes one `DbWriteMessage` at a time,
-/// eliminating "database is locked" errors from concurrent writers.
-pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool) {
+/// eliminating "database is locked" errors from concurrent writers. Every
+/// executed buy / sell passes through here, so it is also what tells the
+/// dashboard's balance cache to re-read Kotak after a LIVE trade.
+pub async fn db_writer(
+    mut rx: mpsc::Receiver<DbWriteMessage>,
+    pool: SqlitePool,
+    balance: Arc<BalanceCache>,
+) {
     while let Some(msg) = rx.recv().await {
         let _timer = telemetry::DbWriteTimer::start(msg.metric_kind());
         match msg {
@@ -480,6 +489,11 @@ pub async fn db_writer(mut rx: mpsc::Receiver<DbWriteMessage>, pool: SqlitePool)
                 stamp_duty, transaction_charge, gst, net_value,
                 signal_id, raw_message, exit_reason, mode,
             } => {
+                // The fill happened at the broker whether or not the rows
+                // below land, so the balance is re-read either way.
+                if mode == "LIVE" {
+                    balance.trade_recorded();
+                }
                 let timestamp = current_ist_timestamp_string();
                 let mut tx = match pool.begin().await {
                     Ok(t) => t,

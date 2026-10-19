@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { ScreenId } from './types';
 import { apiFetch, getStoredServerBase, persistServerBase } from './lib/api';
-import { balanceLabel, fmt, todayIsoIST } from './lib/format';
+import { balanceAsOf, balanceLabel, fmt, todayIsoIST } from './lib/format';
 import { usePortfolioSnapshot } from './hooks/usePortfolioSnapshot';
 
 // Layout
@@ -155,6 +155,9 @@ export default function App() {
                   <span className="text-lg sm:text-xl font-bold text-on-surface tabular-nums mt-1">
                     {portfolio?.balance_source === 'LIVE_UNAVAILABLE' ? '—' : `₹${fmt(portfolio?.balance ?? 0)}`}
                   </span>
+                  {balanceAsOf(portfolio?.balance_updated_at) && (
+                    <span className="text-[10px] text-on-surface-variant">{balanceAsOf(portfolio?.balance_updated_at)}</span>
+                  )}
                 </div>
                 <div className="bg-surface-container-lowest rounded-xl border border-outline-variant p-3 sm:p-4 shadow-sm flex flex-col justify-between">
                   <div className="flex items-center justify-between text-[11px] sm:text-xs text-on-surface-variant font-semibold uppercase tracking-wider">

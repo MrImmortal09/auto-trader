@@ -166,6 +166,8 @@ export interface Portfolio {
   balance: number;
   /** "LIVE" | "PAPER" | "LIVE_UNAVAILABLE" — see backend Portfolio struct. */
   balance_source: string;
+  /** IST time of the Kotak read behind a "LIVE" balance; absent otherwise. */
+  balance_updated_at?: string | null;
   trades: PaperTrade[];
 }
 
