@@ -1,4 +1,4 @@
-import { Bell, User, AlertOctagon, ShieldCheck, Lock, Eye, KeyRound } from 'lucide-react';
+import { Bell, User, AlertOctagon, ShieldCheck, Lock, Eye, KeyRound, Zap } from 'lucide-react';
 import type { ScreenId } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 
@@ -18,6 +18,7 @@ export function TopNavBar({
 
   const titles: Record<ScreenId, string> = {
     dashboard: 'Trading Dashboard',
+    execute: 'Execute — Scalp Desk',
     positions: 'Active Positions & Signals',
     analytics: 'Trade Analytics & Order Flow Deep Dive',
     market: 'Market Data — OI, PCR & VWAP Trend',
@@ -28,6 +29,7 @@ export function TopNavBar({
   // Phones only have room for a word or two next to the action buttons.
   const shortTitles: Record<ScreenId, string> = {
     dashboard: 'Dashboard',
+    execute: 'Execute',
     positions: 'Positions',
     analytics: 'Analytics',
     market: 'Market Data',
@@ -116,9 +118,14 @@ export function TopNavBar({
         </button>
         <button
           onClick={handleExecuteClick}
-          className="bg-primary text-on-primary px-3 sm:px-3.5 py-1.5 rounded-lg text-xs font-bold hover:bg-primary/90 transition-colors shadow-sm flex items-center gap-1"
+          className={`px-3 sm:px-3.5 py-1.5 rounded-lg text-xs font-bold transition-colors shadow-sm flex items-center gap-1 ${
+            activeScreen === 'execute'
+              ? 'bg-secondary text-on-secondary hover:bg-secondary/90'
+              : 'bg-primary text-on-primary hover:bg-primary/90'
+          }`}
         >
-          <span className="sm:hidden">+ Trade</span>
+          <Zap size={13} />
+          <span className="sm:hidden">Trade</span>
           <span className="hidden sm:inline">Execute Order</span>
         </button>
       </div>

@@ -256,6 +256,10 @@ export interface MonitoredPosition {
   entry_zone?: [number, number] | null;
   /** IST `HH:MM` this still-unbought call stops being valid (call validity window). */
   call_expires_at?: string | null;
+  /** Opened by hand from the Execute screen: market entry, no stop, no target. */
+  manual?: boolean;
+  /** A manual add still waiting to be sent. */
+  manual_add?: { lots: number; requested_at: string } | null;
 }
 
 export interface KotakForm {
@@ -343,7 +347,7 @@ export interface ReconcileApplyItem {
   action: ReconcileAction;
 }
 
-export type ScreenId = 'dashboard' | 'positions' | 'analytics' | 'market' | 'portfolio' | 'system' | 'settings';
+export type ScreenId = 'dashboard' | 'execute' | 'positions' | 'analytics' | 'market' | 'portfolio' | 'system' | 'settings';
 
 export type TgStep = 'idle' | 'resuming' | 'code' | 'twofa' | 'chats' | 'running';
 
@@ -469,4 +473,72 @@ export interface TelemetrySnapshot {
   latest: TelemetrySample | null;
   history: TelemetryPoint[];
   sample_every_secs: number;
+}
+
+// ---------------------------------------------------------------------------
+// Execute screen (SSE /api/execute/stream) — mirrors `backend/server/src/execute.rs`.
+// ---------------------------------------------------------------------------
+
+export interface ExecuteQuote {
+  /** Broker trading symbol — what a BUY tap sends. */
+  sym: string;
+  ltp: number | null;
+  /** Milliseconds since this contract's own last tick. */
+  age_ms: number | null;
+}
+
+export interface ExecuteRow {
+  strike: number;
+  ce: ExecuteQuote | null;
+  pe: ExecuteQuote | null;
+}
+
+export interface ExecuteBoard {
+  index: string;
+  /** `YYYY-MM-DD`. */
+  expiry: string;
+  days_to_expiry: number;
+  lot_size: number;
+  spot: number | null;
+  /** Live Kotak index tick, Upstox's 60 s poll, or put-call parity. */
+  spot_source: 'kotak' | 'upstox' | 'parity' | null;
+  atm: number | null;
+  /** ATM ± 7 strikes; the screen shows 11 of them. */
+  rows: ExecuteRow[];
+}
+
+export interface ExecutePosition {
+  id: string;
+  manual: boolean;
+  index: string;
+  strike: number | null;
+  option_type: string | null;
+  symbol: string;
+  lot_size: number;
+  qty: number;
+  avg: number;
+  ltp: number | null;
+  pnl: number | null;
+  placing: boolean;
+  adding: boolean;
+  exiting: boolean;
+  halted: boolean;
+}
+
+export interface ExecuteFrame {
+  /** Unix ms. */
+  ts: number;
+  mode: string;
+  kill_switch: boolean;
+  /** Manual buys are accepted (09:15–15:30 IST, weekday). */
+  market_open: boolean;
+  feed: { connected: boolean; last_tick_age_ms: number | null };
+  kotak_ready: boolean;
+  indices: { index: string; spot: number | null; change_pct: number | null }[];
+  board: ExecuteBoard | null;
+  board_error: string | null;
+  positions: ExecutePosition[];
+  /** Engine errors from the last minute (`ts` on the frame's clock): the
+   * underlying, and the position when the engine said which. */
+  errors: { instrument: string; position_id: string | null; message: string; ts: number }[];
 }

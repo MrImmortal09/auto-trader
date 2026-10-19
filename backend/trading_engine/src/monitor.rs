@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,8 @@ enum PosAction {
     /// Drop a position that is still waiting for its entry and never will take
     /// one (signal cancelled/changed, or the end-of-day entry cutoff).
     Expire { reason: String },
+    /// A manual add that won't be booked — see `manual_add_verdict`.
+    DropManualAdd { reason: String },
 }
 
 struct Pending {
@@ -173,6 +176,7 @@ fn find_duplicate_open_position<'a>(
 ) -> Option<&'a MonitoredPosition> {
     positions.iter().find(|p| {
         !matches!(p.state, TradeState::Closed)
+            && !p.manual
             && p.signal.instrument_name.eq_ignore_ascii_case(&signal.instrument_name)
             && p.signal.strike == signal.strike
             && p.signal.option_type == signal.option_type
@@ -280,7 +284,9 @@ fn size_entry(
 ) -> EntrySizing {
     let base_qty = compute_entry_qty(&pos.signal, lot_size, pos.override_qty, cfg, Some(ltp));
     let unscaled = |note| EntrySizing::Buy { qty: base_qty, note, topup_eligible: false, topup_stepped: false };
-    if !cfg.indicator_sizing {
+    // A manual buy is exactly the lots the user tapped for — the indicator
+    // neither scales nor vetoes it.
+    if !cfg.indicator_sizing || pos.manual {
         return unscaled(None);
     }
     // Equity / futures signals are sized on notional and not gated.
@@ -351,7 +357,7 @@ fn topup_sizing(
     gate: &EntryGate,
     entry_cutoff: bool,
 ) -> Option<(i32, String, bool)> {
-    if !cfg.indicator_sizing || !cfg.indicator_topup || cfg.kill_switch_active || entry_cutoff {
+    if !cfg.indicator_sizing || !cfg.indicator_topup || cfg.kill_switch_active || entry_cutoff || pos.manual {
         return None;
     }
     let mode = cfg.topup_mode();
@@ -538,6 +544,9 @@ fn entry_past_target1(signal: &TradeSignal, ltp: f64) -> Option<f64> {
 /// the stated range — even with `entry_window_pct = 0`; a configured `pct`
 /// can only pull its far edge in, never push it past the range.
 pub fn entry_buy_window(signal: &TradeSignal, cfg: &TradingConfig) -> Option<(f64, f64)> {
+    if is_market_entry(signal) {
+        return None;
+    }
     let pct_window = pct_entry_window(signal, cfg);
     match signal.entry_price_max {
         Some(max) if signal.entry_condition.eq_ignore_ascii_case("ABOVE") => {
@@ -565,6 +574,94 @@ fn pct_entry_window(signal: &TradeSignal, cfg: &TradingConfig) -> Option<(f64, f
     Some(if cond == "BELOW" { (x - w, x) } else { (x, x + w) })
 }
 
+/// A manual buy from the Execute screen: `entry_condition` `"MARKET"` — buy
+/// on the next tick at whatever the price is, with no trigger and no window.
+fn is_market_entry(signal: &TradeSignal) -> bool {
+    signal.entry_condition.eq_ignore_ascii_case("MARKET")
+}
+
+/// Whether a manual order tapped at `requested_at` (IST timestamp) is too old
+/// to send now.
+fn manual_order_stale(requested_at: &str, now_ts: &str) -> bool {
+    let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok();
+    match (parse(requested_at), parse(now_ts)) {
+        (Some(at), Some(now)) => (now - at).num_seconds() > shared_domain::MANUAL_ORDER_TTL_SECS,
+        // An unreadable timestamp can't prove the order is fresh.
+        _ => true,
+    }
+}
+
+/// `Some(reason)` once a manual position's first buy has gone unsent past
+/// [`shared_domain::MANUAL_ORDER_TTL_SECS`] — the user tapped at a price
+/// that is gone, so it is dropped rather than bought late. An entry already
+/// at the broker, or whose send outcome is unknown, is never dropped here:
+/// the order book settles it.
+fn manual_entry_expired_reason(pos: &MonitoredPosition, now_ts: &str) -> Option<String> {
+    (pos.manual
+        && matches!(pos.state, TradeState::WaitingForEntry)
+        && pos.entry_order_id.is_none()
+        && !pos.entry_send_uncertain
+        && manual_order_stale(&pos.created_at, now_ts))
+    .then(|| {
+        format!(
+            "MANUAL_ENTRY_TIMEOUT — not sent within {} s of the tap (feed, funds check or Kotak too slow); nothing bought, tap again",
+            shared_domain::MANUAL_ORDER_TTL_SECS
+        )
+    })
+}
+
+/// What to do with a manual position's pending add (`manual_add`).
+#[derive(Debug, PartialEq)]
+enum ManualAddVerdict {
+    /// Buy `qty` more now.
+    Buy { qty: i32 },
+    /// Not now — something else is in flight; look again next tick.
+    Wait,
+    /// Drop the request; `reason` says why, for the log.
+    Drop { reason: String },
+}
+
+/// The engine's answer to a pending manual add, or `None` when there is none.
+/// Refused outright (and cleared) under the kill switch, past the entry
+/// cutoff, while the position is being exited, or once it is too old to send;
+/// held while a sell or another buy is still in flight.
+fn manual_add_verdict(
+    pos: &MonitoredPosition,
+    cfg: &TradingConfig,
+    entry_cutoff: bool,
+    now_ts: &str,
+) -> Option<ManualAddVerdict> {
+    let add = pos.manual_add.as_ref()?;
+    if !pos.manual || !matches!(pos.state, TradeState::Active) {
+        return Some(ManualAddVerdict::Drop { reason: "the position is no longer open".to_string() });
+    }
+    let refused = if add.lots <= 0 {
+        Some(format!("invalid lot count {}", add.lots))
+    } else if cfg.kill_switch_active {
+        Some("kill switch is active".to_string())
+    } else if entry_cutoff {
+        Some("no new buys after 15:39 IST".to_string())
+    } else if pos.force_exit.is_some() {
+        Some("the position is being exited".to_string())
+    } else if manual_order_stale(&add.requested_at, now_ts) {
+        Some(format!("not sent within {} s of the tap", shared_domain::MANUAL_ORDER_TTL_SECS))
+    } else {
+        None
+    };
+    if let Some(reason) = refused {
+        return Some(ManualAddVerdict::Drop { reason });
+    }
+    if pos.sizing.topup_order_id.is_some()
+        || pos.sizing.topup_send_uncertain
+        || pos.pending_exit_order_id.is_some()
+        || pos.manual_sell_qty.is_some()
+        || pos.executed_qty <= 0
+    {
+        return Some(ManualAddVerdict::Wait);
+    }
+    Some(ManualAddVerdict::Buy { qty: add.lots * lot_size_of(pos) })
+}
+
 /// Whether `ltp` is where the engine should buy `signal` right now.
 ///
 /// With `entry_window_pct = 0` this is the classic one-sided check
@@ -572,6 +669,9 @@ fn pct_entry_window(signal: &TradeSignal, cfg: &TradingConfig) -> Option<(f64, f
 /// configured it also refuses a price that has run past the far edge — that
 /// position keeps waiting for a pull-back. Unknown entry conditions never fire.
 fn entry_triggered(signal: &TradeSignal, ltp: f64, cfg: &TradingConfig) -> bool {
+    if is_market_entry(signal) {
+        return true;
+    }
     match entry_buy_window(signal, cfg) {
         Some((low, high)) => ltp >= low && ltp <= high,
         None => match signal.entry_condition.to_uppercase().as_str() {
@@ -599,7 +699,7 @@ fn pre_t1_trail_update(
     ltp: f64,
     cfg: &TradingConfig,
 ) -> Option<f64> {
-    if !cfg.pre_t1_trailing || !matches!(pos.state, TradeState::Active) {
+    if !cfg.pre_t1_trailing || !matches!(pos.state, TradeState::Active) || pos.manual {
         return None;
     }
     let t1 = *pos.signal.targets.first()?;
@@ -677,7 +777,7 @@ const ENTRY_RETRY_THROTTLE: Duration = Duration::from_secs(5);
 const UNCERTAIN_ENTRY_GRACE: Duration = Duration::from_secs(20);
 
 /// True at/after 15:39 IST, for the remainder of the day.
-fn is_entry_cutoff_passed() -> bool {
+pub fn is_entry_cutoff_passed() -> bool {
     use chrono::Timelike;
     let now = shared_domain::now_ist();
     let (h, m) = (now.hour(), now.minute());
@@ -946,13 +1046,38 @@ async fn loud_error(
     instrument: &str,
     message: &str,
 ) {
-    tracing::error!(instrument = %instrument, "LIVE: {message}");
+    loud_error_for(db_tx, log_tx, instrument, None, message).await;
+}
+
+/// [`loud_error`] about one position — the line carries its id, so the
+/// Execute screen can tell the user which tap it was about.
+async fn loud_error_at(
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    instrument: &str,
+    pos_id: &str,
+    message: &str,
+) {
+    loud_error_for(db_tx, log_tx, instrument, Some(pos_id), message).await;
+}
+
+async fn loud_error_for(
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    instrument: &str,
+    pos_id: Option<&str>,
+    message: &str,
+) {
+    tracing::error!(instrument = %instrument, position = ?pos_id, "LIVE: {message}");
     telemetry::ENGINE_LIVE_ERRORS.inc();
-    let payload = json!({
+    let mut payload = json!({
         "event": "LIVE_ERROR",
         "instrument": instrument,
         "message": message,
     });
+    if let Some(id) = pos_id {
+        payload["position_id"] = json!(id);
+    }
     send_log(db_tx, log_tx, "ERROR", &payload.to_string()).await;
 }
 
@@ -1097,6 +1222,68 @@ async fn record_live_sell(
 
 /// Everything the reconciler needs about one position, snapshotted so the
 /// positions lock can be released before the broker is called.
+/// Every order number seen in the broker's book, with the poll it first
+/// showed up in. An unconfirmed send is only ever matched to an order that
+/// first appeared *after* it went out — never to an older fill on the same
+/// contract (an earlier scalp, already closed and no longer claimed by any
+/// position), which would leave the engine believing it holds lots it has
+/// already sold.
+#[derive(Default)]
+pub(crate) struct OrderBookMemory {
+    /// Successful order-book reads so far. Only ever grows.
+    polls: u64,
+    day: Option<chrono::NaiveDate>,
+    first_seen: HashMap<String, u64>,
+}
+
+impl OrderBookMemory {
+    fn record(&mut self, book: &[kotak_client::KotakOrder]) {
+        let today = shared_domain::today_ist();
+        if self.day != Some(today) {
+            self.day = Some(today);
+            self.first_seen.clear();
+        }
+        self.polls += 1;
+        for o in book {
+            self.first_seen.entry(o.order_no.trim().to_string()).or_insert(self.polls);
+        }
+    }
+
+    fn polls(&self) -> u64 {
+        self.polls
+    }
+
+    fn appeared_after(&self, order_no: &str, poll: u64) -> bool {
+        self.first_seen.get(order_no.trim()).is_some_and(|&seen| seen > poll)
+    }
+}
+
+/// Buy orders in `book` that could be an unconfirmed send of `want_qty` on
+/// `sym`: not a sell, not already some position's order, the same quantity,
+/// and — when the send's poll is known — first seen after it went out.
+fn unconfirmed_buy_candidates<'a>(
+    book: &'a [kotak_client::KotakOrder],
+    sym: &str,
+    want_qty: i32,
+    claimed: &[String],
+    memory: &OrderBookMemory,
+    sent_after_poll: Option<u64>,
+) -> Vec<&'a kotak_client::KotakOrder> {
+    let sym = sym.trim();
+    if sym.is_empty() {
+        return Vec::new();
+    }
+    book.iter()
+        .filter(|o| {
+            !o.is_sell()
+                && o.trading_symbol.trim() == sym
+                && !claimed.iter().any(|c| c.trim() == o.order_no.trim())
+                && (want_qty <= 0 || o.ordered_qty() == want_qty)
+                && sent_after_poll.is_none_or(|poll| memory.appeared_after(&o.order_no, poll))
+        })
+        .collect()
+}
+
 struct LiveLeg {
     pos_id: String,
     instrument: String,
@@ -1114,6 +1301,7 @@ struct LiveLeg {
     /// set while `entry_order_id` is `None`.
     entry_send_uncertain: bool,
     entry_uncertain_qty: Option<i32>,
+    entry_uncertain_poll: Option<u64>,
     /// Whole seconds since that send attempt, for the grace-window timeout.
     entry_attempt_secs: Option<i64>,
     /// The entry is being retried as an IOC limit (a prior market send was
@@ -1130,6 +1318,12 @@ struct LiveLeg {
     topup_retry_as_limit: bool,
     /// Whole seconds since the top-up was sent.
     topup_attempt_secs: Option<i64>,
+    /// A manual position: its top-up leg is the user's own add.
+    manual: bool,
+    /// A manual add whose send outcome is unknown — hunted like an entry.
+    topup_send_uncertain: bool,
+    topup_uncertain_qty: Option<i32>,
+    topup_uncertain_poll: Option<u64>,
 }
 
 /// Settle every tracked order against the broker's order book.
@@ -1143,6 +1337,7 @@ async fn reconcile_live_orders(
     db_tx: &mpsc::Sender<DbWriteMessage>,
     log_tx: &broadcast::Sender<String>,
     brokerage: f64,
+    book_memory: &mut OrderBookMemory,
 ) -> bool {
     let (legs, claimed_entry_ids): (Vec<LiveLeg>, Vec<String>) = {
         let g = positions.read().await;
@@ -1153,6 +1348,7 @@ async fn reconcile_live_orders(
                     || p.sl_order_id.is_some()
                     || p.pending_exit_order_id.is_some()
                     || p.sizing.topup_order_id.is_some()
+                    || p.sizing.topup_send_uncertain
             })
             .map(|p| LiveLeg {
                 pos_id: p.id.clone(),
@@ -1172,6 +1368,7 @@ async fn reconcile_live_orders(
                 entry_cancel_sent: p.entry_cancel_sent,
                 entry_send_uncertain: p.entry_send_uncertain && p.entry_order_id.is_none(),
                 entry_uncertain_qty: p.entry_uncertain_qty,
+                entry_uncertain_poll: p.entry_uncertain_poll,
                 entry_attempt_secs: secs_since_ist(&p.entry_attempt_at),
                 entry_retry_as_limit: p.entry_retry_as_limit,
                 sl_order_id: p.sl_order_id.clone(),
@@ -1182,6 +1379,10 @@ async fn reconcile_live_orders(
                 topup_cancel_sent: p.sizing.topup_cancel_sent,
                 topup_retry_as_limit: p.sizing.topup_retry_as_limit,
                 topup_attempt_secs: secs_since_ist(&p.sizing.topup_attempt_at),
+                manual: p.manual,
+                topup_send_uncertain: p.sizing.topup_send_uncertain,
+                topup_uncertain_qty: p.sizing.topup_uncertain_qty,
+                topup_uncertain_poll: p.sizing.topup_uncertain_poll,
             })
             .collect();
         // Every entry order number the engine already owns — the uncertain-entry
@@ -1213,6 +1414,7 @@ async fn reconcile_live_orders(
             return false;
         }
     };
+    book_memory.record(&book);
 
     let mut mutated = false;
 
@@ -1226,18 +1428,9 @@ async fn reconcile_live_orders(
         if leg.entry_send_uncertain {
             let want_qty = leg.entry_uncertain_qty.unwrap_or(0);
             let sym = leg.trading_symbol.trim();
-            let matches: Vec<&kotak_client::KotakOrder> = if sym.is_empty() {
-                Vec::new()
-            } else {
-                book.iter()
-                    .filter(|o| {
-                        !o.is_sell()
-                            && o.trading_symbol.trim() == sym
-                            && !claimed_entry_ids.iter().any(|c| c.trim() == o.order_no.trim())
-                            && (want_qty <= 0 || o.ordered_qty() == want_qty)
-                    })
-                    .collect()
-            };
+            let matches = unconfirmed_buy_candidates(
+                &book, sym, want_qty, &claimed_entry_ids, book_memory, leg.entry_uncertain_poll,
+            );
 
             match matches.as_slice() {
                 [ord] => {
@@ -1249,7 +1442,7 @@ async fn reconcile_live_orders(
                         p.entry_uncertain_qty = None;
                         p.entry_cancel_sent = false;
                     }).await;
-                    loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                         "found order {adopted} ({status}) for {sym} in the book and adopted it as this position's entry — its placement had been unconfirmed. It settles on the next poll; verify against your broker app"
                     )).await;
                     mutated = true;
@@ -1279,7 +1472,7 @@ async fn reconcile_live_orders(
                         p.entry_uncertain_qty = None;
                         p.live_halt = Some("unconfirmed entry send matched multiple broker orders".to_string());
                     }).await;
-                    loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                         "an unconfirmed entry send for {sym} matches {n} buy orders in the book — cannot tell which is ours, so this position is halted; resolve it at the broker terminal"
                     )).await;
                     mutated = true;
@@ -1298,7 +1491,7 @@ async fn reconcile_live_orders(
                     if filled > 0 {
                         if avg <= 0.0 {
                             avg = leg.entry_price;
-                            loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                            loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                                 "entry order {oid} filled {filled} but the broker reported no average price — booking it at the signal entry {avg:.2}, verify against the contract note"
                             )).await;
                         }
@@ -1333,7 +1526,7 @@ async fn reconcile_live_orders(
                         })).await;
 
                         if ordered > 0 && filled < ordered {
-                            loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                            loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                                 "entry order {oid} filled only {filled} of {ordered} — running the position on the filled quantity"
                             )).await;
                         }
@@ -1357,7 +1550,7 @@ async fn reconcile_live_orders(
                             p.entry_order_id = None;
                             p.entry_retry_as_limit = false;
                         }).await;
-                        loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                        loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                             "entry order {oid} came back {} ({}) with nothing filled — signal dropped",
                             ord.status, ord.reject_reason
                         )).await;
@@ -1367,11 +1560,82 @@ async fn reconcile_live_orders(
                     // A market buy that only partly filled: keep what we got and
                     // release the rest instead of chasing the price.
                     if let Err(e) = kotak_cancel(kotak, &oid, &leg.trading_symbol).await {
-                        loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                        loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                             "could not cancel the unfilled remainder of entry order {oid}: {e}"
                         )).await;
                     }
                     with_position(positions, &leg.pos_id, |p| p.entry_cancel_sent = true).await;
+                    mutated = true;
+                }
+            }
+        }
+
+        // ── Unconfirmed manual add ──────────────────────────────────────── //
+        // The same hunt as for an unconfirmed entry: adopt the matching buy
+        // so the top-up leg settles it from the next poll on, or — once the
+        // grace window has passed on a clean read — conclude it never reached
+        // the broker. The position's other legs still settle below.
+        if leg.topup_send_uncertain {
+            let want_qty = leg.topup_uncertain_qty.unwrap_or(0);
+            let sym = leg.trading_symbol.trim();
+            let matches = unconfirmed_buy_candidates(
+                &book, sym, want_qty, &claimed_entry_ids, book_memory, leg.topup_uncertain_poll,
+            );
+            match matches.as_slice() {
+                [ord] => {
+                    let adopted = ord.order_no.trim().to_string();
+                    let status = ord.status.trim().to_string();
+                    with_position(positions, &leg.pos_id, |p| {
+                        p.sizing.topup_order_id = Some(adopted.clone());
+                        p.sizing.topup_send_uncertain = false;
+                        p.sizing.topup_uncertain_qty = None;
+                        p.sizing.topup_uncertain_poll = None;
+                        p.sizing.topup_cancel_sent = false;
+                    }).await;
+                    loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
+                        "found order {adopted} ({status}) for {sym} in the book and adopted it as the add whose placement was unconfirmed — it settles on the next poll; verify against your broker app"
+                    )).await;
+                    mutated = true;
+                }
+                [] => {
+                    let waited = leg.topup_attempt_secs.unwrap_or(0);
+                    if waited >= UNCERTAIN_ENTRY_GRACE.as_secs() as i64 {
+                        with_position(positions, &leg.pos_id, |p| {
+                            p.sizing.topup_send_uncertain = false;
+                            p.sizing.topup_uncertain_qty = None;
+                            p.sizing.topup_uncertain_poll = None;
+                            p.sizing.topup_exit_on_fill = false;
+                            // Kept open only because this add might have filled.
+                            if p.executed_qty <= 0
+                                && p.pending_exit_order_id.is_none()
+                                && p.sl_order_id.is_none()
+                                && p.sizing.topup_order_id.is_none()
+                                && !matches!(p.state, TradeState::WaitingForEntry)
+                            {
+                                p.state = TradeState::Closed;
+                                p.force_exit = None;
+                            }
+                        }).await;
+                        live_info(db_tx, log_tx, json!({
+                            "event": "ADD_SEND_UNCONFIRMED_CLEARED",
+                            "instrument": leg.instrument,
+                            "note": format!("no matching order in the book {waited}s after an unconfirmed add — treating it as never placed"),
+                            "mode": "LIVE",
+                        })).await;
+                        mutated = true;
+                    }
+                }
+                many => {
+                    let n = many.len();
+                    with_position(positions, &leg.pos_id, |p| {
+                        p.sizing.topup_send_uncertain = false;
+                        p.sizing.topup_uncertain_qty = None;
+                        p.sizing.topup_uncertain_poll = None;
+                        p.live_halt = Some("unconfirmed add matched multiple broker orders".to_string());
+                    }).await;
+                    loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
+                        "an unconfirmed add for {sym} matches {n} buy orders in the book — cannot tell which is ours, so this position is halted; resolve it at the broker terminal"
+                    )).await;
                     mutated = true;
                 }
             }
@@ -1390,7 +1654,7 @@ async fn reconcile_live_orders(
                     if filled > 0 {
                         if avg <= 0.0 {
                             avg = leg.entry_price;
-                            loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                            loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                                 "top-up order {oid} filled {filled} but the broker reported no average price — booking it at the signal entry {avg:.2}, verify against the contract note"
                             )).await;
                         }
@@ -1422,14 +1686,15 @@ async fn reconcile_live_orders(
                         }).await;
 
                         let fees = FeeCalculator::calculate(filled, avg, "BUY", leg.is_options, brokerage);
-                        tracing::info!(instrument = %leg.instrument, price = avg, qty = filled, "LIVE top-up filled");
+                        let kind = if leg.manual { "MANUAL_ADD" } else { "TOPUP" };
+                        tracing::info!(instrument = %leg.instrument, price = avg, qty = filled, kind, "LIVE top-up filled");
                         send_trade(
                             db_tx, &leg.instrument, "BUY", filled, avg, &fees,
                             leg.signal_id.clone(), leg.raw_message.clone(),
-                            Some("TOPUP".to_string()), "LIVE",
+                            Some(kind.to_string()), "LIVE",
                         ).await;
                         live_info(db_tx, log_tx, json!({
-                            "event": "TOPUP",
+                            "event": kind,
                             "instrument": leg.instrument,
                             "price": round2(avg),
                             "qty": filled,
@@ -1438,7 +1703,7 @@ async fn reconcile_live_orders(
                             "mode": "LIVE",
                         })).await;
                         if ordered > 0 && filled < ordered {
-                            loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                            loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                                 "top-up order {oid} filled only {filled} of {ordered} — running the position on the filled quantity"
                             )).await;
                         }
@@ -1470,7 +1735,7 @@ async fn reconcile_live_orders(
                         if retry {
                             tracing::info!(instrument = %leg.instrument, %oid, "LIVE top-up IOC limit expired unfilled — may retry");
                         } else {
-                            loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                            loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                                 "top-up order {oid} came back {} ({}) with nothing filled — no top-up, the position is unchanged",
                                 ord.status, ord.reject_reason
                             )).await;
@@ -1480,7 +1745,7 @@ async fn reconcile_live_orders(
                 } else if ord.filled_qty() > 0 && !leg.topup_cancel_sent {
                     // Partly filled: keep what we got, release the rest.
                     if let Err(e) = kotak_cancel(kotak, &oid, &leg.trading_symbol).await {
-                        loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                        loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                             "could not cancel the unfilled remainder of top-up order {oid}: {e}"
                         )).await;
                     }
@@ -1508,7 +1773,7 @@ async fn reconcile_live_orders(
                         p.force_exit = None;
                     }
                 }).await;
-                loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                     "top-up order {oid} is not in the broker's order book — no longer tracking it and nothing was added to the position. Check the broker app for that order"
                 )).await;
                 mutated = true;
@@ -1525,7 +1790,7 @@ async fn reconcile_live_orders(
                         let reason = if leg.at_target1 { "TRAIL_SL_HIT" } else { "SL_HIT" };
                         record_live_sell(db_tx, log_tx, leg, filled, avg, reason, brokerage).await;
                     } else {
-                        loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                        loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                             "stop-loss order {oid} reports complete but gave no usable fill data (qty {filled}, avg {avg}) — reconcile the position manually"
                         )).await;
                     }
@@ -1537,6 +1802,7 @@ async fn reconcile_live_orders(
                         if p.executed_qty <= 0
                             && p.pending_exit_order_id.is_none()
                             && p.sizing.topup_order_id.is_none()
+                            && !p.sizing.topup_send_uncertain
                         {
                             p.state = TradeState::Closed;
                             p.force_exit = None;
@@ -1544,7 +1810,7 @@ async fn reconcile_live_orders(
                     }).await;
                     mutated = true;
                 } else if ord.is_rejected() || ord.is_cancelled() {
-                    loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                         "stop-loss order {oid} is {} at the broker ({}) — the position is unprotected and a new stop will be placed",
                         ord.status, ord.reject_reason
                     )).await;
@@ -1586,7 +1852,7 @@ async fn reconcile_live_orders(
                     } else {
                         // Hard reject from the exchange / RMS — log loudly and
                         // count against the exit-attempt cap.
-                        loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                        loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                             "exit order {oid} ({reason}) came back {} ({}) with nothing sold",
                             ord.status, ord.reject_reason
                         )).await;
@@ -1599,14 +1865,17 @@ async fn reconcile_live_orders(
                         p.pending_exit_order_id = None;
                         p.pending_exit_qty = 0;
                         p.pending_exit_reason = None;
-                        if p.executed_qty <= 0 && p.sizing.topup_order_id.is_none() {
+                        if p.executed_qty <= 0
+                            && p.sizing.topup_order_id.is_none()
+                            && !p.sizing.topup_send_uncertain
+                        {
                             p.state = TradeState::Closed;
                             p.force_exit = None;
                             now_closed = true;
                         } else if p.executed_qty <= 0 {
                             // Fully sold, but a top-up buy is still at the
-                            // broker and could yet fill: stay open until its
-                            // leg settles it (that leg then closes this).
+                            // broker (or may be) and could yet fill: stay open
+                            // until its leg settles it (that leg then closes this).
                             now_closed = true;
                         } else if shortfall > 0 && !was_cancelled {
                             // Hard reject with qty still outstanding: force an
@@ -1633,7 +1902,7 @@ async fn reconcile_live_orders(
                         // next tick and issues a fresh IOC order automatically.
                     }).await;
                     if shortfall > 0 && !was_cancelled {
-                        loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                        loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
                             "exit order {oid} ({reason}) filled {filled} of {} — squaring off the remainder",
                             leg.pending_exit_qty
                         )).await;
@@ -1684,6 +1953,7 @@ async fn reconcile_on_startup(
     db_tx: &mpsc::Sender<DbWriteMessage>,
     log_tx: &broadcast::Sender<String>,
     brokerage: f64,
+    book_memory: &mut OrderBookMemory,
 ) -> bool {
     tracing::info!("LIVE startup reconciliation starting");
 
@@ -1703,7 +1973,26 @@ async fn reconcile_on_startup(
     // 1. Settle whatever we were already tracking first, so a fill that landed
     //    while we were down is recorded as a real trade rather than inferred
     //    from a quantity difference below.
-    reconcile_live_orders(positions, kotak, db_tx, log_tx, brokerage).await;
+    reconcile_live_orders(positions, kotak, db_tx, log_tx, brokerage, book_memory).await;
+
+    // 1a. An add whose placement was never confirmed is let go of for the
+    //     same reason as a stray top-up below: the broker's positions decide
+    //     the holding, so whatever it bought is counted there, once.
+    let unconfirmed_adds: Vec<String> = {
+        let mut g = positions.write().await;
+        g.iter_mut()
+            .filter(|p| p.sizing.topup_send_uncertain)
+            .map(|p| {
+                p.sizing.topup_send_uncertain = false;
+                p.sizing.topup_uncertain_qty = None;
+                p.sizing.topup_uncertain_poll = None;
+                p.signal.instrument_name.clone()
+            })
+            .collect()
+    };
+    for instrument in &unconfirmed_adds {
+        loud_error(db_tx, log_tx, instrument, "an add's placement was still unconfirmed at startup — the holding is taken from the broker's positions; check the broker app for that order").await;
+    }
 
     // 1b. A top-up buy that step 1 could not settle (still open, or not in
     //     today's book) is let go of here: the broker's positions decide the
@@ -2322,27 +2611,8 @@ async fn adopt_manual(
         record
     };
 
-    use shared_domain::{AmoFlag, ExchangeSegment, OrderRequest, OrderType, ProductCode, TradeSignal, TransactionType, Validity};
-    let exchange_segment = match record.exchange_segment_code.as_str() {
-        "bse_fo" => ExchangeSegment::BseFo,
-        "nse_cm" => ExchangeSegment::NseCm,
-        _ => ExchangeSegment::NseFo,
-    };
-    let resolved_order = OrderRequest {
-        after_market_order: AmoFlag::No,
-        disclosed_quantity: "0".to_string(),
-        exchange_segment,
-        market_protection: "0".to_string(),
-        product_code: ProductCode::Nrml,
-        portfolio_flag: "N".to_string(),
-        price: "0".to_string(),
-        order_type: OrderType::Limit,
-        quantity: record.lot_size.to_string(),
-        validity: Validity::Day,
-        trigger_price: "0".to_string(),
-        trading_symbol: record.trading_symbol.clone(),
-        transaction_type: TransactionType::Buy,
-    };
+    use shared_domain::TradeSignal;
+    let resolved_order = record.order_template();
 
     // Kotak's figure is a same-day VWAP over every fill of the symbol; when the
     // user knows what this particular lot actually cost, take their number.
@@ -2409,11 +2679,14 @@ async fn adopt_manual(
         entry_attempt_at: None,
         entry_send_uncertain: false,
         entry_uncertain_qty: None,
+        entry_uncertain_poll: None,
         entry_retry_as_limit: false,
         live_halt: None,
         entry_zone: None,
         call_expires_at: None,
         sizing: Default::default(),
+        manual: false,
+        manual_add: None,
     };
 
     { positions.write().await.push(new_pos); }
@@ -2479,6 +2752,9 @@ enum LiveAction {
     /// User-requested partial market sell for `qty`, leaving the rest of the
     /// holding running exactly as before (state, current_sl untouched).
     ManualSell { qty: i32 },
+    /// A manual add that won't be sent (`manual_add_verdict`): clear it and
+    /// say why. No broker call.
+    DropManualAdd { reason: String },
 }
 
 struct LivePending {
@@ -2539,6 +2815,10 @@ fn decide_live(
             if pos.entry_order_id.is_some() {
                 // In flight — the order book decides what happened.
                 return None;
+            }
+            // A manual tap that couldn't be sent promptly is not bought late.
+            if let Some(reason) = manual_entry_expired_reason(pos, &gate.now_ts) {
+                return Some(LiveAction::AbandonEntry { reason, loud: true });
             }
             // The call has outlived its validity window without being bought.
             // Checked only once nothing is in flight: an entry already sent was
@@ -2672,6 +2952,30 @@ fn decide_live(
                 }
             }
 
+            // A manual position has no target and is never topped up by the
+            // indicator: the only thing left for it is an add the user asked for.
+            if pos.manual {
+                return match manual_add_verdict(pos, cfg, entry_cutoff, &gate.now_ts)? {
+                    ManualAddVerdict::Wait => None,
+                    ManualAddVerdict::Drop { reason } => Some(LiveAction::DropManualAdd { reason }),
+                    ManualAddVerdict::Buy { qty } => {
+                        let ltp = ltp?;
+                        let limit_price = if pos.sizing.topup_retry_as_limit {
+                            entry_retry_limit_price(&pos.signal, cfg, ltp, pos.tick_size)
+                        } else {
+                            None
+                        };
+                        Some(LiveAction::TopUp {
+                            qty,
+                            ltp,
+                            limit_price,
+                            note: "MANUAL_ADD".to_string(),
+                            rearm: false,
+                        })
+                    }
+                };
+            }
+
             let ltp = ltp?;
             match pos.state {
                 TradeState::Active => {
@@ -2798,6 +3102,8 @@ fn decide_topup(
 
 /// Immutable snapshot of the bits of a position needed to talk to the broker.
 struct LiveCtx {
+    pos_id: String,
+    manual: bool,
     instrument: String,
     trading_symbol: String,
     base: shared_domain::OrderRequest,
@@ -2807,6 +3113,8 @@ struct LiveCtx {
     /// Indicator top-up buy still at the broker, if any.
     topup_order_id: Option<String>,
     topup_cancel_sent: bool,
+    /// A manual add whose send outcome is unknown.
+    topup_send_uncertain: bool,
     executed_qty: i32,
     tick_size: f64,
     /// LTP-map key, for pricing an IOC limit fallback when a market order is
@@ -2854,11 +3162,18 @@ async fn exec_exit_all(
         }).await;
         if !ctx.topup_cancel_sent {
             if let Err(e) = kotak_cancel(kotak, topup_id, &ctx.trading_symbol).await {
-                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                     "could not cancel in-flight top-up order {topup_id} before the {reason} exit ({e}) — anything it fills will be sold as soon as it settles"
                 )).await;
             }
         }
+    }
+
+    // An add whose send outcome is unknown can't be cancelled (we don't know
+    // its order number), but if the hunt later finds it filled, it is sold
+    // straight back — the same rule as a known top-up above.
+    if ctx.topup_send_uncertain {
+        with_position(positions, pos_id, |p| p.sizing.topup_exit_on_fill = true).await;
     }
 
     if let Some(sl_id) = &ctx.sl_order_id {
@@ -2873,13 +3188,13 @@ async fn exec_exit_all(
                 None => true,
             };
             if still_open {
-                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                     "could not cancel stop-loss {sl_id} before the {reason} exit ({e}) — holding the market sell back so we cannot end up short"
                 )).await;
                 bump_exit_attempts(positions, db_tx, log_tx, pos_id, &ctx.instrument).await;
                 return;
             }
-            loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+            loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                 "stop-loss {sl_id} was already inactive at the broker ({e}) — proceeding with the {reason} market exit"
             )).await;
         }
@@ -2901,14 +3216,14 @@ async fn exec_exit_all(
     // cover).
     let safe_qty = sellable_qty(positions, pos_id, &ctx.trading_symbol, qty).await;
     if safe_qty < qty {
-        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+        loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
             "{reason} exit trimmed from {qty} to {safe_qty} — another tracked leg on {} already has a stop resting or a sell in flight",
             ctx.trading_symbol
         )).await;
     }
     let qty = safe_qty;
     if qty <= 0 {
-        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+        loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
             "{reason} exit produced no sellable quantity for {} — another tracked leg on this contract already accounts for the full holding; check for a duplicate-position or bookkeeping mismatch",
             ctx.trading_symbol
         )).await;
@@ -2972,7 +3287,7 @@ async fn place_exit_sell(
             return Some(order_id);
         }
         Err(e) if e.is_session_expired() || e.is_ambiguous() => {
-            loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+            loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                 "market exit ({reason}) for {qty} was rejected: {e} — the position is unprotected until a new stop is placed"
             )).await;
             return None;
@@ -2982,7 +3297,7 @@ async fn place_exit_sell(
 
     // Hard rejection — try an IOC limit a protection band below the touch.
     let Some(ltp) = ref_ltp.filter(|v| *v > 0.0) else {
-        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+        loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
             "market exit ({reason}) for {qty} was rejected: {rejected} — no live price for a limit fallback, still unprotected"
         )).await;
         return None;
@@ -2992,7 +3307,7 @@ async fn place_exit_sell(
         ctx.tick_size,
     );
     if floor <= 0.0 {
-        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+        loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
             "market exit ({reason}) for {qty} was rejected: {rejected} — could not price a limit fallback, still unprotected"
         )).await;
         return None;
@@ -3000,7 +3315,7 @@ async fn place_exit_sell(
     let lim = build_ioc_limit_order(&ctx.base, shared_domain::TransactionType::Sell, qty, floor);
     match kotak_place(kotak, &lim).await {
         Ok(order_id) => {
-            loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+            loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                 "market exit ({reason}) for {qty} was refused ({rejected}) — placed an IOC limit sell at ₹{floor:.2} instead"
             )).await;
             live_info(db_tx, log_tx, json!({
@@ -3016,7 +3331,7 @@ async fn place_exit_sell(
             Some(order_id)
         }
         Err(e2) => {
-            loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+            loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                 "exit ({reason}) for {qty} rejected as both market ({rejected}) and limit ({e2}) — the position is unprotected"
             )).await;
             None
@@ -3033,12 +3348,15 @@ async fn exec_live_action(
     cfg: &TradingConfig,
     ltp_map: &Arc<DashMap<String, f64>>,
     pending: &LivePending,
+    book_polls: u64,
 ) -> bool {
     let ctx = {
         let g = positions.read().await;
         let Some(p) = g.iter().find(|p| p.id == pending.pos_id) else { return false; };
         let Some(base) = p.resolved_order.clone() else { return false; };
         LiveCtx {
+            pos_id: p.id.clone(),
+            manual: p.manual,
             instrument: p.signal.instrument_name.clone(),
             trading_symbol: base.trading_symbol.clone(),
             base,
@@ -3047,6 +3365,7 @@ async fn exec_live_action(
             sl_order_id: p.sl_order_id.clone(),
             topup_order_id: p.sizing.topup_order_id.clone(),
             topup_cancel_sent: p.sizing.topup_cancel_sent,
+            topup_send_uncertain: p.sizing.topup_send_uncertain,
             executed_qty: p.executed_qty,
             tick_size: p.tick_size,
             ws_key: p.ws_scrip_key.clone(),
@@ -3084,7 +3403,7 @@ async fn exec_live_action(
                     Ok(limits) => {
                         limits_err = None;
                         if limits.net < required {
-                            loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                            loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                                 "not enough funds for {qty} @ ~₹{ltp:.2}: needs ₹{required:.2} (₹{order_value:.2} order + ₹{FUNDS_BUFFER_INR:.0} buffer) but only ₹{:.2} is available — signal dropped",
                                 limits.net
                             )).await;
@@ -3108,7 +3427,7 @@ async fn exec_live_action(
                 // it to one attempt per poll). A dead session is surfaced so
                 // the server's watchdog re-logs-in; a transient blip just waits.
                 let cause = if e.is_session_expired() { "Kotak session expired" } else { "Kotak unreachable" };
-                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                     "could not verify funds before entry ({e}) — {cause}; holding the signal and retrying, nothing bought"
                 )).await;
                 return true;
@@ -3171,7 +3490,7 @@ async fn exec_live_action(
                     // counted as a real attempt: leave the position waiting so
                     // it enters once the watchdog restores the session (the
                     // trigger / past-target-1 guards are re-checked each tick).
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "entry order not sent — Kotak session expired ({e}); holding the signal until the session is restored, nothing bought"
                     )).await;
                 }
@@ -3185,9 +3504,10 @@ async fn exec_live_action(
                     with_position(positions, &pending.pos_id, |p| {
                         p.entry_send_uncertain = true;
                         p.entry_uncertain_qty = Some(*qty);
+                        p.entry_uncertain_poll = Some(book_polls);
                         p.entry_attempts += 1;
                     }).await;
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "entry order send got no broker verdict ({e}) — it MAY be live at Kotak. Reconciling against the order book before anything else; check your broker app now"
                     )).await;
                 }
@@ -3202,7 +3522,7 @@ async fn exec_live_action(
                         p.entry_attempts += 1;
                         p.entry_retry_as_limit = true;
                     }).await;
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "entry market buy for {qty} was rejected: {e} — retrying as an IOC limit inside the buy window, nothing bought yet"
                     )).await;
                 }
@@ -3215,12 +3535,12 @@ async fn exec_live_action(
                         attempts = p.entry_attempts;
                     }).await;
                     if attempts >= shared_domain::MAX_ENTRY_ATTEMPTS {
-                        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                             "entry limit buy for {qty} was rejected: {e} — {attempts} attempts, signal dropped"
                         )).await;
                         with_position(positions, &pending.pos_id, |p| p.state = TradeState::Closed).await;
                     } else {
-                        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                             "entry limit buy for {qty} was rejected: {e} — retrying (attempt {attempts})"
                         )).await;
                     }
@@ -3252,6 +3572,9 @@ async fn exec_live_action(
                 p.sizing.topup_attempts += 1;
                 // How this attempt was sized; read when its fill settles.
                 p.sizing.topup_rearm = *rearm;
+                // One tap is one attempt: whatever happens below, a manual
+                // add is never resent by itself.
+                p.manual_add = None;
             }).await;
 
             // Same pre-flight as an entry: pay for the order and keep the buffer.
@@ -3261,7 +3584,7 @@ async fn exec_live_action(
             match kotak_limits(kotak).await {
                 Ok(limits) if limits.net < required => {
                     with_position(positions, &pending.pos_id, |p| p.sizing.topup_base_qty = None).await;
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "not enough funds to top up {qty} @ ~₹{ltp:.2}: needs ₹{required:.2} (₹{order_value:.2} order + ₹{FUNDS_BUFFER_INR:.0} buffer) but only ₹{:.2} is available — no top-up, the position is unchanged",
                         limits.net
                     )).await;
@@ -3269,7 +3592,7 @@ async fn exec_live_action(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "could not verify funds before the top-up ({e}) — nothing bought, the position is unchanged"
                     )).await;
                     return true;
@@ -3304,8 +3627,23 @@ async fn exec_live_action(
                 }
                 Err(e) if e.is_session_expired() => {
                     // Provably not placed. May be retried within the cap.
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "top-up order not sent — Kotak session expired ({e}); nothing bought, the position is unchanged"
+                    )).await;
+                }
+                Err(e) if e.is_ambiguous() && ctx.manual => {
+                    // A manual add with no verdict: it MAY be live. Hunt the
+                    // order book for it like an unconfirmed entry, and keep
+                    // the position from taking another buy or being closed
+                    // out from under it until that settles. Meanwhile the
+                    // engine still only ever sells what it knows it holds.
+                    with_position(positions, &pending.pos_id, |p| {
+                        p.sizing.topup_send_uncertain = true;
+                        p.sizing.topup_uncertain_qty = Some(*qty);
+                        p.sizing.topup_uncertain_poll = Some(book_polls);
+                    }).await;
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                        "add of {qty} got no broker verdict ({e}) — it MAY be live at Kotak. Reconciling against the order book; check your broker app now"
                     )).await;
                 }
                 Err(e) if e.is_ambiguous() => {
@@ -3314,7 +3652,7 @@ async fn exec_live_action(
                     // it holds (so it can never sell more than that) and makes
                     // no further top-up attempt for this call.
                     with_position(positions, &pending.pos_id, |p| p.sizing.topup_base_qty = None).await;
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "top-up buy of {qty} got no broker verdict ({e}) — it MAY have been bought at Kotak. The engine is NOT tracking it: it still manages {} and will not sell the extra. Check your broker app now and square off or adopt any extra quantity yourself",
                         ctx.executed_qty
                     )).await;
@@ -3323,12 +3661,12 @@ async fn exec_live_action(
                     // Market buy refused by the RMS (the post-open `Not_Ok`):
                     // any retry goes in as an IOC limit inside the buy range.
                     with_position(positions, &pending.pos_id, |p| p.sizing.topup_retry_as_limit = true).await;
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "top-up market buy for {qty} was rejected: {e} — nothing bought; any retry will be an IOC limit inside the buy range"
                     )).await;
                 }
                 Err(e) => {
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "top-up limit buy for {qty} was rejected: {e} — nothing bought, the position is unchanged"
                     )).await;
                 }
@@ -3342,7 +3680,7 @@ async fn exec_live_action(
                     return false;
                 }
                 if let Err(e) = kotak_cancel(kotak, entry_id, &ctx.trading_symbol).await {
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "could not cancel in-flight entry order {entry_id} ({reason}): {e} — it may still fill, leaving the position open"
                     )).await;
                     with_position(positions, &pending.pos_id, |p| p.entry_cancel_sent = true).await;
@@ -3355,7 +3693,7 @@ async fn exec_live_action(
                 p.entry_retry_as_limit = false;
             }).await;
             if *loud {
-                loud_error(db_tx, log_tx, &ctx.instrument, &format!("entry not taken — {reason}")).await;
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!("entry not taken — {reason}")).await;
             } else {
                 tracing::info!(instrument = %ctx.instrument, reason, "LIVE entry abandoned");
                 live_info(db_tx, log_tx, json!({
@@ -3400,7 +3738,7 @@ async fn exec_live_action(
             // on top of.
             let slice_qty = sellable_qty(positions, &pending.pos_id, &ctx.trading_symbol, *slice).await;
             if slice_qty < *slice {
-                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                     "target-1 sell trimmed from {slice} to {slice_qty} — another tracked leg on {} already has a stop resting or a sell in flight",
                     ctx.trading_symbol
                 )).await;
@@ -3423,7 +3761,7 @@ async fn exec_live_action(
                     tracing::info!(instrument = %ctx.instrument, slice_qty, keep, "LIVE target 1 slice placed");
                 }
                 None => {
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "target-1 sell of {slice_qty} could not be placed — still holding the full {} at the trailed stop, squaring off at market",
                         ctx.executed_qty
                     )).await;
@@ -3464,7 +3802,7 @@ async fn exec_live_action(
             // Same cross-leg cap as any other live sell (see `sellable_qty`).
             let qty = sellable_qty(positions, &pending.pos_id, &ctx.trading_symbol, *qty).await;
             if qty <= 0 {
-                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                     "manual sell skipped — another tracked leg on {} already accounts for the full holding",
                     ctx.trading_symbol
                 )).await;
@@ -3490,12 +3828,19 @@ async fn exec_live_action(
                     })).await;
                 }
                 Err(e) => {
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "manual sell of {qty} was rejected: {e} — still holding the full {}, nothing changed, try again",
                         ctx.executed_qty
                     )).await;
                 }
             }
+        }
+
+        LiveAction::DropManualAdd { reason } => {
+            with_position(positions, &pending.pos_id, |p| p.manual_add = None).await;
+            loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                "add not placed — {reason}; nothing bought, the position is unchanged"
+            )).await;
         }
     }
 
@@ -3504,6 +3849,7 @@ async fn exec_live_action(
 
 /// One LIVE iteration: settle the broker's view, decide, act, then drop anything
 /// that has finished.
+#[allow(clippy::too_many_arguments)]
 async fn live_tick(
     positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
     kotak: &KotakHandle,
@@ -3513,13 +3859,14 @@ async fn live_tick(
     cfg: &TradingConfig,
     last_poll: &mut Instant,
     gate: &EntryGate,
+    book_memory: &mut OrderBookMemory,
 ) {
     let mut mutated = false;
 
     let poll_due = last_poll.elapsed() >= LIVE_POLL_INTERVAL;
     if poll_due {
         *last_poll = Instant::now();
-        mutated |= reconcile_live_orders(positions, kotak, db_tx, log_tx, cfg.brokerage_per_order).await;
+        mutated |= reconcile_live_orders(positions, kotak, db_tx, log_tx, cfg.brokerage_per_order, book_memory).await;
     }
 
     // ── Pre-T1 trail (bookkeeping only — no broker calls) ────────────── //
@@ -3573,7 +3920,7 @@ async fn live_tick(
 
     // ── Act (no positions lock across broker calls) ──────────────────── //
     for pending in &decisions {
-        mutated |= exec_live_action(positions, kotak, db_tx, log_tx, cfg, ltp_map, pending).await;
+        mutated |= exec_live_action(positions, kotak, db_tx, log_tx, cfg, ltp_map, pending, book_memory.polls()).await;
     }
 
     // ── Drop closed positions, cancelling anything they still track ──── //
@@ -3654,6 +4001,9 @@ pub async fn start_position_monitor(
 
     let mut last_live_poll = Instant::now() - Duration::from_secs(10);
     let mut startup_reconciled = false;
+    // Which order numbers the broker's book held, and since when — see
+    // `OrderBookMemory`.
+    let mut book_memory = OrderBookMemory::default();
     // Throttles retries of a *failed* startup reconciliation so they cost the
     // same one poll per LIVE_POLL_INTERVAL as everything else, instead of
     // hammering the broker on every 50 ms engine tick (Kotak's documented
@@ -4028,33 +4378,11 @@ pub async fn start_position_monitor(
                                 let mut resolved_expiry = None;
                                 if let Some(ref store) = *scrip_guard {
                                     if let Some(record) = store.resolve_signal(&signal) {
-                                        // Build OrderRequest
-                                        use shared_domain::{OrderRequest, AmoFlag, ExchangeSegment, ProductCode, OrderType, Validity, TransactionType};
-                                        let qty = record.lot_size.to_string(); // we use lot size by default
                                         resolved_token = Some(record.instrument_token.clone());
                                         resolved_segment_code = Some(record.exchange_segment_code.clone());
                                         resolved_tick_size = record.tick_size;
                                         resolved_expiry = Some(record.expiry_date);
-                                        let exchange_segment = match record.exchange_segment_code.as_str() {
-                                            "bse_fo" => ExchangeSegment::BseFo,
-                                            "nse_cm" => ExchangeSegment::NseCm,
-                                            _ => ExchangeSegment::NseFo,
-                                        };
-                                        resolved_order = Some(OrderRequest {
-                                            after_market_order: AmoFlag::No,
-                                            disclosed_quantity: "0".to_string(),
-                                            exchange_segment,
-                                            market_protection: "0".to_string(),
-                                            product_code: ProductCode::Nrml,
-                                            portfolio_flag: "N".to_string(),
-                                            price: "0".to_string(),
-                                            order_type: OrderType::Limit,
-                                            quantity: qty,
-                                            validity: Validity::Day,
-                                            trigger_price: "0".to_string(),
-                                            trading_symbol: record.trading_symbol.clone(),
-                                            transaction_type: TransactionType::Buy,
-                                        })
+                                        resolved_order = Some(record.order_template());
                                     }
                                 }
 
@@ -4134,8 +4462,11 @@ pub async fn start_position_monitor(
                                 let mut pos_guard = positions.write().await;
                                 // Automatically exit existing opposite positions for this instrument (e.g., CE trade when PE signal arrives)
                                 for p in pos_guard.iter_mut() {
+                                    // A manual scalp is the user's own call — a
+                                    // signal never exits it.
                                     if p.signal.instrument_name.eq_ignore_ascii_case(&signal.instrument_name)
                                         && !matches!(p.state, TradeState::Closed)
+                                        && !p.manual
                                     {
                                         let is_opposite_option = p.signal.option_type.is_some()
                                             && signal.option_type.is_some()
@@ -4190,11 +4521,14 @@ pub async fn start_position_monitor(
                                     entry_attempt_at: None,
                                     entry_send_uncertain: false,
                                     entry_uncertain_qty: None,
+                                    entry_uncertain_poll: None,
                                     entry_retry_as_limit: false,
                                     live_halt: None,
                                     entry_zone: None,
                                     call_expires_at: None,
                                     sizing: Default::default(),
+                                    manual: false,
+                                    manual_add: None,
                                 });
                                 telemetry::signal(SignalOutcome::Accepted);
                                 let snapshot = pos_guard.clone();
@@ -4240,7 +4574,7 @@ pub async fn start_position_monitor(
                         last_reconcile_attempt = Instant::now();
                         let has_session = { lock_kotak(&kotak).await.is_some() };
                         if has_session {
-                            startup_reconciled = reconcile_on_startup(&positions, &kotak, &db_tx, &log_tx, cfg.brokerage_per_order).await;
+                            startup_reconciled = reconcile_on_startup(&positions, &kotak, &db_tx, &log_tx, cfg.brokerage_per_order, &mut book_memory).await;
                         }
                     }
                     telemetry::LIVE_STARTUP_RECONCILED.set(startup_reconciled as i64);
@@ -4251,7 +4585,7 @@ pub async fn start_position_monitor(
                     if !startup_reconciled { continue; }
                     if positions.read().await.is_empty() { continue; }
                     let gate = EntryGate::new(&indicator_feed);
-                    live_tick(&positions, &kotak, &db_tx, &log_tx, &ltp_map, &cfg, &mut last_live_poll, &gate).await;
+                    live_tick(&positions, &kotak, &db_tx, &log_tx, &ltp_map, &cfg, &mut last_live_poll, &gate, &mut book_memory).await;
                     continue;
                 }
 
@@ -4314,6 +4648,10 @@ pub async fn start_position_monitor(
                         }
                         if let Some(reason) = call_expired_reason(pos, &cfg, &gate.now_ts) {
                             pending.push(Pending { idx: i, ltp: 0.0, action: PosAction::Expire { reason } });
+                            continue;
+                        }
+                        if let Some(reason) = manual_entry_expired_reason(pos, &gate.now_ts) {
+                            pending.push(Pending { idx: i, ltp: 0.0, action: PosAction::Cancel { reason } });
                             continue;
                         }
                     }
@@ -4435,6 +4773,18 @@ pub async fn start_position_monitor(
                                     new_sl,
                                     exec_price: None,
                                 })
+                            } else if pos.manual {
+                                // A manual position's only other move is an
+                                // add the user asked for.
+                                match manual_add_verdict(pos, &cfg, entry_cutoff, &gate.now_ts) {
+                                    Some(ManualAddVerdict::Buy { qty }) => Some(PosAction::TopUpBuy {
+                                        qty,
+                                        note: "MANUAL_ADD".to_string(),
+                                        rearm: false,
+                                    }),
+                                    Some(ManualAddVerdict::Drop { reason }) => Some(PosAction::DropManualAdd { reason }),
+                                    Some(ManualAddVerdict::Wait) | None => None,
+                                }
                             } else {
                                 // Nothing to exit — the only other thing an
                                 // Active position can do is the indicator top-up.
@@ -4510,9 +4860,11 @@ pub async fn start_position_monitor(
                             pos.sizing.topup_base_qty = rearm.then_some(total);
                             pos.sizing.topup_stepped = rearm;
                             positions_mutated = true;
+                            let kind = if pos.manual { "MANUAL_ADD" } else { "TOPUP" };
+                            pos.manual_add = None;
 
                             let msg = json!({
-                                "event": "TOPUP",
+                                "event": kind,
                                 "instrument": instrument,
                                 "price": round2(pa.ltp),
                                 "qty": qty,
@@ -4522,7 +4874,7 @@ pub async fn start_position_monitor(
                                 "mode": cfg.mode.as_str(),
                             });
                             tracing::info!(instrument = %instrument, price = pa.ltp, qty, total, "Top-up executed");
-                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some("TOPUP".to_string()), &cfg.mode).await;
+                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some(kind.to_string()), &cfg.mode).await;
                             send_log(&db_tx, &log_tx, "INFO", &msg.to_string()).await;
                         }
 
@@ -4606,10 +4958,14 @@ pub async fn start_position_monitor(
                         PosAction::Cancel { reason } => {
                             pos.state = TradeState::Closed;
                             positions_mutated = true;
-                            let msg = format!(
-                                r#"{{"event":"ERROR","instrument":"{}","message":"Trade cancelled: {}"}}"#,
-                                instrument, reason
-                            );
+                            // Built with json! so a reason with quotes stays valid JSON.
+                            let msg = json!({
+                                "event": "ERROR",
+                                "instrument": instrument,
+                                "position_id": pos.id,
+                                "message": format!("Trade cancelled: {reason}"),
+                            })
+                            .to_string();
                             tracing::error!(instrument = %instrument, reason = %reason, "Trade cancelled");
                             send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                         }
@@ -4627,6 +4983,19 @@ pub async fn start_position_monitor(
                             .to_string();
                             tracing::info!(instrument = %instrument, reason = %reason, "Waiting position dropped");
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                        }
+
+                        PosAction::DropManualAdd { reason } => {
+                            pos.manual_add = None;
+                            positions_mutated = true;
+                            let msg = json!({
+                                "event": "ERROR",
+                                "instrument": instrument,
+                                "position_id": pos.id,
+                                "message": format!("add not placed — {reason}; nothing bought, the position is unchanged"),
+                            })
+                            .to_string();
+                            send_log(&db_tx, &log_tx, "ERROR", &msg).await;
                         }
                     }
                 }
@@ -4706,11 +5075,14 @@ mod tests {
             entry_attempt_at: None,
             entry_send_uncertain: false,
             entry_uncertain_qty: None,
+            entry_uncertain_poll: None,
             entry_retry_as_limit: false,
             live_halt: None,
             entry_zone: None,
             call_expires_at: None,
             sizing: Default::default(),
+            manual: false,
+            manual_add: None,
         }
     }
 
@@ -6258,5 +6630,341 @@ mod tests {
             }
             other => panic!("expected a limit top-up, got {other:?}"),
         }
+    }
+
+    // ── Manual scalps (Execute screen) ─────────────────────────────────── //
+
+    /// A manual 2-lot tap on the `nse_fo|999` contract (lot 75, LTP 121):
+    /// market entry, no stop, no target.
+    fn manual_position(ltp_map: &Arc<DashMap<String, f64>>) -> MonitoredPosition {
+        let mut pos = live_waiting_position(ltp_map);
+        pos.manual = true;
+        pos.signal.source = "manual".into();
+        pos.signal.entry_condition = "MARKET".into();
+        pos.signal.entry_price = 121.0;
+        pos.signal.stop_loss = 0.0;
+        pos.signal.targets = vec![];
+        pos.current_sl = 0.0;
+        pos.override_qty = Some(2);
+        pos
+    }
+
+    fn manual_active(ltp_map: &Arc<DashMap<String, f64>>) -> MonitoredPosition {
+        let mut pos = manual_position(ltp_map);
+        pos.state = TradeState::Active;
+        pos.executed_qty = 150;
+        pos.avg_buy_price = 121.0;
+        pos
+    }
+
+    /// An empty-feed gate whose clock reads `hms` today.
+    fn gate_at(hms: &str) -> EntryGate {
+        EntryGate { feed: entry_gate::new_indicator_feed(), now_ts: format!("{} {hms}", ist_today()) }
+    }
+
+    #[test]
+    fn a_manual_buy_goes_in_at_market_for_exactly_the_lots_tapped() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = manual_position(&ltp);
+        // A strongly bearish reading would hold back or shrink a CE signal.
+        let gate = gate_with("NIFTY", false);
+        pos.created_at = gate.now_ts.clone();
+        let mut cfg = cfg_with_lots(1, 3);
+        cfg.indicator_sizing = true;
+        cfg.entry_window_pct = 10.0;
+        // Far from where any trigger or buy window would sit.
+        ltp.insert("nse_fo|999".to_string(), 300.0);
+        assert_eq!(entry_buy_window(&pos.signal, &cfg), None);
+        match decide_live(&pos, &ltp, &cfg, false, true, &gate) {
+            Some(LiveAction::PlaceEntry { qty, limit_price: None, sizing_note: None, topup_eligible: false, .. }) => {
+                assert_eq!(qty, 150)
+            }
+            other => panic!("expected a 2-lot market entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_manual_tap_not_sent_promptly_is_dropped_but_never_once_in_flight() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = manual_position(&ltp);
+        let gate = gate_at("11:05:00");
+        let cfg = cfg_with_lots(1, 3);
+
+        pos.created_at = format!("{} 11:04:50", ist_today());
+        assert!(matches!(decide_live(&pos, &ltp, &cfg, false, true, &gate), Some(LiveAction::PlaceEntry { .. })));
+
+        pos.created_at = format!("{} 11:04:40", ist_today());
+        match decide_live(&pos, &ltp, &cfg, false, true, &gate) {
+            Some(LiveAction::AbandonEntry { reason, loud: true }) => assert!(reason.starts_with("MANUAL_ENTRY_TIMEOUT"), "{reason}"),
+            other => panic!("expected the stale tap to be dropped, got {other:?}"),
+        }
+
+        // At the broker, or possibly at the broker: the order book settles it.
+        pos.entry_order_id = Some("1".into());
+        assert_eq!(decide_live(&pos, &ltp, &cfg, false, true, &gate), None);
+        pos.entry_order_id = None;
+        pos.entry_send_uncertain = true;
+        assert_eq!(decide_live(&pos, &ltp, &cfg, false, true, &gate), None);
+
+        // A signal position is never subject to the manual timeout.
+        let mut signal_pos = manual_position(&ltp);
+        signal_pos.manual = false;
+        signal_pos.created_at = format!("{} 11:04:40", ist_today());
+        assert_eq!(manual_entry_expired_reason(&signal_pos, &gate.now_ts), None);
+    }
+
+    #[test]
+    fn a_manual_position_never_exits_or_trails_by_itself() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = manual_active(&ltp);
+        let gate = test_gate();
+        let mut cfg = cfg_with_lots(1, 3);
+        cfg.dynamic_targeting = true;
+        cfg.pre_t1_trailing = true;
+        cfg.indicator_sizing = true;
+        cfg.indicator_topup = true;
+        for price in [0.05, 60.0, 121.0, 500.0, 5000.0] {
+            ltp.insert("nse_fo|999".to_string(), price);
+            assert_eq!(decide_live(&pos, &ltp, &cfg, false, true, &gate), None, "at {price}");
+            assert_eq!(pre_t1_trail_update(&mut pos.clone(), price, &cfg), None);
+            assert_eq!(topup_sizing(&pos, 75, &cfg, price, &gate, false), None);
+        }
+        // The user's exit (or the kill switch's) still sells everything.
+        pos.force_exit = Some("CLOSED_VIA_FRONTEND".into());
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg, false, true, &gate),
+            Some(LiveAction::ExitAll { qty: 150, .. })
+        ));
+    }
+
+    #[test]
+    fn a_manual_add_buys_the_tapped_lots_through_the_top_up_leg() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = manual_active(&ltp);
+        let gate = gate_at("11:05:00");
+        let cfg = cfg_with_lots(1, 3);
+        let add_at = |hms: &str| Some(shared_domain::ManualAdd { lots: 1, requested_at: format!("{} {hms}", ist_today()) });
+        pos.manual_add = add_at("11:05:00");
+
+        assert_eq!(
+            decide_live(&pos, &ltp, &cfg, false, true, &gate),
+            Some(LiveAction::TopUp { qty: 75, ltp: 121.0, limit_price: None, note: "MANUAL_ADD".into(), rearm: false })
+        );
+
+        // A market add the RMS refused goes in as an IOC limit next time.
+        let mut retry = pos.clone();
+        retry.sizing.topup_retry_as_limit = true;
+        assert!(matches!(
+            decide_live(&retry, &ltp, &cfg, false, true, &gate),
+            Some(LiveAction::TopUp { limit_price: Some(_), .. })
+        ));
+
+        // Another buy or a sell still in flight: wait for it.
+        let mut busy = pos.clone();
+        busy.sizing.topup_order_id = Some("9".into());
+        assert_eq!(decide_live(&busy, &ltp, &cfg, false, true, &gate), None);
+        let mut unconfirmed = pos.clone();
+        unconfirmed.sizing.topup_send_uncertain = true;
+        assert_eq!(decide_live(&unconfirmed, &ltp, &cfg, false, true, &gate), None);
+
+        // A user sell, and an exit, both go before an add.
+        let mut selling = pos.clone();
+        selling.manual_sell_qty = Some(75);
+        assert_eq!(decide_live(&selling, &ltp, &cfg, false, true, &gate), Some(LiveAction::ManualSell { qty: 75 }));
+        let mut exiting = pos.clone();
+        exiting.force_exit = Some("MANUAL_EXIT_ALL".into());
+        assert!(matches!(
+            decide_live(&exiting, &ltp, &cfg, false, true, &gate),
+            Some(LiveAction::ExitAll { qty: 150, .. })
+        ));
+
+        // Refused and cleared: kill switch, the 15:39 cutoff, a stale tap.
+        let mut halted = cfg.clone();
+        halted.kill_switch_active = true;
+        assert!(matches!(decide_live(&pos, &ltp, &halted, false, true, &gate), Some(LiveAction::DropManualAdd { .. })));
+        assert!(matches!(decide_live(&pos, &ltp, &cfg, true, true, &gate), Some(LiveAction::DropManualAdd { .. })));
+        let mut stale = pos.clone();
+        stale.manual_add = add_at("11:04:40");
+        assert!(matches!(decide_live(&stale, &ltp, &cfg, false, true, &gate), Some(LiveAction::DropManualAdd { .. })));
+    }
+
+    #[test]
+    fn a_resent_signal_is_never_merged_into_a_manual_position() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = manual_active(&ltp);
+        pos.signal.entry_condition = "ABOVE".into();
+        let signal = pos.signal.clone();
+        assert!(find_duplicate_open_position(std::slice::from_ref(&pos), &signal).is_none());
+        pos.manual = false;
+        assert!(find_duplicate_open_position(std::slice::from_ref(&pos), &signal).is_some());
+    }
+
+    /// The real PAPER loop over a manual scalp: an add is booked at the LTP
+    /// with the average recomputed, a collapsing price never exits it, and
+    /// the user's exit sells the whole holding.
+    #[tokio::test(start_paused = true)]
+    async fn paper_monitor_runs_a_manual_scalp() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = manual_active(&ltp);
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        let (db_tx, mut db_rx) = mpsc::channel(1024);
+        let (_signal_tx, signal_rx) = broadcast::channel(8);
+        tokio::spawn(start_position_monitor(
+            signal_rx,
+            db_tx,
+            ltp.clone(),
+            Arc::new(RwLock::new(cfg_with_lots(1, 3))),
+            positions.clone(),
+            broadcast::channel(1024).0,
+            Arc::new(RwLock::new(None)),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            entry_gate::new_indicator_feed(),
+        ));
+
+        ltp.insert("nse_fo|999".to_string(), 131.0);
+        positions.write().await[0].manual_add = Some(shared_domain::ManualAdd {
+            lots: 1,
+            requested_at: shared_domain::current_ist_timestamp_string(),
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let p = positions.read().await[0].clone();
+        assert_eq!(p.manual_add, None);
+        // Past the 15:39 cutoff the add is refused instead — the clock here is real.
+        let added = !is_entry_cutoff_passed();
+        if added {
+            assert_eq!(p.executed_qty, 225);
+            assert!((p.avg_buy_price - (121.0 * 150.0 + 131.0 * 75.0) / 225.0).abs() < 1e-9);
+        } else {
+            assert_eq!(p.executed_qty, 150);
+        }
+        let held = p.executed_qty;
+
+        ltp.insert("nse_fo|999".to_string(), 1.0);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let p = positions.read().await[0].clone();
+        assert!(matches!(p.state, TradeState::Active));
+        assert_eq!(p.executed_qty, held);
+
+        positions.write().await[0].force_exit = Some("CLOSED_VIA_FRONTEND".into());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(positions.read().await.is_empty());
+
+        let mut trades = Vec::new();
+        while let Ok(msg) = db_rx.try_recv() {
+            if let DbWriteMessage::Trade { action, qty, exit_reason, .. } = msg {
+                trades.push((action, qty, exit_reason.unwrap_or_default()));
+            }
+        }
+        let mut expected = Vec::new();
+        if added {
+            expected.push(("BUY".to_string(), 75, "MANUAL_ADD".to_string()));
+        }
+        expected.push(("SELL".to_string(), held, "CLOSED_VIA_FRONTEND".to_string()));
+        assert_eq!(trades.iter().map(|(a, q, r)| (a.clone(), *q as i32, r.clone())).collect::<Vec<_>>(), expected);
+    }
+
+    /// A Telegram call on the other side of the same index exits that index's
+    /// open signal positions — but never a manual scalp.
+    #[tokio::test(start_paused = true)]
+    async fn an_opposite_signal_leaves_a_manual_scalp_alone() {
+        let ltp = Arc::new(DashMap::new());
+        let manual = manual_active(&ltp);
+        let mut store = crate::scrip_master::ScripStore::default();
+        store.records.insert("NIFTY".to_string(), vec![crate::scrip_master::ScripRecord {
+            instrument_token: "1000".into(),
+            trading_symbol: "NIFTY99D3125000PE".into(),
+            symbol_name: "NIFTY".into(),
+            exchange_segment_code: "nse_fo".into(),
+            strike_price: 2_500_000.0,
+            option_type: "PE".into(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2099, 12, 31).unwrap(),
+            lot_size: 75,
+            tick_size: 0.05,
+        }]);
+        let positions = Arc::new(RwLock::new(vec![manual]));
+        let (db_tx, _db_rx) = mpsc::channel(1024);
+        let (signal_tx, signal_rx) = broadcast::channel(8);
+        tokio::spawn(start_position_monitor(
+            signal_rx,
+            db_tx,
+            ltp.clone(),
+            Arc::new(RwLock::new(cfg_with_lots(1, 3))),
+            positions.clone(),
+            broadcast::channel(1024).0,
+            Arc::new(RwLock::new(Some(store))),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            entry_gate::new_indicator_feed(),
+        ));
+        signal_tx.send(TradeSignal {
+            instrument_name: "NIFTY".into(),
+            strike: Some(25000.0),
+            option_type: Some("PE".into()),
+            expiry: None,
+            action: "BUY".into(),
+            entry_condition: "ABOVE".into(),
+            entry_price: 100.0,
+            entry_price_max: None,
+            targets: vec![150.0],
+            stop_loss: 80.0,
+            source: "telegram".into(),
+            signal_id: Some("77".into()),
+            raw_message: None,
+        }).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let g = positions.read().await;
+        let manual = g.iter().find(|p| p.manual).expect("manual scalp still tracked");
+        assert_eq!(manual.force_exit, None);
+        assert!(matches!(manual.state, TradeState::Active));
+        assert!(g.iter().any(|p| !p.manual && p.signal.option_type.as_deref() == Some("PE")), "the PE call was taken in");
+    }
+
+    fn book_order(no: &str, side: &str, qty: i32) -> kotak_client::KotakOrder {
+        serde_json::from_value(json!({
+            "nOrdNo": no,
+            "ordSt": "complete",
+            "trdSym": "NIFTY26O2022950CE",
+            "trnsTp": side,
+            "qty": qty.to_string(),
+            "fldQty": qty.to_string(),
+            "avgPrc": "100.00",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_unconfirmed_send_is_never_matched_to_an_older_fill_on_the_same_contract() {
+        const SYM: &str = "NIFTY26O2022950CE";
+        let mut memory = OrderBookMemory::default();
+        // An earlier scalp: bought, sold, its position long gone — so its
+        // entry is no longer claimed by anything.
+        let earlier = vec![book_order("1", "B", 65), book_order("2", "S", 65)];
+        memory.record(&earlier);
+        let sent_after = memory.polls();
+
+        // The same 1-lot buy again, its send unconfirmed. Until the new order
+        // shows up, the old fill must not be taken for it.
+        memory.record(&earlier);
+        assert!(unconfirmed_buy_candidates(&earlier, SYM, 65, &[], &memory, Some(sent_after)).is_empty());
+
+        let mut book = earlier.clone();
+        book.push(book_order("3", "B", 65));
+        memory.record(&book);
+        let found: Vec<&str> = unconfirmed_buy_candidates(&book, SYM, 65, &[], &memory, Some(sent_after))
+            .iter()
+            .map(|o| o.order_no.as_str())
+            .collect();
+        assert_eq!(found, ["3"]);
+
+        // Someone else's order, another quantity, another contract: never it.
+        assert!(unconfirmed_buy_candidates(&book, SYM, 65, &["3".to_string()], &memory, Some(sent_after)).is_empty());
+        assert!(unconfirmed_buy_candidates(&book, SYM, 130, &[], &memory, Some(sent_after)).is_empty());
+        assert!(unconfirmed_buy_candidates(&book, "NIFTY26O2023000CE", 65, &[], &memory, Some(sent_after)).is_empty());
+
+        // After a restart the send's poll is unknown: symbol and quantity
+        // alone decide, as they always did.
+        assert_eq!(unconfirmed_buy_candidates(&book, SYM, 65, &[], &memory, None).len(), 2);
     }
 }

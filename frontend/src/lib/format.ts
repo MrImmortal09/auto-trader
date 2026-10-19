@@ -50,6 +50,9 @@ export function formatExitReason(reason?: string): string {
     case 'TRAILED_SL_HIT':
     case 'TRAIL_SL_HIT': return 'Trailed SL Hit';
     case 'CLOSED_VIA_FRONTEND': return 'Closed via Frontend';
+    case 'MANUAL_EXIT_ALL': return 'Exit All (scalps)';
+    case 'MANUAL_SELL': return 'Manual Sell';
+    case 'MANUAL_ADD': return 'Manual Add';
     case 'TELEGRAM_EXIT': return 'Exit via Telegram Msg';
     case 'OPPOSITE_SIGNAL_EXIT': return 'Opposite Signal Exit';
     case 'TGT1_FULL':

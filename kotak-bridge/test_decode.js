@@ -1,7 +1,7 @@
 // Run with: npm test
 const test = require('node:test');
 const assert = require('node:assert');
-const { splitBatch, readDividers, decodeTick } = require('./index.js');
+const { splitBatch, readDividers, decodeTick, decodeIndexTick } = require('./index.js');
 
 // The worked example from Kotak's guide (§10): a 54-byte Mini Touch Line
 // packet for nse_cm token 11536, last_traded_price 123456 with divider 100.
@@ -73,4 +73,34 @@ test('splits a batch and drops a truncated tail', () => {
 
 test('stops on a corrupt length instead of looping', () => {
     assert.deepStrictEqual(splitBatch(Buffer.from([0, 0, 1, 2, 3])), []);
+});
+
+// An index packet (7207, 87 bytes) laid out per the guide's §7.2.
+function indexPacket({ exchangeId = 1, name = 'Nifty 50', rawValue = 2296360, rawClose = 2286760 } = {}) {
+    const p = Buffer.alloc(87);
+    p.writeUInt16LE(87, 0);
+    p.writeUInt16LE(7207, 2);
+    p.writeInt8(exchangeId, 4);
+    p.writeUInt32LE(4247863880, 9);
+    p.writeInt32LE(rawClose, 17);
+    p.writeInt32LE(rawValue, 29);
+    p.write(name, 66, 'utf8');
+    return p;
+}
+
+test('decodes an index packet by name, with its previous close', () => {
+    assert.deepStrictEqual(decodeIndexTick(indexPacket(), DIVIDERS), {
+        tk: 'Nifty 50', e: 'nse_cm', ltp: 22963.6, close: 22867.6, idx: true,
+    });
+    assert.strictEqual(decodeIndexTick(indexPacket({ exchangeId: 5, name: 'SENSEX' }), { 5: 100 }).e, 'bse_cm');
+});
+
+test('rejects index packets it cannot trust', () => {
+    const short = indexPacket().subarray(0, 80);
+    const scrip = indexPacket(); scrip.writeUInt16LE(7208, 2);
+    for (const p of [short, scrip, indexPacket({ rawValue: 0 }), indexPacket({ name: '' }), indexPacket({ exchangeId: 42 })]) {
+        assert.strictEqual(decodeIndexTick(p, DIVIDERS), null);
+    }
+    // A market-picture decoder never mistakes an index packet for a price.
+    assert.strictEqual(decodeTick(indexPacket(), DIVIDERS), null);
 });

@@ -13,6 +13,34 @@ pub mod telemetry;
 /// both contain "NIFTY".
 pub const INDEX_NAMES: &[&str] = &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"];
 
+/// `(segment, name)` of an index's spot value on Kotak's market feed
+/// (`subscribeIndices`), or `None` for anything that isn't one of
+/// [`INDEX_NAMES`]. All six were confirmed live on 2026-10-19: the index
+/// packets come back carrying exactly these names.
+pub fn kotak_index_feed(index: &str) -> Option<(&'static str, &'static str)> {
+    Some(match index.to_uppercase().as_str() {
+        "NIFTY" => ("nse_cm", "Nifty 50"),
+        "BANKNIFTY" => ("nse_cm", "Nifty Bank"),
+        "FINNIFTY" => ("nse_cm", "Nifty Fin Service"),
+        "MIDCPNIFTY" => ("nse_cm", "NIFTY MID SELECT"),
+        "SENSEX" => ("bse_cm", "SENSEX"),
+        "BANKEX" => ("bse_cm", "BANKEX"),
+        _ => return None,
+    })
+}
+
+/// Key under which the feed stores an index's live value in the shared price
+/// map — `idx|NIFTY 50`. Index ticks are keyed by name, not by the opaque
+/// numeric token the feed attaches to them.
+pub fn index_price_key(feed_name: &str) -> String {
+    format!("idx|{}", feed_name.trim().to_uppercase())
+}
+
+/// Key for an index's previous close, stored alongside [`index_price_key`].
+pub fn index_close_key(feed_name: &str) -> String {
+    format!("idx_close|{}", feed_name.trim().to_uppercase())
+}
+
 pub const IST_OFFSET_SECS: i32 = 5 * 60 * 60 + 30 * 60;
 
 pub fn ist_offset() -> FixedOffset {
@@ -445,7 +473,7 @@ impl TradingConfig {
 /// An inbound signal parsed from Telegram or any other source.
 ///
 /// Supports equity, F&O, and options instruments.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TradeSignal {
     /// Underlying or full instrument name (e.g. `"NIFTY"`, `"RELIANCE"`).
     pub instrument_name: String,
@@ -485,9 +513,10 @@ pub struct TradeSignal {
 // Position lifecycle
 // ===========================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum TradeState {
     /// Order placed; waiting for price to cross `entry_price`.
+    #[default]
     WaitingForEntry,
     /// Position is open and actively being monitored.
     Active,
@@ -498,7 +527,7 @@ pub enum TradeState {
 }
 
 /// A live position held in memory by the trading engine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MonitoredPosition {
     pub id: String,
     pub signal: TradeSignal,
@@ -644,6 +673,13 @@ pub struct MonitoredPosition {
     /// — used to match it in the order book while `entry_send_uncertain` is set.
     #[serde(default)]
     pub entry_uncertain_qty: Option<i32>,
+    /// LIVE mode: how many order-book polls the engine had completed when the
+    /// unconfirmed entry went out. Only an order that first shows up in a
+    /// later poll can be it — an older fill on the same contract (a scalp
+    /// already closed) never is. Not persisted: after a restart it is `None`
+    /// and the hunt matches on symbol and quantity alone, as it always did.
+    #[serde(skip)]
+    pub entry_uncertain_poll: Option<u64>,
     /// LIVE mode: the last market entry send for this position was hard-rejected
     /// by the broker / exchange RMS — the generic `Not_Ok` (`code 1041`-style)
     /// that Kotak returns for market orders in the first minutes after the
@@ -673,7 +709,46 @@ pub struct MonitoredPosition {
     /// Indicator-sizing bookkeeping for this call — see [`SizingState`].
     #[serde(default)]
     pub sizing: SizingState,
+    /// Opened by hand from the Execute screen rather than from a signal. A
+    /// manual position buys at market (`entry_condition` `"MARKET"`) exactly
+    /// the lots asked for, with no indicator gate, and carries no stop or
+    /// target — it closes only on the user's own exit, the kill switch, or
+    /// the expiry-day square-off. Telegram signals never touch it.
+    #[serde(default)]
+    pub manual: bool,
+    /// Manual position: an add the user asked for on top of the holding,
+    /// picked up by the engine on its next tick and cleared once it acts.
+    #[serde(default)]
+    pub manual_add: Option<ManualAdd>,
 }
+
+impl MonitoredPosition {
+    /// A buy on top of the holding is pending: a manual add not sent yet, a
+    /// top-up order at the broker, or one whose send outcome is unknown.
+    pub fn buy_in_flight(&self) -> bool {
+        self.manual_add.is_some() || self.sizing.topup_order_id.is_some() || self.sizing.topup_send_uncertain
+    }
+
+    /// A sell is pending: a requested exit, a sell order at the broker, or a
+    /// partial sell not sent yet.
+    pub fn sell_in_flight(&self) -> bool {
+        self.force_exit.is_some() || self.pending_exit_order_id.is_some() || self.manual_sell_qty.is_some()
+    }
+}
+
+/// A pending "buy more of this contract" request on a manual position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManualAdd {
+    pub lots: i32,
+    /// IST `%Y-%m-%d %H:%M:%S` of the tap — an add that can't be sent within
+    /// a few seconds of it is dropped, never sent late.
+    pub requested_at: String,
+}
+
+/// A manual order (the first buy or an add) not sent to the broker within
+/// this many seconds of the tap is dropped rather than sent at a price the
+/// user never saw.
+pub const MANUAL_ORDER_TTL_SECS: i64 = 15;
 
 /// Per-position state of the indicator entry gate
 /// (`TradingConfig::indicator_sizing`): the wait-on-disagree log marker and
@@ -720,6 +795,17 @@ pub struct SizingState {
     /// LIVE: the market top-up was RMS-rejected; retry as an IOC limit
     /// (same rule as `MonitoredPosition::entry_retry_as_limit`).
     pub topup_retry_as_limit: bool,
+    /// LIVE, manual add only: the buy was sent but Kotak's answer was lost, so
+    /// it may be live. The reconciler hunts the order book for it (as for an
+    /// unconfirmed entry) and adopts it as `topup_order_id`; until then the
+    /// position takes no other buy and is never closed out from under it.
+    pub topup_send_uncertain: bool,
+    /// Quantity of that unconfirmed add, to match it in the order book.
+    pub topup_uncertain_qty: Option<i32>,
+    /// Order-book polls completed when it went out — see
+    /// `MonitoredPosition::entry_uncertain_poll`.
+    #[serde(skip)]
+    pub topup_uncertain_poll: Option<u64>,
 }
 
 /// LIVE mode: hard cap on entry send attempts for one position — see

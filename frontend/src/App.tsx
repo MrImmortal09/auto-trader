@@ -24,6 +24,7 @@ import { TradeAnalyticsScreen } from './screens/TradeAnalyticsScreen';
 import { PortfolioPerformanceScreen } from './screens/PortfolioPerformanceScreen';
 import { MarketDataScreen } from './screens/MarketDataScreen';
 import { SystemPulseScreen } from './screens/SystemPulseScreen';
+import { ExecuteScreen } from './screens/ExecuteScreen';
 
 export default function App() {
   const [logHeight, setLogHeight] = useState(220);
@@ -41,6 +42,7 @@ export default function App() {
       if (p.startsWith('/analytics')) return 'analytics';
       if (p.startsWith('/market')) return 'market';
       if (p.startsWith('/positions')) return 'positions';
+      if (p.startsWith('/execute')) return 'execute';
     }
     return 'dashboard';
   });
@@ -88,6 +90,7 @@ export default function App() {
     if (typeof window !== 'undefined') {
       const paths: Record<ScreenId, string> = {
         dashboard: '/',
+        execute: '/execute',
         positions: '/positions',
         analytics: '/analytics',
         market: '/market',
@@ -119,7 +122,7 @@ export default function App() {
         <TopNavBar
           activeScreen={activeScreen}
           serverBase={serverBase}
-          onNewTrade={() => handleSelectScreen('positions')}
+          onNewTrade={() => handleSelectScreen('execute')}
           onOpenKillSwitch={() => setKillSwitchOpen(true)}
           killSwitchActive={killSwitchActive}
         />
@@ -193,6 +196,10 @@ export default function App() {
               {/* Trade History Table */}
               <PortfolioSection serverBase={serverBase} />
             </>
+          )}
+
+          {activeScreen === 'execute' && (
+            <ExecuteScreen serverBase={serverBase} portfolio={portfolio} />
           )}
 
           {activeScreen === 'positions' && (

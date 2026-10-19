@@ -26,3 +26,5 @@ pub mod kill_switch;
 pub use kill_switch::{post_kill_switch_handler, post_kill_switch_reset_handler, get_kill_switch_status_handler};
 pub mod telemetry;
 pub use telemetry::{metrics_handler, telemetry_snapshot_handler, telemetry_stream_handler};
+pub mod execute;
+pub use execute::{execute_stream_handler, execute_buy_handler, execute_exit_all_handler};

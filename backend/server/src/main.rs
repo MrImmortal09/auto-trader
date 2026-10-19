@@ -6,6 +6,7 @@
 
 mod balance;
 mod db;
+mod execute;
 mod market_data;
 mod pulse;
 mod routes;
@@ -158,6 +159,8 @@ pub(crate) struct AppState {
     /// Kotak balance for `/api/portfolio`, refreshed in the background — see
     /// `balance`. The page never calls Kotak itself.
     pub balance: Arc<balance::BalanceCache>,
+    /// The Execute screen's option ladders — see `execute`.
+    pub execute: Arc<execute::ExecuteBoard>,
 }
 
 // ---------------------------------------------------------------------------
@@ -965,8 +968,10 @@ async fn main() {
         indicator_feed,
         pulse: Arc::new(pulse::PulseHub::new()),
         balance,
+        execute: Arc::new(execute::ExecuteBoard::new()),
     };
     pulse::spawn_sampler(state.clone());
+    state.execute.spawn_error_watch(&state.log_tx);
     // Reconnect Telegram from the last Start, so a restart or an update needs
     // no login code. Nothing missed while down is replayed.
     tokio::spawn(routes::resume_saved_telegram(state.clone()));
@@ -995,6 +1000,9 @@ async fn main() {
         .route("/api/positions/:id/sell",           post(routes::sell_position_handler))
         .route("/api/positions/reconcile/preview",  get(routes::reconcile_preview_handler))
         .route("/api/positions/reconcile/apply",    post(routes::reconcile_apply_handler))
+        .route("/api/execute/stream",               get(routes::execute_stream_handler))
+        .route("/api/execute/buy",                  post(routes::execute_buy_handler))
+        .route("/api/execute/exit-all",             post(routes::execute_exit_all_handler))
         .route("/api/settings",                     get(routes::get_settings_handler)
                                                    .post(routes::post_settings_handler))
         .route("/api/kill-switch",                  post(routes::post_kill_switch_handler)

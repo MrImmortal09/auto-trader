@@ -9,6 +9,7 @@ import {
   Settings,
   TrendingUp,
   Wallet,
+  Zap,
 } from 'lucide-react';
 import type { ScreenId } from '../../types';
 import { apiFetch } from '../../lib/api';
@@ -132,6 +133,14 @@ export function SideNavBar({
         >
           <LayoutDashboard size={isCollapsed ? 20 : 18} className="shrink-0" />
           {!isCollapsed && <span>Dashboard</span>}
+        </div>
+        <div
+          onClick={() => onSelectScreen('execute')}
+          title="Execute — one-tap scalping"
+          className={itemClass(activeScreen === 'execute')}
+        >
+          <Zap size={isCollapsed ? 20 : 18} className="shrink-0" />
+          {!isCollapsed && <span>Execute</span>}
         </div>
         <div
           onClick={() => onSelectScreen('positions')}

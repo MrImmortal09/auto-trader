@@ -65,6 +65,26 @@
   }
 }
 
+/* Execute screen: a price cell briefly tints on an up/down tick. The cell is
+   re-keyed on every tick, so the animation restarts without any timers. */
+@keyframes tick-up {
+  from { background-color: rgb(108 248 187 / 0.7); }
+  to { background-color: transparent; }
+}
+@keyframes tick-down {
+  from { background-color: rgb(255 218 214 / 0.95); }
+  to { background-color: transparent; }
+}
+.tick-up { animation: tick-up 650ms ease-out; }
+.tick-down { animation: tick-down 650ms ease-out; }
+
+/* Execute screen: EXIT ALL fills while held. */
+@keyframes hold-fill {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+.hold-fill { animation: hold-fill var(--hold-ms, 600ms) linear forwards; transform-origin: left; }
+
 /* Shared micro-component utilities used in App.tsx */
 @layer utilities {
   .input-sm {
@@ -76,6 +96,12 @@
   }
   .tabular-nums {
     font-variant-numeric: tabular-nums;
+  }
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
   }
   .pt-safe {
     padding-top: max(env(safe-area-inset-top), 0.75rem);

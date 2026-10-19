@@ -19,6 +19,49 @@ fn resolve_bridge_dir() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_dir())
 }
 
+/// What the bridge has been asked to stream, so a restarted bridge replays it.
+#[derive(Default)]
+struct Subscribed {
+    /// Positions' contracts — kept for as long as this stream runs.
+    scrips: std::collections::HashSet<String>,
+    /// The Execute screen's option ladders (`"ladder": true`) — dropped at
+    /// each day's close, so they never pile up across days.
+    ladder: std::collections::HashSet<String>,
+    /// Index spot values by name (`nse_cm|Nifty 50`).
+    indices: std::collections::HashSet<String>,
+}
+
+impl Subscribed {
+    fn len(&self) -> usize {
+        self.scrips.union(&self.ladder).count() + self.indices.len()
+    }
+
+    /// Every scrip to stream: positions' and the ladders'.
+    fn all_scrips(&self) -> Vec<String> {
+        self.scrips.union(&self.ladder).cloned().collect()
+    }
+}
+
+/// Record what a control message for the bridge subscribes to — scrips
+/// (`{"scrips": "nse_fo|1&nse_fo|2"}`, a ladder's with `"ladder": true`) or,
+/// for `subscribe_indices`, index names (`{"indices": "nse_cm|Nifty 50"}`).
+fn remember_subscriptions(msg: &str, subs: &mut Subscribed) {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(msg) else { return };
+    let (field, set) = match parsed.get("action").and_then(|v| v.as_str()) {
+        Some("subscribe_indices") => ("indices", &mut subs.indices),
+        _ if parsed.get("ladder").and_then(|v| v.as_bool()) == Some(true) => ("scrips", &mut subs.ladder),
+        _ => ("scrips", &mut subs.scrips),
+    };
+    if let Some(s) = parsed.get(field).and_then(|v| v.as_str()) {
+        for item in s.split(|c| c == ',' || c == '&') {
+            let item = item.trim();
+            if !item.is_empty() {
+                set.insert(item.to_string());
+            }
+        }
+    }
+}
+
 /// Kotak's production market-feed endpoint, used when the login response
 /// carried no `feedUrl` of its own.
 pub const DEFAULT_FEED_URL: &str = "wss://sfeed.kotaksecurities.com/apifeed";
@@ -37,11 +80,11 @@ pub async fn start_market_data_stream(
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_FEED_URL.to_string());
 
-    let mut active_scrips = std::collections::HashSet::new();
+    let mut subs = Subscribed::default();
     for s in initial_scrips.split(|c| c == ',' || c == '&') {
         let s = s.trim();
         if !s.is_empty() {
-            active_scrips.insert(s.to_string());
+            subs.scrips.insert(s.to_string());
         }
     }
 
@@ -56,7 +99,7 @@ pub async fn start_market_data_stream(
     let mut close_deadline: Option<tokio::time::Instant> = None;
 
     loop {
-        telemetry::FEED_SUBSCRIPTIONS.set(active_scrips.len() as i64);
+        telemetry::FEED_SUBSCRIPTIONS.set(subs.len() as i64);
 
         // If child is dead or not started, start it
         if current_stdin.is_none() {
@@ -74,16 +117,7 @@ pub async fn start_market_data_stream(
                     _ = &mut sleep => {}
                     msg_opt = rx.recv() => {
                         if let Some(msg) = msg_opt {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg) {
-                                if let Some(s) = parsed.get("scrips").and_then(|v| v.as_str()) {
-                                    for item in s.split(|c| c == ',' || c == '&') {
-                                        let item = item.trim();
-                                        if !item.is_empty() {
-                                            active_scrips.insert(item.to_string());
-                                        }
-                                    }
-                                }
-                            }
+                            remember_subscriptions(&msg, &mut subs);
                         } else {
                             return; // rx closed
                         }
@@ -92,7 +126,8 @@ pub async fn start_market_data_stream(
                 continue;
             }
 
-            let scrips_str = active_scrips.iter().cloned().collect::<Vec<_>>().join("&");
+            let scrips_str = subs.all_scrips().join("&");
+            let indices_str = subs.indices.iter().cloned().collect::<Vec<_>>().join(",");
             info!("Starting Node.js bridge for Kotak WebSocket ({}) with scrips: {}", feed_url, scrips_str);
 
             let mut child = match Command::new("bash")
@@ -121,7 +156,8 @@ pub async fn start_market_data_stream(
                 "url": feed_url,
                 "user": ucc,
                 "auth": sid,
-                "scrips": scrips_str
+                "scrips": scrips_str,
+                "indices": indices_str
             });
             let mut connect_str = connect_payload.to_string();
             connect_str.push('\n');
@@ -151,7 +187,15 @@ pub async fn start_market_data_stream(
                                 for item in arr {
                                     if let (Some(tk), Some(e)) = (item["tk"].as_str(), item["e"].as_str()) {
                                         if let Some(ltp) = item["ltp"].as_f64().or_else(|| item["ltp"].as_str().and_then(|s| s.parse::<f64>().ok())) {
-                                            let key = format!("{}|{}", e.to_ascii_lowercase(), tk.trim());
+                                            // Index ticks are keyed by the index's name.
+                                            let key = if item["idx"].as_bool() == Some(true) {
+                                                if let Some(close) = item["close"].as_f64().filter(|c| *c > 0.0) {
+                                                    prices_clone.insert(shared_domain::index_close_key(tk), close);
+                                                }
+                                                shared_domain::index_price_key(tk)
+                                            } else {
+                                                format!("{}|{}", e.to_ascii_lowercase(), tk.trim())
+                                            };
                                             telemetry::feed_tick(&key);
                                             prices_clone.insert(key, ltp);
                                         }
@@ -181,16 +225,7 @@ pub async fn start_market_data_stream(
             msg_opt = rx.recv() => {
                 match msg_opt {
                     Some(msg) => {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg) {
-                            if let Some(s) = parsed.get("scrips").and_then(|v| v.as_str()) {
-                                for item in s.split(|c| c == ',' || c == '&') {
-                                    let item = item.trim();
-                                    if !item.is_empty() {
-                                        active_scrips.insert(item.to_string());
-                                    }
-                                }
-                            }
-                        }
+                        remember_subscriptions(&msg, &mut subs);
                         if let Some(stdin) = current_stdin.as_mut() {
                             let mut payload = msg.clone();
                             if !payload.ends_with('\n') { payload.push('\n'); }
@@ -235,10 +270,44 @@ pub async fn start_market_data_stream(
                 if let Some(mut child) = child_opt.take() { let _ = child.kill().await; }
                 current_stdin = None;
                 close_deadline = None;
-                for scrip in active_scrips.iter() {
-                    prices.remove(scrip);
+                for scrip in subs.all_scrips() {
+                    prices.remove(&scrip);
+                }
+                // Ladders are re-requested by the Execute screen tomorrow,
+                // around tomorrow's prices.
+                subs.ladder.clear();
+                for index in subs.indices.iter() {
+                    let name = index.split_once('|').map_or(index.as_str(), |(_, n)| n);
+                    prices.remove(&shared_domain::index_price_key(name));
+                    prices.remove(&shared_domain::index_close_key(name));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    #[test]
+    fn ladder_positions_and_indices_are_remembered_apart() {
+        let mut subs = Subscribed::default();
+        remember_subscriptions(r#"{"action":"subscribe","scrips":"nse_fo|1&nse_fo|2"}"#, &mut subs);
+        remember_subscriptions(r#"{"action":"subscribe","scrips":"nse_fo|2&nse_fo|3","ladder":true}"#, &mut subs);
+        remember_subscriptions(r#"{"action":"subscribe_indices","indices":"nse_cm|Nifty 50,bse_cm|SENSEX"}"#, &mut subs);
+
+        let mut all = subs.all_scrips();
+        all.sort();
+        assert_eq!(all, ["nse_fo|1", "nse_fo|2", "nse_fo|3"]);
+        assert_eq!(subs.len(), 5);
+        assert!(subs.indices.contains("nse_cm|Nifty 50"));
+
+        // The day's close drops only the ladder: a position's contract stays,
+        // even one the ladder had asked for too.
+        subs.ladder.clear();
+        let mut all = subs.all_scrips();
+        all.sort();
+        assert_eq!(all, ["nse_fo|1", "nse_fo|2"]);
     }
 }

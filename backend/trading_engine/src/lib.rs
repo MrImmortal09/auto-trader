@@ -9,5 +9,5 @@ pub mod monitor;
 pub mod scrip_master;
 
 pub use fees::{ChargeBreakdown, FeeCalculator};
-pub use monitor::{start_position_monitor, preview_reconciliation, apply_reconciliation, round_down_tick, entry_buy_window, lots_for_instrument};
-pub use scrip_master::{ScripStore, ScripRecord};
+pub use monitor::{start_position_monitor, preview_reconciliation, apply_reconciliation, round_down_tick, entry_buy_window, lots_for_instrument, is_entry_cutoff_passed};
+pub use scrip_master::{index_fo_segment, ChainStrike, OptionChain, ScripRecord, ScripStore};

@@ -7,6 +7,7 @@ const readline = require('readline');
 // https://www.kotakneo.com/uploads/kotak_neo_market_data_websocket_guide_38e4831feb.pdf
 
 const HEADER_SIZE = 9;
+const MSG_INDEX = 7207;
 const MSG_MARKET_PICTURE = 7208;
 const MSG_SUBSCRIBE_ACK = 1109;
 const MSG_AUTH_OK = 1117;
@@ -16,6 +17,7 @@ const LEVEL_MINI_TOUCH_LINE = 1;
 const LEVELS_MARKET_PICTURE = [2, 4, 8];
 const MINI_TOUCH_LINE_SIZE = 54;
 const MARKET_PICTURE_FIXED_SIZE = 144;
+const INDEX_PACKET_SIZE = 87;
 const DEFAULT_DIVIDER = 100;
 
 // Liveness: a quiet feed is asked for a snapshot; one left unanswered is dead.
@@ -86,6 +88,28 @@ function decodeTick(packet, dividers) {
     return { tk: String(packet.readUInt32LE(9)), e: exchange, ltp: raw / divider };
 }
 
+// Decode an index packet (7207) into { tk: <index name>, e, ltp, close, idx },
+// or null. Index ticks carry the name they were subscribed by ("Nifty 50") next
+// to an opaque numeric token, so they are keyed by name.
+function decodeIndexTick(packet, dividers) {
+    if (packet.length < INDEX_PACKET_SIZE) return null;
+    if (packet.readUInt16LE(2) !== MSG_INDEX) return null;
+
+    const exchangeId = packet.readInt8(4);
+    const exchange = EXCHANGE_BY_ID[exchangeId];
+    if (!exchange) return null;
+
+    const name = packet.subarray(66, 87).toString('utf8').replace(/\0[\s\S]*$/, '').trim();
+    const raw = packet.readInt32LE(29);
+    if (!name || raw <= 0) return null;
+
+    const divider = dividers[exchangeId] || DEFAULT_DIVIDER;
+    const tick = { tk: name, e: exchange, ltp: raw / divider, idx: true };
+    const close = packet.readInt32LE(17);
+    if (close > 0) tick.close = close / divider;
+    return tick;
+}
+
 function describeError(err) {
     if (!err) return "unknown error";
     const inner = Array.isArray(err.errors)
@@ -94,7 +118,7 @@ function describeError(err) {
     return [err.code, err.message, inner].filter(Boolean).join(' — ') || String(err);
 }
 
-module.exports = { splitBatch, readDividers, decodeTick };
+module.exports = { splitBatch, readDividers, decodeTick, decodeIndexTick };
 
 if (require.main === module) {
     main();
@@ -119,6 +143,9 @@ function main() {
     let feedReady = false;
     let pendingSubscriptions = [];
     let subscribedTokens = new Set();
+    // Indices go through their own subscribe event, by name ("nse_cm|Nifty 50").
+    let pendingIndexSubscriptions = [];
+    let subscribedIndices = new Set();
 
     const rl = readline.createInterface({
         input: process.stdin,
@@ -139,25 +166,30 @@ function main() {
     function fail(message) {
         feedReady = false;
         pendingSubscriptions = [];
+        pendingIndexSubscriptions = [];
         console.log(JSON.stringify({ event: "error", message }));
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         if (watchdogInterval) clearInterval(watchdogInterval);
         process.exit(1);
     }
 
-    function sendSubscribe(scrips) {
+    function sendSubscribe(scrips, event = "subscribeScripsLite", into = subscribedTokens) {
         const tokens = String(scrips).split(/[,&]/).map((s) => s.trim()).filter(Boolean);
         if (tokens.length === 0) return;
         try {
             wsClient.send(JSON.stringify({
-                event: "subscribeScripsLite",
+                event,
                 inputtoken: tokens.join(','),
                 ack_symbol: true
             }));
-            for (const token of tokens) subscribedTokens.add(token);
+            for (const token of tokens) into.add(token);
         } catch (e) {
             console.log(JSON.stringify({ event: "error", message: `subscribe failed: ${e.message}` }));
         }
+    }
+
+    function sendIndexSubscribe(indices) {
+        sendSubscribe(indices, "subscribeIndices", subscribedIndices);
     }
 
     function handleControlFrame(text) {
@@ -181,6 +213,8 @@ function main() {
                 console.log(JSON.stringify({ event: "connected", message_code: code }));
                 for (const scrips of pendingSubscriptions) sendSubscribe(scrips);
                 pendingSubscriptions = [];
+                for (const indices of pendingIndexSubscriptions) sendIndexSubscribe(indices);
+                pendingIndexSubscriptions = [];
             }
         } else if (code === MSG_SUBSCRIBE_ACK) {
             console.log(JSON.stringify({
@@ -198,6 +232,8 @@ function main() {
             feedReady = false;
             pendingSubscriptions = msg.scrips ? [msg.scrips] : [];
             subscribedTokens = new Set();
+            pendingIndexSubscriptions = msg.indices ? [msg.indices] : [];
+            subscribedIndices = new Set();
             dividers = {};
             lastMessageTime = Date.now();
 
@@ -241,12 +277,20 @@ function main() {
                     if (quietFor > WATCHDOG_TIMEOUT_MS) {
                         console.error("Watchdog timeout: No data received from Kotak WebSocket for 30s. Exiting bridge to force restart...");
                         fail("Watchdog timeout: no data for 30s");
-                    } else if (quietFor > QUIET_PROBE_MS && feedReady && subscribedTokens.size > 0) {
+                    } else if (quietFor > QUIET_PROBE_MS && feedReady) {
                         try {
-                            wsClient.send(JSON.stringify({
-                                event: "snapshotScripsLite",
-                                inputtoken: [...subscribedTokens].join(',')
-                            }));
+                            if (subscribedTokens.size > 0) {
+                                wsClient.send(JSON.stringify({
+                                    event: "snapshotScripsLite",
+                                    inputtoken: [...subscribedTokens].join(',')
+                                }));
+                            }
+                            if (subscribedIndices.size > 0) {
+                                wsClient.send(JSON.stringify({
+                                    event: "snapshotIndices",
+                                    inputtoken: [...subscribedIndices].join(',')
+                                }));
+                            }
                         } catch (e) { /* closing — onclose handles it */ }
                     }
                 }, 5000);
@@ -255,6 +299,7 @@ function main() {
             wsClient.on('close', function (code, reason) {
                 feedReady = false;
                 pendingSubscriptions = [];
+                pendingIndexSubscriptions = [];
                 console.log(JSON.stringify({ event: "closed", code: code, reason: reason ? reason.toString() : null }));
                 if (heartbeatInterval) clearInterval(heartbeatInterval);
                 if (watchdogInterval) clearInterval(watchdogInterval);
@@ -273,7 +318,7 @@ function main() {
                 }
                 const ticks = [];
                 for (const packet of splitBatch(data)) {
-                    const tick = decodeTick(packet, dividers);
+                    const tick = decodeTick(packet, dividers) || decodeIndexTick(packet, dividers);
                     if (tick) ticks.push(tick);
                 }
                 if (ticks.length > 0) {
@@ -288,6 +333,14 @@ function main() {
                 } else {
                     // Not authenticated yet — queue for drain on the auth response
                     pendingSubscriptions.push(msg.scrips);
+                }
+            }
+        } else if (msg.action === 'subscribe_indices') {
+            if (wsClient && msg.indices) {
+                if (feedReady) {
+                    sendIndexSubscribe(msg.indices);
+                } else {
+                    pendingIndexSubscriptions.push(msg.indices);
                 }
             }
         } else if (msg.action === 'close') {
