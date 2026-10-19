@@ -18,6 +18,16 @@ function nextTargetLabel(p: MonitoredPosition): string {
   return p.signal.targets.map((t) => `₹${fmt(t)}`).join(' / ');
 }
 
+// A range call (`PUTS 140-145`) is stored as `ABOVE 140` capped at
+// `entry_price_max` — show it the way the channel wrote it.
+function entryLabel(p: MonitoredPosition): string {
+  const { entry_condition, entry_price, entry_price_max } = p.signal;
+  if (entry_price_max != null) {
+    return `₹${fmt(entry_price)}–₹${fmt(entry_price_max)}`;
+  }
+  return `${entry_condition} ₹${fmt(entry_price)}`;
+}
+
 // A dynamic-targeting runner keeps extending past target 1 without ever
 // changing `TradeState` off "Target1Hit" (that's still the correct lifecycle
 // state — see shared_domain). `dynamic_rung_number` counts how many rungs
@@ -219,7 +229,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                       }`}>{p.signal.action}</span>
                     </td>
                     <td className="px-3 py-2.5 text-on-surface font-mono-code">
-                      <div>{p.signal.entry_condition} ₹{fmt(p.signal.entry_price)}</div>
+                      <div>{entryLabel(p)}</div>
                       {p.entry_zone && (
                         <div className="text-[10px] text-secondary font-normal" title="The engine only buys inside this premium window — it will not chase a price that has run past it.">
                           Buy zone: ₹{fmt(p.entry_zone[0])}–₹{fmt(p.entry_zone[1])}
@@ -267,7 +277,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                 <div className="grid grid-cols-2 gap-2 text-xs font-mono-code bg-surface-container-low p-2.5 rounded-lg border border-outline-variant/50">
                   <div>
                     <div className="text-on-surface-variant text-[10px] uppercase font-sans">Trigger</div>
-                    <div className="font-semibold text-on-surface">{p.signal.entry_condition} ₹{fmt(p.signal.entry_price)}</div>
+                    <div className="font-semibold text-on-surface">{entryLabel(p)}</div>
                     {p.entry_zone && (
                       <div className="text-[10px] text-secondary font-normal font-sans">
                         Buy ₹{fmt(p.entry_zone[0])}–₹{fmt(p.entry_zone[1])}

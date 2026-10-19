@@ -521,6 +521,18 @@ TGT 2600 / 2700
 SL 2420
 ```
 
+Options calls with an **entry range** instead of a trigger (BUY only):
+```
+BUY NIFTY NEXT WEEK 23000 STRIKE PUTS 140-145 SL 120 TARGET 175
+BUY NIFTY NEXT WEEK 23000 STRIKE PUTS @ 125-130 SL 105 TARGET 165
+BUY NIFTY 22300 CALLS CMP 100-102 SL 90 TARGET 125
+```
+- The engine buys only while LTP is inside the range: below it the call waits for the price to climb in; above it, for a pullback. The entry-window % setting can only narrow the range.
+- `CALL(S)` / `PUT(S)` mean `CE` / `PE`; `STRIKE` and the `@` / `CMP` / `AT` prefix are optional.
+- `NEXT WEEK` = the weekly expiry falling in next calendar week (Mon–Sun) — NIFTY's Tuesday, SENSEX's Thursday. Other instruments have no weekly series, so `NEXT WEEK` calls on them are refused.
+- A range that is backwards, starts at/below the SL, or reaches target 1 is refused.
+- A BUY call that names no instrument (`BUY AGAIN 22300 CALLS CMP 100-102`) is ignored — never applied as an SL update to the message it replies to.
+
 ### Reply Commands (SL Updates & Forced Exits)
 
 When replying directly to an original trade signal message in Telegram, the ingester recognises:

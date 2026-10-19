@@ -219,6 +219,8 @@ export interface MonitoredPosition {
     action: string;
     entry_condition: string;
     entry_price: number;
+    /** Top of an entry range (`140-145`); the engine buys only inside it. */
+    entry_price_max?: number | null;
     stop_loss: number;
     targets: number[];
   };

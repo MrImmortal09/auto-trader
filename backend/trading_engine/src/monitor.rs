@@ -533,7 +533,22 @@ fn entry_past_target1(signal: &TradeSignal, ltp: f64) -> Option<f64> {
 /// * `BELOW X` → `[X - w, X]` — take the breakdown, never chase past `X - w`
 ///
 /// `pct` is clamped to `[0, 100]` on save, so `X + w` never exceeds target 1.
+///
+/// A range signal (`140-145`, `entry_price_max` set) always has a window —
+/// the stated range — even with `entry_window_pct = 0`; a configured `pct`
+/// can only pull its far edge in, never push it past the range.
 pub fn entry_buy_window(signal: &TradeSignal, cfg: &TradingConfig) -> Option<(f64, f64)> {
+    let pct_window = pct_entry_window(signal, cfg);
+    match signal.entry_price_max {
+        Some(max) if signal.entry_condition.eq_ignore_ascii_case("ABOVE") => {
+            let high = pct_window.map_or(max, |(_, h)| h.min(max));
+            Some((signal.entry_price, high))
+        }
+        _ => pct_window,
+    }
+}
+
+fn pct_entry_window(signal: &TradeSignal, cfg: &TradingConfig) -> Option<(f64, f64)> {
     if cfg.entry_window_pct <= 0.0 {
         return None;
     }
@@ -2355,6 +2370,7 @@ async fn adopt_manual(
             action: "BUY".to_string(),
             entry_condition: "ABOVE".to_string(),
             entry_price: avg_buy_price,
+            entry_price_max: None,
             targets: vec![tgt],
             stop_loss: sl,
             source: "MANUAL_RECONCILE".to_string(),
@@ -3775,7 +3791,10 @@ pub async fn start_position_monitor(
                             let mut sl_result = None;
                             for p in write_guard.iter_mut() {
                                 if p.signal.signal_id.as_ref() == Some(sig_id) {
-                                    if p.signal.entry_price != signal.entry_price || p.signal.entry_condition != signal.entry_condition {
+                                    if p.signal.entry_price != signal.entry_price
+                                        || p.signal.entry_price_max != signal.entry_price_max
+                                        || p.signal.entry_condition != signal.entry_condition
+                                    {
                                         p.force_exit = Some("ENTRY_CHANGED_ERROR".to_string());
                                         updated = true;
                                         break;
@@ -4648,6 +4667,7 @@ mod tests {
                 action: "BUY".to_string(),
                 entry_condition: "ABOVE".to_string(),
                 entry_price: 120.0,
+                entry_price_max: None,
                 targets: vec![140.0, 160.0],
                 stop_loss: 100.0,
                 source: "test".to_string(),
@@ -4704,6 +4724,7 @@ mod tests {
             action: "BUY".to_string(),
             entry_condition: "ABOVE".to_string(),
             entry_price: 120.0,
+            entry_price_max: None,
             targets: vec![140.0, 160.0],
             stop_loss: 100.0,
             source: "test".to_string(),
@@ -4994,6 +5015,53 @@ mod tests {
         sig.entry_condition = "ABOVE".to_string();
         sig.targets.clear();
         assert_eq!(entry_buy_window(&sig, &cfg), Some((120.0, 150.0)));
+    }
+
+    #[test]
+    fn range_signal_buys_only_inside_its_range() {
+        // `BUY ... PUTS 120-124` — with no entry window configured the range
+        // itself is the window: wait below it, wait for a pullback above it.
+        let cfg = cfg_with_lots(1, 3);
+        let mut sig = position_created_at("").signal; // ABOVE 120, target1 140
+        sig.entry_price_max = Some(124.0);
+        assert_eq!(entry_buy_window(&sig, &cfg), Some((120.0, 124.0)));
+        assert!(!entry_triggered(&sig, 119.95, &cfg));
+        assert!(entry_triggered(&sig, 120.0, &cfg));
+        assert!(entry_triggered(&sig, 124.0, &cfg));
+        assert!(!entry_triggered(&sig, 124.05, &cfg));
+        assert!(!entry_triggered(&sig, 500.0, &cfg));
+
+        // The IOC retry limit never goes past the range's top either.
+        assert_eq!(entry_retry_limit_price(&sig, &cfg, 123.0, 0.05), Some(124.0));
+
+        // The parser only ever pairs a range with ABOVE; on anything else the
+        // cap is ignored and the classic trigger applies.
+        sig.entry_condition = "BELOW".to_string();
+        assert_eq!(entry_buy_window(&sig, &cfg), None);
+        assert!(entry_triggered(&sig, 100.0, &cfg));
+    }
+
+    #[test]
+    fn range_signal_never_buys_past_target1() {
+        // Even inside the range, an LTP already at target 1 is refused (the
+        // parser rejects such ranges, but an edit can still lower target 1).
+        let cfg = cfg_with_lots(1, 3);
+        let mut sig = position_created_at("").signal; // target1 140
+        sig.entry_price_max = Some(145.0);
+        assert!(entry_triggered(&sig, 141.0, &cfg));
+        assert_eq!(entry_past_target1(&sig, 141.0), Some(140.0));
+    }
+
+    #[test]
+    fn entry_window_can_only_tighten_a_range() {
+        let mut cfg = cfg_with_lots(1, 3);
+        let mut sig = position_created_at("").signal; // ABOVE 120, target1 140
+        sig.entry_price_max = Some(124.0);
+
+        cfg.entry_window_pct = 10.0; // 120 + 2 — tighter than the range
+        assert_eq!(entry_buy_window(&sig, &cfg), Some((120.0, 122.0)));
+        cfg.entry_window_pct = 50.0; // 120 + 10 — wider; the range still caps it
+        assert_eq!(entry_buy_window(&sig, &cfg), Some((120.0, 124.0)));
     }
 
     #[test]

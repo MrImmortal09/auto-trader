@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::{Datelike, Days, NaiveDate, Weekday};
 use regex::Regex;
 use shared_domain::{today_ist, TradeSignal};
 
@@ -13,6 +13,25 @@ static OPTS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(BUY|SELL)\s+([A-Z0-9&\-]+)\s+(\d+(?:\.\d+)?)\s+(CE|PE)\s+(ABOVE|BELOW)\s+(\d+(?:\.\d+)?)",
     ).expect("OPTS_RE")
+});
+
+/// Options signal with an entry range instead of a trigger:
+/// `BUY NIFTY NEXT WEEK 23000 STRIKE PUTS 140-145`,
+/// `BUY NIFTY NEXT WEEK 23000 STRIKE PUTS @ 125-130`,
+/// `BUY NIFTY 22300 CALLS CMP 100-102`. BUY only — this account never writes
+/// options.
+static RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\bBUY\s+([A-Z][A-Z0-9&\-]*)\s+(NEXT\s+WEEK\s+)?(\d+(?:\.\d+)?)\s+(?:STRIKE\s+)?(CE|PE|CALLS?|PUTS?)\s+(?:(?:@|AT|CMP)\s*)?(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\b",
+    ).expect("RANGE_RE")
+});
+
+/// A BUY that names a strike and a side — what a call looks like even when
+/// `parse_signal` can't make a trade of it (`BUY AGAIN 22300 CALLS CMP 100-102`
+/// names no instrument).
+static BUY_CALL_SHAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bBUY\b[^\n]*?\b\d+(?:\.\d+)?\s+(?:STRIKE\s+)?(?:CE|PE|CALLS?|PUTS?)\b")
+        .expect("BUY_CALL_SHAPE_RE")
 });
 
 /// Equity signal (no strike/type): `BUY RELIANCE ABOVE 2500`
@@ -199,8 +218,30 @@ fn resolve_expiry_date_with_now(
     Some(resolved.format("%d-%b-%Y").to_string().to_uppercase())
 }
 
-fn resolve_expiry_date(day_str: Option<&str>, month_str: &str, instrument: &str) -> Option<String> {
-    resolve_expiry_date_with_now(day_str, month_str, instrument, today_ist())
+/// Weekday the weekly series expires on, for the indices that still list
+/// weeklies. `None` for everything else (BANKNIFTY and the other NSE indices
+/// lost their weeklies in Nov 2024; stocks never had them), so a `NEXT WEEK`
+/// call on those is refused rather than guessed.
+fn weekly_expiry_weekday(instrument: &str) -> Option<Weekday> {
+    match instrument {
+        "NIFTY" => Some(Weekday::Tue),
+        "SENSEX" => Some(Weekday::Thu),
+        _ => None,
+    }
+}
+
+/// `NEXT WEEK` → the weekly expiry falling in next calendar week (Mon–Sun),
+/// pulled back to the previous trading day when that day is a holiday. Posted
+/// Wed 21 Oct 2026, a NIFTY call means the 27 Oct contract.
+fn next_week_expiry_with_now(instrument: &str, now: NaiveDate) -> Option<String> {
+    let weekday = weekly_expiry_weekday(instrument)?;
+    let next_monday = now + Days::new(7 - u64::from(now.weekday().num_days_from_monday()));
+    let date = adjust_for_holidays(next_monday + Days::new(u64::from(weekday.num_days_from_monday())));
+    Some(date.format("%d-%b-%Y").to_string().to_uppercase())
+}
+
+fn option_side(word: &str) -> &'static str {
+    if word.to_uppercase().starts_with('C') { "CE" } else { "PE" }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,17 +250,40 @@ fn resolve_expiry_date(day_str: Option<&str>, month_str: &str, instrument: &str)
 
 /// Parse a raw Telegram message into a [`TradeSignal`].
 ///
-/// Tries the options pattern first, falls back to equity.
-/// Returns `None` if neither pattern matches.
+/// Tries the options trigger pattern first, then the options range pattern,
+/// then equity. Returns `None` if none matches.
 ///
-/// # Example
+/// # Examples
 /// ```text
 /// BUY BHEL 425 CE ABOVE 8.25
 /// TARGET :- 9.50 / 11.50
 /// SL :- 5
 /// JULY EXPIRY
+///
+/// BUY NIFTY NEXT WEEK 23000 STRIKE PUTS @ 125-130 SL 105 TARGET 165
 /// ```
 pub fn parse_signal(text: &str, source: &str, signal_id: Option<String>) -> Option<TradeSignal> {
+    parse_signal_on(text, source, signal_id, today_ist())
+}
+
+/// [`parse_signal`] as if received on `today` (IST) — relative expiries
+/// (`NEXT WEEK`, `JULY`, `1ST SEPTEMBER`) resolve against it.
+pub fn parse_signal_on(
+    text: &str,
+    source: &str,
+    signal_id: Option<String>,
+    today: NaiveDate,
+) -> Option<TradeSignal> {
+    let targets: Vec<f64> = TGT_RE.captures(text)
+        .map(|c| c[1].split('/').filter_map(|p| p.trim().parse().ok()).collect())
+        .unwrap_or_default();
+
+    let stop_loss = SL_RE.captures(text)
+        .and_then(|c| c[1].parse().ok())
+        .unwrap_or(0.0);
+
+    let mut entry_price_max = None;
+    let mut next_week = false;
     let (action, instrument_name, strike, option_type, entry_condition, entry_price) =
         if let Some(caps) = OPTS_RE.captures(text) {
             (
@@ -229,14 +293,31 @@ pub fn parse_signal(text: &str, source: &str, signal_id: Option<String>) -> Opti
                 caps[5].to_uppercase(),
                 caps[6].parse::<f64>().ok()?,
             )
-        } else if let Some(caps) = EQT_RE.captures(text) {
-            let name = caps[2].to_uppercase();
-            // Plain English satisfies this pattern too — see NOISE_INSTRUMENTS.
-            if NOISE_INSTRUMENTS.contains(&name.as_str()) {
+        } else if let Some(caps) = RANGE_RE.captures(text) {
+            let low = caps[5].parse::<f64>().ok()?;
+            let high = caps[6].parse::<f64>().ok()?;
+            // A range that is backwards, starts at/under the stop, or reaches
+            // target 1 is a typo, not a trade.
+            if low <= 0.0 || high < low || (stop_loss > 0.0 && low <= stop_loss) {
                 return None;
             }
+            if targets.first().is_some_and(|&t1| high >= t1) {
+                return None;
+            }
+            entry_price_max = Some(high);
+            next_week = caps.get(2).is_some();
             (
-                caps[1].to_uppercase(), name,
+                "BUY".to_string(), caps[1].to_uppercase(),
+                Some(caps[3].parse::<f64>().ok()?),
+                Some(option_side(&caps[4]).to_string()),
+                // The range's low edge behaves as an ABOVE trigger; the engine
+                // caps the buy at `entry_price_max` (see `entry_buy_window`).
+                "ABOVE".to_string(),
+                low,
+            )
+        } else if let Some(caps) = EQT_RE.captures(text) {
+            (
+                caps[1].to_uppercase(), caps[2].to_uppercase(),
                 None, None,
                 caps[3].to_uppercase(),
                 caps[4].parse::<f64>().ok()?,
@@ -245,27 +326,38 @@ pub fn parse_signal(text: &str, source: &str, signal_id: Option<String>) -> Opti
             return None;
         };
 
-    let targets: Vec<f64> = TGT_RE.captures(text)
-        .map(|c| c[1].split('/').filter_map(|p| p.trim().parse().ok()).collect())
-        .unwrap_or_default();
+    // Plain English satisfies these patterns too (see NOISE_INSTRUMENTS), and
+    // `BUY AGAIN 22300 CALLS` names no instrument at all — never guess one.
+    if NOISE_INSTRUMENTS.contains(&instrument_name.as_str()) {
+        return None;
+    }
 
-    let stop_loss = SL_RE.captures(text)
-        .and_then(|c| c[1].parse().ok())
-        .unwrap_or(0.0);
-
-    let expiry = EXPIRY_RE.captures(text).and_then(|c| {
-        let day = c.get(1).map(|m| m.as_str());
-        let month = c.get(2).map(|m| m.as_str())?;
-        resolve_expiry_date(day, month, &instrument_name)
-    });
+    let expiry = if next_week {
+        // An instrument with no weekly series can't have a "next week" contract.
+        Some(next_week_expiry_with_now(&instrument_name, today)?)
+    } else {
+        EXPIRY_RE.captures(text).and_then(|c| {
+            let day = c.get(1).map(|m| m.as_str());
+            let month = c.get(2).map(|m| m.as_str())?;
+            resolve_expiry_date_with_now(day, month, &instrument_name, today)
+        })
+    };
 
     Some(TradeSignal {
         instrument_name, strike, option_type, expiry,
-        action, entry_condition, entry_price, targets, stop_loss,
+        action, entry_condition, entry_price, entry_price_max, targets, stop_loss,
         source: source.to_owned(),
         signal_id,
         raw_message: Some(text.to_owned()),
     })
+}
+
+/// Whether `text` is a BUY call naming a strike and a side, whether or not
+/// [`parse_signal`] could make a trade of it. An unparsed one must not fall
+/// through to the reply handlers: its `SL 90` would otherwise be applied to
+/// whatever position the message happens to reply to.
+pub fn looks_like_buy_call(text: &str) -> bool {
+    BUY_CALL_SHAPE_RE.is_match(text)
 }
 
 /// Parse a raw Telegram reply message to extract a stop-loss update.
@@ -280,6 +372,47 @@ pub fn parse_reply_sl(text: &str) -> Option<f64> {
 pub fn parse_reply_exit(text: &str) -> Option<f64> {
     UPDATE_EXIT_RE.captures(text)
         .and_then(|c| c[1].parse().ok())
+}
+
+/// What the Telegram event loop does with one message.
+#[derive(Debug, Clone)]
+pub enum Inbound {
+    /// A complete call — trade it.
+    Signal(TradeSignal),
+    /// Looks like a BUY call but isn't one we can trade (see
+    /// [`looks_like_buy_call`]) — drop it, loudly.
+    IgnoredCall,
+    /// A reply moving the stop of the position opened from message `parent`.
+    SlUpdate { parent: String, new_sl: f64 },
+    /// A reply ordering the position opened from message `parent` out at `price`.
+    Exit { parent: String, price: f64 },
+    /// Nothing actionable.
+    Unparsed,
+}
+
+/// Route one Telegram message. `reply_to` is the id of the message it replies
+/// to, if any; `today` is the IST date it arrived.
+///
+/// Order matters. A complete signal wins over the reply patterns — every
+/// signal body carries an `SL :- x` line, so a signal the channel posts *as a
+/// reply* would otherwise be swallowed as a stop-loss update. Then an
+/// unreadable BUY call is dropped before the reply patterns for the same
+/// reason: `BUY AGAIN 22300 CALLS ... SL 90` must not move another stop.
+pub fn classify(text: &str, msg_id: &str, reply_to: Option<&str>, today: NaiveDate) -> Inbound {
+    if let Some(signal) = parse_signal_on(text, "telegram", Some(msg_id.to_owned()), today) {
+        return Inbound::Signal(signal);
+    }
+    if looks_like_buy_call(text) {
+        return Inbound::IgnoredCall;
+    }
+    let Some(parent) = reply_to else { return Inbound::Unparsed };
+    if let Some(new_sl) = parse_reply_sl(text) {
+        Inbound::SlUpdate { parent: parent.to_owned(), new_sl }
+    } else if let Some(price) = parse_reply_exit(text) {
+        Inbound::Exit { parent: parent.to_owned(), price }
+    } else {
+        Inbound::Unparsed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +556,7 @@ mod tests {
     #[test]
     fn a_full_signal_also_matches_the_reply_sl_pattern() {
         // Why `parse_signal` has to be tried before the reply patterns in
-        // `stream.rs`: every signal body carries an `SL :- x` line, so a
+        // `classify`: every signal body carries an `SL :- x` line, so a
         // signal the channel happens to post *as a reply* looks exactly like
         // a stop-loss update to `parse_reply_sl`. Checking replies first
         // swallowed the whole trade.
@@ -454,5 +587,96 @@ mod tests {
         assert_eq!(sig.targets, vec![365.0, 450.0]);
         assert_eq!(sig.stop_loss, 250.0);
         assert!(sig.expiry.is_some());
+        assert_eq!(sig.entry_price_max, None);
+    }
+
+    #[test]
+    fn range_call_with_next_week_expiry() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 21).unwrap(); // a Wednesday
+        let text = "BUY NIFTY NEXT WEEK 23000 STRIKE PUTS 140-145 SL 120 TARGET 175";
+        let sig = parse_signal_on(text, "test", None, today).unwrap();
+        assert_eq!(sig.action, "BUY");
+        assert_eq!(sig.instrument_name, "NIFTY");
+        assert_eq!(sig.strike, Some(23000.0));
+        assert_eq!(sig.option_type.as_deref(), Some("PE"));
+        assert_eq!(sig.entry_condition, "ABOVE");
+        assert_eq!(sig.entry_price, 140.0);
+        assert_eq!(sig.entry_price_max, Some(145.0));
+        assert_eq!(sig.stop_loss, 120.0);
+        assert_eq!(sig.targets, vec![175.0]);
+        assert_eq!(sig.expiry.as_deref(), Some("27-OCT-2026"));
+
+        let text = "BUY NIFTY NEXT WEEK 23000 STRIKE PUTS @ 125-130 SL 105 TARGET 165";
+        let sig = parse_signal_on(text, "test", None, today).unwrap();
+        assert_eq!(sig.option_type.as_deref(), Some("PE"));
+        assert_eq!((sig.entry_price, sig.entry_price_max), (125.0, Some(130.0)));
+        assert_eq!(sig.stop_loss, 105.0);
+        assert_eq!(sig.targets, vec![165.0]);
+        assert_eq!(sig.expiry.as_deref(), Some("27-OCT-2026"));
+    }
+
+    #[test]
+    fn range_call_with_cmp_and_calls() {
+        let text = "✅ BUY NIFTY 22300 CALLS CMP 100-102 SL 90 TARGET 125";
+        let sig = parse_signal(text, "test", None).unwrap();
+        assert_eq!(sig.instrument_name, "NIFTY");
+        assert_eq!(sig.strike, Some(22300.0));
+        assert_eq!(sig.option_type.as_deref(), Some("CE"));
+        assert_eq!((sig.entry_price, sig.entry_price_max), (100.0, Some(102.0)));
+        assert_eq!(sig.stop_loss, 90.0);
+        assert_eq!(sig.targets, vec![125.0]);
+        assert_eq!(sig.expiry, None); // no expiry named -> nearest, as for CE/PE calls
+    }
+
+    #[test]
+    fn call_without_an_instrument_is_ignored() {
+        // Real message from the channel: no instrument, no expiry. Never guess.
+        let text = "✅ BUY AGAIN 22300 CALLS CMP 100-102 SL 90 TARGET 125";
+        assert!(parse_signal(text, "test", None).is_none());
+        assert!(looks_like_buy_call(text));
+        // The same with the classic trigger wording.
+        assert!(parse_signal("BUY AGAIN 22300 CE ABOVE 100\nSL 90", "test", None).is_none());
+
+        // Ordinary replies are not mistaken for calls.
+        assert!(!looks_like_buy_call("Move SL to 140"));
+        assert!(!looks_like_buy_call("exit at 610"));
+        assert!(!looks_like_buy_call("Book profit in 22300 CE"));
+    }
+
+    #[test]
+    fn nonsense_ranges_are_refused() {
+        let base = "BUY NIFTY 23000 PUTS";
+        // Backwards.
+        assert!(parse_signal(&format!("{base} 145-140 SL 120 TARGET 175"), "test", None).is_none());
+        // Starts at/under the stop-loss.
+        assert!(parse_signal(&format!("{base} 120-125 SL 120 TARGET 175"), "test", None).is_none());
+        // Reaches target 1 (a typo like `140-1450`).
+        assert!(parse_signal(&format!("{base} 140-1450 SL 120 TARGET 175"), "test", None).is_none());
+        // Sane one still parses.
+        assert!(parse_signal(&format!("{base} 140-145 SL 120 TARGET 175"), "test", None).is_some());
+    }
+
+    #[test]
+    fn next_week_needs_a_weekly_series() {
+        let text = "BUY BANKNIFTY NEXT WEEK 55000 STRIKE CALLS 300-310 SL 250 TARGET 380";
+        assert!(parse_signal(text, "test", None).is_none());
+        assert!(looks_like_buy_call(text));
+    }
+
+    #[test]
+    fn next_week_is_the_expiry_in_next_calendar_week() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let nifty = |now| next_week_expiry_with_now("NIFTY", now);
+        // Monday, Wednesday and Sunday of the week of 19 Oct 2026 all mean 27 Oct.
+        assert_eq!(nifty(d(2026, 10, 19)).as_deref(), Some("27-OCT-2026"));
+        assert_eq!(nifty(d(2026, 10, 21)).as_deref(), Some("27-OCT-2026"));
+        assert_eq!(nifty(d(2026, 10, 25)).as_deref(), Some("27-OCT-2026"));
+        // On expiry day itself, next week is the following Tuesday.
+        assert_eq!(nifty(d(2026, 10, 27)).as_deref(), Some("03-NOV-2026"));
+        // Next week's Tuesday a holiday (10 Nov 2026) -> the Monday before.
+        assert_eq!(nifty(d(2026, 11, 4)).as_deref(), Some("09-NOV-2026"));
+        // SENSEX expires Thursdays.
+        assert_eq!(next_week_expiry_with_now("SENSEX", d(2026, 10, 19)).as_deref(), Some("29-OCT-2026"));
+        assert_eq!(next_week_expiry_with_now("BANKNIFTY", d(2026, 10, 19)), None);
     }
 }

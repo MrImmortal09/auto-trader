@@ -6,10 +6,10 @@ use grammers_client::update::Update;
 use grammers_client::{Client, SignInError};
 use grammers_session::updates::UpdatesLike;
 use shared_domain::telemetry::{self, ParseResult};
-use shared_domain::TradeSignal;
+use shared_domain::{today_ist, TradeSignal};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::parser::{parse_signal, parse_reply_sl, parse_reply_exit};
+use crate::parser::{classify, Inbound};
 use crate::session_file;
 
 // ---------------------------------------------------------------------------
@@ -81,69 +81,12 @@ pub(crate) async fn run_event_loop(
         telemetry::telegram_message(is_edit);
 
         let msg_id_str = msg.id().to_string();
+        let reply_to = msg.reply_to_message_id().map(|id| id.to_string());
 
-        // Parse as a full signal FIRST, before the reply patterns.
-        //
-        // Every signal body carries an `SL :- x` line, and `parse_reply_sl`
-        // matches that line on its own — so a signal the channel posts *as a
-        // reply* (they routinely do) looked exactly like a stop-loss update.
-        // The whole BUY was thrown away and re-emitted as a bare UPDATE_SL
-        // pointing at the parent message id; no position carried that id, so
-        // the monitor's update loop found nothing and logged nothing, and the
-        // trade vanished without a trace. A complete signal is unambiguous and
-        // strictly more specific than "contains a number after SL", so it wins.
-        let new_signal = parse_signal(text, "telegram", Some(msg_id_str));
-
-        let mut emitted = false;
-
-        if let (None, Some(reply_to_id)) = (&new_signal, msg.reply_to_message_id()) {
-            if let Some(new_sl) = parse_reply_sl(text) {
-                let signal = TradeSignal {
-                    instrument_name: "UPDATE".to_string(),
-                    strike: None,
-                    option_type: None,
-                    expiry: None,
-                    action: "UPDATE_SL".to_string(),
-                    entry_condition: "ABOVE".to_string(),
-                    entry_price: 0.0,
-                    targets: vec![],
-                    stop_loss: new_sl,
-                    source: "telegram_reply".to_string(),
-                    signal_id: Some(reply_to_id.to_string()),
-                    raw_message: Some(text.to_owned()),
-                };
-                tracing::info!(new_sl, "Reply parsed as SL update — broadcasting");
-                telemetry::telegram_parsed(ParseResult::SlUpdate);
-                if tx.send(signal).is_err() {
-                    tracing::warn!("[telegram] No receivers — update dropped");
-                }
-                emitted = true;
-            } else if let Some(exit_price) = parse_reply_exit(text) {
-                let signal = TradeSignal {
-                    instrument_name: "UPDATE".to_string(),
-                    strike: None,
-                    option_type: None,
-                    expiry: None,
-                    action: "EXIT_AT".to_string(),
-                    entry_condition: "ABOVE".to_string(),
-                    entry_price: exit_price,
-                    targets: vec![],
-                    stop_loss: 0.0,
-                    source: "telegram_reply".to_string(),
-                    signal_id: Some(reply_to_id.to_string()),
-                    raw_message: Some(text.to_owned()),
-                };
-                tracing::info!(exit_price, "Reply parsed as EXIT_AT — broadcasting");
-                telemetry::telegram_parsed(ParseResult::Exit);
-                if tx.send(signal).is_err() {
-                    tracing::warn!("[telegram] No receivers — update dropped");
-                }
-                emitted = true;
-            }
-        }
-
-        if !emitted {
-            if let Some(signal) = new_signal {
+        // Routing (and why its order matters) lives in `classify`, where the
+        // tests can reach it.
+        match classify(text, &msg_id_str, reply_to.as_deref(), today_ist()) {
+            Inbound::Signal(signal) => {
                 tracing::info!(
                     instrument = %signal.instrument_name,
                     action = %signal.action,
@@ -153,13 +96,61 @@ pub(crate) async fn run_event_loop(
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — signal dropped");
                 }
-            } else {
+            }
+            Inbound::IgnoredCall => {
+                tracing::warn!("[telegram] BUY call not traded — no instrument or unsupported expiry/entry: {text}");
+                if let Some(ref ltx) = log_tx {
+                    let first_line = text.lines().next().unwrap_or_default();
+                    let log_msg = serde_json::json!({
+                        "event": "SIGNAL_IGNORED",
+                        "level": "WARN",
+                        "message": format!("BUY call not traded — no instrument, or an unsupported expiry/entry: {first_line}"),
+                    });
+                    let _ = ltx.send(log_msg.to_string());
+                }
                 telemetry::telegram_parsed(ParseResult::Unparsed);
             }
+            Inbound::SlUpdate { parent, new_sl } => {
+                let signal = reply_update(text, parent, "UPDATE_SL", 0.0, new_sl);
+                tracing::info!(new_sl, "Reply parsed as SL update — broadcasting");
+                telemetry::telegram_parsed(ParseResult::SlUpdate);
+                if tx.send(signal).is_err() {
+                    tracing::warn!("[telegram] No receivers — update dropped");
+                }
+            }
+            Inbound::Exit { parent, price } => {
+                let signal = reply_update(text, parent, "EXIT_AT", price, 0.0);
+                tracing::info!(exit_price = price, "Reply parsed as EXIT_AT — broadcasting");
+                telemetry::telegram_parsed(ParseResult::Exit);
+                if tx.send(signal).is_err() {
+                    tracing::warn!("[telegram] No receivers — update dropped");
+                }
+            }
+            Inbound::Unparsed => telemetry::telegram_parsed(ParseResult::Unparsed),
         }
     }
 
     tracing::info!("[telegram] Event loop exited");
+}
+
+/// The bare `UPDATE_SL` / `EXIT_AT` signal the monitor matches to the position
+/// opened from message `parent`.
+fn reply_update(text: &str, parent: String, action: &str, entry_price: f64, stop_loss: f64) -> TradeSignal {
+    TradeSignal {
+        instrument_name: "UPDATE".to_string(),
+        strike: None,
+        option_type: None,
+        expiry: None,
+        action: action.to_string(),
+        entry_condition: "ABOVE".to_string(),
+        entry_price,
+        entry_price_max: None,
+        targets: vec![],
+        stop_loss,
+        source: "telegram_reply".to_string(),
+        signal_id: Some(parent),
+        raw_message: Some(text.to_owned()),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -31,6 +31,7 @@ async fn main() {
         action: "BUY".to_string(),
         entry_condition: "ABOVE".to_string(),
         entry_price: 5.1,
+        entry_price_max: None,
         targets: vec![7.0, 10.0],
         stop_loss: 4.0,
         source: "telegram".to_string(),

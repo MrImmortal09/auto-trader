@@ -461,6 +461,12 @@ pub struct TradeSignal {
     pub entry_condition: String,
     /// Trigger / reference price for entry.
     pub entry_price: f64,
+    /// Upper edge of an entry *range* (`140-145`, `@ 125-130`, `CMP 100-102`).
+    /// When set, `entry_condition` is `"ABOVE"` and the engine buys only while
+    /// LTP is in `[entry_price, entry_price_max]` — above it the call waits for
+    /// a pullback. `None` for a single-trigger `ABOVE`/`BELOW` signal.
+    #[serde(default)]
+    pub entry_price_max: Option<f64>,
     /// Ordered list of price targets (e.g. `[250.0, 320.0]`).
     pub targets: Vec<f64>,
     /// Initial stop-loss price.
@@ -1040,6 +1046,25 @@ pub enum DbWriteMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_saved_before_entry_ranges_still_loads() {
+        // Open positions are persisted as JSON; ones written by an older build
+        // have no `entry_price_max` and must restore as plain triggers.
+        let json = r#"{"instrument_name":"SENSEX","strike":74400.0,"option_type":"CE",
+            "expiry":"22-OCT-2026","action":"BUY","entry_condition":"ABOVE","entry_price":620.0,
+            "targets":[670.0,900.0],"stop_loss":500.0,"source":"telegram","signal_id":"27962",
+            "raw_message":"BUY SENSEX 74400 CE ABOVE 620"}"#;
+        let sig: TradeSignal = serde_json::from_str(json).unwrap();
+        assert_eq!(sig.entry_price, 620.0);
+        assert_eq!(sig.entry_price_max, None);
+
+        let round_trip: TradeSignal = serde_json::from_str(&serde_json::to_string(&TradeSignal {
+            entry_price_max: Some(625.0),
+            ..sig
+        }).unwrap()).unwrap();
+        assert_eq!(round_trip.entry_price_max, Some(625.0));
+    }
 
     #[test]
     fn trading_config_kill_switch_defaults_to_false() {
