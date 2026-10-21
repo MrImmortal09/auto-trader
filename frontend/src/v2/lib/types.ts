@@ -191,6 +191,13 @@ export interface Fill {
   pnl: number | null;
 }
 
+/** An index whose options are held open on their expiry day. */
+export interface Expiring {
+  index: string;
+  series: 'weekly' | 'monthly';
+  positions: number;
+}
+
 /** `GET /api/v2/status`. */
 export interface StatusAnswer {
   now: string;
@@ -200,6 +207,9 @@ export interface StatusAnswer {
   market_open: boolean;
   market: string;
   health: HealthSet | null;
+  /** Seconds since the price feed's last tick, while it's connected. */
+  feed_age_secs: number | null;
+  expiring: Expiring[];
   day_pnl: number;
   fills: Fill[];
   last_fill_id: number;
@@ -333,4 +343,181 @@ export interface HistoryAnswer {
   /** Newest first. */
   calls: Call[];
   more_calls: number;
+}
+
+// ── System (`GET /api/v2/system`) ───────────────────────────────────────── //
+
+/** What became of today's calls; the parts add up to `calls`. */
+export interface SignalCounts {
+  calls: number;
+  traded: number;
+  waiting: number;
+  expired: number;
+  indicator: number;
+  not_index: number;
+  other: number;
+}
+
+export interface OrderCounts {
+  /** LIVE: orders sent to Kotak. Paper: its fills. */
+  sent: number;
+  filled: number;
+  rejected: number;
+  cancelled: number;
+  poll_failures: number;
+}
+
+export interface SystemAnswer {
+  day: string;
+  mode: Mode;
+  /** `HH:MM` the server started, when that was today. */
+  started_today: string | null;
+  uptime_secs: number | null;
+  version: string;
+  /** The last Scrip Master download. */
+  scrip_loaded_at: string | null;
+  signals: SignalCounts;
+  orders: OrderCounts;
+  telegram: { listening: number | null; messages: number; last_at: string | null };
+  kotak: { relogins: number; logged_in_at: string | null };
+  upstox: { configured: boolean; token_expires: string | null };
+}
+
+// ── Market (v1's `/api/market/*`, unchanged) ────────────────────────────── //
+
+export type MarketIndex = 'NIFTY' | 'BANKNIFTY' | 'SENSEX';
+export type Bias = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+
+export interface IndicatorScore {
+  call: number;
+  put: number;
+  ratio: number | null;
+  /** +1 buy, −1 sell, 0. */
+  option: number;
+  vwap: number;
+  /** −2 … +2. */
+  overall: number;
+}
+
+export interface IndicatorReading {
+  index: string;
+  /** The check's `HH:MM`. */
+  check_time: string;
+  /** When its snapshot was polled. */
+  ts: string;
+  score: IndicatorScore;
+  bias: Bias;
+  /** The opening 09:16 check, always neutral. */
+  opening: boolean;
+}
+
+/** What a call arriving now would get. */
+export interface CallVerdict {
+  action: 'SCALE' | 'WAIT' | 'SKIP';
+  multiplier: number | null;
+  base_lots: number;
+  lots: number | null;
+  note: string;
+}
+
+/** `GET /api/market/indicator`. */
+export interface IndicatorAnswer {
+  configured: boolean;
+  /** Indicator sizing is on. */
+  enabled: boolean;
+  now: string;
+  indices: { index: MarketIndex; reading: IndicatorReading | null; bias: Bias; ce: CallVerdict; pe: CallVerdict }[];
+}
+
+export interface ChainStrike {
+  strike: number;
+  call_oi: number;
+  call_prev_oi: number;
+  put_oi: number;
+  put_prev_oi: number;
+}
+
+/** `GET /api/market/option-chain?underlying=`. */
+export interface OptionChainAnswer {
+  underlying: MarketIndex;
+  expiry: string | null;
+  spot: number | null;
+  atm_strike: number | null;
+  updated_at: string | null;
+  strikes: ChainStrike[];
+}
+
+export interface TrendRow {
+  /** The check's `HH:MM`, or the forming one's latest snapshot. */
+  time: string;
+  live: boolean;
+  ts: string;
+  call_oi: number;
+  put_oi: number;
+  call_oi_chg: number;
+  put_oi_chg: number;
+  spot: number;
+  fut_ltp: number | null;
+  fut_vwap: number | null;
+}
+
+/** `GET /api/market/intraday-trend`. */
+export interface TrendAnswer {
+  underlying: MarketIndex;
+  date: string | null;
+  interval: number;
+  window: number;
+  /** Newest first. */
+  rows: TrendRow[];
+}
+
+export interface MarketLiveIndex {
+  underlying: MarketIndex;
+  expiry: string | null;
+  spot: number | null;
+  future_symbol: string | null;
+  fut_ltp: number | null;
+  fut_vwap: number | null;
+  updated_at: string | null;
+  last_error: string | null;
+}
+
+/** `GET /api/market/live`. */
+export interface MarketLive {
+  configured: boolean;
+  indices: MarketLiveIndex[];
+}
+
+// ── Connections ─────────────────────────────────────────────────────────── //
+
+/** `GET /api/auth/kotak`. */
+export interface KotakState {
+  connected: boolean;
+  session_present?: boolean;
+  session_healthy?: boolean;
+  has_env_credentials: boolean;
+  has_totp_secret: boolean;
+  auto_login_enabled: boolean;
+  auto_login_ready: boolean;
+  auto_login_reason?: string | null;
+  masked_ucc?: string | null;
+}
+
+/** `GET /api/auth/telegram/status`. */
+export interface TelegramState {
+  state: string;
+  chat_ids: number[];
+}
+
+/** `GET /api/v2/mode-check`: what switching between Paper and LIVE would do. */
+export interface ModeCheck {
+  mode: Mode;
+  kotak_connected: boolean;
+  /** Kotak's net funds, from the hourly cache. */
+  funds: { net: number; fetched_at: string } | null;
+  kill_switch: boolean;
+  /** Positions holding quantity now, in the current mode. */
+  open: number;
+  waiting: number;
+  lots: { index: string; lots: number }[];
 }

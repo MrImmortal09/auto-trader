@@ -13,6 +13,7 @@ mod history;
 mod market_data;
 mod pulse;
 mod routes;
+mod system;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1058,6 +1059,8 @@ async fn main() {
         .route("/api/v2/status",                    get(routes::v2::status_handler))
         .route("/api/v2/chain",                     get(routes::v2::chain_handler))
         .route("/api/v2/marks",                     get(routes::v2::marks_handler))
+        .route("/api/v2/system",                    get(routes::v2::system_handler))
+        .route("/api/v2/mode-check",                get(routes::v2::mode_check_handler))
         .route("/api/v2/candles",                   get(routes::v2::candles_handler))
         .route("/api/v2/candles/stream",            get(routes::v2::candles_stream_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
