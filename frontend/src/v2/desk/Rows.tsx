@@ -44,6 +44,7 @@ export function OpenRow({ p, desktop, sending, onLessLot, onExit }: {
   // −1 lot sells exactly one lot: the least the exchange takes.
   const lessLot = (
     <Button
+      pointerOnly
       kind="loss-outline"
       size={desktop ? 'sm' : 'lg'}
       disabled={locked || p.qty < p.lot_size}
@@ -55,7 +56,7 @@ export function OpenRow({ p, desktop, sending, onLessLot, onExit }: {
     </Button>
   );
   const exit = (
-    <Button kind="loss" size={desktop ? 'sm' : 'lg'} disabled={locked} onClick={onExit} title={`Sell all ${p.qty} at market`} className={desktop ? '' : 'w-full'}>
+    <Button pointerOnly kind="loss" size={desktop ? 'sm' : 'lg'} disabled={locked} onClick={onExit} title={`Sell all ${p.qty} at market`} className={desktop ? '' : 'w-full'}>
       Exit
     </Button>
   );

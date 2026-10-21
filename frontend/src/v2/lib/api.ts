@@ -3,7 +3,8 @@
 
 import { apiFetch } from '../../lib/api';
 import type { ReconcileApplyItem, ReconcileFinding } from '../../types';
-import type { DeskAnswer, FeedAnswer, GroupId, HistoryAnswer, RangeId, StatusAnswer } from './types';
+import type { ChartLevel } from '../../types';
+import type { ChainAnswer, DeskAnswer, FeedAnswer, Flags, GroupId, HistoryAnswer, MarksAnswer, RangeId, StatusAnswer } from './types';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -35,6 +36,9 @@ export const getStatus = (base: string, after: number | null) =>
   getJson<StatusAnswer>(base, after == null ? '/api/v2/status' : `/api/v2/status?after=${after}`);
 export const getHistory = (base: string, range: RangeId, group: GroupId) =>
   getJson<HistoryAnswer>(base, `/api/v2/history?range=${range}&group=${group}`);
+export const getFlags = (base: string) => getJson<Flags>(base, '/api/v2/flags');
+export const getChain = (base: string, index: string) => getJson<ChainAnswer>(base, `/api/v2/chain?index=${encodeURIComponent(index)}`);
+export const getMarks = (base: string) => getJson<MarksAnswer>(base, '/api/v2/marks');
 
 /** How an action went. `status` 202 means LIVE accepted it and the engine is
  * placing the order; 0 means the server couldn't be reached. */
@@ -69,6 +73,17 @@ export const exitPosition = (base: string, id: string) => send(base, `${position
 export const cancelPosition = (base: string, id: string) => send(base, position(id), 'DELETE');
 /** Lots a waiting call buys, or `null` for the default — v1's quantity override. */
 export const setLots = (base: string, id: string, lots: number | null) => send(base, position(id), 'PATCH', { override_qty: lots });
+
+/** One tap on the ladder: a market buy of `lots`, or an add to the scalp
+ * already held on that contract — v1's Execute buy. */
+export const executeBuy = (base: string, tradingSymbol: string, lots: number) =>
+  send(base, '/api/execute/buy', 'POST', { trading_symbol: tradingSymbol, lots });
+/** Sell every scalp at market — v1's Exit all. */
+export const executeExitAll = (base: string) => send(base, '/api/execute/exit-all', 'POST');
+/** Set (`{price, trigger}`), clear (`null`) or keep (left out) a scalp's chart
+ * stop and target — PR 4's endpoint, behind the `chart_stops` switch. */
+export const setChartLevels = (base: string, id: string, levels: { stop?: ChartLevel | null; target?: ChartLevel | null }) =>
+  send(base, `/api/v2/positions/${encodeURIComponent(id)}`, 'PATCH', levels);
 
 export const engageKillSwitch = (base: string) => send(base, '/api/kill-switch', 'POST');
 export const resumeTrading = (base: string) => send(base, '/api/kill-switch/reset', 'POST');

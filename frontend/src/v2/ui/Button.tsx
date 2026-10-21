@@ -25,6 +25,8 @@ export function Button({
   kind = 'neutral',
   size = 'sm',
   icon,
+  pointerOnly = false,
+  onClick,
   className = '',
   children,
   ...rest
@@ -32,11 +34,21 @@ export function Button({
   kind?: ButtonKind;
   size?: ButtonSize;
   icon?: ReactNode;
+  /** For a button that sends an order: no keyboard key ever sends one, so a
+   * click from Enter or Space (`detail` 0) is ignored. */
+  pointerOnly?: boolean;
 }) {
   return (
     <button
       type="button"
       {...rest}
+      onClick={
+        pointerOnly && onClick
+          ? (e) => {
+              if (e.detail !== 0) onClick(e);
+            }
+          : onClick
+      }
       className={`inline-flex shrink-0 select-none items-center justify-center whitespace-nowrap transition-[background-color,filter] disabled:cursor-not-allowed disabled:opacity-50 ${KIND[kind]} ${SIZE[size]} ${className}`}
     >
       {icon}
