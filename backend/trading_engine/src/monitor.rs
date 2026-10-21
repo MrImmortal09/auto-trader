@@ -7,7 +7,7 @@ use kotak_client::KotakClient;
 use shared_domain::entry_gate::{self, Agreement, IndicatorFeed, SizingVerdict};
 use shared_domain::telemetry::{self, SignalOutcome};
 use shared_domain::{
-    DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradingConfig,
+    DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradeTag, TradingConfig,
 };
 use tokio::sync::{broadcast, mpsc, RwLock};
 
@@ -66,8 +66,7 @@ async fn send_trade(
     qty: i32,
     price: f64,
     c: &ChargeBreakdown,
-    signal_id: Option<String>,
-    raw_message: Option<String>,
+    tag: &TradeTag,
     exit_reason: Option<String>,
     mode: &str,
 ) {
@@ -79,7 +78,7 @@ async fn send_trade(
         stt_charge: c.stt_charge, sebi_fee: c.sebi_fee,
         stamp_duty: c.stamp_duty, transaction_charge: c.transaction_charge,
         gst: c.gst, net_value: c.net_value,
-        signal_id, raw_message, exit_reason,
+        tag: tag.clone(), exit_reason,
         mode: mode.to_owned(),
     }).await;
 }
@@ -123,7 +122,7 @@ async fn book_paper_sell(
         price
     );
     tracing::info!(instrument = %instrument, reason, price, pnl, "Exit executed");
-    send_trade(db_tx, instrument, "SELL", qty, price, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some(reason.to_string()), &cfg.mode).await;
+    send_trade(db_tx, instrument, "SELL", qty, price, &fees, &TradeTag::of(&pos.signal), Some(reason.to_string()), &cfg.mode).await;
     send_log(db_tx, log_tx, "INFO", &msg).await;
 }
 
@@ -1214,7 +1213,7 @@ async fn record_live_sell(
     tracing::info!(instrument = %leg.instrument, reason, price, qty, pnl, "LIVE exit filled");
     send_trade(
         db_tx, &leg.instrument, "SELL", qty, price, &fees,
-        leg.signal_id.clone(), leg.raw_message.clone(), Some(reason.to_string()), "LIVE",
+        &leg.tag, Some(reason.to_string()), "LIVE",
     ).await;
     live_info(db_tx, log_tx, json!({
         "event": reason,
@@ -1299,8 +1298,8 @@ struct LiveLeg {
     instrument: String,
     trading_symbol: String,
     is_options: bool,
-    signal_id: Option<String>,
-    raw_message: Option<String>,
+    /// The call its trades are recorded under.
+    tag: TradeTag,
     avg_buy_price: f64,
     entry_price: f64,
     at_target1: bool,
@@ -1369,8 +1368,7 @@ async fn reconcile_live_orders(
                     .map(|o| o.trading_symbol.clone())
                     .unwrap_or_default(),
                 is_options: p.signal.option_type.is_some(),
-                signal_id: p.signal.signal_id.clone(),
-                raw_message: p.signal.raw_message.clone(),
+                tag: TradeTag::of(&p.signal),
                 avg_buy_price: p.avg_buy_price,
                 entry_price: p.signal.entry_price,
                 at_target1: matches!(p.state, TradeState::Target1Hit),
@@ -1525,7 +1523,7 @@ async fn reconcile_live_orders(
                         tracing::info!(instrument = %leg.instrument, price = avg, qty = filled, "LIVE entry filled");
                         send_trade(
                             db_tx, &leg.instrument, "BUY", filled, avg, &fees,
-                            leg.signal_id.clone(), leg.raw_message.clone(),
+                            &leg.tag,
                             Some("ENTRY".to_string()), "LIVE",
                         ).await;
                         live_info(db_tx, log_tx, json!({
@@ -1704,7 +1702,7 @@ async fn reconcile_live_orders(
                         tracing::info!(instrument = %leg.instrument, price = avg, qty = filled, kind, "LIVE top-up filled");
                         send_trade(
                             db_tx, &leg.instrument, "BUY", filled, avg, &fees,
-                            leg.signal_id.clone(), leg.raw_message.clone(),
+                            &leg.tag,
                             Some(kind.to_string()), "LIVE",
                         ).await;
                         live_info(db_tx, log_tx, json!({
@@ -2660,6 +2658,7 @@ async fn adopt_manual(
             source: "MANUAL_RECONCILE".to_string(),
             signal_id: None,
             raw_message: None,
+            chat: None,
         },
         state: TradeState::Active,
         created_at: shared_domain::current_ist_timestamp_string(),
@@ -4905,7 +4904,7 @@ pub async fn start_position_monitor(
                                 "mode": cfg.mode.as_str(),
                             });
                             tracing::info!(instrument = %instrument, price = pa.ltp, qty, total, "Top-up executed");
-                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some(kind.to_string()), &cfg.mode).await;
+                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, &TradeTag::of(&pos.signal), Some(kind.to_string()), &cfg.mode).await;
                             send_log(&db_tx, &log_tx, "INFO", &msg.to_string()).await;
                         }
 
@@ -4937,7 +4936,7 @@ pub async fn start_position_monitor(
                                 pa.ltp, fees.net_value
                             );
                             tracing::info!(instrument = %instrument, price = pa.ltp, qty, "Entry executed");
-                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, pos.signal.signal_id.clone(), pos.signal.raw_message.clone(), Some("ENTRY".to_string()), &cfg.mode).await;
+                            send_trade(&db_tx, &instrument, "BUY", qty, pa.ltp, &fees, &TradeTag::of(&pos.signal), Some("ENTRY".to_string()), &cfg.mode).await;
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
                         }
 
@@ -5074,6 +5073,7 @@ mod tests {
                 source: "test".to_string(),
                 signal_id: None,
                 raw_message: None,
+                chat: None,
             },
             state: TradeState::WaitingForEntry,
             created_at: created_at.to_string(),
@@ -5135,6 +5135,7 @@ mod tests {
             source: "test".to_string(),
             signal_id: Some("different-message-id".to_string()),
             raw_message: None,
+            chat: None,
         }
     }
 
@@ -6944,6 +6945,7 @@ mod tests {
             source: "telegram".into(),
             signal_id: Some("77".into()),
             raw_message: None,
+            chat: None,
         }).unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
 

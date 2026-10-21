@@ -37,6 +37,7 @@ async fn main() {
         source: "telegram".to_string(),
         signal_id: None,
         raw_message: None,
+        chat: None,
     };
 
     if let Some(record) = store.resolve_signal(&signal) {

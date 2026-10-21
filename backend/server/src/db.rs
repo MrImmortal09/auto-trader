@@ -165,6 +165,17 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         &pool,
         "ALTER TABLE paper_trades ADD COLUMN mode TEXT NOT NULL DEFAULT 'PAPER'",
     ).await;
+    // The call each trade belongs to, for the v2 history: its Telegram chat
+    // (NULL for scalps, the webhook, and every row written before these
+    // columns existed — "Unknown channel"), and its side and strike.
+    for sql in [
+        "ALTER TABLE paper_trades ADD COLUMN chat_id INTEGER",
+        "ALTER TABLE paper_trades ADD COLUMN chat_title TEXT",
+        "ALTER TABLE paper_trades ADD COLUMN option_type TEXT",
+        "ALTER TABLE paper_trades ADD COLUMN strike REAL",
+    ] {
+        ensure_column(&pool, sql).await;
+    }
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS open_positions (
@@ -619,7 +630,7 @@ pub async fn db_writer(
                 ticker, action, qty, executed_price,
                 gross_value, brokerage, stt_charge, sebi_fee,
                 stamp_duty, transaction_charge, gst, net_value,
-                signal_id, raw_message, exit_reason, mode,
+                tag, exit_reason, mode,
             } => {
                 // The fill happened at the broker whether or not the rows
                 // below land, so the balance is re-read either way.
@@ -641,13 +652,15 @@ pub async fn db_writer(
                      (ticker, action, qty, executed_price, timestamp,
                       gross_value, brokerage, stt_charge, sebi_fee,
                       stamp_duty, transaction_charge, gst, net_value,
-                      signal_id, raw_message, exit_reason, mode)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      signal_id, raw_message, exit_reason, mode,
+                      chat_id, chat_title, option_type, strike)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 )
                  .bind(&ticker).bind(&action).bind(qty as i64).bind(executed_price).bind(&timestamp)
                 .bind(gross_value).bind(brokerage).bind(stt_charge).bind(sebi_fee)
                 .bind(stamp_duty).bind(transaction_charge).bind(gst).bind(net_value)
-                .bind(&signal_id).bind(&raw_message).bind(&exit_reason).bind(&mode)
+                .bind(&tag.signal_id).bind(&tag.raw_message).bind(&exit_reason).bind(&mode)
+                .bind(tag.chat_id).bind(&tag.chat_title).bind(&tag.option_type).bind(tag.strike)
                 .execute(&mut *tx).await
                 {
                     tracing::error!("DB trade insert: {e}");
@@ -859,6 +872,39 @@ mod tests {
 
         clear_telegram_resume(&pool).await;
         assert!(load_telegram_resume(&pool).await.is_none());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_trade_row_keeps_its_call_chat_side_and_strike() {
+        let db = TempDb::new("trade-tag");
+        let pool = init_db(&db.url()).await;
+        let (tx, rx) = mpsc::channel(4);
+        let writer = tokio::spawn(db_writer(rx, pool.clone(), Arc::new(BalanceCache::new())));
+        let tag = shared_domain::TradeTag {
+            signal_id: Some("27962".into()),
+            raw_message: Some("BUY NIFTY 25000 CE ABOVE 120".into()),
+            chat_id: Some(-1001),
+            chat_title: Some("Alpha Calls".into()),
+            option_type: Some("CE".into()),
+            strike: Some(25_000.0),
+        };
+        tx.send(DbWriteMessage::Trade {
+            ticker: "NIFTY".into(), action: "BUY".into(), qty: 65, executed_price: 120.0,
+            gross_value: 7_800.0, brokerage: 20.0, stt_charge: 0.0, sebi_fee: 0.0078,
+            stamp_duty: 0.234, transaction_charge: 2.73, gst: 4.09, net_value: 7_827.06,
+            tag, exit_reason: Some("ENTRY".into()), mode: "PAPER".into(),
+        }).await.unwrap();
+        drop(tx);
+        writer.await.unwrap();
+
+        let row: (Option<i64>, Option<String>, Option<String>, Option<f64>, Option<String>) = sqlx::query_as(
+            "SELECT chat_id, chat_title, option_type, strike, signal_id FROM paper_trades",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (Some(-1001), Some("Alpha Calls".into()), Some("CE".into()), Some(25_000.0), Some("27962".into())));
         pool.close().await;
     }
 

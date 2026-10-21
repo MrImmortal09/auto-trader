@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;
-use shared_domain::{current_ist_timestamp_string, DbWriteMessage, TradeState};
+use shared_domain::{current_ist_timestamp_string, DbWriteMessage, TradeState, TradeTag};
 use trading_engine::{Exchange, FeeCalculator};
 
 use crate::routes::positions::persist_positions_snapshot;
@@ -51,13 +51,15 @@ pub async fn post_kill_switch_handler(State(state): State<AppState>) -> impl Int
                     );
                     let timestamp = current_ist_timestamp_string();
 
+                    let tag = TradeTag::of(&pos.signal);
                     let _ = sqlx::query(
                         "INSERT INTO paper_trades
                          (ticker, action, qty, executed_price, timestamp,
                           gross_value, brokerage, stt_charge, sebi_fee,
                           stamp_duty, transaction_charge, gst, net_value,
-                          signal_id, raw_message, exit_reason, mode)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          signal_id, raw_message, exit_reason, mode,
+                          chat_id, chat_title, option_type, strike)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     )
                     .bind(&instrument)
                     .bind("SELL")
@@ -72,10 +74,14 @@ pub async fn post_kill_switch_handler(State(state): State<AppState>) -> impl Int
                     .bind(fees.transaction_charge)
                     .bind(fees.gst)
                     .bind(fees.net_value)
-                    .bind(pos.signal.signal_id.as_deref())
-                    .bind(pos.signal.raw_message.as_deref())
+                    .bind(&tag.signal_id)
+                    .bind(&tag.raw_message)
                     .bind("KILL_SWITCH")
                     .bind("PAPER")
+                    .bind(tag.chat_id)
+                    .bind(&tag.chat_title)
+                    .bind(&tag.option_type)
+                    .bind(tag.strike)
                     .execute(&state.db_pool)
                     .await;
 
