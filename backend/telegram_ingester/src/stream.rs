@@ -91,13 +91,16 @@ pub(crate) async fn run_event_loop(
         // Routing (and why its order matters) lives in `classify_with`, where
         // the tests can reach it.
         let flags_now = *flags.read().await;
+        // Which chat it came from: kept on a call's position and trades, and
+        // what a reply or an edit is matched within — message ids are only
+        // unique per chat.
+        let chat = SignalChat {
+            id: chat_id,
+            title: msg.peer().and_then(|p| p.name()).map(str::to_string),
+        };
         match classify_with(text, &msg_id_str, reply_to.as_deref(), today_ist(), flags_now) {
             Inbound::Signal(mut signal) => {
-                // Which chat it came from, kept on the position and its trades.
-                signal.chat = Some(SignalChat {
-                    id: chat_id,
-                    title: msg.peer().and_then(|p| p.name()).map(str::to_string),
-                });
+                signal.chat = Some(chat);
                 tracing::info!(
                     instrument = %signal.instrument_name,
                     action = %signal.action,
@@ -145,7 +148,7 @@ pub(crate) async fn run_event_loop(
                 telemetry::telegram_parsed(ParseResult::Unparsed);
             }
             Inbound::SlUpdate { parent, new_sl } => {
-                let signal = reply_update(text, parent, "UPDATE_SL", 0.0, new_sl);
+                let signal = reply_update(text, parent, chat, "UPDATE_SL", 0.0, new_sl);
                 tracing::info!(new_sl, "Reply parsed as SL update — broadcasting");
                 telemetry::telegram_parsed(ParseResult::SlUpdate);
                 if tx.send(signal).is_err() {
@@ -153,7 +156,7 @@ pub(crate) async fn run_event_loop(
                 }
             }
             Inbound::Exit { parent, price } => {
-                let signal = reply_update(text, parent, "EXIT_AT", price, 0.0);
+                let signal = reply_update(text, parent, chat, "EXIT_AT", price, 0.0);
                 tracing::info!(exit_price = price, "Reply parsed as EXIT_AT — broadcasting");
                 telemetry::telegram_parsed(ParseResult::Exit);
                 if tx.send(signal).is_err() {
@@ -187,8 +190,8 @@ async fn record_log(
 }
 
 /// The bare `UPDATE_SL` / `EXIT_AT` signal the monitor matches to the position
-/// opened from message `parent`.
-fn reply_update(text: &str, parent: String, action: &str, entry_price: f64, stop_loss: f64) -> TradeSignal {
+/// opened from message `parent` in `chat`.
+fn reply_update(text: &str, parent: String, chat: SignalChat, action: &str, entry_price: f64, stop_loss: f64) -> TradeSignal {
     TradeSignal {
         instrument_name: "UPDATE".to_string(),
         strike: None,
@@ -203,7 +206,7 @@ fn reply_update(text: &str, parent: String, action: &str, entry_price: f64, stop
         source: "telegram_reply".to_string(),
         signal_id: Some(parent),
         raw_message: Some(text.to_owned()),
-        chat: None,
+        chat: Some(chat),
     }
 }
 

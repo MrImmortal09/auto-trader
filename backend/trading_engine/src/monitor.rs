@@ -187,6 +187,20 @@ fn find_duplicate_open_position<'a>(
 }
 
 
+/// Whether `incoming` — a reply command or a call that may be an edit — is
+/// about `pos`'s call: the same Telegram message in the same chat. Telegram
+/// numbers messages per chat, so a message id alone can belong to another
+/// channel's call. A position or update with no chat recorded (opened before
+/// chats were kept, or from the webhook) matches on the id alone, as before.
+fn same_message(pos: &TradeSignal, incoming: &TradeSignal) -> bool {
+    pos.signal_id.is_some()
+        && pos.signal_id == incoming.signal_id
+        && match (&pos.chat, &incoming.chat) {
+            (Some(a), Some(b)) => a.id == b.id,
+            _ => true,
+        }
+}
+
 /// Lots to buy for `instrument_name`: the per-index override if one is set
 /// (see `TradingConfig::index_lots_by_symbol`), else `index_lots` for a known
 /// index, else `other_lots` for anything else (stock options).
@@ -4053,7 +4067,7 @@ pub async fn start_position_monitor(
                                 // (instrument, stop before the reply, verdict)
                                 let mut matched = None;
                                 for p in write_guard.iter_mut() {
-                                    if p.signal.signal_id.as_ref() == Some(sig_id) {
+                                    if same_message(&p.signal, &signal) {
                                         let verdict = sl_change_verdict(p, signal.stop_loss, &cfg, &gate);
                                         let before = p.current_sl;
                                         if matches!(verdict, SlChange::Apply { .. }) {
@@ -4108,7 +4122,7 @@ pub async fn start_position_monitor(
                                 let mut write_guard = positions.write().await;
                                 let mut updated = false;
                                 for p in write_guard.iter_mut() {
-                                    if p.signal.signal_id.as_ref() == Some(sig_id) {
+                                    if same_message(&p.signal, &signal) {
                                         if !matches!(p.state, TradeState::Closed) {
                                             // The price is advisory: PAPER books the
                                             // exit at it, LIVE exits at market and
@@ -4161,7 +4175,7 @@ pub async fn start_position_monitor(
                             // `None` when the edit changed the entry (force-exited below).
                             let mut sl_result = None;
                             for p in write_guard.iter_mut() {
-                                if p.signal.signal_id.as_ref() == Some(sig_id) {
+                                if same_message(&p.signal, &signal) {
                                     if p.signal.entry_price != signal.entry_price
                                         || p.signal.entry_price_max != signal.entry_price_max
                                         || p.signal.entry_condition != signal.entry_condition
@@ -7147,5 +7161,209 @@ mod tests {
         let (left, sells) = paper_chart_run(pos, ltp, &[(NIFTY_SPOT, 25_080.0), (NIFTY_SPOT, 25_055.0)]).await;
         assert!(left.is_empty());
         assert_eq!(sells, vec![("SELL".to_string(), 150, "CHART_STOP".to_string())]);
+    }
+
+    // ── Replies and edits stay within their chat ─────────────────────── //
+
+    fn chat(id: i64) -> Option<shared_domain::SignalChat> {
+        Some(shared_domain::SignalChat { id, title: None })
+    }
+
+    #[test]
+    fn a_reply_or_edit_is_about_the_same_message_in_the_same_chat() {
+        let mut pos = matching_signal();
+        pos.signal_id = Some("42".into());
+        pos.chat = chat(-100);
+        let mut incoming = pos.clone();
+        assert!(same_message(&pos, &incoming));
+        // Telegram numbers messages per chat: another chat's message 42 is
+        // another call.
+        incoming.chat = chat(-200);
+        assert!(!same_message(&pos, &incoming));
+        incoming.chat = chat(-100);
+        incoming.signal_id = Some("43".into());
+        assert!(!same_message(&pos, &incoming));
+        // With no chat on one side — a position opened before chats were
+        // kept, or a webhook signal — the id alone decides, as before.
+        incoming.signal_id = Some("42".into());
+        incoming.chat = None;
+        assert!(same_message(&pos, &incoming));
+        pos.chat = None;
+        incoming.chat = chat(-200);
+        assert!(same_message(&pos, &incoming));
+        // No id, no match.
+        pos.signal_id = None;
+        incoming.signal_id = None;
+        assert!(!same_message(&pos, &incoming));
+    }
+
+    /// Chat -100's call, message 42: Active, 75 held at 120, stop 100,
+    /// targets 140/160, LTP 135.
+    fn chat_a_call_42(ltp: &Arc<DashMap<String, f64>>) -> MonitoredPosition {
+        let mut pos = live_one_lot_at_target1(ltp);
+        pos.signal.signal_id = Some("42".into());
+        pos.signal.chat = chat(-100);
+        ltp.insert("nse_fo|999".to_string(), 135.0);
+        pos
+    }
+
+    /// Run the PAPER monitor over `positions`: returns the positions it
+    /// shares, its DB writes, and where to send it signals.
+    fn spawn_paper_monitor(
+        positions: Vec<MonitoredPosition>,
+        ltp: &Arc<DashMap<String, f64>>,
+        store: Option<crate::scrip_master::ScripStore>,
+    ) -> (Arc<RwLock<Vec<MonitoredPosition>>>, mpsc::Receiver<DbWriteMessage>, broadcast::Sender<TradeSignal>) {
+        let positions = Arc::new(RwLock::new(positions));
+        let (db_tx, db_rx) = mpsc::channel(1024);
+        let (signal_tx, signal_rx) = broadcast::channel(8);
+        tokio::spawn(start_position_monitor(
+            signal_rx,
+            db_tx,
+            ltp.clone(),
+            Arc::new(RwLock::new(cfg_with_lots(1, 3))),
+            positions.clone(),
+            broadcast::channel(1024).0,
+            Arc::new(RwLock::new(store)),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            entry_gate::new_indicator_feed(),
+        ));
+        (positions, db_rx, signal_tx)
+    }
+
+    /// A reply on message 42 from `from`, as the ingester sends it.
+    fn reply_on_42(action: &str, from: Option<shared_domain::SignalChat>, price: f64, new_sl: f64) -> TradeSignal {
+        TradeSignal {
+            instrument_name: "UPDATE".into(),
+            strike: None,
+            option_type: None,
+            expiry: None,
+            action: action.into(),
+            entry_condition: "ABOVE".into(),
+            entry_price: price,
+            entry_price_max: None,
+            targets: vec![],
+            stop_loss: new_sl,
+            source: "telegram_reply".into(),
+            signal_id: Some("42".into()),
+            raw_message: None,
+            chat: from,
+        }
+    }
+
+    /// Another chat's "move SL" and "exit" replies on its own message 42
+    /// leave chat -100's message-42 position alone, and are reported as
+    /// matching nothing. The same replies from -100 apply.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_from_another_chat_does_not_touch_the_position() {
+        let ltp = Arc::new(DashMap::new());
+        let (positions, mut db_rx, signal_tx) = spawn_paper_monitor(vec![chat_a_call_42(&ltp)], &ltp, None);
+        signal_tx.send(reply_on_42("UPDATE_SL", chat(-200), 0.0, 110.0)).unwrap();
+        signal_tx.send(reply_on_42("EXIT_AT", chat(-200), 130.0, 0.0)).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        {
+            let g = positions.read().await;
+            assert_eq!(g.len(), 1);
+            assert!(matches!(g[0].state, TradeState::Active));
+            assert_eq!((g[0].current_sl, g[0].force_exit.as_deref()), (100.0, None));
+        }
+        let mut unmatched = 0;
+        while let Ok(msg) = db_rx.try_recv() {
+            match msg {
+                DbWriteMessage::Trade { .. } => panic!("nothing may be sold"),
+                DbWriteMessage::Log { level, message } if message.contains("no open position for the replied-to signal") => {
+                    assert_eq!(level, "ERROR");
+                    unmatched += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(unmatched, 2);
+
+        signal_tx.send(reply_on_42("UPDATE_SL", chat(-100), 0.0, 110.0)).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(positions.read().await[0].current_sl, 110.0);
+        signal_tx.send(reply_on_42("EXIT_AT", chat(-100), 130.0, 0.0)).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(positions.read().await.is_empty());
+        let mut sells = Vec::new();
+        while let Ok(msg) = db_rx.try_recv() {
+            if let DbWriteMessage::Trade { action, qty, exit_reason, .. } = msg {
+                sells.push((action, qty, exit_reason.unwrap_or_default()));
+            }
+        }
+        assert_eq!(sells, vec![("SELL".to_string(), 75, "EXIT_AT_130.00".to_string())]);
+    }
+
+    /// A call in another chat can carry the same message id as an open
+    /// position's call. It is a new call, not an edit of that position —
+    /// which its different entry used to force-exit (ENTRY_CHANGED_ERROR),
+    /// dropping the call itself. An edit from the position's own chat still
+    /// applies in place.
+    #[tokio::test(start_paused = true)]
+    async fn another_chats_call_with_the_same_message_id_is_a_new_call() {
+        let ltp = Arc::new(DashMap::new());
+        let mut store = crate::scrip_master::ScripStore::default();
+        store.records.insert("NIFTY".to_string(), vec![crate::scrip_master::ScripRecord {
+            instrument_token: "1001".into(),
+            trading_symbol: "NIFTY99D3125100CE".into(),
+            symbol_name: "NIFTY".into(),
+            exchange_segment_code: "nse_fo".into(),
+            strike_price: 2_510_000.0,
+            option_type: "CE".into(),
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2099, 12, 31).unwrap(),
+            lot_size: 75,
+            tick_size: 0.05,
+        }]);
+        let original = chat_a_call_42(&ltp);
+        let (positions, mut db_rx, signal_tx) = spawn_paper_monitor(vec![original.clone()], &ltp, Some(store));
+        // Same side, another strike and entry: neither a duplicate nor an
+        // opposite call of the open position.
+        signal_tx.send(TradeSignal {
+            instrument_name: "NIFTY".into(),
+            strike: Some(25100.0),
+            option_type: Some("CE".into()),
+            expiry: None,
+            action: "BUY".into(),
+            entry_condition: "ABOVE".into(),
+            entry_price: 90.0,
+            entry_price_max: None,
+            targets: vec![110.0, 130.0],
+            stop_loss: 70.0,
+            source: "telegram".into(),
+            signal_id: Some("42".into()),
+            raw_message: None,
+            chat: chat(-200),
+        }).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Taken in as a position of its own, whatever the time: past the
+        // 15:39 cutoff (the clock here is real) the next tick then expires it
+        // unfilled, as it would any call.
+        let mut taken = false;
+        while let Ok(msg) = db_rx.try_recv() {
+            if let DbWriteMessage::PositionsSnapshot { json } = msg {
+                let snapshot: Vec<MonitoredPosition> = serde_json::from_str(&json).unwrap();
+                taken |= snapshot.iter().any(|p| p.signal.chat == chat(-200) && p.signal.strike == Some(25100.0));
+            }
+        }
+        assert!(taken, "the new call was taken in");
+        {
+            let g = positions.read().await;
+            let a = g.iter().find(|p| p.signal.chat == chat(-100)).expect("chat -100's position is still open");
+            assert!(matches!(a.state, TradeState::Active));
+            assert_eq!(a.force_exit, None);
+            assert_eq!((a.signal.entry_price, a.signal.targets.as_slice(), a.current_sl), (120.0, &[140.0, 160.0][..], 100.0));
+        }
+
+        // Chat -100 editing its message 42: same entry, new targets and stop.
+        let mut edit = original.signal.clone();
+        edit.targets = vec![145.0, 170.0];
+        edit.stop_loss = 105.0;
+        signal_tx.send(edit).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let g = positions.read().await;
+        let a = g.iter().find(|p| p.signal.chat == chat(-100)).expect("chat -100's position is still open");
+        assert_eq!((a.signal.targets.as_slice(), a.current_sl), (&[145.0, 170.0][..], 105.0));
     }
 }
