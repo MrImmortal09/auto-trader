@@ -9,7 +9,13 @@
 //! - `GET /v2/option/contract`      — list option contracts → nearest expiry
 //! - `GET /v2/option/chain`         — full put/call chain with `oi` + `prev_oi`
 //! - `GET /v2/market-quote/quotes`  — full quote (`last_price`, `average_price`)
-//! - instruments JSON (gzip)        — to find the current-month index future
+//! - `GET /v3/historical-candle/…`  — OHLCV candles for past days
+//! - `GET /v3/historical-candle/intraday/…` — today's OHLCV candles
+//! - `GET /v3/feed/market-data-feed/authorize` — the live feed's WebSocket URL
+//!   (see [`feed`])
+//! - instruments JSON (gzip)        — index futures and options by contract
+
+pub mod feed;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,7 +27,10 @@ use serde::de::{DeserializeOwned, DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use shared_domain::telemetry;
 
+pub use feed::LtpTick;
+
 const API_BASE: &str = "https://api.upstox.com/v2";
+const API_V3: &str = "https://api.upstox.com/v3";
 /// Per-request budget for the small JSON API calls.
 const API_TIMEOUT: Duration = Duration::from_secs(20);
 /// Budget for downloading a multi-MB gzipped instruments file.
@@ -44,6 +53,8 @@ pub enum UpstoxError {
     Api { status: u16, body: String },
     #[error("decode error: {0}")]
     Decode(String),
+    #[error("market-data feed: {0}")]
+    Feed(String),
 }
 
 /// Fixed metric label for an API path (the paths are literals in this file).
@@ -61,6 +72,26 @@ impl UpstoxError {
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, UpstoxError::Api { status: 401 | 403, .. })
     }
+}
+
+/// Fixed metric label for a call's outcome.
+fn result_label<T>(res: &Result<T, UpstoxError>) -> &'static str {
+    match res {
+        Ok(_) => "ok",
+        Err(UpstoxError::Api { status, .. }) => telemetry::status_class(*status),
+        Err(UpstoxError::Decode(_)) => "decode_error",
+        Err(_) => "transport_error",
+    }
+}
+
+/// `key` as one URL path segment: `NSE_INDEX|Nifty 50` → `NSE_INDEX%7CNifty%2050`.
+fn path_segment(key: &str) -> String {
+    key.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Accepts a JSON number, a numeric string, or null (→ 0.0). Upstox returns
@@ -170,6 +201,65 @@ pub struct FutureContract {
     pub trading_symbol: String,
 }
 
+/// One OHLCV candle from the V3 candle APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Candle {
+    /// Unix ms of the candle's start (Upstox stamps a candle by its start).
+    pub start_ms: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    /// Traded during the candle; 0 for an index.
+    pub volume: f64,
+    pub oi: f64,
+}
+
+#[derive(Deserialize)]
+struct CandleData {
+    #[serde(default)]
+    candles: Vec<Vec<serde_json::Value>>,
+}
+
+/// `[timestamp, open, high, low, close, volume, oi]` rows, newest first as
+/// Upstox sends them, into candles oldest first. A row that can't be read is
+/// dropped, never guessed at.
+fn parse_candles(rows: &[Vec<serde_json::Value>]) -> Vec<Candle> {
+    let mut out: Vec<Candle> = rows
+        .iter()
+        .filter_map(|r| {
+            let start_ms = DateTime::parse_from_rfc3339(r.first()?.as_str()?).ok()?.timestamp_millis();
+            let n = |i: usize| r.get(i).and_then(|v| v.as_f64().or_else(|| v.as_str()?.trim().parse().ok()));
+            Some(Candle {
+                start_ms,
+                open: n(1)?,
+                high: n(2)?,
+                low: n(3)?,
+                close: n(4)?,
+                volume: n(5).unwrap_or(0.0),
+                oi: n(6).unwrap_or(0.0),
+            })
+        })
+        .collect();
+    out.sort_by_key(|c| c.start_ms);
+    out.dedup_by_key(|c| c.start_ms);
+    out
+}
+
+/// An index future or option, from the instruments files.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Derivative {
+    pub underlying: String,
+    /// `"FUT"`, `"CE"` or `"PE"`.
+    pub kind: String,
+    /// The IST date it expires on.
+    pub expiry: NaiveDate,
+    /// 0 for a future.
+    pub strike: f64,
+    pub instrument_key: String,
+    pub lot_size: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -198,13 +288,7 @@ impl UpstoxClient {
     ) -> Result<T, UpstoxError> {
         let started = std::time::Instant::now();
         let res = self.get_json_inner(path, params).await;
-        let result = match &res {
-            Ok(_) => "ok",
-            Err(UpstoxError::Api { status, .. }) => telemetry::status_class(*status),
-            Err(UpstoxError::Decode(_)) => "decode_error",
-            Err(_) => "transport_error",
-        };
-        telemetry::upstox_request(endpoint_label(path), result, started.elapsed().as_secs_f64());
+        telemetry::upstox_request(endpoint_label(path), result_label(&res), started.elapsed().as_secs_f64());
         res
     }
 
@@ -215,6 +299,24 @@ impl UpstoxClient {
     ) -> Result<T, UpstoxError> {
         let url = reqwest::Url::parse_with_params(&format!("{API_BASE}{path}"), params)
             .map_err(|e| UpstoxError::Decode(e.to_string()))?;
+        self.fetch(url, path).await
+    }
+
+    /// GET a V3 `path` (its segments already percent-encoded), timed under
+    /// `label`.
+    async fn get_v3<T: DeserializeOwned>(&self, path: &str, label: &'static str) -> Result<T, UpstoxError> {
+        let started = std::time::Instant::now();
+        let res = match reqwest::Url::parse(&format!("{API_V3}{path}")) {
+            Ok(url) => self.fetch(url, label).await,
+            Err(e) => Err(UpstoxError::Decode(e.to_string())),
+        };
+        telemetry::upstox_request(label, result_label(&res), started.elapsed().as_secs_f64());
+        res
+    }
+
+    /// GET `url` with the token and unwrap the response's `data`; `what`
+    /// names the call in a decode error.
+    async fn fetch<T: DeserializeOwned>(&self, url: reqwest::Url, what: &str) -> Result<T, UpstoxError> {
         let resp = self
             .http
             .get(url)
@@ -233,7 +335,37 @@ impl UpstoxClient {
         }
         serde_json::from_str::<Envelope<T>>(&body)
             .map(|e| e.data)
-            .map_err(|e| UpstoxError::Decode(format!("{path}: {e}")))
+            .map_err(|e| UpstoxError::Decode(format!("{what}: {e}")))
+    }
+
+    /// `interval_min`-minute candles for `key` (e.g. `NSE_INDEX|Nifty 50`) on
+    /// the days `from..=to`, oldest first. Past days only: Upstox answers
+    /// nothing for today here (see [`Self::intraday_candles`]), and allows at
+    /// most a month per request for intervals up to 15 minutes.
+    pub async fn historical_candles(
+        &self,
+        key: &str,
+        interval_min: u32,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<Candle>, UpstoxError> {
+        let path = format!(
+            "/historical-candle/{}/minutes/{interval_min}/{}/{}",
+            path_segment(key),
+            to.format("%Y-%m-%d"),
+            from.format("%Y-%m-%d"),
+        );
+        let data: CandleData = self.get_v3(&path, "historical_candle").await?;
+        Ok(parse_candles(&data.candles))
+    }
+
+    /// Today's `interval_min`-minute candles for `key`, oldest first. During
+    /// the session the newest one is still forming — Upstox sends it with
+    /// only a last price — so callers must not take it as a finished bar.
+    pub async fn intraday_candles(&self, key: &str, interval_min: u32) -> Result<Vec<Candle>, UpstoxError> {
+        let path = format!("/historical-candle/intraday/{}/minutes/{interval_min}", path_segment(key));
+        let data: CandleData = self.get_v3(&path, "intraday_candle").await?;
+        Ok(parse_candles(&data.candles))
     }
 
     /// Nearest option expiry on or after `today` for an underlying such as
@@ -293,12 +425,7 @@ impl UpstoxClient {
         wanted: &[&str],
         today: NaiveDate,
     ) -> Result<HashMap<String, FutureContract>, UpstoxError> {
-        let resp = self.http.get(instruments_url).timeout(INSTRUMENTS_TIMEOUT).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(UpstoxError::Api { status: status.as_u16(), body: String::new() });
-        }
-        let gz = resp.bytes().await?;
+        let gz = self.download_instruments(instruments_url).await?;
         let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
 
         tokio::task::spawn_blocking(move || {
@@ -311,6 +438,42 @@ impl UpstoxClient {
         })
         .await
         .map_err(|e| UpstoxError::Decode(e.to_string()))?
+    }
+
+    /// Every future and option on the `wanted` underlyings (`NIFTY`,
+    /// `SENSEX`, …) in an instruments file, stream-filtered the same way as
+    /// [`Self::nearest_index_futures`]. For the six indices that is about
+    /// 8,000 contracts across the NSE and BSE files.
+    pub async fn index_derivatives(
+        &self,
+        instruments_url: &str,
+        wanted: &[&str],
+    ) -> Result<Vec<Derivative>, UpstoxError> {
+        let gz = self.download_instruments(instruments_url).await?;
+        let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
+
+        tokio::task::spawn_blocking(move || {
+            let reader = BufReader::new(flate2::read::GzDecoder::new(&gz[..]));
+            let mut de = serde_json::Deserializer::from_reader(reader);
+            let keep = |r: &InstrumentRow| is_index_derivative(r, &wanted);
+            let rows = RowFilter { keep: &keep }
+                .deserialize(&mut de)
+                .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))?;
+            Ok(rows.iter().filter_map(to_derivative).collect())
+        })
+        .await
+        .map_err(|e| UpstoxError::Decode(e.to_string()))?
+    }
+
+    /// The gzipped bytes of an instruments file (a few MB; the rows are
+    /// decompressed and filtered as a stream by the callers).
+    async fn download_instruments(&self, instruments_url: &str) -> Result<bytes::Bytes, UpstoxError> {
+        let resp = self.http.get(instruments_url).timeout(INSTRUMENTS_TIMEOUT).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(UpstoxError::Api { status: status.as_u16(), body: String::new() });
+        }
+        Ok(resp.bytes().await?)
     }
 }
 
@@ -332,6 +495,61 @@ struct InstrumentRow {
     trading_symbol: String,
     #[serde(default, deserialize_with = "num")]
     expiry: f64,
+    #[serde(default, deserialize_with = "num")]
+    strike_price: f64,
+    #[serde(default, deserialize_with = "num")]
+    lot_size: f64,
+}
+
+/// A future or option on one of `wanted`, in an F&O segment.
+fn is_index_derivative(row: &InstrumentRow, wanted: &[String]) -> bool {
+    matches!(row.instrument_type.as_str(), "FUT" | "CE" | "PE")
+        && row.segment.ends_with("_FO")
+        && wanted.iter().any(|w| *w == row.underlying_symbol)
+}
+
+/// Upstox stamps expiry as epoch millis on the expiry day itself, so the IST
+/// date of that instant is the expiry date.
+fn to_derivative(row: &InstrumentRow) -> Option<Derivative> {
+    let expiry = DateTime::from_timestamp_millis(row.expiry as i64)?
+        .with_timezone(&shared_domain::ist_offset())
+        .date_naive();
+    Some(Derivative {
+        underlying: row.underlying_symbol.clone(),
+        kind: row.instrument_type.clone(),
+        expiry,
+        strike: if row.instrument_type == "FUT" { 0.0 } else { row.strike_price },
+        instrument_key: row.instrument_key.clone(),
+        lot_size: row.lot_size.max(0.0) as u32,
+    })
+}
+
+/// Keeps the rows `keep` accepts while the instruments array streams past.
+struct RowFilter<'a, F: Fn(&InstrumentRow) -> bool> {
+    keep: &'a F,
+}
+
+impl<'de, F: Fn(&InstrumentRow) -> bool> DeserializeSeed<'de> for RowFilter<'_, F> {
+    type Value = Vec<InstrumentRow>;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'de, F: Fn(&InstrumentRow) -> bool> Visitor<'de> for RowFilter<'_, F> {
+    type Value = Vec<InstrumentRow>;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("an array of instruments")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut out = Vec::new();
+        while let Some(row) = seq.next_element::<InstrumentRow>()? {
+            if (self.keep)(&row) {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
 }
 
 struct FutFilter<'a> {
@@ -466,5 +684,76 @@ mod tests {
         assert_eq!(pick_nearest_futures(rows(&json), date(24))["NIFTY"].instrument_key, "NSE_FO|1");
         // The day after, it rolls to October.
         assert_eq!(pick_nearest_futures(rows(&json), date(25))["NIFTY"].instrument_key, "NSE_FO|2");
+    }
+
+    fn ist_ms(d: u32, h: u32, m: u32) -> i64 {
+        NaiveDate::from_ymd_opt(2026, 10, d)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap()
+            .and_local_timezone(shared_domain::ist_offset())
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn candles_come_back_oldest_first_and_unreadable_rows_are_dropped() {
+        // Shape of a real intraday answer: newest first, numbers or strings.
+        let body = r#"{"status":"success","data":{"candles":[
+            ["2026-10-21T09:20:00+05:30",23039.2,23045.0,23001.5,23010.0,0,0],
+            ["2026-10-21T09:15:00+05:30",23016.0,23063.6,22976.15,23039.2,1200,"35"],
+            ["not a time",1,1,1,1,0,0],
+            ["2026-10-21T09:25:00+05:30",null,1,1,1,0,0]
+        ]}}"#;
+        let env: Envelope<CandleData> = serde_json::from_str(body).unwrap();
+        let candles = parse_candles(&env.data.candles);
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].start_ms, ist_ms(21, 9, 15));
+        assert_eq!((candles[0].open, candles[0].high, candles[0].volume, candles[0].oi), (23016.0, 23063.6, 1200.0, 35.0));
+        assert_eq!(candles[1].start_ms, ist_ms(21, 9, 20));
+    }
+
+    #[test]
+    fn an_instrument_key_is_one_encoded_path_segment() {
+        assert_eq!(path_segment("NSE_INDEX|Nifty 50"), "NSE_INDEX%7CNifty%2050");
+        assert_eq!(path_segment("BSE_FO|1101628"), "BSE_FO%7C1101628");
+    }
+
+    #[test]
+    fn derivatives_keep_the_wanted_futures_and_options_with_their_ist_expiry() {
+        // Rows as they appear in NSE.json.gz on 2026-10-21. Expiry is the
+        // epoch millis of 15:29:59 IST on the expiry day.
+        let json = r#"[
+            {"segment":"NSE_INDEX","instrument_type":"INDEX","instrument_key":"NSE_INDEX|Nifty 50"},
+            {"segment":"NSE_FO","instrument_type":"CE","underlying_symbol":"MIDCPNIFTY","instrument_key":"NSE_FO|50918","lot_size":120,"strike_price":15250.0,"expiry":1793125799000},
+            {"segment":"NSE_FO","instrument_type":"FUT","underlying_symbol":"BANKNIFTY","instrument_key":"NSE_FO|48699","lot_size":30,"strike_price":0,"expiry":1793125799000},
+            {"segment":"NSE_FO","instrument_type":"PE","underlying_symbol":"RELIANCE","instrument_key":"NSE_FO|7","lot_size":500,"strike_price":3000,"expiry":1793125799000},
+            {"segment":"NSE_EQ","instrument_type":"EQ","instrument_key":"NSE_EQ|INE002A01018"}
+        ]"#;
+        let wanted = vec!["MIDCPNIFTY".to_string(), "BANKNIFTY".to_string()];
+        let keep = |r: &InstrumentRow| is_index_derivative(r, &wanted);
+        let mut de = serde_json::Deserializer::from_str(json);
+        let rows = RowFilter { keep: &keep }.deserialize(&mut de).unwrap();
+        let found: Vec<Derivative> = rows.iter().filter_map(to_derivative).collect();
+
+        let oct27 = NaiveDate::from_ymd_opt(2026, 10, 27).unwrap();
+        assert_eq!(found, vec![
+            Derivative {
+                underlying: "MIDCPNIFTY".into(),
+                kind: "CE".into(),
+                expiry: oct27,
+                strike: 15250.0,
+                instrument_key: "NSE_FO|50918".into(),
+                lot_size: 120,
+            },
+            Derivative {
+                underlying: "BANKNIFTY".into(),
+                kind: "FUT".into(),
+                expiry: oct27,
+                strike: 0.0,
+                instrument_key: "NSE_FO|48699".into(),
+                lot_size: 30,
+            },
+        ]);
     }
 }

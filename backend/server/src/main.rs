@@ -5,6 +5,7 @@
 //! - [`routes`] — Axum route handlers (portfolio, settings, auth)
 
 mod balance;
+mod candles;
 mod db;
 mod execute;
 mod market_data;
@@ -164,6 +165,10 @@ pub(crate) struct AppState {
     pub balance: Arc<balance::BalanceCache>,
     /// The Execute screen's option ladders — see `execute`.
     pub execute: Arc<execute::ExecuteBoard>,
+    /// Read-only Upstox client (`UPSTOX_ANALYTICS_TOKEN`), when configured.
+    pub upstox: Option<upstox_client::UpstoxClient>,
+    /// The v2 charts' bars — started by the first `/api/v2/candles` request.
+    pub candles: Arc<candles::CandleService>,
 }
 
 // ---------------------------------------------------------------------------
@@ -935,7 +940,7 @@ async fn main() {
         }
     };
     let market = Arc::new(market_data::MarketDataState::new(upstox.is_some()));
-    if let Some(client) = upstox {
+    if let Some(client) = upstox.clone() {
         tokio::spawn(market_data::run_poller(
             client,
             Arc::clone(&market),
@@ -976,6 +981,8 @@ async fn main() {
         pulse: Arc::new(pulse::PulseHub::new()),
         balance,
         execute: Arc::new(execute::ExecuteBoard::new()),
+        upstox,
+        candles: Arc::new(candles::CandleService::new()),
     };
     pulse::spawn_sampler(state.clone());
     state.execute.spawn_error_watch(&state.log_tx);
@@ -1038,6 +1045,8 @@ async fn main() {
         .route("/api/auth/session",                 get(routes::session_status_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
+        .route("/api/v2/candles",                   get(routes::v2::candles_handler))
+        .route("/api/v2/candles/stream",            get(routes::v2::candles_stream_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
         .layer(middleware::from_fn(auth_middleware))
         // Outside auth, so rejected requests are counted too.

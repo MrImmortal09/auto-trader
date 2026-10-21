@@ -3,7 +3,7 @@
 //! # Modules
 //! - [`error`]     — `KotakError`, `KotakCredentials`
 //! - [`client`]    — `KotakClient` (REST: login, orders, order book, positions, limits)
-//! - [`websocket`] — `start_market_data_stream` (live prices)
+//! - [`websocket`] — `start_market_data_stream` (live prices), `subscribe_ticks`
 
 pub mod error;
 pub mod client;
@@ -13,7 +13,7 @@ pub mod websocket;
 pub use error::{KotakCredentials, KotakError};
 pub use client::{KotakClient, KotakLimits, KotakOrder, KotakPosition};
 pub use totp::generate_totp;
-pub use websocket::start_market_data_stream;
+pub use websocket::{start_market_data_stream, subscribe_ticks, PriceTick};
 
 use std::sync::Arc;
 use dashmap::DashMap;

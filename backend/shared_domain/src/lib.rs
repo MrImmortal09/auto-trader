@@ -1183,6 +1183,21 @@ pub enum DbWriteMessage {
         fut_ltp: Option<f64>,
         fut_vwap: Option<f64>,
     },
+    /// One of today's 1-minute bars for a v2 chart (analytics only), cached
+    /// so a restart doesn't lose the day. `source` is `"upstox"` for an
+    /// official minute, `"ticks"` for one built from live ticks; an official
+    /// minute is never overwritten by a ticked one.
+    CandleMinute {
+        symbol: String,
+        /// Unix ms of the minute's start.
+        t: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: Option<f64>,
+        source: &'static str,
+    },
 }
 
 #[cfg(test)]

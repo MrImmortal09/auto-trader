@@ -1,9 +1,42 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::broadcast;
 use shared_domain::telemetry;
 use tracing::{error, info, warn};
+
+/// One price as the bridge decoded it, stamped when this server read it.
+#[derive(Debug, Clone)]
+pub struct PriceTick {
+    /// Price-map key: `nse_fo|47158`, or `idx|NIFTY 50` for an index.
+    pub key: String,
+    pub ltp: f64,
+    /// Unix ms it was read from the bridge.
+    pub at_ms: i64,
+}
+
+/// Room for a burst of ticks while a listener catches up.
+const TICK_TAP_CAPACITY: usize = 4096;
+
+static TICK_TAP: LazyLock<broadcast::Sender<PriceTick>> =
+    LazyLock::new(|| broadcast::channel(TICK_TAP_CAPACITY).0);
+
+/// Every price the bridge decodes from now on, for the v2 candle service.
+/// The feed never waits on a listener: with none it skips the copy, and one
+/// that falls behind misses ticks (`RecvError::Lagged`), never the feed.
+pub fn subscribe_ticks() -> broadcast::Receiver<PriceTick> {
+    TICK_TAP.subscribe()
+}
+
+/// Copy one decoded price to the tap — only while something listens, so with
+/// no v2 client open the feed does exactly what it did before the tap.
+fn publish_tick(key: &str, ltp: f64) {
+    if TICK_TAP.receiver_count() > 0 {
+        let at_ms = shared_domain::now_ist().timestamp_millis();
+        let _ = TICK_TAP.send(PriceTick { key: key.to_string(), ltp, at_ms });
+    }
+}
 
 fn resolve_bridge_dir() -> Option<PathBuf> {
     let mut candidates = Vec::new();
@@ -197,6 +230,7 @@ pub async fn start_market_data_stream(
                                                 format!("{}|{}", e.to_ascii_lowercase(), tk.trim())
                                             };
                                             telemetry::feed_tick(&key);
+                                            publish_tick(&key, ltp);
                                             prices_clone.insert(key, ltp);
                                         }
                                     }
@@ -309,5 +343,14 @@ mod subscription_tests {
         let mut all = subs.all_scrips();
         all.sort();
         assert_eq!(all, ["nse_fo|1", "nse_fo|2"]);
+    }
+
+    #[test]
+    fn a_tick_reaches_whoever_listens() {
+        let mut rx = subscribe_ticks();
+        publish_tick("nse_fo|51342", 159.55);
+        let tick = rx.try_recv().expect("the listener gets the tick");
+        assert_eq!((tick.key.as_str(), tick.ltp), ("nse_fo|51342", 159.55));
+        assert!(tick.at_ms > 0);
     }
 }
