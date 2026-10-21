@@ -1,7 +1,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 
 // Figma "Button". On jade, brick and marigold fills the text is dark.
-export type ButtonKind = 'profit' | 'loss' | 'loss-outline' | 'neutral' | 'ghost' | 'alert';
+export type ButtonKind = 'profit' | 'loss' | 'loss-outline' | 'neutral' | 'ghost' | 'quiet' | 'alert' | 'live';
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
 const KIND: Record<ButtonKind, string> = {
@@ -10,7 +10,10 @@ const KIND: Record<ButtonKind, string> = {
   'loss-outline': 'border border-loss text-loss hover:bg-loss-subtle',
   neutral: 'bg-raised text-fg hover:bg-line',
   ghost: 'text-fg hover:bg-raised',
+  quiet: 'text-fg-muted hover:bg-raised hover:text-fg',
   alert: 'border border-loss text-loss hover:bg-loss-subtle',
+  // Real money: marigold, only for going LIVE.
+  live: 'bg-live text-on-accent hover:brightness-110',
 };
 
 const SIZE: Record<ButtonSize, string> = {
