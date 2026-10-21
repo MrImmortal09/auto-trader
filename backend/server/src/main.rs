@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use axum::{routing::{get, post}, Router};
 use chrono::{Datelike, Duration as ChronoDuration};
 use dashmap::DashMap;
-use shared_domain::{DbWriteMessage, TradeSignal, TradingConfig};
+use shared_domain::{DbWriteMessage, FeatureFlags, TradeSignal, TradingConfig};
 use sqlx::sqlite::SqlitePool;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tower_http::{cors::CorsLayer, services::ServeDir};
@@ -118,6 +118,9 @@ pub(crate) struct AppState {
     pub db_tx:       mpsc::Sender<DbWriteMessage>,
     /// Runtime trading config — updated by POST /api/settings.
     pub trading_cfg: Arc<RwLock<TradingConfig>>,
+    /// v2 engine switches — updated by PUT /api/v2/flags, read by the
+    /// Telegram loop on every message and by the webhook.
+    pub flags: Arc<RwLock<FeatureFlags>>,
     /// Live price map shared with the position monitor.
     pub prices:      Arc<DashMap<String, f64>>,
     /// Authenticated Kotak client (None until POST /api/auth/kotak).
@@ -678,6 +681,8 @@ async fn main() {
     // 3. Load TradingConfig from DB
     let trading_cfg = Arc::new(RwLock::new(db::load_config_from_db(&pool).await));
     tracing::info!(mode = %trading_cfg.read().await.mode, "TradingConfig loaded");
+    let flags = Arc::new(RwLock::new(db::load_feature_flags(&pool).await));
+    tracing::info!(flags = ?*flags.read().await, "Feature flags loaded");
 
     // 4. Shared state
     let prices: Arc<DashMap<String, f64>> = Arc::new(DashMap::new());
@@ -704,6 +709,7 @@ async fn main() {
             .collect();
         tokio::spawn(telegram_ingester::start_ingester_loop(
             api_id, api_hash, chat_ids, signal_tx.clone(), Some(log_tx.clone()),
+            Arc::clone(&flags), Some(write_tx.clone()),
         ));
     } else {
         tracing::info!("TELEGRAM_API_ID not set — ingester disabled (use /api/auth/telegram)");
@@ -952,6 +958,7 @@ async fn main() {
         db_pool: pool,
         db_tx: write_tx.clone(),
         trading_cfg,
+        flags,
         prices,
         kotak: kotak_client_opt,
         telegram: Arc::new(Mutex::new(telegram_ingester::TelegramManager::new())),
@@ -1029,6 +1036,8 @@ async fn main() {
         .route("/api/auth/telegram/disconnect",     axum::routing::delete(routes::disconnect_telegram))
         .route("/api/auth/verify-passkey",          post(routes::verify_passkey_handler))
         .route("/api/auth/session",                 get(routes::session_status_handler))
+        .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
+                                                   .put(routes::v2::put_flags_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
         .layer(middleware::from_fn(auth_middleware))
         // Outside auth, so rejected requests are counted too.

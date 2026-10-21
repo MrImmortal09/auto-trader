@@ -533,6 +533,8 @@ BUY NIFTY 22300 CALLS CMP 100-102 SL 90 TARGET 125
 - A range that is backwards, starts at/below the SL, or reaches target 1 is refused.
 - A BUY call that names no instrument (`BUY AGAIN 22300 CALLS CMP 100-102`) is ignored — never applied as an SL update to the message it replies to.
 
+**Index options only** (`index_options_only`, off by default; `PUT /api/v2/flags`): when on, only CE/PE calls with a strike on NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX or BANKEX are traded, matched by exact name (`NIFTY50` is not NIFTY). Stock options, equity calls and index calls with no strike (`BUY NIFTY ABOVE 25000`) are skipped and logged as `SIGNAL_SKIPPED`, from Telegram and from the webhook alike, including edits of such calls. Reply commands and positions already open are unaffected.
+
 ### Reply Commands (SL Updates & Forced Exits)
 
 When replying directly to an original trade signal message in Telegram, the ingester recognises:
@@ -662,8 +664,10 @@ The **Daily Reports** page provides an aggregated view of trading performance by
 | `GET` | `/api/settings` | Current `TradingConfig` as JSON |
 | `GET` | `/api/market/indicator` | Last closed VWAP + PCR check per index and the CE / PE sizing verdict a call triggering now would get |
 | `POST` | `/api/settings` | Update `TradingConfig` (persisted to DB + in-memory) |
-| `POST` | `/api/webhook/telegram` | Inject a `TradeSignal` JSON manually |
+| `POST` | `/api/webhook/telegram` | Inject a `TradeSignal` JSON manually (422 for a non-index call while `index_options_only` is on) |
 | `GET` | `/api/logs/stream` | SSE stream of engine log events |
+| `GET` | `/api/v2/flags` | v2 engine switches: `{"index_options_only": false, "chart_stops": false}` |
+| `PUT` | `/api/v2/flags` | Change only the switches named in the body; saved in their own table, so a v1 settings save never resets them |
 
 ---
 

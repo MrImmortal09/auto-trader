@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;
 use shared_domain::{current_ist_timestamp_string, DbWriteMessage, TradeState};
-use trading_engine::FeeCalculator;
+use trading_engine::{Exchange, FeeCalculator};
 
 use crate::routes::positions::persist_positions_snapshot;
 use crate::AppState;
@@ -46,7 +46,9 @@ pub async fn post_kill_switch_handler(State(state): State<AppState>) -> impl Int
                         .filter(|p| *p > 0.0)
                         .unwrap_or(pos.avg_buy_price);
 
-                    let fees = FeeCalculator::calculate(qty, ltp, "SELL", is_options, brokerage);
+                    let fees = FeeCalculator::calculate_on(
+                        Exchange::for_underlying(&instrument), qty, ltp, "SELL", is_options, brokerage,
+                    );
                     let timestamp = current_ist_timestamp_string();
 
                     let _ = sqlx::query(

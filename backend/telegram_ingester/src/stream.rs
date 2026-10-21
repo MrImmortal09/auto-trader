@@ -6,10 +6,10 @@ use grammers_client::update::Update;
 use grammers_client::{Client, SignInError};
 use grammers_session::updates::UpdatesLike;
 use shared_domain::telemetry::{self, ParseResult};
-use shared_domain::{today_ist, TradeSignal};
-use tokio::sync::{broadcast, mpsc};
+use shared_domain::{today_ist, DbWriteMessage, FeatureFlags, TradeSignal};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
-use crate::parser::{classify, Inbound};
+use crate::parser::{classify_with, Inbound};
 use crate::session_file;
 
 // ---------------------------------------------------------------------------
@@ -31,12 +31,17 @@ pub(crate) fn prompt(label: &str) -> String {
 /// Inner update loop — runs until the stream closes or the channel is dropped.
 /// The caller is responsible for authentication; the client must already be
 /// authorised before passing it here.
+///
+/// `flags` are the live engine switches (`/api/v2/flags`), read once per
+/// message; `db_tx` is where a call skipped under them is recorded.
 pub(crate) async fn run_event_loop(
     client: Client,
     updates_rx: mpsc::UnboundedReceiver<UpdatesLike>,
     target_chat_ids: Vec<i64>,
     tx: broadcast::Sender<TradeSignal>,
     log_tx: Option<broadcast::Sender<String>>,
+    flags: Arc<RwLock<FeatureFlags>>,
+    db_tx: Option<mpsc::Sender<DbWriteMessage>>,
 ) {
     let mut stream = match client.stream_updates(updates_rx, Default::default()).await {
         Ok(s) => s,
@@ -83,9 +88,10 @@ pub(crate) async fn run_event_loop(
         let msg_id_str = msg.id().to_string();
         let reply_to = msg.reply_to_message_id().map(|id| id.to_string());
 
-        // Routing (and why its order matters) lives in `classify`, where the
-        // tests can reach it.
-        match classify(text, &msg_id_str, reply_to.as_deref(), today_ist()) {
+        // Routing (and why its order matters) lives in `classify_with`, where
+        // the tests can reach it.
+        let flags_now = *flags.read().await;
+        match classify_with(text, &msg_id_str, reply_to.as_deref(), today_ist(), flags_now) {
             Inbound::Signal(signal) => {
                 tracing::info!(
                     instrument = %signal.instrument_name,
@@ -96,6 +102,29 @@ pub(crate) async fn run_event_loop(
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — signal dropped");
                 }
+            }
+            Inbound::NotIndexOption(signal) => {
+                tracing::info!(
+                    instrument = %signal.instrument_name,
+                    "[telegram] Call skipped — not an index option (index_options_only is on)"
+                );
+                let first_line = text.lines().next().unwrap_or_default();
+                let payload = serde_json::json!({
+                    "event": "SIGNAL_SKIPPED",
+                    "level": "INFO",
+                    "reason": "not_index_option",
+                    "source": "telegram",
+                    "message": format!("Skipped: not an index option — {first_line}"),
+                    "instrument": signal.instrument_name,
+                    "chat_id": chat_id,
+                    "msg_id": msg.id(),
+                    "edited": is_edit,
+                    "text": text,
+                });
+                record_log(log_tx.as_ref(), db_tx.as_ref(), "INFO", payload).await;
+                // Not traded, like an unreadable call — the System screen's
+                // counters stay as they were.
+                telemetry::telegram_parsed(ParseResult::Unparsed);
             }
             Inbound::IgnoredCall => {
                 tracing::warn!("[telegram] BUY call not traded — no instrument or unsupported expiry/entry: {text}");
@@ -131,6 +160,25 @@ pub(crate) async fn run_event_loop(
     }
 
     tracing::info!("[telegram] Event loop exited");
+}
+
+/// Send `payload` to the live log stream and, when there is one, to the
+/// durable `system_logs` table, so it survives a restart and a page reload.
+async fn record_log(
+    log_tx: Option<&broadcast::Sender<String>>,
+    db_tx: Option<&mpsc::Sender<DbWriteMessage>>,
+    level: &str,
+    payload: serde_json::Value,
+) {
+    let message = payload.to_string();
+    if let Some(db_tx) = db_tx {
+        let _ = db_tx
+            .send(DbWriteMessage::Log { level: level.to_owned(), message: message.clone() })
+            .await;
+    }
+    if let Some(log_tx) = log_tx {
+        let _ = log_tx.send(message);
+    }
 }
 
 /// The bare `UPDATE_SL` / `EXIT_AT` signal the monitor matches to the position
@@ -169,6 +217,8 @@ pub async fn start_ingester_loop(
     target_chat_ids: Vec<i64>,
     tx: broadcast::Sender<TradeSignal>,
     log_tx: Option<broadcast::Sender<String>>,
+    flags: Arc<RwLock<FeatureFlags>>,
+    db_tx: Option<mpsc::Sender<DbWriteMessage>>,
 ) {
     let session = session_file::load_session();
 
@@ -207,5 +257,5 @@ pub async fn start_ingester_loop(
         }
     }
 
-    run_event_loop(client, updates_rx, target_chat_ids, tx, log_tx).await;
+    run_event_loop(client, updates_rx, target_chat_ids, tx, log_tx, flags, db_tx).await;
 }

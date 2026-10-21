@@ -72,9 +72,9 @@ impl Exchange {
 pub struct FeeCalculator;
 
 impl FeeCalculator {
-    /// Charges for one leg at NSE rates. Kept so existing callers compile
-    /// unchanged; SENSEX and BANKEX legs should move to
-    /// [`FeeCalculator::calculate_on`] with [`Exchange::for_underlying`].
+    /// Charges for one leg at NSE rates: [`FeeCalculator::calculate_on`] with
+    /// [`Exchange::Nse`]. The engine and the routes call `calculate_on` with
+    /// [`Exchange::for_underlying`], so SENSEX and BANKEX legs get BSE rates.
     pub fn calculate(
         qty: i32,
         price: f64,

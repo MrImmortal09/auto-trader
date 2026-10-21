@@ -28,3 +28,4 @@ pub mod telemetry;
 pub use telemetry::{metrics_handler, telemetry_snapshot_handler, telemetry_stream_handler};
 pub mod execute;
 pub use execute::{execute_stream_handler, execute_buy_handler, execute_exit_all_handler};
+pub mod v2;

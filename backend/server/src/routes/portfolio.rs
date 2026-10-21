@@ -64,16 +64,45 @@ pub struct Portfolio {
 // ---------------------------------------------------------------------------
 
 /// `POST /api/webhook/telegram` — inject a `TradeSignal` directly.
+///
+/// With `index_options_only` on, a BUY or SELL call that isn't an index option
+/// is skipped just as the same call from Telegram would be, and answered 422.
+/// Stop moves and exits (`UPDATE_SL`, `EXIT_AT`) are not calls and always go
+/// through.
 pub async fn webhook_handler(
     State(state): State<AppState>,
     Json(signal): Json<TradeSignal>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     tracing::info!(instrument = %signal.instrument_name, "Webhook signal received");
+    let is_call = signal.action.eq_ignore_ascii_case("BUY") || signal.action.eq_ignore_ascii_case("SELL");
+    if is_call && state.flags.read().await.index_options_only && !signal.is_index_option() {
+        tracing::info!(
+            instrument = %signal.instrument_name,
+            "Webhook call skipped — not an index option (index_options_only is on)"
+        );
+        crate::routes::auth_kotak::send_log(&state.db_tx, &state.log_tx, "INFO", serde_json::json!({
+            "event": "SIGNAL_SKIPPED",
+            "level": "INFO",
+            "reason": "not_index_option",
+            "source": "webhook",
+            "message": format!(
+                "Skipped: not an index option — webhook {} {}",
+                signal.action, signal.instrument_name
+            ),
+            "instrument": signal.instrument_name,
+        }))
+        .await;
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "skipped: not an index option", "reason": "not_index_option"})),
+        )
+            .into_response();
+    }
     match state.signal_tx.send(signal) {
-        Ok(_) => StatusCode::OK,
+        Ok(_) => StatusCode::OK.into_response(),
         Err(_) => {
             tracing::warn!("No engine receivers — signal dropped");
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
