@@ -174,10 +174,19 @@ pub struct Sample {
     pub sse_clients: i64,
 }
 
+/// Where today's counts start from: the last sample before IST midnight, or
+/// none on the day the server started — everything it has counted is today's.
+#[derive(Clone)]
+pub struct DayStart {
+    pub day: chrono::NaiveDate,
+    pub baseline: Option<Arc<Sample>>,
+}
+
 /// Shared between the sampler (writer) and the routes (readers).
 pub struct PulseHub {
     history: Mutex<VecDeque<Point>>,
     latest: watch::Sender<Option<Arc<Sample>>>,
+    day_start: Mutex<Option<DayStart>>,
 }
 
 impl PulseHub {
@@ -185,7 +194,13 @@ impl PulseHub {
         Self {
             history: Mutex::new(VecDeque::with_capacity(HISTORY_LEN)),
             latest: watch::channel(None).0,
+            day_start: Mutex::new(None),
         }
+    }
+
+    /// Today's starting point for the counters, once a sample exists.
+    pub fn day_start(&self) -> Option<DayStart> {
+        self.day_start.lock().ok().and_then(|d| d.clone())
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Option<Arc<Sample>>> {
@@ -201,6 +216,17 @@ impl PulseHub {
     }
 
     fn publish(&self, sample: Sample) {
+        let today = shared_domain::today_ist();
+        if let Ok(mut start) = self.day_start.lock() {
+            match start.as_ref() {
+                None => *start = Some(DayStart { day: today, baseline: None }),
+                // A new day: count on from the last sample before midnight.
+                Some(s) if s.day != today => {
+                    *start = Some(DayStart { day: today, baseline: self.latest.borrow().clone() });
+                }
+                Some(_) => {}
+            }
+        }
         if let Ok(mut h) = self.history.lock() {
             if h.len() == HISTORY_LEN {
                 h.pop_front();

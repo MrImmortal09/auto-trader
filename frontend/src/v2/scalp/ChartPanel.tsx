@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Check, ChevronDown, Layers as LayersIcon } from 'lucide-react';
+import { useCallback, useState } from 'react';
+import { ChevronDown, Layers as LayersIcon } from 'lucide-react';
 import { INDEX_ORDER } from '../../lib/execute';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
+import { CheckboxRow } from '../ui/CheckboxRow';
+import { Popover } from '../ui/Popover';
 import type { CrosshairBus } from './bus';
 import { KChart, type ChartLine, type ChartMarker, type Placing } from './KChart';
 import type { Layers } from './lines';
@@ -10,52 +12,6 @@ import { sameSym, symbolLabel, type Bar, type ChartSym, type Tf } from './model'
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 const TFS: Tf[] = ['1m', '5m', '15m'];
-
-/** A popover anchored under its button; a click outside or Escape closes it. */
-function Popover({ open, onClose, align = 'left', children }: { open: boolean; onClose: () => void; align?: 'left' | 'right'; children: ReactNode }) {
-  const box = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: PointerEvent) => {
-      if (box.current && !box.current.parentElement?.contains(e.target as Node)) onClose();
-    };
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
-    document.addEventListener('pointerdown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('pointerdown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open, onClose]);
-  if (!open) return null;
-  return (
-    <div ref={box} className={`absolute top-full z-30 mt-1 min-w-[260px] animate-fade-in rounded-12 border border-line bg-panel p-2 shadow-lg ${align === 'right' ? 'right-0' : 'left-0'}`}>
-      {children}
-    </div>
-  );
-}
-
-/** Figma "Checkbox row". */
-function CheckboxRow({ checked, disabled = false, title, note, onChange }: { checked: boolean; disabled?: boolean; title: string; note: string; onChange: (v: boolean) => void }) {
-  return (
-    <button
-      type="button"
-      role="checkbox"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className="flex w-full items-start gap-3 rounded-8 px-2 py-2 text-left hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
-    >
-      <span className={`mt-0.5 grid size-4 shrink-0 place-items-center rounded-4 border ${checked ? 'border-fg bg-fg text-on-accent' : 'border-line-strong'}`}>
-        {checked && <Check size={12} strokeWidth={3} />}
-      </span>
-      <span className="min-w-0">
-        <span className="block type-body text-fg">{title}</span>
-        <span className="block type-caption text-fg-muted">{note}</span>
-      </span>
-    </button>
-  );
-}
 
 /** One chart: its header (instrument, timeframe, Layers) and the chart. */
 export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, spot, change, chain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, compact }: {

@@ -245,6 +245,12 @@ pub fn expires_on(index: &str, day: NaiveDate) -> bool {
     monthly_expiry_date(day.year(), day.month(), index) == Some(day)
 }
 
+/// Whether `index`'s **monthly** options expire on `day` (see [`expires_on`]).
+/// Display only, like it.
+pub fn monthly_expires_on(index: &str, day: NaiveDate) -> bool {
+    monthly_expiry_date(day.year(), day.month(), index) == Some(day)
+}
+
 /// `NEXT WEEK` → the weekly expiry falling in next calendar week (Mon–Sun),
 /// pulled back to the previous trading day when that day is a holiday. Posted
 /// Wed 21 Oct 2026, a NIFTY call means the 27 Oct contract.
