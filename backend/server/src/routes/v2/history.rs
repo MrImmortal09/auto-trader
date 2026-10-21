@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::history::{self, GroupBy, Leg, Range, Report};
+use crate::history::{self, GroupBy, Range, Report};
 use crate::AppState;
 
 fn bad_request(msg: &str) -> Response {
@@ -50,16 +50,7 @@ pub async fn history_handler(State(state): State<AppState>, Query(q): Query<Hist
         None => state.trading_cfg.read().await.mode.clone(),
     };
 
-    let legs = match sqlx::query_as::<_, Leg>(
-        "SELECT id, ticker, action, qty, executed_price, timestamp, net_value,
-                brokerage + stt_charge + sebi_fee + stamp_duty + transaction_charge + gst AS charges,
-                signal_id, raw_message, exit_reason, chat_id, chat_title, option_type, strike
-         FROM paper_trades WHERE mode = ? ORDER BY id ASC",
-    )
-    .bind(&mode)
-    .fetch_all(&state.db_pool)
-    .await
-    {
+    let legs = match history::load_legs(&state.db_pool, &mode).await {
         Ok(legs) => legs,
         Err(e) => {
             tracing::error!("history: {e}");

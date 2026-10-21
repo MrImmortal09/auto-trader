@@ -281,7 +281,30 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     ).execute(&pool).await.unwrap();
     // ~4.5k rows per trading day; keep a month.
     let cutoff = (shared_domain::now_ist() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
-    let _ = sqlx::query("DELETE FROM oi_snapshots WHERE ts < ?").bind(cutoff).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM oi_snapshots WHERE ts < ?").bind(&cutoff).execute(&pool).await;
+
+    // Every message from the monitored chats, for the v2 Desk's feed (see
+    // `routes::v2::feed`); display only. New table, so existing databases
+    // keep working. A month is kept, like the OI snapshots.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS telegram_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            chat_title TEXT,
+            msg_id INTEGER NOT NULL,
+            sent_at TEXT NOT NULL,
+            text TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            reply_to INTEGER,
+            value REAL,
+            edited_at TEXT,
+            UNIQUE (chat_id, msg_id)
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_telegram_messages_sent ON telegram_messages (sent_at)",
+    ).execute(&pool).await.unwrap();
+    let _ = sqlx::query("DELETE FROM telegram_messages WHERE sent_at < ?").bind(&cutoff).execute(&pool).await;
 
     pool
 }
@@ -752,6 +775,28 @@ pub async fn db_writer(
                 {
                     tracing::error!("DB candle insert: {e}");
                     telemetry::db_write_error("candle");
+                }
+            }
+            DbWriteMessage::TelegramMessage { chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, edited } => {
+                // An edit keeps the first-seen send time and title, and
+                // replaces the text and how it was routed.
+                let edited_at = edited.then(current_ist_timestamp_string);
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO telegram_messages
+                     (chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, edited_at)
+                     VALUES (?,?,?,?,?,?,?,?,?)
+                     ON CONFLICT(chat_id, msg_id) DO UPDATE SET
+                       chat_title = COALESCE(excluded.chat_title, telegram_messages.chat_title),
+                       text = excluded.text, kind = excluded.kind, reply_to = excluded.reply_to,
+                       value = excluded.value, edited_at = COALESCE(excluded.edited_at, telegram_messages.edited_at)",
+                )
+                .bind(chat_id).bind(&chat_title).bind(msg_id).bind(&sent_at).bind(&text)
+                .bind(kind).bind(reply_to).bind(value).bind(&edited_at)
+                .execute(&pool)
+                .await
+                {
+                    tracing::error!("DB telegram message insert: {e}");
+                    telemetry::db_write_error("telegram_message");
                 }
             }
         }

@@ -7,6 +7,7 @@
 mod balance;
 mod candles;
 mod db;
+mod desk;
 mod execute;
 mod history;
 mod market_data;
@@ -1052,6 +1053,9 @@ async fn main() {
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))
         .route("/api/v2/history",                   get(routes::v2::history_handler))
+        .route("/api/v2/desk",                      get(routes::v2::desk_handler))
+        .route("/api/v2/feed",                      get(routes::v2::feed_handler))
+        .route("/api/v2/status",                    get(routes::v2::status_handler))
         .route("/api/v2/candles",                   get(routes::v2::candles_handler))
         .route("/api/v2/candles/stream",            get(routes::v2::candles_stream_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))

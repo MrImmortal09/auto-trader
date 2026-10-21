@@ -1,0 +1,138 @@
+/*
+ * v2 styles: the redesign's tokens from the Figma variables (file
+ * e3VTbfjdKm17YiNQ2Tgvem), dark theme only. Imported only by src/v2/main.tsx,
+ * so none of this reaches v1, and v1's src/index.css never reaches v2.
+ *
+ * Spacing needs no tokens: Tailwind's 4 px scale covers every Figma value.
+ */
+
+@import url("https://fonts.googleapis.com/css2?family=Anek+Latin:wdth,wght@75..125,100..800&display=swap");
+/* Only v2's own files are scanned for classes. */
+@import "tailwindcss" source(".");
+
+@theme {
+  /* Only the design palette exists, so colour keeps its meaning. */
+  --color-*: initial;
+
+  --font-sans: "Anek Latin", ui-sans-serif, system-ui, sans-serif;
+
+  --color-canvas: #1a1f29;               /* color/bg/canvas: app background */
+  --color-panel: #242b37;                /* color/bg/panel: panels, sheets, ladder */
+  --color-raised: #2c3442;               /* color/bg/raised: selected, hover, ITM shading */
+  --color-inset: #141820;                /* color/bg/inset: status bar, nav rail, wells */
+  --color-scrim: rgb(14 17 22 / 0.66);   /* color/bg/scrim: behind sheets and dialogs */
+  --color-line: #353e4d;                 /* color/border/default: hairlines, dividers */
+  --color-line-strong: #4a5465;          /* color/border/strong: rail track, focus */
+  --color-fg: #e8eaee;                   /* color/text/primary: 13.7:1 on canvas */
+  --color-fg-muted: #8e97a7;             /* color/text/secondary: 5.6:1 on canvas */
+  --color-on-accent: #1a1f29;            /* color/text/on-accent: text on jade, brick, marigold */
+  --color-profit: #22b47f;               /* profit, buy, targets: 6.2:1 on canvas */
+  --color-loss: #ee705c;                 /* loss, stop, exit, kill switch: 5.6:1 on canvas */
+  --color-live: #f0a63a;                 /* real money (LIVE) only */
+  --color-profit-subtle: rgb(34 180 127 / 0.16);
+  --color-loss-subtle: rgb(238 112 92 / 0.16);
+  --color-live-subtle: rgb(240 166 58 / 0.18);
+  --color-chart-grid: #2c3442;
+  --color-chart-indicator: #79a7f2;      /* VWAP, PCR, first indicator line */
+
+  --radius-4: 4px;                       /* chips, axis tags */
+  --radius-6: 6px;                       /* desktop buttons, segments, inputs */
+  --radius-8: 8px;                       /* phone buttons, tracks, nav items */
+  --radius-12: 12px;                     /* panels, cards */
+  --radius-16: 16px;                     /* dialogs, bottom sheets (top corners) */
+
+  --animate-fade-in: v2-fade-in 150ms ease-out;
+  --animate-rise-in: v2-rise-in 180ms ease-out;
+  --animate-sheet-in: v2-sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  @keyframes v2-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes v2-rise-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes v2-sheet-in {
+    from { transform: translateY(100%); }
+    to { transform: none; }
+  }
+}
+
+/* The exact names set as code syntax on the Figma variables, for plain CSS and
+   chart styles. */
+:root {
+  color-scheme: dark;
+  --color-bg-canvas: var(--color-canvas);
+  --color-bg-panel: var(--color-panel);
+  --color-bg-raised: var(--color-raised);
+  --color-bg-inset: var(--color-inset);
+  --color-bg-scrim: var(--color-scrim);
+  --color-border-default: var(--color-line);
+  --color-border-strong: var(--color-line-strong);
+  --color-text-primary: var(--color-fg);
+  --color-text-secondary: var(--color-fg-muted);
+  --color-text-on-accent: var(--color-on-accent);
+
+  /* Layout sizes used in the Figma frames */
+  --layout-status-bar: 40px;      /* desktop; the phone app bar is 44px */
+  --layout-nav-rail: 72px;        /* desktop nav rail */
+  --layout-calls-rail: 320px;     /* Telegram feed on Desk · today */
+  --layout-tab-bar: 50px;         /* phone, plus the home-indicator safe area */
+  --layout-touch: 44px;           /* minimum phone touch target */
+}
+
+/* Text styles: Figma Num/* and Text/* */
+@utility num-hero   { font-size: 34px; line-height: 38px; font-weight: 600; letter-spacing: -0.5px; font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
+@utility num-large  { font-size: 22px; line-height: 26px; font-weight: 600; letter-spacing: -0.2px; font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
+@utility num-medium { font-size: 15px; line-height: 20px; font-weight: 500; font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
+@utility num-small  { font-size: 12px; line-height: 16px; font-weight: 500; font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
+@utility type-title       { font-size: 16px; line-height: 22px; font-weight: 600; }
+@utility type-body-strong { font-size: 14px; line-height: 20px; font-weight: 600; }
+@utility type-body        { font-size: 14px; line-height: 20px; font-weight: 400; }
+@utility type-label       { font-size: 12px; line-height: 16px; font-weight: 500; letter-spacing: 0.1px; }
+@utility type-caption     { font-size: 11px; line-height: 14px; font-weight: 400; letter-spacing: 0.1px; }
+@utility type-button      { font-size: 13px; line-height: 16px; font-weight: 600; letter-spacing: 0.1px; }
+@utility type-button-lg   { font-size: 15px; line-height: 20px; font-weight: 600; letter-spacing: 0.1px; }
+/* Digits in running text line up the way the numbers do. */
+@utility tnum { font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
+
+@utility pt-safe { padding-top: env(safe-area-inset-top); }
+@utility pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+
+/* A hold-to-confirm button's fill, sweeping across for --hold-ms. */
+@utility hold-sweep {
+  animation: v2-hold var(--hold-ms, 1000ms) linear forwards;
+  transform-origin: left;
+}
+@keyframes v2-hold {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+@layer base {
+  html, body {
+    background: var(--color-canvas);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+  }
+  body {
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  /* No double-tap zoom on a button tapped twice in a row. */
+  button, a, [role="button"], [role="tab"] {
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  button:not(:disabled) { cursor: pointer; }
+  :focus-visible {
+    outline: 2px solid var(--color-line-strong);
+    outline-offset: 2px;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line) transparent;
+  }
+}

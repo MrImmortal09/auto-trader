@@ -6,7 +6,7 @@ use grammers_client::update::Update;
 use grammers_client::{Client, SignInError};
 use grammers_session::updates::UpdatesLike;
 use shared_domain::telemetry::{self, ParseResult};
-use shared_domain::{today_ist, DbWriteMessage, FeatureFlags, SignalChat, TradeSignal};
+use shared_domain::{ist_offset, today_ist, DbWriteMessage, FeatureFlags, SignalChat, TradeSignal};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::parser::{classify_with, Inbound};
@@ -98,7 +98,9 @@ pub(crate) async fn run_event_loop(
             id: chat_id,
             title: msg.peer().and_then(|p| p.name()).map(str::to_string),
         };
-        match classify_with(text, &msg_id_str, reply_to.as_deref(), today_ist(), flags_now) {
+        let chat_title = chat.title.clone();
+        // (how it was routed, the message a reply answers, a reply's price)
+        let routed: (&'static str, Option<i64>, Option<f64>) = match classify_with(text, &msg_id_str, reply_to.as_deref(), today_ist(), flags_now) {
             Inbound::Signal(mut signal) => {
                 signal.chat = Some(chat);
                 tracing::info!(
@@ -110,6 +112,7 @@ pub(crate) async fn run_event_loop(
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — signal dropped");
                 }
+                ("signal", None, None)
             }
             Inbound::NotIndexOption(signal) => {
                 tracing::info!(
@@ -133,6 +136,7 @@ pub(crate) async fn run_event_loop(
                 // Not traded, like an unreadable call — the System screen's
                 // counters stay as they were.
                 telemetry::telegram_parsed(ParseResult::Unparsed);
+                ("not_index_option", None, None)
             }
             Inbound::IgnoredCall => {
                 tracing::warn!("[telegram] BUY call not traded — no instrument or unsupported expiry/entry: {text}");
@@ -146,24 +150,51 @@ pub(crate) async fn run_event_loop(
                     let _ = ltx.send(log_msg.to_string());
                 }
                 telemetry::telegram_parsed(ParseResult::Unparsed);
+                ("ignored_call", None, None)
             }
             Inbound::SlUpdate { parent, new_sl } => {
+                let answers = parent.parse().ok();
                 let signal = reply_update(text, parent, chat, "UPDATE_SL", 0.0, new_sl);
                 tracing::info!(new_sl, "Reply parsed as SL update — broadcasting");
                 telemetry::telegram_parsed(ParseResult::SlUpdate);
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — update dropped");
                 }
+                ("sl_update", answers, Some(new_sl))
             }
             Inbound::Exit { parent, price } => {
+                let answers = parent.parse().ok();
                 let signal = reply_update(text, parent, chat, "EXIT_AT", price, 0.0);
                 tracing::info!(exit_price = price, "Reply parsed as EXIT_AT — broadcasting");
                 telemetry::telegram_parsed(ParseResult::Exit);
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — update dropped");
                 }
+                ("exit", answers, Some(price))
             }
-            Inbound::Unparsed => telemetry::telegram_parsed(ParseResult::Unparsed),
+            Inbound::Unparsed => {
+                telemetry::telegram_parsed(ParseResult::Unparsed);
+                ("unparsed", None, None)
+            }
+        };
+
+        // Kept for the v2 Desk's feed only after the engine has it, so
+        // storing a message never holds up a signal.
+        if let Some(db_tx) = db_tx.as_ref() {
+            let (kind, reply_to, value) = routed;
+            let _ = db_tx
+                .send(DbWriteMessage::TelegramMessage {
+                    chat_id,
+                    chat_title,
+                    msg_id: i64::from(msg.id()),
+                    sent_at: msg.date().with_timezone(&ist_offset()).format("%Y-%m-%d %H:%M:%S").to_string(),
+                    text: text.to_owned(),
+                    kind,
+                    reply_to,
+                    value,
+                    edited: is_edit,
+                })
+                .await;
         }
     }
 
