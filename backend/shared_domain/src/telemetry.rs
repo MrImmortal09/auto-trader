@@ -527,7 +527,7 @@ pub static DB_POOL_CONNECTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| int_gau
     "db_pool_connections", "SQLite pool connections", &["state"],
 ));
 
-pub const DB_WRITE_KINDS: [&str; 5] = ["trade", "log", "positions_snapshot", "oi_snapshot", "candle"];
+pub const DB_WRITE_KINDS: [&str; 6] = ["trade", "log", "positions_snapshot", "oi_snapshot", "candle", "telegram_message"];
 
 impl DbWriteMessage {
     /// Fixed metric label for this message's kind.
@@ -538,6 +538,7 @@ impl DbWriteMessage {
             DbWriteMessage::PositionsSnapshot { .. } => "positions_snapshot",
             DbWriteMessage::OiSnapshot { .. } => "oi_snapshot",
             DbWriteMessage::CandleMinute { .. } => "candle",
+            DbWriteMessage::TelegramMessage { .. } => "telegram_message",
         }
     }
 }

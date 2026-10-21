@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::{Days, NaiveDate};
 use serde::Serialize;
+use shared_domain::INDEX_NAMES;
+use telegram_ingester::parser::expires_on;
 
 /// Channel shown for a call with no Telegram chat recorded: anything written
 /// before chats were kept, the webhook, and positions adopted from the broker.
@@ -54,6 +56,8 @@ impl Leg {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LegRow {
+    /// The trade row's id: newer legs have larger ids.
+    pub id: i64,
     pub t: String,
     pub action: String,
     pub qty: i64,
@@ -69,6 +73,8 @@ pub struct Call {
     pub key: String,
     pub channel: String,
     pub chat_id: Option<i64>,
+    /// The Telegram message it came from (`manual-…` for a scalp).
+    pub signal_id: Option<String>,
     pub index: String,
     /// `CE` or `PE`, when known.
     pub side: Option<String>,
@@ -86,6 +92,8 @@ pub struct Call {
     /// The call's original message.
     pub message: Option<String>,
     pub legs: Vec<LegRow>,
+    /// How it ended, once sold — see `desk::outcome`.
+    pub outcome: Option<crate::desk::Outcome>,
 }
 
 impl Call {
@@ -125,6 +133,19 @@ fn channel_of(leg: &Leg) -> String {
     }
 }
 
+/// Every trade row of `mode` (`PAPER` or `LIVE`), oldest first.
+pub async fn load_legs(pool: &sqlx::SqlitePool, mode: &str) -> Result<Vec<Leg>, sqlx::Error> {
+    sqlx::query_as::<_, Leg>(
+        "SELECT id, ticker, action, qty, executed_price, timestamp, net_value,
+                brokerage + stt_charge + sebi_fee + stamp_duty + transaction_charge + gst AS charges,
+                signal_id, raw_message, exit_reason, chat_id, chat_title, option_type, strike
+         FROM paper_trades WHERE mode = ? ORDER BY id ASC",
+    )
+    .bind(mode)
+    .fetch_all(pool)
+    .await
+}
+
 /// Group trade rows into calls, in the order each call first appears.
 pub fn calls(legs: Vec<Leg>) -> Vec<Call> {
     let mut order: Vec<String> = Vec::new();
@@ -156,9 +177,10 @@ pub fn calls(legs: Vec<Leg>) -> Vec<Call> {
                 .iter()
                 .find_map(|l| l.option_type.clone())
                 .or_else(|| message.as_deref().and_then(side_in).map(str::to_string));
-            Some(Call {
+            let mut call = Call {
                 channel: channel_of(first),
                 chat_id: first.chat_id,
+                signal_id: first.signal_id.clone(),
                 index: first.ticker.clone(),
                 side,
                 strike: legs.iter().find_map(|l| l.strike),
@@ -173,6 +195,7 @@ pub fn calls(legs: Vec<Leg>) -> Vec<Call> {
                 legs: legs
                     .iter()
                     .map(|l| LegRow {
+                        id: l.id,
                         t: l.timestamp.clone(),
                         action: l.action.clone(),
                         qty: l.qty,
@@ -183,7 +206,10 @@ pub fn calls(legs: Vec<Leg>) -> Vec<Call> {
                     })
                     .collect(),
                 key,
-            })
+                outcome: None,
+            };
+            call.outcome = crate::desk::outcome(&call);
+            Some(call)
         })
         .collect()
 }
@@ -273,6 +299,10 @@ pub struct GroupRow {
     pub calls: usize,
     pub wins: usize,
     pub net: f64,
+    pub gross_profit: f64,
+    pub gross_loss: f64,
+    /// Gross profit over gross loss; `None` without a losing call.
+    pub profit_factor: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -281,6 +311,8 @@ pub struct DayRow {
     pub calls: usize,
     pub wins: usize,
     pub net: f64,
+    /// The indices whose options expired that day.
+    pub expiries: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -352,13 +384,32 @@ pub fn report(calls: &[Call], today: NaiveDate, range: Range, group: GroupBy) ->
             GroupBy::Index => call.index.clone(),
             GroupBy::Side => call.side.clone().unwrap_or_else(|| "Other".to_string()),
         };
-        let row = groups.entry(label.clone()).or_insert(GroupRow { label, calls: 0, wins: 0, net: 0.0 });
+        let row = groups.entry(label.clone()).or_insert(GroupRow {
+            label,
+            calls: 0,
+            wins: 0,
+            net: 0.0,
+            gross_profit: 0.0,
+            gross_loss: 0.0,
+            profit_factor: None,
+        });
         row.calls += 1;
         row.wins += usize::from(*pnl > 0.0);
         row.net += pnl;
+        row.gross_profit += pnl.max(0.0);
+        row.gross_loss += (-pnl).max(0.0);
+        row.profit_factor = (row.gross_loss > 0.0).then(|| row.gross_profit / row.gross_loss);
 
         let date = call.closed_at.as_deref().and_then(|t| t.get(..10)).unwrap_or_default().to_string();
-        let day = days.entry(date.clone()).or_insert(DayRow { date, calls: 0, wins: 0, net: 0.0 });
+        let day = days.entry(date.clone()).or_insert_with(|| DayRow {
+            expiries: NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map(|d| INDEX_NAMES.iter().copied().filter(|i| expires_on(i, d)).collect())
+                .unwrap_or_default(),
+            date,
+            calls: 0,
+            wins: 0,
+            net: 0.0,
+        });
         day.calls += 1;
         day.wins += usize::from(*pnl > 0.0);
         day.net += pnl;
@@ -520,8 +571,11 @@ mod tests {
         assert_eq!(r.curve[1].drawdown, 1_500.0);
         // Grouped by index, best first.
         assert_eq!(r.groups.iter().map(|g| (g.label.as_str(), g.calls, g.net)).collect::<Vec<_>>(), [("NIFTY", 2, 1_700.0), ("SENSEX", 1, -1_500.0)]);
+        assert_eq!(r.groups.iter().map(|g| g.profit_factor).collect::<Vec<_>>(), [None, Some(0.0)]);
         assert_eq!(r.days.len(), 1);
         assert_eq!((r.days[0].calls, r.days[0].net), (3, 200.0));
+        // 21 Oct 2026 is a Wednesday: nothing expired.
+        assert!(r.days[0].expiries.is_empty());
         // Listed newest first.
         assert_eq!(r.calls.first().map(|c| c.closed_at.as_deref()), Some(Some("2026-10-21 11:30:00")));
 

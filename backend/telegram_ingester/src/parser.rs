@@ -105,7 +105,8 @@ fn parse_month(m: &str) -> Option<u32> {
     else { None }
 }
 
-fn is_trading_holiday(d: NaiveDate) -> bool {
+/// A weekend, or an exchange holiday on the list for that year (2026 so far).
+pub fn is_trading_holiday(d: NaiveDate) -> bool {
     if d.weekday() == Weekday::Sat || d.weekday() == Weekday::Sun {
         return true;
     }
@@ -228,6 +229,20 @@ fn weekly_expiry_weekday(instrument: &str) -> Option<Weekday> {
         "SENSEX" => Some(Weekday::Thu),
         _ => None,
     }
+}
+
+/// Whether `index`'s weekly or monthly options expire on `day` — the expiry
+/// weekday of that week or month, pulled back to the trading day before when
+/// it falls on a holiday. Display only: the engine trades the expiry the
+/// Scrip Master resolves, never this.
+pub fn expires_on(index: &str, day: NaiveDate) -> bool {
+    if let Some(weekday) = weekly_expiry_weekday(index) {
+        let monday = day - Days::new(u64::from(day.weekday().num_days_from_monday()));
+        if adjust_for_holidays(monday + Days::new(u64::from(weekday.num_days_from_monday()))) == day {
+            return true;
+        }
+    }
+    monthly_expiry_date(day.year(), day.month(), index) == Some(day)
 }
 
 /// `NEXT WEEK` → the weekly expiry falling in next calendar week (Mon–Sun),
@@ -699,6 +714,21 @@ mod tests {
         // SENSEX expires Thursdays.
         assert_eq!(next_week_expiry_with_now("SENSEX", d(2026, 10, 19)).as_deref(), Some("29-OCT-2026"));
         assert_eq!(next_week_expiry_with_now("BANKNIFTY", d(2026, 10, 19)), None);
+    }
+
+    #[test]
+    fn expiry_days_follow_the_weekly_and_monthly_rules() {
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        // Dussehra (Tue 20 Oct) moved that week's NIFTY weekly to Monday.
+        assert!(expires_on("NIFTY", d(10, 19)));
+        assert!(!expires_on("NIFTY", d(10, 20)));
+        assert!(expires_on("NIFTY", d(10, 27)));
+        assert!(expires_on("SENSEX", d(10, 22)));
+        // Monthly only: the last Tuesday, or the last Thursday on BSE.
+        assert!(expires_on("BANKNIFTY", d(10, 27)));
+        assert!(!expires_on("BANKNIFTY", d(10, 13)));
+        assert!(expires_on("BANKEX", d(10, 29)));
+        assert!(!expires_on("BANKEX", d(10, 22)));
     }
 
     #[test]

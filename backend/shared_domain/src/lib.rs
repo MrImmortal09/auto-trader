@@ -1306,6 +1306,25 @@ pub enum DbWriteMessage {
         volume: Option<f64>,
         source: &'static str,
     },
+    /// A message from a monitored Telegram chat, for the v2 Desk's feed
+    /// (display only — never read by the engine). Kept per chat and message
+    /// id, so an edit replaces the text it was first stored with.
+    TelegramMessage {
+        chat_id: i64,
+        chat_title: Option<String>,
+        msg_id: i64,
+        /// When Telegram says it was sent, IST `YYYY-MM-DD HH:MM:SS`.
+        sent_at: String,
+        text: String,
+        /// How the ingester routed it: `signal`, `not_index_option`,
+        /// `ignored_call`, `sl_update`, `exit` or `unparsed`.
+        kind: &'static str,
+        /// The message a reply command answers.
+        reply_to: Option<i64>,
+        /// A reply's new stop, or its exit price.
+        value: Option<f64>,
+        edited: bool,
+    },
 }
 
 #[cfg(test)]
