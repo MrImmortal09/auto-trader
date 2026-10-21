@@ -4,7 +4,8 @@ import { Button, type ButtonKind, type ButtonSize } from './Button';
 /**
  * A button that fires only after being held for `holdMs` — for actions a
  * stray tap must never trigger. A fill sweeps across while it's held, and
- * letting go early cancels. Holding Space or Enter works the same way.
+ * letting go early cancels. Pointer only: what it fires sends orders, and no
+ * keyboard key ever sends an order.
  */
 export function HoldButton({ onFire, holdMs = 1000, kind = 'loss', size = 'sm', disabled = false, className = '', children }: {
   onFire: () => void;
@@ -52,13 +53,6 @@ export function HoldButton({ onFire, holdMs = 1000, kind = 'loss', size = 'sm', 
       onPointerUp={cancel}
       onPointerLeave={cancel}
       onPointerCancel={cancel}
-      onKeyDown={(e) => {
-        if ((e.key === 'Enter' || e.key === ' ') && !e.repeat) {
-          e.preventDefault();
-          start();
-        }
-      }}
-      onKeyUp={cancel}
       onBlur={cancel}
       onContextMenu={(e) => e.preventDefault()}
       className={`relative touch-none overflow-hidden ${className}`}

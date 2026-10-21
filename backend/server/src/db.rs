@@ -304,6 +304,10 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_telegram_messages_sent ON telegram_messages (sent_at)",
     ).execute(&pool).await.unwrap();
+    // What a call named, for the v2 charts' call markers.
+    ensure_column(&pool, "ALTER TABLE telegram_messages ADD COLUMN instrument TEXT").await;
+    ensure_column(&pool, "ALTER TABLE telegram_messages ADD COLUMN strike REAL").await;
+    ensure_column(&pool, "ALTER TABLE telegram_messages ADD COLUMN side TEXT").await;
     let _ = sqlx::query("DELETE FROM telegram_messages WHERE sent_at < ?").bind(&cutoff).execute(&pool).await;
 
     pool
@@ -777,21 +781,23 @@ pub async fn db_writer(
                     telemetry::db_write_error("candle");
                 }
             }
-            DbWriteMessage::TelegramMessage { chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, edited } => {
+            DbWriteMessage::TelegramMessage { chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, instrument, strike, side, edited } => {
                 // An edit keeps the first-seen send time and title, and
                 // replaces the text and how it was routed.
                 let edited_at = edited.then(current_ist_timestamp_string);
                 if let Err(e) = sqlx::query(
                     "INSERT INTO telegram_messages
-                     (chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, edited_at)
-                     VALUES (?,?,?,?,?,?,?,?,?)
+                     (chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, edited_at, instrument, strike, side)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                      ON CONFLICT(chat_id, msg_id) DO UPDATE SET
                        chat_title = COALESCE(excluded.chat_title, telegram_messages.chat_title),
                        text = excluded.text, kind = excluded.kind, reply_to = excluded.reply_to,
-                       value = excluded.value, edited_at = COALESCE(excluded.edited_at, telegram_messages.edited_at)",
+                       value = excluded.value, edited_at = COALESCE(excluded.edited_at, telegram_messages.edited_at),
+                       instrument = excluded.instrument, strike = excluded.strike, side = excluded.side",
                 )
                 .bind(chat_id).bind(&chat_title).bind(msg_id).bind(&sent_at).bind(&text)
                 .bind(kind).bind(reply_to).bind(value).bind(&edited_at)
+                .bind(&instrument).bind(strike).bind(&side)
                 .execute(&pool)
                 .await
                 {

@@ -481,8 +481,9 @@ pub struct FeatureFlags {
     /// options, equity, an index call with no strike) is skipped instead.
     /// See [`TradeSignal::is_index_option`].
     pub index_options_only: bool,
-    /// Stops and targets dragged on the v2 charts. Stored ahead of the engine
-    /// change that uses it; nothing reads it yet.
+    /// Stops and targets set on the v2 charts, for scalps only
+    /// (`PATCH /api/v2/positions/:id`). While off, no new level can be set;
+    /// levels already set stay until their position closes.
     pub chart_stops: bool,
 }
 
@@ -1323,6 +1324,10 @@ pub enum DbWriteMessage {
         reply_to: Option<i64>,
         /// A reply's new stop, or its exit price.
         value: Option<f64>,
+        /// The index, strike and side a call named, when it named them.
+        instrument: Option<String>,
+        strike: Option<f64>,
+        side: Option<String>,
         edited: bool,
     },
 }

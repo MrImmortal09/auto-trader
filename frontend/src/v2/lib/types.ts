@@ -205,6 +205,77 @@ export interface StatusAnswer {
   last_fill_id: number;
 }
 
+/** `GET /api/v2/flags`. */
+export interface Flags {
+  index_options_only: boolean;
+  chart_stops: boolean;
+}
+
+export interface ChainSide {
+  /** The broker's trading symbol — what a Buy sends. */
+  symbol: string;
+  /** Signed (a put's is negative); `assumed` when Upstox had none. */
+  delta: { value: number; assumed: boolean };
+}
+
+/** `GET /api/v2/chain?index=`: the nearest expiry, as the Execute screen trades it. */
+export interface ChainAnswer {
+  index: string;
+  expiry: string;
+  lot_size: number;
+  tick_size: number;
+  delta_at: string | null;
+  strikes: { strike: number; ce: ChainSide | null; pe: ChainSide | null }[];
+}
+
+export interface FillMark {
+  id: number;
+  t: string;
+  action: string;
+  qty: number;
+  price: number;
+  index: string;
+  strike: number | null;
+  side: string | null;
+  scalp: boolean;
+  reason: string | null;
+}
+
+export interface CallMark {
+  id: number;
+  t: string;
+  channel: string | null;
+  index: string;
+  strike: number | null;
+  side: string | null;
+  text: string;
+}
+
+export interface TelegramLine {
+  id: string;
+  index: string;
+  strike: number | null;
+  side: string | null;
+  expiry: string | null;
+  state: 'waiting' | 'active' | 'target1';
+  channel: string;
+  qty: number;
+  avg: number;
+  entry: number;
+  ltp: number | null;
+  pnl: number | null;
+  stop: number;
+  targets: number[];
+}
+
+/** `GET /api/v2/marks`: today's fills, Telegram calls and Telegram positions. */
+export interface MarksAnswer {
+  day: string;
+  fills: FillMark[];
+  calls: CallMark[];
+  telegram: TelegramLine[];
+}
+
 export type RangeId = 'today' | '7d' | '30d' | 'all';
 export type GroupId = 'channel' | 'index' | 'cepe';
 

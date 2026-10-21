@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Desk } from './desk/Desk';
 import { resumeTrading } from './lib/api';
 import { plural } from './lib/format';
@@ -14,6 +14,9 @@ import { useGuard } from './shell/useGuard';
 import { useEngineErrors, useStatus } from './shell/useStatus';
 import { Banner } from './ui/Banner';
 import { Segment } from './ui/Segment';
+
+// The charts are heavy (KLineChart): only loaded once Scalp is opened.
+const Scalp = lazy(() => import('./scalp/Scalp').then((m) => ({ default: m.Scalp })));
 
 /** "Kill switch: 3 positions exited and the waiting call cancelled." */
 function stoppedLine(s: Stopped): string {
@@ -63,6 +66,10 @@ export default function App() {
   const content =
     screen === 'desk' ? (
       <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} />
+    ) : screen === 'scalp' ? (
+      <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>
+        <Scalp serverBase={serverBase} desktop={desktop} />
+      </Suspense>
     ) : !desktop && (screen === 'system' || screen === 'settings') ? (
       // Phone: More holds System and Settings behind a two-way switch.
       <div className="flex min-h-full flex-col">

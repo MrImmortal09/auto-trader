@@ -99,8 +99,7 @@ pub(crate) async fn run_event_loop(
             title: msg.peer().and_then(|p| p.name()).map(str::to_string),
         };
         let chat_title = chat.title.clone();
-        // (how it was routed, the message a reply answers, a reply's price)
-        let routed: (&'static str, Option<i64>, Option<f64>) = match classify_with(text, &msg_id_str, reply_to.as_deref(), today_ist(), flags_now) {
+        let routed: Routed = match classify_with(text, &msg_id_str, reply_to.as_deref(), today_ist(), flags_now) {
             Inbound::Signal(mut signal) => {
                 signal.chat = Some(chat);
                 tracing::info!(
@@ -109,10 +108,11 @@ pub(crate) async fn run_event_loop(
                     "Signal parsed — broadcasting"
                 );
                 telemetry::telegram_parsed(ParseResult::Signal);
+                let routed = Routed::call("signal", &signal);
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — signal dropped");
                 }
-                ("signal", None, None)
+                routed
             }
             Inbound::NotIndexOption(signal) => {
                 tracing::info!(
@@ -136,7 +136,7 @@ pub(crate) async fn run_event_loop(
                 // Not traded, like an unreadable call — the System screen's
                 // counters stay as they were.
                 telemetry::telegram_parsed(ParseResult::Unparsed);
-                ("not_index_option", None, None)
+                Routed::call("not_index_option", &signal)
             }
             Inbound::IgnoredCall => {
                 tracing::warn!("[telegram] BUY call not traded — no instrument or unsupported expiry/entry: {text}");
@@ -150,7 +150,7 @@ pub(crate) async fn run_event_loop(
                     let _ = ltx.send(log_msg.to_string());
                 }
                 telemetry::telegram_parsed(ParseResult::Unparsed);
-                ("ignored_call", None, None)
+                Routed::kind("ignored_call")
             }
             Inbound::SlUpdate { parent, new_sl } => {
                 let answers = parent.parse().ok();
@@ -160,7 +160,7 @@ pub(crate) async fn run_event_loop(
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — update dropped");
                 }
-                ("sl_update", answers, Some(new_sl))
+                Routed { reply_to: answers, value: Some(new_sl), ..Routed::kind("sl_update") }
             }
             Inbound::Exit { parent, price } => {
                 let answers = parent.parse().ok();
@@ -170,18 +170,17 @@ pub(crate) async fn run_event_loop(
                 if tx.send(signal).is_err() {
                     tracing::warn!("[telegram] No receivers — update dropped");
                 }
-                ("exit", answers, Some(price))
+                Routed { reply_to: answers, value: Some(price), ..Routed::kind("exit") }
             }
             Inbound::Unparsed => {
                 telemetry::telegram_parsed(ParseResult::Unparsed);
-                ("unparsed", None, None)
+                Routed::kind("unparsed")
             }
         };
 
         // Kept for the v2 Desk's feed only after the engine has it, so
         // storing a message never holds up a signal.
         if let Some(db_tx) = db_tx.as_ref() {
-            let (kind, reply_to, value) = routed;
             let _ = db_tx
                 .send(DbWriteMessage::TelegramMessage {
                     chat_id,
@@ -189,9 +188,12 @@ pub(crate) async fn run_event_loop(
                     msg_id: i64::from(msg.id()),
                     sent_at: msg.date().with_timezone(&ist_offset()).format("%Y-%m-%d %H:%M:%S").to_string(),
                     text: text.to_owned(),
-                    kind,
-                    reply_to,
-                    value,
+                    kind: routed.kind,
+                    reply_to: routed.reply_to,
+                    value: routed.value,
+                    instrument: routed.instrument,
+                    strike: routed.strike,
+                    side: routed.side,
                     edited: is_edit,
                 })
                 .await;
@@ -199,6 +201,34 @@ pub(crate) async fn run_event_loop(
     }
 
     tracing::info!("[telegram] Event loop exited");
+}
+
+/// How a message was routed, as the v2 Desk's feed stores it.
+struct Routed {
+    kind: &'static str,
+    /// The message a reply answers.
+    reply_to: Option<i64>,
+    /// A reply's new stop, or its exit price.
+    value: Option<f64>,
+    instrument: Option<String>,
+    strike: Option<f64>,
+    side: Option<String>,
+}
+
+impl Routed {
+    fn kind(kind: &'static str) -> Routed {
+        Routed { kind, reply_to: None, value: None, instrument: None, strike: None, side: None }
+    }
+
+    /// A call, with the contract it named.
+    fn call(kind: &'static str, signal: &TradeSignal) -> Routed {
+        Routed {
+            instrument: Some(signal.instrument_name.clone()),
+            strike: signal.strike,
+            side: signal.option_type.clone(),
+            ..Routed::kind(kind)
+        }
+    }
 }
 
 /// Send `payload` to the live log stream and, when there is one, to the
