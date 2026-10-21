@@ -46,7 +46,7 @@ export interface Placing {
   /** Stays the same while the same level is being placed. */
   key: string;
   data: OrderLineData;
-  /** `false` refuses that spot (past the price): place again. */
+  /** `false` leaves nothing set there: place again. */
   onPlace: (price: number) => boolean;
 }
 
@@ -364,7 +364,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pla
   });
 
   // "+ Stop": a line that follows the pointer until the next click or tap. A
-  // spot refused (past the price) leaves it following, to tap again.
+  // spot not taken leaves it following, to tap again.
   const placingKey = placing?.key ?? null;
   useEffect(() => {
     const c = chart.current;

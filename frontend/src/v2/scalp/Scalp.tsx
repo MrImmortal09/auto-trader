@@ -16,7 +16,7 @@ import { CrosshairBus } from './bus';
 import type { Placing } from './KChart';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, type LevelActions, type LevelKind, type Layers } from './lines';
-import { approxMoney, istClock, levelCrossed, levelPnl, levelSide, toTick, type ChartSym, type Tf } from './model';
+import { approxMoney, istClock, levelCrossed, levelPnl, toTick, type ChartSym, type Tf } from './model';
 import { PositionSheet, ScalpBar, ScalpPositionsPanel, type PositionHandlers } from './ScalpPositions';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -225,29 +225,10 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   const tick = (index: string) => chains[index]?.tick_size ?? 0.05;
 
-  /** Set a level unless it is past the price — that would sell at once, and
-   * isn't allowed — or there's no live price to tell. `false` when refused. */
+  /** Set a level where it was dropped, on the tick. One past the price sells
+   * the whole holding at market on the engine's next tick — a quick exit. */
   function trySet(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel): boolean {
-    const at = { ...lvl, price: toTick(lvl.price, lvl.trigger === 'premium' ? tick(p.index) : 0.05) };
-    const crossed = levelCrossed(kind, at, p.option_type, p.ltp, spot[p.index] ?? null);
-    if (crossed !== false) {
-      const label = contractLabel(p.index, p.strike, p.option_type);
-      const watched = at.trigger === 'premium' ? 'its price' : p.index;
-      const now = at.trigger === 'premium' ? p.ltp : spot[p.index];
-      const title = `${kind === 'stop' ? 'Stop' : 'Target'} not set on ${label}`;
-      toast(
-        crossed
-          ? {
-              tone: 'loss',
-              title,
-              body: `It has to be ${levelSide(kind, at.trigger, p.option_type)} ${watched} (${now == null ? '—' : price(now)} now) — past it, it would sell at once.`,
-              key: `crossed-${p.id}-${kind}`,
-            }
-          : { tone: 'loss', title, body: `No live price for ${watched} to check it against yet.`, key: `noprice-${p.id}-${kind}` },
-      );
-      return false;
-    }
-    void sendLevel(p, kind, at);
+    void sendLevel(p, kind, { ...lvl, price: toTick(lvl.price, lvl.trigger === 'premium' ? tick(p.index) : 0.05) });
     return true;
   }
 
@@ -276,7 +257,7 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
         const lvl = { price: at, trigger };
         const indexNow = spot[p.index] ?? null;
         const past = levelCrossed(kind, lvl, p.option_type, p.ltp, indexNow) === true;
-        return [{ key: 'label', text: past ? `${word} · past the price, can't go here` : `${word} ${approxMoney(levelPnl(lvl, p, indexNow, delta))}`, color }];
+        return [{ key: 'label', text: past ? `${word} · past the price, sells all here` : `${word} ${approxMoney(levelPnl(lvl, p, indexNow, delta))}`, color }];
       },
       axisText: (at) => price(at),
     };

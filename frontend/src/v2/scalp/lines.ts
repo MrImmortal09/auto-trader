@@ -73,12 +73,12 @@ function levelLine(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel, cx: Lin
     draggable,
     parts: (at) => {
       const moved = { price: at, trigger: lvl.trigger };
-      // Dragged past the price it would sell at once: it won't be set there.
+      // Dropped past the price it sells the whole holding at once.
       const past = levelCrossed(kind, moved, p.option_type, p.ltp, cx.spot[p.index] ?? null) === true;
       const parts: LinePart[] = [
         {
           key: 'label',
-          text: past ? `${word} · past the price, won't set` : `${word} ${approxMoney(levelPnl(moved, p, cx.spot[p.index] ?? null, delta))}`,
+          text: past ? `${word} · past the price, sells all on release` : `${word} ${approxMoney(levelPnl(moved, p, cx.spot[p.index] ?? null, delta))}`,
           color,
           icon: draggable ? 'grip' : 'lock',
         },

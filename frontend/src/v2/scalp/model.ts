@@ -61,8 +61,8 @@ export function levelPnl(
  * Whether a stop or target at `lvl` would fire at once — the engine's rule
  * (`chart_level_hit`): on the premium a stop is reached falling and a target
  * rising; on the index a call loses as it falls, a put as it rises. `null`
- * without a live price to tell. The server refuses such a level; the chart
- * never sends one.
+ * without a live price to tell. Set there, it sells the whole holding on the
+ * engine's next tick — the chart says so while a line is past the price.
  */
 export function levelCrossed(
   kind: 'stop' | 'target',
@@ -98,9 +98,10 @@ export function levelText(index: string, side: string | null, lvl: ChartLevel, k
   return `${index} ${falls ? '≤' : '≥'} ${level(lvl.price)}`;
 }
 
-/** Round to the exchange's tick: levels are prices the engine compares. */
+/** Round to the exchange's tick: levels are prices the engine compares.
+ * Paise at most, so 25,132.35 never goes out as 25132.350000000002. */
 export function toTick(price: number, tick = 0.05): number {
-  return Math.round(price / tick) * tick;
+  return Number((Math.round(price / tick) * tick).toFixed(2));
 }
 
 export interface Bar {
