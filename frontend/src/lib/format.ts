@@ -2,7 +2,7 @@
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-import type { MonitoredPosition, PaperTrade } from '../types';
+import type { ChartLevel, MonitoredPosition, PaperTrade } from '../types';
 
 /** Full contract label — "SENSEX 82000 CE" — instead of the bare underlying,
  * which is ambiguous when several strikes are being traded at once. Falls back
@@ -20,6 +20,21 @@ export function fmt(n: number) {
     maximumFractionDigits: 2,
     minimumFractionDigits: 2,
   }).format(n);
+}
+
+/** A chart stop or target the way it fires: "₹92.50" on the option's price,
+ * or "NIFTY ≤ 25,060" on its index — a call's stop and a put's target fire as
+ * the index falls, the other two as it rises. */
+export function chartLevelLabel(
+  index: string,
+  optionType: string | null | undefined,
+  level: ChartLevel,
+  kind: 'stop' | 'target',
+): string {
+  if (level.trigger === 'premium') return `₹${fmt(level.price)}`;
+  const falls = (kind === 'stop') === (optionType === 'CE');
+  const value = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(level.price);
+  return `${index} ${falls ? '≤' : '≥'} ${value}`;
 }
 
 export function totalCharges(t: PaperTrade) {
@@ -60,6 +75,8 @@ export function formatExitReason(reason?: string): string {
     case 'TGT1_HIT': return 'Target 1 Hit';
     case 'TGT2_HIT': return 'Target 2 Hit';
     case 'EXPIRY_SQUAREOFF': return 'Expiry Square-off';
+    case 'CHART_STOP': return 'Chart Stop Hit';
+    case 'CHART_TARGET': return 'Chart Target Hit';
     default:
       if (reason.startsWith('EXIT_AT_')) {
         const price = reason.replace('EXIT_AT_', '');

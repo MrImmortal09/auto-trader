@@ -776,9 +776,79 @@ pub struct MonitoredPosition {
     /// picked up by the engine on its next tick and cleared once it acts.
     #[serde(default)]
     pub manual_add: Option<ManualAdd>,
+    /// A scalp's stop and target set from a v2 chart — see [`ChartLevels`].
+    /// Left out of the JSON while unset, so positions without one serialize
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "ChartLevels::is_empty")]
+    pub chart: ChartLevels,
+}
+
+/// What a chart stop or target watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LevelTrigger {
+    /// The option's own last traded price.
+    Premium,
+    /// Its underlying index's value. A call's stop fires when the index falls
+    /// to the level and its target when the index rises to it; a put's the
+    /// other way round.
+    Index,
+}
+
+/// One stop or target level.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChartLevel {
+    pub price: f64,
+    pub trigger: LevelTrigger,
+}
+
+/// A scalp's stop and target, set from a v2 chart
+/// (`PATCH /api/v2/positions/:id`, behind `FeatureFlags::chart_stops`).
+/// Reaching either sells the whole holding at market, through the same exit
+/// as any stop. Once set they protect the position until it closes, whatever
+/// the switch says later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChartLevels {
+    #[serde(default)]
+    pub stop: Option<ChartLevel>,
+    #[serde(default)]
+    pub target: Option<ChartLevel>,
+}
+
+impl ChartLevels {
+    pub fn is_empty(&self) -> bool {
+        self.stop.is_none() && self.target.is_none()
+    }
 }
 
 impl MonitoredPosition {
+    /// The exit reason once the option's `premium`, or its index's `index`
+    /// value, has reached this position's chart stop (checked first) or
+    /// target. Never for a position that isn't a CE or a PE.
+    pub fn chart_level_hit(&self, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
+        let call = match self.signal.option_type.as_deref() {
+            Some(t) if t.eq_ignore_ascii_case("CE") => true,
+            Some(t) if t.eq_ignore_ascii_case("PE") => false,
+            _ => return None,
+        };
+        let reached = |level: &ChartLevel, is_stop: bool| {
+            let (value, falling) = match level.trigger {
+                // On its own premium a stop is reached falling and a target
+                // rising, for a call and a put alike.
+                LevelTrigger::Premium => (premium, is_stop),
+                // On the index a call loses as it falls, a put as it rises.
+                LevelTrigger::Index => (index, is_stop == call),
+            };
+            value.is_some_and(|v| v > 0.0 && if falling { v <= level.price } else { v >= level.price })
+        };
+        if self.chart.stop.as_ref().is_some_and(|l| reached(l, true)) {
+            return Some("CHART_STOP");
+        }
+        if self.chart.target.as_ref().is_some_and(|l| reached(l, false)) {
+            return Some("CHART_TARGET");
+        }
+        None
+    }
     /// A buy on top of the holding is pending: a manual add not sent yet, a
     /// top-up order at the broker, or one whose send outcome is unknown.
     pub fn buy_in_flight(&self) -> bool {
@@ -1354,6 +1424,85 @@ mod tests {
         assert!(!call("NIFTYIT", Some(25000.0), Some("CE")).is_index_option());
         // A reply's bare update signal is not a call at all.
         assert!(!call("UPDATE", None, None).is_index_option());
+    }
+
+    fn scalp(side: &str, chart: ChartLevels) -> MonitoredPosition {
+        MonitoredPosition {
+            signal: TradeSignal {
+                instrument_name: "NIFTY".into(),
+                strike: Some(25_100.0),
+                option_type: Some(side.into()),
+                action: "BUY".into(),
+                ..Default::default()
+            },
+            manual: true,
+            chart,
+            ..Default::default()
+        }
+    }
+
+    fn on_index(price: f64) -> ChartLevel {
+        ChartLevel { price, trigger: LevelTrigger::Index }
+    }
+
+    fn on_premium(price: f64) -> ChartLevel {
+        ChartLevel { price, trigger: LevelTrigger::Premium }
+    }
+
+    #[test]
+    fn index_levels_follow_the_side_of_the_option() {
+        // A call: stop below the index, target above it.
+        let call = scalp("CE", ChartLevels { stop: Some(on_index(25_060.0)), target: Some(on_index(25_180.0)) });
+        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_100.0)), None);
+        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_060.0)), Some("CHART_STOP"));
+        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_000.0)), Some("CHART_STOP"));
+        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_180.0)), Some("CHART_TARGET"));
+        // A put: stop above the index, target below it.
+        let put = scalp("PE", ChartLevels { stop: Some(on_index(25_140.0)), target: Some(on_index(25_020.0)) });
+        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_100.0)), None);
+        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_140.0)), Some("CHART_STOP"));
+        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_200.0)), Some("CHART_STOP"));
+        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_020.0)), Some("CHART_TARGET"));
+        // No index value yet: nothing fires.
+        assert_eq!(call.chart_level_hit(Some(100.0), None), None);
+    }
+
+    #[test]
+    fn premium_levels_work_the_same_for_calls_and_puts() {
+        for side in ["CE", "PE"] {
+            let pos = scalp(side, ChartLevels { stop: Some(on_premium(92.5)), target: Some(on_premium(140.0)) });
+            assert_eq!(pos.chart_level_hit(Some(100.0), Some(25_000.0)), None, "{side}");
+            assert_eq!(pos.chart_level_hit(Some(92.5), None), Some("CHART_STOP"), "{side}");
+            assert_eq!(pos.chart_level_hit(Some(140.05), None), Some("CHART_TARGET"), "{side}");
+            assert_eq!(pos.chart_level_hit(None, Some(25_000.0)), None, "{side}");
+        }
+    }
+
+    #[test]
+    fn a_stop_wins_over_a_target_and_only_real_prices_count() {
+        let mixed = scalp("CE", ChartLevels { stop: Some(on_premium(92.5)), target: Some(on_index(25_180.0)) });
+        assert_eq!(mixed.chart_level_hit(Some(90.0), Some(25_200.0)), Some("CHART_STOP"));
+        assert_eq!(mixed.chart_level_hit(Some(0.0), Some(0.0)), None);
+        assert_eq!(scalp("CE", ChartLevels::default()).chart_level_hit(Some(1.0), Some(1.0)), None);
+        // Only options have chart levels.
+        let mut not_an_option = mixed;
+        not_an_option.signal.option_type = None;
+        assert_eq!(not_an_option.chart_level_hit(Some(90.0), Some(25_200.0)), None);
+    }
+
+    #[test]
+    fn chart_levels_stay_out_of_the_json_until_set() {
+        let plain = scalp("CE", ChartLevels::default());
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("chart").is_none(), "positions without levels serialize as before");
+        let restored: MonitoredPosition = serde_json::from_value(json).unwrap();
+        assert!(restored.chart.is_empty());
+
+        let with = scalp("PE", ChartLevels { stop: Some(on_index(25_140.0)), target: None });
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["chart"], serde_json::json!({ "stop": { "price": 25140.0, "trigger": "index" }, "target": null }));
+        let restored: MonitoredPosition = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.chart, with.chart);
     }
 
     #[test]

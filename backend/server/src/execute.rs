@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::Serialize;
-use shared_domain::{telemetry, MonitoredPosition, TradeState, INDEX_NAMES};
+use shared_domain::{telemetry, ChartLevels, MonitoredPosition, TradeState, INDEX_NAMES};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use trading_engine::{ChainStrike, OptionChain, ScripRecord};
 
@@ -275,6 +275,9 @@ struct PositionRow {
     exiting: bool,
     /// The engine stopped acting on it by itself — see the log.
     halted: bool,
+    /// A scalp's stop and target set from a v2 chart; left out while unset.
+    #[serde(skip_serializing_if = "ChartLevels::is_empty")]
+    chart: ChartLevels,
 }
 
 pub(crate) fn price(state: &AppState, key: &str) -> Option<f64> {
@@ -449,6 +452,7 @@ fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
         adding: p.buy_in_flight(),
         exiting: p.sell_in_flight(),
         halted: p.live_halt.is_some(),
+        chart: p.chart,
     }
 }
 

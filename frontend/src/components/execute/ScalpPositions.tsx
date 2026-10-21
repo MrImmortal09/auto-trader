@@ -1,7 +1,7 @@
 import { LoaderCircle, Moon } from 'lucide-react';
 import type { ExecutePosition } from '../../types';
 import { contractLabel, fmtPnl } from '../../lib/execute';
-import { fmt } from '../../lib/format';
+import { chartLevelLabel, fmt } from '../../lib/format';
 import { PriceCell } from './PriceCell';
 
 function Tag({ tone, children }: { tone: 'scalp' | 'signal' | 'busy' | 'bad' | 'night'; children: React.ReactNode }) {
@@ -58,6 +58,17 @@ function PositionRow({ p, busy, nearClose, onExit, onSellLot }: {
             </>
           )}
         </div>
+        {(p.chart?.stop || p.chart?.target) && (
+          <div className="mt-0.5 text-[11px] font-mono-code tabular-nums flex flex-wrap items-center gap-x-1">
+            {p.chart.stop && (
+              <span className="font-semibold text-error">stop {chartLevelLabel(p.index, p.option_type, p.chart.stop, 'stop')}</span>
+            )}
+            {p.chart.stop && p.chart.target && <span className="mx-1 text-outline">·</span>}
+            {p.chart.target && (
+              <span className="font-semibold text-secondary">target {chartLevelLabel(p.index, p.option_type, p.chart.target, 'target')}</span>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="text-right min-w-[96px]">

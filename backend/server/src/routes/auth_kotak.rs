@@ -268,6 +268,10 @@ async fn perform_kotak_login(
                 let _ = tx.send(payload.to_string());
                 resubscribed += 1;
             }
+            // A scalp's index-triggered chart level needs its index streaming.
+            for msg in crate::routes::v2::chart_index_subscriptions(&deps.positions.read().await) {
+                let _ = tx.send(msg);
+            }
         }
         drop(tx_guard);
 

@@ -799,6 +799,10 @@ async fn main() {
                     prices.insert(key.clone(), 0.0);
                     let _ = tx.send(serde_json::json!({"action": "subscribe", "scrips": key}).to_string());
                 }
+                // A scalp's index-triggered chart level needs its index streaming.
+                for msg in routes::v2::chart_index_subscriptions(&positions.read().await) {
+                    let _ = tx.send(msg);
+                }
             }
         }
     } else {
@@ -1045,6 +1049,7 @@ async fn main() {
         .route("/api/auth/session",                 get(routes::session_status_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
+        .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))
         .route("/api/v2/candles",                   get(routes::v2::candles_handler))
         .route("/api/v2/candles/stream",            get(routes::v2::candles_stream_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
