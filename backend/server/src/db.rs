@@ -226,6 +226,23 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    // Today's 1-minute bars for the v2 charts (see `candles`), so a restart
+    // keeps the day. Pruned to today whenever the candle service starts. New
+    // table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS candles (
+            symbol TEXT NOT NULL,
+            t INTEGER NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (symbol, t)
+        )",
+    ).execute(&pool).await.unwrap();
+
     // Upstox option-chain analytics (see `market_data.rs`). New table, so this
     // is backward compatible with existing databases.
     sqlx::query(
@@ -707,8 +724,56 @@ pub async fn db_writer(
                     telemetry::db_write_error("oi_snapshot");
                 }
             }
+            DbWriteMessage::CandleMinute { symbol, t, open, high, low, close, volume, source } => {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO candles (symbol, t, open, high, low, close, volume, source)
+                     VALUES (?,?,?,?,?,?,?,?)
+                     ON CONFLICT(symbol, t) DO UPDATE SET
+                       open = excluded.open, high = excluded.high, low = excluded.low,
+                       close = excluded.close, volume = excluded.volume, source = excluded.source
+                     WHERE candles.source <> 'upstox' OR excluded.source = 'upstox'",
+                )
+                .bind(&symbol).bind(t).bind(open).bind(high).bind(low).bind(close).bind(volume).bind(source)
+                .execute(&pool)
+                .await
+                {
+                    tracing::error!("DB candle insert: {e}");
+                    telemetry::db_write_error("candle");
+                }
+            }
         }
     }
+}
+
+/// One cached 1-minute bar: `(t, open, high, low, close, volume, source)`.
+pub type CandleRow = (i64, f64, f64, f64, f64, Option<f64>, String);
+
+/// `symbol`'s cached minutes from `since` (Unix ms) on, oldest first.
+pub async fn load_candle_minutes(pool: &SqlitePool, symbol: &str, since: i64) -> Vec<CandleRow> {
+    sqlx::query_as::<_, CandleRow>(
+        "SELECT t, open, high, low, close, volume, source FROM candles
+         WHERE symbol = ? AND t >= ? ORDER BY t ASC",
+    )
+    .bind(symbol)
+    .bind(since)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(symbol, error = %e, "Could not read cached candles");
+        Vec::new()
+    })
+}
+
+/// Drop cached minutes from before `before` (Unix ms): only today's are kept.
+pub async fn prune_candles(pool: &SqlitePool, before: i64) {
+    if let Err(e) = sqlx::query("DELETE FROM candles WHERE t < ?").bind(before).execute(pool).await {
+        tracing::warn!(error = %e, "Could not prune cached candles");
+    }
+}
+
+/// [`prune_candles`] for a spawned task.
+pub async fn prune_candles_owned(pool: SqlitePool, before: i64) {
+    prune_candles(&pool, before).await;
 }
 
 #[cfg(test)]
