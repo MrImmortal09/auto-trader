@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { ChevronLeft, Download } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Download } from 'lucide-react';
 import { useTelemetryStream } from '../../hooks/useTelemetryStream';
 import { getSystem } from '../lib/api';
 import { hhmm, plural } from '../lib/format';
@@ -7,57 +7,25 @@ import { usePoll } from '../lib/usePoll';
 import type { HealthSet, Level, SystemAnswer } from '../lib/types';
 import { Button } from '../ui/Button';
 import { EngineLog, LogPreview } from './EngineLog';
+import { ConnectionsCard, EndpointCard, OrderFlow, PositionsCard, SignalFlow } from './EngineStats';
+import { HostFacts } from './HostFacts';
 import { HealthTile } from './HealthTile';
+import { Card, CountRow, GroupTitle } from './parts';
+import { CpuCard, MemoryCard, RuntimeCard, TrafficCards } from './ServerStats';
 import { downloadLog } from './logLines';
 import { TICK_BUDGET_MS, TickChart } from './TickChart';
+import { ago, count, ms, uptime } from './units';
 import { useEngineLog } from './useEngineLog';
 
-const COUNT = new Intl.NumberFormat('en-IN');
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const CLOCK = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-
-/** "8.4 ms", "142 ms", "1.2 s". */
-function ms(v: number | null | undefined): string {
-  if (v == null) return '—';
-  if (v >= 1000) return `${(v / 1000).toFixed(1)} s`;
-  return v >= 10 ? `${Math.round(v)} ms` : `${v.toFixed(1)} ms`;
-}
-
-/** "0.3 s", "12 s", "4 min". */
-function ago(secs: number | null | undefined): string {
-  if (secs == null) return '—';
-  if (secs < 10) return `${secs.toFixed(1)} s`;
-  if (secs < 120) return `${Math.round(secs)} s`;
-  return `${Math.round(secs / 60)} min`;
-}
 
 /** "Mar 2027" from `2027-03-14`. */
 function monthYear(day: string): string {
   return `${MONTHS[Number(day.slice(5, 7)) - 1]} ${day.slice(0, 4)}`;
 }
 
-function Card({ title, note, children }: { title: string; note?: ReactNode; children: ReactNode }) {
-  return (
-    <section className="flex min-w-0 flex-col rounded-12 bg-panel p-4">
-      <div className="flex items-baseline gap-2">
-        <h3 className="type-title text-fg">{title}</h3>
-        {note && <span className="type-caption text-fg-muted">{note}</span>}
-      </div>
-      <div className="mt-2 flex-1">{children}</div>
-    </section>
-  );
-}
-
-function CountRow({ label, value, alarm = false }: { label: string; value: ReactNode; alarm?: boolean }) {
-  return (
-    <div className="flex items-center justify-between py-1.5">
-      <span className="type-body text-fg-muted">{label}</span>
-      <span className={`num-medium ${alarm ? 'text-loss' : 'text-fg'}`}>{value}</span>
-    </div>
-  );
-}
-
-const n = (v: number | undefined) => (v == null ? '—' : COUNT.format(v));
+const n = count;
 
 /** The tiles: engine, Kotak, price feed, Telegram and Upstox. */
 function tiles(t: ReturnType<typeof useTelemetryStream>, d: SystemAnswer | null, level: (k: keyof HealthSet) => Level, health: HealthSet | null, compact: boolean) {
@@ -91,7 +59,7 @@ function tiles(t: ReturnType<typeof useTelemetryStream>, d: SystemAnswer | null,
       key="feed"
       name="Price feed"
       level={level('feed')}
-      value={s ? `${COUNT.format(Math.round(s.feed_ticks_per_sec))} ticks/s` : '—'}
+      value={s ? `${count(Math.round(s.feed_ticks_per_sec))} ticks/s` : '—'}
       detail={`Last tick ${ago(s?.feed_last_tick_age_secs)} ago${compact ? '' : ` · ${n(s?.feed_subscriptions)} subscriptions`}`}
       series={series((p) => p.feed_ticks_per_sec)}
       compact={compact}
@@ -127,11 +95,36 @@ function tiles(t: ReturnType<typeof useTelemetryStream>, d: SystemAnswer | null,
  * tick time and its log. Live from `/api/telemetry/*` and `/api/logs/*`;
  * the day's counts from `/api/v2/system`.
  */
-export function System({ serverBase, desktop, health }: { serverBase: string; desktop: boolean; health: HealthSet | null }) {
+/** Everything below the day's overview: traffic, the counts since the
+ * server started, connections, the host, positions and latency by endpoint. */
+function Details({ serverBase, t, marketOpen, compact }: { serverBase: string; t: ReturnType<typeof useTelemetryStream>; marketOpen: boolean; compact: boolean }) {
+  const s = t.latest;
+  const grid = (cols: string, children: ReactNode) => <div className={`grid gap-4 ${compact ? 'grid-cols-1' : cols}`}>{children}</div>;
+  return (
+    <>
+      <GroupTitle title="Traffic" note="last 15 minutes" />
+      {grid('grid-cols-3', <TrafficCards s={s} history={t.history} height={compact ? 120 : 150} />)}
+      <GroupTitle title="Since the server started" note={s ? `${uptime(s.process_uptime_secs)} ago` : undefined} />
+      {s ? (
+        <>
+          {grid('grid-cols-2', <><SignalFlow s={s} compact={compact} /><OrderFlow s={s} compact={compact} /></>)}
+          {grid('grid-cols-3', <><ConnectionsCard s={s} marketOpen={marketOpen} /><HostFacts serverBase={serverBase} /></>)}
+          <PositionsCard s={s} compact={compact} />
+          {grid('grid-cols-2', <><EndpointCard title="Kotak REST by endpoint" rows={s.kotak_endpoints} keyLabel="Endpoint" errorLabel="Not 2xx" /><EndpointCard title="Dashboard API by route" rows={s.http_routes} keyLabel="Route" errorLabel="5xx" /></>)}
+        </>
+      ) : (
+        <p className="type-body text-fg-muted">Waiting for the first sample from the server…</p>
+      )}
+      <p className="type-caption text-fg-muted">The same figures are at /metrics in Prometheus text format, for any outside scraper.</p>
+    </>
+  );
+}
+
+export function System({ serverBase, desktop, health, marketOpen }: { serverBase: string; desktop: boolean; health: HealthSet | null; marketOpen: boolean }) {
   const t = useTelemetryStream(serverBase);
   const sys = usePoll(() => getSystem(serverBase), 15_000, serverBase);
   const log = useEngineLog(serverBase);
-  const [fullLog, setFullLog] = useState(false);
+  const [view, setView] = useState<'overview' | 'log' | 'details'>('overview');
   const d = sys.data;
   const level = (k: keyof HealthSet): Level => health?.[k]?.level ?? 'off';
   const live = d?.mode === 'LIVE';
@@ -140,11 +133,24 @@ export function System({ serverBase, desktop, health }: { serverBase: string; de
   const lateStart = live && d?.started_today && d.started_today > '09:15' ? d.started_today : null;
   const caption = t.stale ? 'Waiting for the server’s next sample…' : `Live · sampled every 2 s${desktop ? ' · charts show the last 15 minutes' : ''}`;
 
-  if (!desktop && fullLog) {
+  if (!desktop && view === 'details') {
+    return (
+      <div className="flex flex-col gap-3 p-4">
+        <button type="button" onClick={() => setView('overview')} className="flex items-center gap-1 self-start type-label text-fg-muted hover:text-fg">
+          <ChevronLeft size={16} /> System
+        </button>
+        <h2 className="type-title text-fg">Server details</h2>
+        <RuntimeCard s={t.latest} />
+        <Details serverBase={serverBase} t={t} marketOpen={marketOpen} compact />
+      </div>
+    );
+  }
+
+  if (!desktop && view === 'log') {
     return (
       <div className="flex flex-col gap-3 p-4">
         <div className="flex items-center justify-between">
-          <button type="button" onClick={() => setFullLog(false)} className="flex items-center gap-1 type-label text-fg-muted hover:text-fg">
+          <button type="button" onClick={() => setView('overview')} className="flex items-center gap-1 type-label text-fg-muted hover:text-fg">
             <ChevronLeft size={16} /> System
           </button>
           <Button size="sm" icon={<Download size={14} />} onClick={() => downloadLog(log.lines)} disabled={log.lines.length === 0}>
@@ -168,15 +174,24 @@ export function System({ serverBase, desktop, health }: { serverBase: string; de
           <CountRow label="Orders filled" value={ord ? `${n(ord.filled)} of ${n(ord.sent)}` : '—'} />
           <CountRow label="Orders rejected" value={n(ord?.rejected)} alarm={(ord?.rejected ?? 0) > 0} />
         </Card>
+        <CpuCard s={t.latest} history={t.history} height={64} />
+        <MemoryCard s={t.latest} history={t.history} height={64} />
         <section className="rounded-12 bg-panel p-4">
           <div className="flex items-center justify-between">
             <h3 className="type-title text-fg">Engine log</h3>
-            <Button size="sm" kind="ghost" onClick={() => setFullLog(true)}>
+            <Button size="sm" kind="ghost" onClick={() => setView('log')}>
               Open full log
             </Button>
           </div>
           <LogPreview lines={log.lines} count={5} />
         </section>
+        <button type="button" onClick={() => setView('details')} className="flex min-h-[60px] items-center gap-3 rounded-12 bg-panel px-4 py-3 text-left">
+          <span className="min-w-0 flex-1">
+            <span className="block type-body-strong text-fg">Server details</span>
+            <span className="mt-0.5 block type-caption text-fg-muted">Runtime, traffic, counts since start, connections, host, positions, latency</span>
+          </span>
+          <ChevronRight size={16} className="shrink-0 text-fg-muted" />
+        </button>
       </div>
     );
   }
@@ -190,6 +205,11 @@ export function System({ serverBase, desktop, health }: { serverBase: string; de
         </Button>
       </div>
       <div className="grid grid-cols-5 gap-4">{tiles(t, d, level, health, false)}</div>
+      <div className="grid grid-cols-3 gap-4">
+        <CpuCard s={t.latest} history={t.history} />
+        <MemoryCard s={t.latest} history={t.history} />
+        <RuntimeCard s={t.latest} />
+      </div>
       <div className="grid grid-cols-3 gap-4">
         <Card title="Signals today">
           <CountRow label="Calls parsed" value={n(sig?.calls)} />
@@ -213,8 +233,9 @@ export function System({ serverBase, desktop, health }: { serverBase: string; de
         </Card>
       </div>
       <section className="rounded-12 bg-panel p-4">
-        <EngineLog lines={log.lines} connected={log.connected} compact={false} />
+        <EngineLog lines={log.lines} connected={log.connected} compact={false} maxHeight={560} />
       </section>
+      <Details serverBase={serverBase} t={t} marketOpen={marketOpen} compact={false} />
     </div>
   );
 }
