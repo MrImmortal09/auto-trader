@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
-use shared_domain::{ChartLevel, LevelTrigger, MonitoredPosition, TradeState};
+use shared_domain::{ChartLevel, ChartLevels, LevelTrigger, MonitoredPosition, TradeState};
 
 use crate::routes::auth_kotak::send_log;
 use crate::routes::positions::persist_positions_snapshot;
@@ -77,6 +77,38 @@ fn refusal(pos: &MonitoredPosition, update: &LevelsUpdate, chart_stops_on: bool)
     None
 }
 
+/// Why a level `update` sets can't be: the price it watches is already past
+/// it, so it would sell the whole holding at once — or there is no live price
+/// to tell. Uses the engine's own rule (`chart_level_hit`). Clearing a level
+/// is never refused.
+fn crossed(pos: &MonitoredPosition, update: &LevelsUpdate, premium: Option<f64>, index: Option<f64>) -> Option<(StatusCode, String)> {
+    for (kind, level) in [("stop", update.stop.flatten()), ("target", update.target.flatten())] {
+        let Some(level) = level else { continue };
+        let (now, watched) = match level.trigger {
+            LevelTrigger::Premium => (premium, "the option".to_string()),
+            LevelTrigger::Index => (index, pos.signal.instrument_name.clone()),
+        };
+        let Some(now) = now.filter(|v| *v > 0.0) else {
+            return Some((
+                StatusCode::CONFLICT,
+                format!("no live price for {watched} to check the {kind} against — try again in a moment"),
+            ));
+        };
+        let mut alone = pos.clone();
+        alone.chart = match kind {
+            "stop" => ChartLevels { stop: Some(level), target: None },
+            _ => ChartLevels { stop: None, target: Some(level) },
+        };
+        if alone.chart_level_hit(premium, index).is_some() {
+            return Some((
+                StatusCode::CONFLICT,
+                format!("that {kind} is already past the price ({watched} at {now:.2}) — it would sell the whole holding at once, so it isn't set"),
+            ));
+        }
+    }
+    None
+}
+
 /// The bridge message that streams `instrument`'s index, if it is one of the six.
 fn index_subscription(instrument: &str) -> Option<String> {
     let (segment, feed_name) = shared_domain::kotak_index_feed(instrument)?;
@@ -106,9 +138,10 @@ fn live_price(state: &AppState, key: &str) -> Option<f64> {
 /// `PATCH /api/v2/positions/:id` `{stop?, target?}` — set, clear or keep a
 /// scalp's chart stop and target. A level is `{price, trigger}` with
 /// `trigger` `"premium"` (the option's price) or `"index"` (its index, which
-/// fires in the direction the option loses or gains). One already crossed is
-/// taken as asked, and the engine sells the whole holding on its next tick:
-/// `sells_now` says so.
+/// fires in the direction the option loses or gains). A level the price is
+/// already past — one that would sell the whole holding at once — is
+/// refused, as is one with no live price to check it against. `sells_now`
+/// would say if a level set were reached all the same.
 pub async fn patch_position_levels_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -122,6 +155,13 @@ pub async fn patch_position_levels_handler(
     if let Some((status, msg)) = refusal(pos, &update, chart_stops_on) {
         return (status, Json(json!({ "error": msg }))).into_response();
     }
+    let instrument = pos.signal.instrument_name.clone();
+    let premium = pos.ws_scrip_key.as_deref().and_then(|k| live_price(&state, k));
+    let index = shared_domain::kotak_index_feed(&instrument)
+        .and_then(|(_, name)| live_price(&state, &shared_domain::index_price_key(name)));
+    if let Some((status, msg)) = crossed(pos, &update, premium, index) {
+        return (status, Json(json!({ "error": msg }))).into_response();
+    }
 
     let before = pos.chart;
     if let Some(stop) = update.stop {
@@ -131,10 +171,6 @@ pub async fn patch_position_levels_handler(
         pos.chart.target = target;
     }
     let chart = pos.chart;
-    let instrument = pos.signal.instrument_name.clone();
-    let premium = pos.ws_scrip_key.as_deref().and_then(|k| live_price(&state, k));
-    let index = shared_domain::kotak_index_feed(&instrument)
-        .and_then(|(_, name)| live_price(&state, &shared_domain::index_price_key(name)));
     let sells_now = pos.chart_level_hit(premium, index);
     let subscription = watches_index(pos).then(|| index_subscription(&instrument)).flatten();
     let snapshot = positions.clone();
@@ -223,6 +259,37 @@ mod tests {
         }
         let bad_price = parse(r#"{"target": {"price": -1, "trigger": "premium"}}"#);
         assert_eq!(refusal(&scalp(), &bad_price, true).map(|r| r.0), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn a_level_already_past_the_price_is_refused() {
+        // A CE with its premium at 100 and NIFTY at 25,112.40.
+        let at = |json: &str| crossed(&scalp(), &parse(json), Some(100.0), Some(25_112.4)).map(|r| r.0);
+        // On the premium a stop goes below the price and a target above it.
+        assert_eq!(at(r#"{"stop": {"price": 95, "trigger": "premium"}}"#), None);
+        assert_eq!(at(r#"{"stop": {"price": 105, "trigger": "premium"}}"#), Some(StatusCode::CONFLICT));
+        assert_eq!(at(r#"{"target": {"price": 110, "trigger": "premium"}}"#), None);
+        assert_eq!(at(r#"{"target": {"price": 99, "trigger": "premium"}}"#), Some(StatusCode::CONFLICT));
+        // On the index a call's stop goes below and its target above.
+        assert_eq!(at(r#"{"stop": {"price": 25060, "trigger": "index"}}"#), None);
+        assert_eq!(at(r#"{"stop": {"price": 25150, "trigger": "index"}}"#), Some(StatusCode::CONFLICT));
+        assert_eq!(at(r#"{"target": {"price": 25100, "trigger": "index"}}"#), Some(StatusCode::CONFLICT));
+        // Both at once: refused when either one is past.
+        assert_eq!(at(r#"{"stop": {"price": 25060, "trigger": "index"}, "target": {"price": 25100, "trigger": "index"}}"#), Some(StatusCode::CONFLICT));
+
+        // A put the other way round: its stop above the index, its target below.
+        let mut put = scalp();
+        put.signal.option_type = Some("PE".into());
+        let put_at = |json: &str| crossed(&put, &parse(json), Some(100.0), Some(25_112.4)).map(|r| r.0);
+        assert_eq!(put_at(r#"{"stop": {"price": 25150, "trigger": "index"}}"#), None);
+        assert_eq!(put_at(r#"{"stop": {"price": 25100, "trigger": "index"}}"#), Some(StatusCode::CONFLICT));
+        assert_eq!(put_at(r#"{"target": {"price": 25050, "trigger": "index"}}"#), None);
+
+        // No live price to check against: refused, never guessed.
+        let refused = crossed(&scalp(), &parse(r#"{"stop": {"price": 25060, "trigger": "index"}}"#), Some(100.0), None);
+        assert!(refused.is_some_and(|(code, msg)| code == StatusCode::CONFLICT && msg.contains("no live price")));
+        // Clearing never is.
+        assert_eq!(crossed(&scalp(), &parse(r#"{"stop": null, "target": null}"#), None, None), None);
     }
 
     #[test]
