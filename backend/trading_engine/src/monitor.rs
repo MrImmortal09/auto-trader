@@ -841,6 +841,13 @@ fn lot_size_of(pos: &MonitoredPosition) -> i32 {
         .unwrap_or(1)
 }
 
+/// The live value of `instrument`'s index from Kotak's feed, when it is one
+/// of the six and has ticked — what an index-triggered chart level watches.
+fn index_ltp(ltp_map: &DashMap<String, f64>, instrument: &str) -> Option<f64> {
+    let (_, feed_name) = shared_domain::kotak_index_feed(instrument)?;
+    ltp_map.get(&shared_domain::index_price_key(feed_name)).map(|v| *v).filter(|v| *v > 0.0)
+}
+
 /// Quantity to release at target 1: `pct` of the holding, rounded **up** to a
 /// whole lot and capped at what we hold.
 ///
@@ -2694,6 +2701,7 @@ async fn adopt_manual(
         sizing: Default::default(),
         manual: false,
         manual_add: None,
+        chart: Default::default(),
     };
 
     { positions.write().await.push(new_pos); }
@@ -2922,6 +2930,13 @@ fn decide_live(
                     qty: held,
                     reason: "EXPIRY_SQUAREOFF".to_string(),
                 });
+            }
+
+            // A scalp's chart stop or target (set from a v2 chart): the whole
+            // holding, through the same exit as any stop — never while another
+            // sell is in flight (checked above).
+            if let Some(reason) = pos.chart_level_hit(ltp, index_ltp(ltp_map, &pos.signal.instrument_name)) {
+                return Some(LiveAction::ExitAll { qty: held, reason: reason.to_string() });
             }
 
             let trigger = round_down_tick(pos.current_sl, pos.tick_size);
@@ -4536,6 +4551,7 @@ pub async fn start_position_monitor(
                                     sizing: Default::default(),
                                     manual: false,
                                     manual_add: None,
+                                    chart: Default::default(),
                                 });
                                 telemetry::signal(SignalOutcome::Accepted);
                                 let snapshot = pos_guard.clone();
@@ -4732,6 +4748,13 @@ pub async fn start_position_monitor(
                             if let Some(ref reason) = pos.force_exit {
                                 Some(PosAction::ExitSell {
                                     qty: pos.executed_qty, reason: reason.clone(), new_sl: None, exec_price: pos.override_exit_price,
+                                })
+                            } else if let Some(reason) =
+                                pos.chart_level_hit(Some(ltp), index_ltp(&ltp_map, &pos.signal.instrument_name))
+                            {
+                                // A scalp's chart stop or target: the whole holding.
+                                Some(PosAction::ExitSell {
+                                    qty: pos.executed_qty, reason: reason.to_string(), new_sl: None, exec_price: None,
                                 })
                             } else if ltp <= pos.current_sl {
                                 // A stop above the signal's SL while still
@@ -5092,6 +5115,7 @@ mod tests {
             sizing: Default::default(),
             manual: false,
             manual_add: None,
+            chart: Default::default(),
         }
     }
 
@@ -6982,5 +7006,144 @@ mod tests {
         // After a restart the send's poll is unknown: symbol and quantity
         // alone decide, as they always did.
         assert_eq!(unconfirmed_buy_candidates(&book, SYM, 65, &[], &memory, None).len(), 2);
+    }
+
+    // ── Chart stops and targets (v2) ─────────────────────────────────── //
+
+    const NIFTY_SPOT: &str = "idx|NIFTY 50";
+
+    fn chart_scalp(side: &str, chart: shared_domain::ChartLevels, ltp: &Arc<DashMap<String, f64>>) -> MonitoredPosition {
+        let mut pos = manual_active(ltp);
+        pos.signal.option_type = Some(side.to_string());
+        pos.chart = chart;
+        pos
+    }
+
+    fn on_index(price: f64) -> Option<shared_domain::ChartLevel> {
+        Some(shared_domain::ChartLevel { price, trigger: shared_domain::LevelTrigger::Index })
+    }
+
+    fn on_premium(price: f64) -> Option<shared_domain::ChartLevel> {
+        Some(shared_domain::ChartLevel { price, trigger: shared_domain::LevelTrigger::Premium })
+    }
+
+    /// What `decide_live` does with a scalp: an exit `(qty, reason)` or nothing.
+    fn live_exit(pos: &MonitoredPosition, ltp: &Arc<DashMap<String, f64>>) -> Option<(i32, String)> {
+        match decide_live(pos, ltp, &cfg_with_lots(1, 3), false, true, &test_gate()) {
+            Some(LiveAction::ExitAll { qty, reason }) => Some((qty, reason)),
+            None => None,
+            other => panic!("expected an exit or nothing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_index_stop_or_target_sells_a_call_or_a_put_in_full() {
+        let ltp = Arc::new(DashMap::new());
+        let exit = |reason: &str| Some((150, reason.to_string()));
+        // A call: stop when NIFTY falls to 25,060, target when it rises to 25,180.
+        let levels = shared_domain::ChartLevels { stop: on_index(25_060.0), target: on_index(25_180.0) };
+        let call = chart_scalp("CE", levels, &ltp);
+        for (spot, want) in [(25_100.0, None), (25_060.0, exit("CHART_STOP")), (25_020.0, exit("CHART_STOP")), (25_180.0, exit("CHART_TARGET"))] {
+            ltp.insert(NIFTY_SPOT.into(), spot);
+            assert_eq!(live_exit(&call, &ltp), want, "CE with NIFTY at {spot}");
+        }
+        // A put: stop when NIFTY rises to 25,140, target when it falls to 25,020.
+        let levels = shared_domain::ChartLevels { stop: on_index(25_140.0), target: on_index(25_020.0) };
+        let put = chart_scalp("PE", levels, &ltp);
+        for (spot, want) in [(25_100.0, None), (25_140.0, exit("CHART_STOP")), (25_200.0, exit("CHART_STOP")), (25_020.0, exit("CHART_TARGET"))] {
+            ltp.insert(NIFTY_SPOT.into(), spot);
+            assert_eq!(live_exit(&put, &ltp), want, "PE with NIFTY at {spot}");
+        }
+        // Without an index value an index level cannot fire.
+        ltp.remove(NIFTY_SPOT);
+        assert_eq!(live_exit(&call, &ltp), None);
+        // A scalp without levels is left alone, as before.
+        ltp.insert(NIFTY_SPOT.into(), 1.0);
+        assert_eq!(live_exit(&manual_active(&ltp), &ltp), None);
+    }
+
+    #[test]
+    fn a_chart_stop_waits_for_a_partial_sell_then_sells_exactly_the_rest() {
+        let ltp = Arc::new(DashMap::new());
+        let levels = shared_domain::ChartLevels { stop: on_premium(110.0), target: None };
+        let mut pos = chart_scalp("CE", levels, &ltp);
+        ltp.insert("nse_fo|999".into(), 105.0);
+
+        // −1 lot is at the broker: 75 of the 150 are being sold. The stop is
+        // through, but nothing more may be sold while that sell is in flight.
+        pos.pending_exit_order_id = Some("ORD1".into());
+        pos.pending_exit_qty = 75;
+        pos.pending_exit_reason = Some("MANUAL_SELL".into());
+        assert_eq!(live_exit(&pos, &ltp), None);
+
+        // It fills: 75 held, nothing in flight. The stop sells exactly those.
+        pos.pending_exit_order_id = None;
+        pos.pending_exit_qty = 0;
+        pos.pending_exit_reason = None;
+        pos.executed_qty = 75;
+        assert_eq!(live_exit(&pos, &ltp), Some((75, "CHART_STOP".to_string())));
+
+        // A −1 lot asked for but not yet sent when the stop is crossed: the
+        // stop sells the whole holding instead — never the two together.
+        pos.manual_sell_qty = Some(75);
+        assert_eq!(live_exit(&pos, &ltp), Some((75, "CHART_STOP".to_string())));
+    }
+
+    /// Run the PAPER monitor over one scalp and return its booked sells.
+    async fn paper_chart_run(
+        pos: MonitoredPosition,
+        ltp: Arc<DashMap<String, f64>>,
+        moves: &[(&str, f64)],
+    ) -> (Vec<MonitoredPosition>, Vec<(String, i64, String)>) {
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        let (db_tx, mut db_rx) = mpsc::channel(1024);
+        let (_signal_tx, signal_rx) = broadcast::channel(8);
+        tokio::spawn(start_position_monitor(
+            signal_rx,
+            db_tx,
+            ltp.clone(),
+            Arc::new(RwLock::new(cfg_with_lots(1, 3))),
+            positions.clone(),
+            broadcast::channel(1024).0,
+            Arc::new(RwLock::new(None)),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            entry_gate::new_indicator_feed(),
+        ));
+        for (key, price) in moves {
+            ltp.insert(key.to_string(), *price);
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        let mut sells = Vec::new();
+        while let Ok(msg) = db_rx.try_recv() {
+            if let DbWriteMessage::Trade { action, qty, exit_reason, .. } = msg {
+                sells.push((action, i64::from(qty), exit_reason.unwrap_or_default()));
+            }
+        }
+        let left = positions.read().await.clone();
+        (left, sells)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_sells_a_scalp_at_its_chart_target() {
+        let ltp = Arc::new(DashMap::new());
+        ltp.insert(NIFTY_SPOT.into(), 25_100.0);
+        let levels = shared_domain::ChartLevels { stop: on_index(25_140.0), target: on_premium(130.0) };
+        let pos = chart_scalp("PE", levels, &ltp);
+        // 125 rides on; 130.5 reaches the target and the whole holding goes.
+        let (left, sells) = paper_chart_run(pos, ltp, &[("nse_fo|999", 125.0), ("nse_fo|999", 130.5)]).await;
+        assert!(left.is_empty());
+        assert_eq!(sells, vec![("SELL".to_string(), 150, "CHART_TARGET".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_sells_a_call_scalp_when_the_index_falls_to_its_stop() {
+        let ltp = Arc::new(DashMap::new());
+        ltp.insert(NIFTY_SPOT.into(), 25_100.0);
+        let levels = shared_domain::ChartLevels { stop: on_index(25_060.0), target: None };
+        let pos = chart_scalp("CE", levels, &ltp);
+        let (left, sells) = paper_chart_run(pos, ltp, &[(NIFTY_SPOT, 25_080.0), (NIFTY_SPOT, 25_055.0)]).await;
+        assert!(left.is_empty());
+        assert_eq!(sells, vec![("SELL".to_string(), 150, "CHART_STOP".to_string())]);
     }
 }

@@ -260,6 +260,20 @@ export interface MonitoredPosition {
   manual?: boolean;
   /** A manual add still waiting to be sent. */
   manual_add?: { lots: number; requested_at: string } | null;
+  /** A scalp's stop and target set from a v2 chart; absent while none is set. */
+  chart?: ChartLevels;
+}
+
+/** A chart stop or target: on the option's own price, or on its index. */
+export interface ChartLevel {
+  price: number;
+  trigger: 'premium' | 'index';
+}
+
+/** A scalp's chart stop and target. Reaching either sells the whole holding. */
+export interface ChartLevels {
+  stop: ChartLevel | null;
+  target: ChartLevel | null;
 }
 
 export interface KotakForm {
@@ -523,6 +537,8 @@ export interface ExecutePosition {
   adding: boolean;
   exiting: boolean;
   halted: boolean;
+  /** Chart stop and target, when set from a v2 chart. */
+  chart?: ChartLevels;
 }
 
 export interface ExecuteFrame {

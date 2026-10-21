@@ -632,6 +632,7 @@ Every completed trade records its explicit exit reason (`exit_reason` column in 
 - `Closed via Frontend`: Manually closed using the dashboard Close button
 - `Exit via Telegram Msg`: Exited via a direct Telegram reply command (e.g., `exit @ 610`)
 - `Opposite Signal Exit`: Automatically closed due to an opposite trade signal arriving
+- `Chart Stop Hit` / `Chart Target Hit`: A scalp's stop or target set from the v2 charts was reached (the whole holding is sold)
 
 ---
 
@@ -668,6 +669,7 @@ The **Daily Reports** page provides an aggregated view of trading performance by
 | `GET` | `/api/logs/stream` | SSE stream of engine log events |
 | `GET` | `/api/v2/flags` | v2 engine switches: `{"index_options_only": false, "chart_stops": false}` |
 | `PUT` | `/api/v2/flags` | Change only the switches named in the body; saved in their own table, so a v1 settings save never resets them |
+| `PATCH` | `/api/v2/positions/:id` | A scalp's chart `stop` and `target`: each `{price, trigger}` with `trigger` `premium` (the option's price) or `index` (its index — a CE's stop fires as the index falls, a PE's as it rises; targets the other way). Left out keeps a level, `null` clears it. Reaching either sells the whole holding; a level already crossed sells on the next tick (`sells_now`). New levels need `chart_stops` on; ones already set stay until the position closes |
 | `GET` | `/api/v2/candles?symbol=&tf=&from=&to=` | Chart bars, oldest first. `symbol`: an index (`NIFTY`), its nearest future (`NIFTY:FUT`) or an option (`NIFTY:2026-10-27:22750:CE`); `tf`: `1m`, `5m` (default) or `15m`; `from`/`to`: IST days (default: the last five). Past days come from Upstox; today's are built from live ticks and replaced minute by minute with Upstox's official candles, which carry the volume |
 | `GET` | `/api/v2/candles/stream?symbols=&tf=` | SSE: every 250 ms, the bars that changed — the forming bar, and a closed bar again when Upstox's official minutes correct it. Up to 6 comma-separated symbols |
 

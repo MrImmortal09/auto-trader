@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Info } from 'lucide-react';
 import type { MonitoredPosition } from '../types';
 import { apiFetch } from '../lib/api';
-import { fmt, instrumentLabel } from '../lib/format';
+import { chartLevelLabel, fmt, instrumentLabel } from '../lib/format';
 import { useAuth } from '../context/AuthContext';
 import { QtyInput } from './QtyInput';
 import { SyncWithKotakButton } from './SyncWithKotakButton';
@@ -16,6 +16,22 @@ function nextTargetLabel(p: MonitoredPosition): string {
     return `₹${fmt(p.next_dynamic_target)} (dynamic)`;
   }
   return p.signal.targets.map((t) => `₹${fmt(t)}`).join(' / ');
+}
+
+// A scalp's chart stop and target (set from the v2 charts) are what the
+// engine sells on, so they replace its empty signal SL and targets here.
+function stopLabel(p: MonitoredPosition): string {
+  const stop = p.chart?.stop;
+  return stop
+    ? `${chartLevelLabel(p.signal.instrument_name, p.signal.option_type, stop, 'stop')} (chart)`
+    : `₹${fmt(p.current_sl)}`;
+}
+
+function targetLabel(p: MonitoredPosition): string {
+  const target = p.chart?.target;
+  return target
+    ? `${chartLevelLabel(p.signal.instrument_name, p.signal.option_type, target, 'target')} (chart)`
+    : nextTargetLabel(p);
 }
 
 // A range call (`PUTS 140-145`) is stored as `ABOVE 140` capped at
@@ -391,8 +407,8 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                       <td className="px-3 py-2.5 text-on-surface font-mono-code">{p.executed_qty}</td>
                       <td className="px-3 py-2.5 text-on-surface font-mono-code">₹{fmt(p.avg_buy_price)}</td>
                       <td className="px-3 py-2.5 text-on-surface font-mono-code font-semibold">{hasLtp ? `₹${fmt(p.ltp!)}` : '—'}</td>
-                      <td className="px-3 py-2.5 text-error font-mono-code font-semibold">₹{fmt(p.current_sl)}</td>
-                      <td className="px-3 py-2.5 text-primary font-mono-code">{nextTargetLabel(p)}</td>
+                      <td className="px-3 py-2.5 text-error font-mono-code font-semibold">{stopLabel(p)}</td>
+                      <td className="px-3 py-2.5 text-primary font-mono-code">{targetLabel(p)}</td>
                       <td className="px-3 py-2.5 text-right font-mono-code">
                         {pnl === null ? (
                           <span className="text-on-surface-variant">—</span>
@@ -455,11 +471,11 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                     </div>
                     <div>
                       <div className="text-on-surface-variant text-[10px] uppercase font-sans">Stop Loss</div>
-                      <div className="font-semibold text-error">₹{fmt(p.current_sl)}</div>
+                      <div className="font-semibold text-error">{stopLabel(p)}</div>
                     </div>
                     <div>
                       <div className="text-on-surface-variant text-[10px] uppercase font-sans">Targets</div>
-                      <div className="font-semibold text-primary truncate">{nextTargetLabel(p)}</div>
+                      <div className="font-semibold text-primary truncate">{targetLabel(p)}</div>
                     </div>
                   </div>
 
