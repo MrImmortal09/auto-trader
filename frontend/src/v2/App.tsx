@@ -63,7 +63,6 @@ export default function App() {
 
   const s = status.data;
   const unreachable = !!status.error;
-  const live = s?.mode === 'LIVE';
   const stopped = s?.kill_switch ? s.stopped ?? { at: null, positions_exited: 0, entries_cancelled: 0 } : null;
 
   const content =
@@ -136,8 +135,6 @@ export default function App() {
       </div>
       {!desktop && <TabBar screen={screen} onSelect={go} />}
 
-      {/* Real money: the whole frame is edged in marigold. */}
-      {live && <div aria-hidden className="pointer-events-none fixed inset-0 z-40 border-2 border-live" />}
 
       {killSwitchOpen && (
         <KillSwitchDialog serverBase={serverBase} mode={s?.mode} onClose={() => setKillSwitchOpen(false)} onDone={() => void status.refresh()} />
