@@ -72,7 +72,13 @@ export function LogPreview({ lines, count }: { lines: LogLine[]; count: number }
  * The engine log: newest first, filtered to orders, signals or errors and
  * searched. With Follow off it holds still, and says how much has arrived.
  */
-export function EngineLog({ lines, connected, compact }: { lines: LogLine[]; connected: boolean | null; compact: boolean }) {
+export function EngineLog({ lines, connected, compact, maxHeight }: {
+  lines: LogLine[];
+  connected: boolean | null;
+  compact: boolean;
+  /** Scroll inside this height instead of growing the page. */
+  maxHeight?: number;
+}) {
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
   // What was showing when Follow went off.
@@ -131,7 +137,7 @@ export function EngineLog({ lines, connected, compact }: { lines: LogLine[]; con
       {shown.length === 0 ? (
         <p className="py-6 type-body text-fg-muted">{source.length === 0 ? 'Waiting for engine events…' : 'Nothing matches.'}</p>
       ) : (
-        <ul className="mt-2">
+        <ul className="mt-2 overflow-y-auto" style={maxHeight ? { maxHeight } : undefined}>
           {shown.map((l) => (
             <Row key={l.id} line={l} today={today} compact={compact} />
           ))}

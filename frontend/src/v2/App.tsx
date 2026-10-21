@@ -81,7 +81,7 @@ export default function App() {
       (() => {
         const page =
           screen === 'system' ? (
-            <System serverBase={serverBase} desktop={desktop} health={s?.health ?? null} />
+            <System serverBase={serverBase} desktop={desktop} health={s?.health ?? null} marketOpen={s?.market_open ?? false} />
           ) : (
             <Settings
               serverBase={serverBase}
