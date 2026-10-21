@@ -692,7 +692,7 @@ All paper trades compute Kotak Neo charges automatically:
 |---|---|
 | Brokerage | Flat ₹20 per leg (configurable) |
 | SEBI fee | 0.0001% of turnover |
-| Exchange transaction charge | Options: 0.03503% of premium (NSE), 0.0325% (BSE: SENSEX, BANKEX) · Equity: 0.00297% (NSE) |
+| Exchange transaction charge | Options: 0.03503% of premium (NSE), 0.0325% (BSE: SENSEX, BANKEX) · Equity: 0.00297% (NSE), 0.00375% (BSE) |
 | STT (options) | 0.15% of premium, SELL side only (since 1 April 2026) |
 | STT (equity intraday) | 0.025% on SELL side only |
 | Stamp duty | 0.003% on BUY side only |

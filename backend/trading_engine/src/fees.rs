@@ -210,4 +210,12 @@ mod tests {
         assert!(close(c.stt_charge, 62.5));
         assert!(close(c.transaction_charge, 7.425));
     }
+
+    #[test]
+    fn equity_exchange_charge_depends_on_exchange() {
+        let nse = FeeCalculator::calculate_on(Exchange::Nse, 100, 2_500.0, "SELL", false, 20.0);
+        let bse = FeeCalculator::calculate_on(Exchange::Bse, 100, 2_500.0, "SELL", false, 20.0);
+        assert!(close(nse.transaction_charge, 7.425));
+        assert!(close(bse.transaction_charge, 9.375));
+    }
 }
