@@ -86,6 +86,11 @@ pub fn upstox_index_key(index: &str) -> Option<&'static str> {
     })
 }
 
+/// Strikes match the same way in both brokers' lists.
+fn same_strike(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
 /// The contract `symbol` names among Upstox's index derivatives on `today`.
 pub fn find_upstox<'a>(symbol: &Symbol, derivatives: &'a [Derivative], today: NaiveDate) -> Option<&'a Derivative> {
     match *symbol {
@@ -95,7 +100,7 @@ pub fn find_upstox<'a>(symbol: &Symbol, derivatives: &'a [Derivative], today: Na
             .filter(|d| d.underlying == index && d.kind == "FUT" && d.expiry >= today)
             .min_by_key(|d| d.expiry),
         Symbol::Option { index, expiry, strike, side } => derivatives.iter().find(|d| {
-            d.underlying == index && d.kind == side.as_str() && d.expiry == expiry && (d.strike - strike).abs() < 1e-6
+            d.underlying == index && d.kind == side.as_str() && d.expiry == expiry && same_strike(d.strike, strike)
         }),
     }
 }
@@ -112,7 +117,7 @@ pub fn find_kotak<'a>(symbol: &Symbol, store: &'a ScripStore, today: NaiveDate) 
             .min_by_key(|r| r.expiry_date),
         Symbol::Option { expiry, strike, side, .. } => {
             let mut matches = records.filter(|r| r.option_type == side.as_str() && r.expiry_date == expiry);
-            matches.find(|r| r.normalized_strike() == Some(strike))
+            matches.find(|r| r.normalized_strike().is_some_and(|s| same_strike(s, strike)))
         }
     }
 }

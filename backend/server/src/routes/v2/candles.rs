@@ -243,7 +243,8 @@ impl Stream {
 /// closed bar again when Upstox's official minutes correct it (which is when
 /// its volume appears). Event `bars`:
 /// `{"tf":"5m","updates":[{"symbol","bar":{t,o,h,l,c,v},"forming"}]}`. A first
-/// `error` event lists symbols that could not be followed.
+/// `error` event lists symbols that could not be followed; when none can be,
+/// the answer is a 404 instead of a stream.
 pub async fn candles_stream_handler(State(state): State<AppState>, Query(q): Query<StreamQuery>) -> Response {
     let Some(tf) = parse_tf(q.tf.as_deref()) else {
         return bad_request("tf must be 1m, 5m or 15m");
@@ -263,11 +264,26 @@ pub async fn candles_stream_handler(State(state): State<AppState>, Query(q): Que
 
     let mut followed: Vec<Symbol> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
+    let mut restarting = false;
     for symbol in symbols {
         match state.candles.track(&state, symbol).await {
             Ok(_) => followed.push(symbol),
-            Err(_) => failed.push(symbol.name()),
+            Err(e) => {
+                restarting |= matches!(e, TrackError::Stopped);
+                failed.push(symbol.name());
+            }
         }
+    }
+    // Nothing to follow: say so instead of holding an empty stream open, which
+    // would only keep the service from stopping. EventSource stops retrying
+    // on an answer that isn't 200.
+    if followed.is_empty() {
+        let (status, error) = if restarting {
+            (StatusCode::SERVICE_UNAVAILABLE, "the candle service is restarting — try again")
+        } else {
+            (StatusCode::NOT_FOUND, "none of these is a contract either broker lists today")
+        };
+        return (status, Json(json!({ "error": error, "symbols": failed }))).into_response();
     }
     let running = state.candles.get(&state).await;
     let mut every = tokio::time::interval(STREAM_EVERY);

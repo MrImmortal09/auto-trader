@@ -43,6 +43,8 @@ const FALLBACK_CHECK: Duration = Duration::from_secs(5);
 const FALLBACK_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Room for a burst of bar changes while a stream catches up.
 const CHANGES_CAPACITY: usize = 1024;
+/// Falling behind Kotak's ticks is logged at most this often.
+const LAG_WARN_EVERY: Duration = Duration::from_secs(60);
 
 fn now_ms() -> i64 {
     shared_domain::now_ist().timestamp_millis()
@@ -454,14 +456,19 @@ impl Running {
     /// Every Kotak tick, for the tracked symbols. Kotak is the primary source.
     async fn kotak_ticks(self: Arc<Self>) {
         let mut rx = kotak_client::subscribe_ticks();
-        let mut lagged = 0u64;
+        // Ticks skipped since the last warning, which goes out at most once
+        // a minute however long the lag lasts.
+        let mut missed = 0u64;
+        let mut warned_at: Option<std::time::Instant> = None;
         loop {
             match rx.recv().await {
                 Ok(t) => self.apply_tick(&t.key, t.at_ms, t.ltp),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    lagged += n;
-                    if lagged == n {
-                        tracing::warn!(missed = n, "Candle service fell behind Kotak's ticks — some ticks skipped");
+                    missed += n;
+                    if warned_at.is_none_or(|at| at.elapsed() >= LAG_WARN_EVERY) {
+                        tracing::warn!(missed, "Candle service fell behind Kotak's ticks — some ticks skipped");
+                        missed = 0;
+                        warned_at = Some(std::time::Instant::now());
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
