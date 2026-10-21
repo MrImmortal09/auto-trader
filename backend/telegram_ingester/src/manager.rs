@@ -5,8 +5,8 @@ use grammers_client::sender::SenderPool;
 use grammers_client::{Client, SignInError};
 use grammers_session::storages::MemorySession;
 use grammers_session::updates::UpdatesLike;
-use shared_domain::TradeSignal;
-use tokio::sync::{broadcast, mpsc};
+use shared_domain::{DbWriteMessage, FeatureFlags, TradeSignal};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::session_file;
 use crate::stream::run_event_loop;
@@ -314,11 +314,14 @@ impl TelegramManager {
 
     /// Spawn the signal-monitoring loop for `chat_ids`.
     /// Clones the `Client` so `list_dialogs` keeps working; consumes `updates_rx`.
+    /// `flags` and `db_tx` are as for the loop itself (see `run_event_loop`).
     pub async fn start_monitoring(
         &mut self,
         chat_ids: Vec<i64>,
         signal_tx: broadcast::Sender<TradeSignal>,
         log_tx: Option<broadcast::Sender<String>>,
+        flags: Arc<RwLock<FeatureFlags>>,
+        db_tx: Option<mpsc::Sender<DbWriteMessage>>,
     ) -> Result<(), TelegramAuthError> {
         let client = self.client.as_ref()
             .ok_or_else(|| TelegramAuthError::WrongState(self.state.clone()))?
@@ -327,7 +330,9 @@ impl TelegramManager {
             .ok_or_else(|| TelegramAuthError::WrongState(self.state.clone()))?;
 
         self.monitored_chats = chat_ids.clone();
-        self.event_loop = Some(tokio::spawn(run_event_loop(client, updates_rx, chat_ids, signal_tx, log_tx)));
+        self.event_loop = Some(tokio::spawn(run_event_loop(
+            client, updates_rx, chat_ids, signal_tx, log_tx, flags, db_tx,
+        )));
         self.state = "running".into();
         Ok(())
     }

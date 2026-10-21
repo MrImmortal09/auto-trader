@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use chrono::{Datelike, Days, NaiveDate, Weekday};
 use regex::Regex;
-use shared_domain::{today_ist, TradeSignal};
+use shared_domain::{today_ist, FeatureFlags, TradeSignal};
 
 // ---------------------------------------------------------------------------
 // Compiled regex cache
@@ -379,6 +379,9 @@ pub fn parse_reply_exit(text: &str) -> Option<f64> {
 pub enum Inbound {
     /// A complete call — trade it.
     Signal(TradeSignal),
+    /// A complete call that isn't an option on one of the six indices, while
+    /// [`FeatureFlags::index_options_only`] is on — skip it, and say so.
+    NotIndexOption(TradeSignal),
     /// Looks like a BUY call but isn't one we can trade (see
     /// [`looks_like_buy_call`]) — drop it, loudly.
     IgnoredCall,
@@ -399,7 +402,24 @@ pub enum Inbound {
 /// unreadable BUY call is dropped before the reply patterns for the same
 /// reason: `BUY AGAIN 22300 CALLS ... SL 90` must not move another stop.
 pub fn classify(text: &str, msg_id: &str, reply_to: Option<&str>, today: NaiveDate) -> Inbound {
+    classify_with(text, msg_id, reply_to, today, FeatureFlags::default())
+}
+
+/// [`classify`] under the engine switches in `flags`; with every switch off
+/// it routes exactly as [`classify`]. With `index_options_only` on, a complete
+/// call that isn't an index option is [`Inbound::NotIndexOption`] — checked
+/// before the reply patterns, so it never becomes a stop move either.
+pub fn classify_with(
+    text: &str,
+    msg_id: &str,
+    reply_to: Option<&str>,
+    today: NaiveDate,
+    flags: FeatureFlags,
+) -> Inbound {
     if let Some(signal) = parse_signal_on(text, "telegram", Some(msg_id.to_owned()), today) {
+        if flags.index_options_only && !signal.is_index_option() {
+            return Inbound::NotIndexOption(signal);
+        }
         return Inbound::Signal(signal);
     }
     if looks_like_buy_call(text) {
@@ -678,5 +698,32 @@ mod tests {
         // SENSEX expires Thursdays.
         assert_eq!(next_week_expiry_with_now("SENSEX", d(2026, 10, 19)).as_deref(), Some("29-OCT-2026"));
         assert_eq!(next_week_expiry_with_now("BANKNIFTY", d(2026, 10, 19)), None);
+    }
+
+    #[test]
+    fn an_expiry_on_a_holiday_moves_to_the_trading_day_before() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let monthly = |index, month, now| resolve_expiry_date_with_now(None, month, index, now);
+        let dated = |index, day, month, now| resolve_expiry_date_with_now(Some(day), month, index, now);
+
+        // NSE monthlies on the last Tuesday: Tue 31 Mar 2026 is Mahavir Jayanti.
+        for index in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"] {
+            assert_eq!(monthly(index, "MARCH", d(2026, 3, 2)).as_deref(), Some("30-MAR-2026"), "{index}");
+        }
+        // BSE on the last Thursday: Thu 26 Mar is Ram Navami, Thu 28 May Bakri Id.
+        for index in ["SENSEX", "BANKEX"] {
+            assert_eq!(monthly(index, "MARCH", d(2026, 3, 2)).as_deref(), Some("25-MAR-2026"), "{index}");
+            assert_eq!(monthly(index, "MAY", d(2026, 5, 4)).as_deref(), Some("27-MAY-2026"), "{index}");
+        }
+
+        // Weeklies named by date: Holi (Tue 3 Mar), Dussehra (Tue 20 Oct),
+        // Diwali Balipratipada (Tue 10 Nov) and Ram Navami (Thu 26 Mar).
+        assert_eq!(dated("NIFTY", "3", "MARCH", d(2026, 3, 2)).as_deref(), Some("02-MAR-2026"));
+        assert_eq!(dated("NIFTY", "20", "OCTOBER", d(2026, 10, 19)).as_deref(), Some("19-OCT-2026"));
+        assert_eq!(dated("NIFTY", "10", "NOVEMBER", d(2026, 11, 4)).as_deref(), Some("09-NOV-2026"));
+        assert_eq!(dated("SENSEX", "26", "MARCH", d(2026, 3, 2)).as_deref(), Some("25-MAR-2026"));
+
+        // `NEXT WEEK` posted the week before Dussehra lands on Monday 19 Oct.
+        assert_eq!(next_week_expiry_with_now("NIFTY", d(2026, 10, 12)).as_deref(), Some("19-OCT-2026"));
     }
 }

@@ -467,6 +467,47 @@ impl TradingConfig {
 }
 
 // ===========================================================================
+// Feature flags
+// ===========================================================================
+
+/// Engine switches for the v2 redesign, stored in their own `feature_flags`
+/// table behind `GET/PUT /api/v2/flags` — never in [`TradingConfig`], which
+/// `POST /api/settings` replaces whole, so a switch kept there would be turned
+/// off every time v1 saves a setting. Both default to off, and with both off
+/// the engine trades exactly as it did before they existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeatureFlags {
+    /// Trade only CE/PE options on [`INDEX_NAMES`]: any other call (stock
+    /// options, equity, an index call with no strike) is skipped instead.
+    /// See [`TradeSignal::is_index_option`].
+    pub index_options_only: bool,
+    /// Stops and targets dragged on the v2 charts. Stored ahead of the engine
+    /// change that uses it; nothing reads it yet.
+    pub chart_stops: bool,
+}
+
+impl FeatureFlags {
+    /// Every switch as `(name, on)`; `name` is both its `feature_flags` row
+    /// and its JSON field.
+    pub fn entries(&self) -> [(&'static str, bool); 2] {
+        [
+            ("index_options_only", self.index_options_only),
+            ("chart_stops", self.chart_stops),
+        ]
+    }
+
+    /// Set the switch called `name`. `false` when there is no such switch.
+    pub fn set(&mut self, name: &str, on: bool) -> bool {
+        match name {
+            "index_options_only" => self.index_options_only = on,
+            "chart_stops" => self.chart_stops = on,
+            _ => return false,
+        }
+        true
+    }
+}
+
+// ===========================================================================
 // Trade signal (options-aware)
 // ===========================================================================
 
@@ -507,6 +548,21 @@ pub struct TradeSignal {
     /// The exact raw message text received, for displaying in reports.
     #[serde(default)]
     pub raw_message: Option<String>,
+}
+
+impl TradeSignal {
+    /// A CE or PE with a strike on one of [`INDEX_NAMES`], matched by exact
+    /// name — the only calls traded while
+    /// [`FeatureFlags::index_options_only`] is on. `NIFTY50` or `BANK NIFTY`
+    /// are not aliases: they don't match.
+    pub fn is_index_option(&self) -> bool {
+        let instrument = self.instrument_name.trim().to_uppercase();
+        self.strike.is_some_and(|s| s > 0.0)
+            && self.option_type.as_deref().is_some_and(|t| {
+                t.eq_ignore_ascii_case("CE") || t.eq_ignore_ascii_case("PE")
+            })
+            && INDEX_NAMES.contains(&instrument.as_str())
+    }
 }
 
 // ===========================================================================
@@ -1249,6 +1305,62 @@ mod tests {
         assert_eq!(cfg.indicator_pcr_sell_below, 0.0);
         assert_eq!(cfg.indicator_vwap_band_pct, 5.0);
         assert_eq!(cfg.call_validity_minutes, 0);
+    }
+
+    fn call(instrument: &str, strike: Option<f64>, side: Option<&str>) -> TradeSignal {
+        TradeSignal {
+            instrument_name: instrument.into(),
+            strike,
+            option_type: side.map(Into::into),
+            action: "BUY".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn index_options_are_ce_or_pe_with_a_strike_on_the_six_indices() {
+        for index in INDEX_NAMES {
+            assert!(call(index, Some(25000.0), Some("CE")).is_index_option(), "{index}");
+            assert!(call(index, Some(25000.0), Some("PE")).is_index_option(), "{index}");
+        }
+        assert!(call(" nifty ", Some(25000.0), Some("ce")).is_index_option());
+
+        // Stock options and equity.
+        assert!(!call("BHEL", Some(425.0), Some("CE")).is_index_option());
+        assert!(!call("RELIANCE", None, None).is_index_option());
+        // An index call with no strike or side could resolve to a future.
+        assert!(!call("NIFTY", None, None).is_index_option());
+        assert!(!call("NIFTY", Some(25000.0), None).is_index_option());
+        assert!(!call("NIFTY", None, Some("CE")).is_index_option());
+        assert!(!call("NIFTY", Some(0.0), Some("CE")).is_index_option());
+        assert!(!call("NIFTY", Some(25000.0), Some("XX")).is_index_option());
+        // Exact names only: no aliases, no substrings.
+        assert!(!call("NIFTY50", Some(25000.0), Some("CE")).is_index_option());
+        assert!(!call("NIFTYIT", Some(25000.0), Some("CE")).is_index_option());
+        // A reply's bare update signal is not a call at all.
+        assert!(!call("UPDATE", None, None).is_index_option());
+    }
+
+    #[test]
+    fn feature_flags_default_off_and_keep_their_api_names() {
+        assert_eq!(FeatureFlags::default(), FeatureFlags { index_options_only: false, chart_stops: false });
+        assert_eq!(
+            serde_json::to_value(FeatureFlags { index_options_only: true, chart_stops: false }).unwrap(),
+            serde_json::json!({ "index_options_only": true, "chart_stops": false }),
+        );
+
+        // `entries` and `set` use exactly the JSON field names, so a stored
+        // row always lands on the switch the API shows.
+        let flags = FeatureFlags { index_options_only: true, chart_stops: false };
+        let json = serde_json::to_value(flags).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), flags.entries().len());
+        for (name, on) in flags.entries() {
+            assert_eq!(json[name], serde_json::json!(on), "{name}");
+            let mut copy = FeatureFlags::default();
+            assert!(copy.set(name, on));
+            assert_eq!(copy.entries().into_iter().find(|(n, _)| *n == name), Some((name, on)));
+        }
+        assert!(!FeatureFlags::default().set("no_such_flag", true));
     }
 }
 

@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use shared_domain::current_ist_timestamp_string;
-use trading_engine::FeeCalculator;
+use trading_engine::{Exchange, FeeCalculator};
 
 use crate::AppState;
 use shared_domain::{DbWriteMessage, MonitoredPosition, TradeState};
@@ -253,7 +253,8 @@ pub async fn close_position_handler(
     };
 
     let cfg = state.trading_cfg.read().await;
-    let fees = FeeCalculator::calculate(
+    let fees = FeeCalculator::calculate_on(
+        Exchange::for_underlying(&instrument),
         qty,
         exit_price,
         "SELL",
@@ -451,7 +452,9 @@ pub async fn sell_position_handler(
     };
 
     let cfg = state.trading_cfg.read().await;
-    let fees = FeeCalculator::calculate(req.qty, exit_price, "SELL", is_options, cfg.brokerage_per_order);
+    let fees = FeeCalculator::calculate_on(
+        Exchange::for_underlying(&instrument), req.qty, exit_price, "SELL", is_options, cfg.brokerage_per_order,
+    );
 
     let mut tx = match state.db_pool.begin().await {
         Ok(t) => t,

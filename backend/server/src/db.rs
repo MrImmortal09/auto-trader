@@ -1,6 +1,6 @@
 use shared_domain::{current_ist_timestamp_string, DbWriteMessage, MonitoredPosition};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
-use shared_domain::{telemetry, TradingConfig};
+use shared_domain::{telemetry, FeatureFlags, TradingConfig};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -211,6 +211,18 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             api_hash TEXT NOT NULL,
             chat_ids TEXT NOT NULL,
             updated_at DATETIME NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+
+    // Engine switches for the v2 redesign (`shared_domain::FeatureFlags`,
+    // `/api/v2/flags`): one row per switch, a missing row means off. Kept out
+    // of `trading_config` because v1's settings save replaces that row whole.
+    // New table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS feature_flags (
+            name TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
         )",
     ).execute(&pool).await.unwrap();
 
@@ -532,6 +544,44 @@ pub async fn clear_telegram_resume(pool: &SqlitePool) {
     }
 }
 
+/// The v2 engine switches. A missing row, an unknown name or an unreadable
+/// table leaves a switch off — today's behaviour.
+pub async fn load_feature_flags(pool: &SqlitePool) -> FeatureFlags {
+    let rows = sqlx::query_as::<_, (String, bool)>("SELECT name, enabled FROM feature_flags")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("load feature_flags: {e}");
+            Vec::new()
+        });
+    let mut flags = FeatureFlags::default();
+    for (name, enabled) in rows {
+        if !flags.set(&name, enabled) {
+            tracing::warn!(name, "Unknown row in feature_flags — ignored");
+        }
+    }
+    flags
+}
+
+/// Store `changes` (`(name, on)` per switch) in one transaction: either all
+/// of them are saved or none is.
+pub async fn save_feature_flags(pool: &SqlitePool, changes: &[(&str, bool)]) -> Result<(), sqlx::Error> {
+    let now = current_ist_timestamp_string();
+    let mut tx = pool.begin().await?;
+    for (name, enabled) in changes {
+        sqlx::query(
+            "INSERT INTO feature_flags (name, enabled, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
+        )
+        .bind(name)
+        .bind(enabled)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 // ---------------------------------------------------------------------------
 // Sequential writer task
 // ---------------------------------------------------------------------------
@@ -744,6 +794,34 @@ mod tests {
 
         clear_telegram_resume(&pool).await;
         assert!(load_telegram_resume(&pool).await.is_none());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn feature_flags_start_off_and_survive_a_restart_and_a_settings_save() {
+        let db = TempDb::new("flags");
+        let pool = init_db(&db.url()).await;
+        assert_eq!(load_feature_flags(&pool).await, FeatureFlags::default());
+
+        save_feature_flags(&pool, &[("index_options_only", true)]).await.unwrap();
+        // What v1's settings save does to its own table never touches them.
+        sqlx::query("UPDATE trading_config SET mode = 'PAPER', other_lots = 1 WHERE id = 1")
+            .execute(&pool).await.unwrap();
+        // A row from a newer build is ignored, not an error.
+        sqlx::query("INSERT INTO feature_flags (name, enabled, updated_at) VALUES ('from_the_future', 1, 'x')")
+            .execute(&pool).await.unwrap();
+        pool.close().await;
+
+        let pool = init_db(&db.url()).await;
+        assert_eq!(
+            load_feature_flags(&pool).await,
+            FeatureFlags { index_options_only: true, chart_stops: false },
+        );
+        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true)]).await.unwrap();
+        assert_eq!(
+            load_feature_flags(&pool).await,
+            FeatureFlags { index_options_only: false, chart_stops: true },
+        );
         pool.close().await;
     }
 }

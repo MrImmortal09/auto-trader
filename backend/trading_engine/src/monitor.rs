@@ -11,7 +11,7 @@ use shared_domain::{
 };
 use tokio::sync::{broadcast, mpsc, RwLock};
 
-use crate::fees::{ChargeBreakdown, FeeCalculator};
+use crate::fees::{ChargeBreakdown, Exchange, FeeCalculator};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -113,7 +113,8 @@ async fn book_paper_sell(
     reason: &str,
 ) {
     let instrument = &pos.signal.instrument_name;
-    let fees = FeeCalculator::calculate(
+    let fees = FeeCalculator::calculate_on(
+        Exchange::for_underlying(instrument),
         qty, price, "SELL", pos.signal.option_type.is_some(), cfg.brokerage_per_order,
     );
     let pnl = fees.net_value - pos.avg_buy_price * qty as f64;
@@ -1199,7 +1200,9 @@ async fn record_live_sell(
     reason: &str,
     brokerage: f64,
 ) {
-    let fees = FeeCalculator::calculate(qty, price, "SELL", leg.is_options, brokerage);
+    let fees = FeeCalculator::calculate_on(
+        Exchange::for_underlying(&leg.instrument), qty, price, "SELL", leg.is_options, brokerage,
+    );
     let pnl = fees.net_value - leg.avg_buy_price * qty as f64;
     tracing::info!(instrument = %leg.instrument, reason, price, qty, pnl, "LIVE exit filled");
     send_trade(
@@ -1509,7 +1512,9 @@ async fn reconcile_live_orders(
                             p.sizing.hold_note = None;
                         }).await;
 
-                        let fees = FeeCalculator::calculate(filled, avg, "BUY", leg.is_options, brokerage);
+                        let fees = FeeCalculator::calculate_on(
+                            Exchange::for_underlying(&leg.instrument), filled, avg, "BUY", leg.is_options, brokerage,
+                        );
                         tracing::info!(instrument = %leg.instrument, price = avg, qty = filled, "LIVE entry filled");
                         send_trade(
                             db_tx, &leg.instrument, "BUY", filled, avg, &fees,
@@ -1685,7 +1690,9 @@ async fn reconcile_live_orders(
                             p.sizing.topup_exit_on_fill = false;
                         }).await;
 
-                        let fees = FeeCalculator::calculate(filled, avg, "BUY", leg.is_options, brokerage);
+                        let fees = FeeCalculator::calculate_on(
+                            Exchange::for_underlying(&leg.instrument), filled, avg, "BUY", leg.is_options, brokerage,
+                        );
                         let kind = if leg.manual { "MANUAL_ADD" } else { "TOPUP" };
                         tracing::info!(instrument = %leg.instrument, price = avg, qty = filled, kind, "LIVE top-up filled");
                         send_trade(
@@ -4847,7 +4854,8 @@ pub async fn start_position_monitor(
                         }
 
                         PosAction::TopUpBuy { qty, note, rearm } => {
-                            let fees = FeeCalculator::calculate(
+                            let fees = FeeCalculator::calculate_on(
+                                Exchange::for_underlying(&instrument),
                                 qty, pa.ltp, "BUY", is_options, cfg.brokerage_per_order,
                             );
                             let held = pos.executed_qty;
@@ -4889,7 +4897,8 @@ pub async fn start_position_monitor(
                                 });
                                 send_log(&db_tx, &log_tx, "INFO", &msg.to_string()).await;
                             }
-                            let fees = FeeCalculator::calculate(
+                            let fees = FeeCalculator::calculate_on(
+                                Exchange::for_underlying(&instrument),
                                 qty, pa.ltp, "BUY", is_options, cfg.brokerage_per_order,
                             );
                             pos.avg_buy_price = pa.ltp;

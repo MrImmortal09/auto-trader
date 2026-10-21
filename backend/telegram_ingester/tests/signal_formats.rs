@@ -8,7 +8,8 @@
 //! flight.
 
 use chrono::NaiveDate;
-use telegram_ingester::parser::{classify, parse_signal_on, Inbound};
+use shared_domain::FeatureFlags;
+use telegram_ingester::parser::{classify, classify_with, parse_signal_on, Inbound};
 
 /// Monday 19 Oct 2026. This week's NIFTY expiry is pulled back to today
 /// (Tue 20 Oct is a holiday); next week's is Tue 27 Oct, SENSEX Thu 29 Oct.
@@ -307,13 +308,27 @@ fn refused_calls_do_not_parse() {
 // ---------------------------------------------------------------------------
 
 fn route(text: &str, reply_to: Option<&str>) -> String {
-    match classify(text, "900", reply_to, today()) {
+    describe(classify(text, "900", reply_to, today()))
+}
+
+/// [`route`] with `index_options_only` switched on (`/api/v2/flags`).
+fn route_index_only(text: &str, reply_to: Option<&str>) -> String {
+    describe(classify_with(text, "900", reply_to, today(), index_only()))
+}
+
+fn index_only() -> FeatureFlags {
+    FeatureFlags { index_options_only: true, ..FeatureFlags::default() }
+}
+
+fn describe(inbound: Inbound) -> String {
+    match inbound {
         Inbound::Signal(s) => format!(
             "signal {} {} #{}",
             s.instrument_name,
             s.strike.unwrap_or_default(),
             s.signal_id.unwrap_or_default()
         ),
+        Inbound::NotIndexOption(s) => format!("skipped {}", s.instrument_name),
         Inbound::IgnoredCall => "ignored".into(),
         Inbound::SlUpdate { parent, new_sl } => format!("sl {new_sl} -> #{parent}"),
         Inbound::Exit { parent, price } => format!("exit {price} -> #{parent}"),
@@ -358,5 +373,106 @@ fn messages_route_to_the_right_action() {
     ];
     for (text, reply_to, want) in cases {
         assert_eq!(route(text, *reply_to), *want, "\n--- message (reply_to {reply_to:?}) ---\n{text}\n---");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expiry calendar: NIFTY and SENSEX weeklies, the other four monthly, and a
+// holiday pulls the expiry back to the trading day before
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expiry_follows_each_index_calendar() {
+    let expiry = |text: &str| parse(text).and_then(|c| c.expiry);
+    let call = |index: &str, when: &str| format!("BUY {index} 25000 CE ABOVE 120\nTARGET :- 140\nSL :- 100\n{when}");
+    let cases: &[(&str, &str, &str)] = &[
+        // Dussehra, Tue 20 Oct 2026, is a holiday: that week's NIFTY weekly
+        // expired on Monday 19 Oct.
+        ("NIFTY", "20 OCTOBER EXPIRY", "19-OCT-2026"),
+        ("NIFTY", "27 OCTOBER EXPIRY", "27-OCT-2026"),
+        // NSE monthlies: the last Tuesday, or the trading day before it.
+        ("NIFTY", "OCTOBER EXPIRY", "27-OCT-2026"),
+        ("BANKNIFTY", "OCTOBER EXPIRY", "27-OCT-2026"),
+        ("FINNIFTY", "OCTOBER EXPIRY", "27-OCT-2026"),
+        ("MIDCPNIFTY", "OCTOBER EXPIRY", "27-OCT-2026"),
+        // Tue 24 Nov 2026 is Guru Nanak Jayanti.
+        ("NIFTY", "NOVEMBER EXPIRY", "23-NOV-2026"),
+        ("BANKNIFTY", "NOVEMBER EXPIRY", "23-NOV-2026"),
+        ("FINNIFTY", "NOVEMBER EXPIRY", "23-NOV-2026"),
+        ("MIDCPNIFTY", "NOVEMBER EXPIRY", "23-NOV-2026"),
+        ("BANKNIFTY", "DECEMBER EXPIRY", "29-DEC-2026"),
+        // BSE: SENSEX weeklies and both monthlies on Thursday.
+        ("SENSEX", "22 OCTOBER", "22-OCT-2026"),
+        ("SENSEX", "OCTOBER EXPIRY", "29-OCT-2026"),
+        ("BANKEX", "OCTOBER EXPIRY", "29-OCT-2026"),
+        ("BANKEX", "NOVEMBER EXPIRY", "26-NOV-2026"),
+        ("BANKEX", "DECEMBER EXPIRY", "31-DEC-2026"),
+    ];
+    for (index, when, want) in cases {
+        assert_eq!(expiry(&call(index, when)).as_deref(), Some(*want), "{index} {when}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Routing with index_options_only on: only CE/PE calls on the six indices
+// trade; every other call is skipped. Everything above holds with it off.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn with_index_options_only_every_other_call_is_skipped() {
+    let parent = Some("500");
+    let cases: &[(&str, Option<&str>, &str)] = &[
+        // Index option calls trade exactly as with the switch off.
+        ("BUY SENSEX 74400 CE ABOVE 620\n\nTARGET :- 670 / 900\n\nSL :- 500\n\n22 OCTOBER", None, "signal SENSEX 74400 #900"),
+        ("BUY SENSEX 74400 CE ABOVE 620\n\nTARGET :- 670 / 900\n\nSL :- 500\n\n22 OCTOBER", parent, "signal SENSEX 74400 #900"),
+        ("BUY NIFTY NEXT WEEK 23000 STRIKE PUTS 140-145 SL 120 TARGET 175", parent, "signal NIFTY 23000 #900"),
+        ("BUY BANKNIFTY 55400 CE ABOVE 690\nTARGET :- 750 / 850\nSL - 600\n26 NOV EXPIRY", None, "signal BANKNIFTY 55400 #900"),
+        ("buy nifty 25000 ce above 120.5\ntgt 140/160\nsl 100", None, "signal NIFTY 25000 #900"),
+        ("BUY SENSEX NEXT WEEK 82000 CALL AT 250-260\nSL 200\nTARGET 300 / 350", None, "signal SENSEX 82000 #900"),
+        ("BUY FINNIFTY 26000 PE ABOVE 80\nTARGET :- 100\nSL :- 60", None, "signal FINNIFTY 26000 #900"),
+        ("BUY MIDCPNIFTY 12000 CE ABOVE 90\nTARGET :- 110\nSL :- 70", None, "signal MIDCPNIFTY 12000 #900"),
+        ("BUY BANKEX 62000 CE ABOVE 300\nTARGET :- 350\nSL :- 250", None, "signal BANKEX 62000 #900"),
+        // A SELL on an index option still reaches the engine, which drops SELL.
+        ("SELL NIFTY 18500 PE BELOW 120\nTARGET: 80\nSL: 145\nAUG EXPIRY", None, "signal NIFTY 18500 #900"),
+        // Stock options, equity and an index call with no strike are skipped,
+        // and as a reply they never become a stop move on the parent.
+        ("BUY BHEL 425 CE ABOVE 8.25\nTARGET :- 9.50 / 11.50\nSL :- 5\nJULY EXPIRY", None, "skipped BHEL"),
+        ("BUY BHEL 425 CE ABOVE 8.25\nTARGET :- 9.50 / 11.50\nSL :- 5\nJULY EXPIRY", parent, "skipped BHEL"),
+        ("BUY M&M 3200 CE ABOVE 45\nTARGET :- 55 / 65\nSL :- 38\nOCTOBER EXPIRY", None, "skipped M&M"),
+        ("BUY BAJAJ-AUTO 11300 CE ABOVE 325\n\nTARGET :- 365 / 450\n\nSL :- 250\n\nAUGUST EXPIRY", None, "skipped BAJAJ-AUTO"),
+        ("BUY RELIANCE ABOVE 2500\nTGT 2600 / 2700\nSL 2420", None, "skipped RELIANCE"),
+        ("BUY TATAMOTORS ABOVE 950\nTARGET 980 / 1000\nS.L. 930", parent, "skipped TATAMOTORS"),
+        ("BUY NIFTY ABOVE 25000\nTARGET 25100\nSL 24950", None, "skipped NIFTY"),
+        // Exact names only — not an alias of NIFTY.
+        ("BUY NIFTY50 25000 CE ABOVE 120\nTARGET :- 140\nSL :- 100", None, "skipped NIFTY50"),
+        // Everything that isn't a complete call routes as with the switch off.
+        ("✅ BUY AGAIN 22300 CALLS CMP 100-102 SL 90 TARGET 125", parent, "ignored"),
+        ("BUY BANKNIFTY NEXT WEEK 55000 STRIKE CALLS 300-310 SL 250 TARGET 380", parent, "ignored"),
+        ("BUY RELIANCE NEXT WEEK 3000 CALLS 40-42 SL 30 TARGET 55", None, "ignored"),
+        ("Move SL to 140", parent, "sl 140 -> #500"),
+        ("Buy more if it dips, SL 95", parent, "sl 95 -> #500"),
+        ("exit at 610", parent, "exit 610 -> #500"),
+        ("Move SL to 140", None, "unparsed"),
+        ("Book profit or trail SL 👍", parent, "unparsed"),
+    ];
+    for (text, reply_to, want) in cases {
+        assert_eq!(
+            route_index_only(text, *reply_to),
+            *want,
+            "\n--- message (reply_to {reply_to:?}, index_options_only) ---\n{text}\n---"
+        );
+    }
+
+    // The same skipped calls are trades with the switch off, as before.
+    assert_eq!(route("BUY BHEL 425 CE ABOVE 8.25\nTARGET :- 9.50 / 11.50\nSL :- 5\nJULY EXPIRY", None), "signal BHEL 425 #900");
+    assert_eq!(route("BUY RELIANCE ABOVE 2500\nTGT 2600 / 2700\nSL 2420", None), "signal RELIANCE 0 #900");
+}
+
+#[test]
+fn with_index_options_only_the_dussehra_call_still_trades_the_monday_expiry() {
+    let text = "BUY NIFTY 25000 CE ABOVE 120\nTARGET :- 140\nSL :- 100\n20 OCTOBER EXPIRY";
+    match classify_with(text, "900", None, today(), index_only()) {
+        Inbound::Signal(s) => assert_eq!(s.expiry.as_deref(), Some("19-OCT-2026")),
+        other => panic!("expected a trade, got {}", describe(other)),
     }
 }

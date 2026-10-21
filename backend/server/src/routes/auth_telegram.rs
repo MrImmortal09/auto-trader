@@ -79,7 +79,16 @@ pub async fn telegram_start_handler(
     Json(req): Json<TelegramStartReq>,
 ) -> impl IntoResponse {
     let mut mgr = state.telegram.lock().await;
-    match mgr.start_monitoring(req.chat_ids, state.signal_tx.clone(), Some(state.log_tx.clone())).await {
+    match mgr
+        .start_monitoring(
+            req.chat_ids,
+            state.signal_tx.clone(),
+            Some(state.log_tx.clone()),
+            state.flags.clone(),
+            Some(state.db_tx.clone()),
+        )
+        .await
+    {
         Ok(()) => {
             // Saved so the next restart reconnects to the same chats by itself.
             if let Some((api_id, api_hash)) = mgr.api_credentials() {
@@ -154,7 +163,13 @@ pub async fn resume_saved_telegram(state: AppState) {
             }
             let outcome = match mgr.resume(saved.api_id, &saved.api_hash).await {
                 Ok(true) => mgr
-                    .start_monitoring(saved.chat_ids.clone(), state.signal_tx.clone(), Some(state.log_tx.clone()))
+                    .start_monitoring(
+                        saved.chat_ids.clone(),
+                        state.signal_tx.clone(),
+                        Some(state.log_tx.clone()),
+                        state.flags.clone(),
+                        Some(state.db_tx.clone()),
+                    )
                     .await
                     .map(|()| true),
                 other => other,
