@@ -71,11 +71,15 @@ pub struct StrikeRow {
     pub call_ltp: f64,
     pub call_volume: f64,
     pub call_iv: f64,
+    /// Upstox's delta; 0.0 when it sent none.
+    pub call_delta: f64,
     pub put_oi: f64,
     pub put_prev_oi: f64,
     pub put_ltp: f64,
     pub put_volume: f64,
     pub put_iv: f64,
+    /// Upstox's delta (negative for a put); 0.0 when it sent none.
+    pub put_delta: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -135,12 +139,14 @@ pub fn to_strike_rows(chain: &[OptionChainStrike]) -> Vec<StrikeRow> {
                 call_prev_oi: cm.prev_oi.unwrap_or(cm.oi),
                 call_ltp: cm.ltp,
                 call_volume: cm.volume,
-                call_iv: call.option_greeks.map(|g| g.iv).unwrap_or(0.0),
+                call_iv: call.option_greeks.as_ref().map(|g| g.iv).unwrap_or(0.0),
+                call_delta: call.option_greeks.as_ref().map(|g| g.delta).unwrap_or(0.0),
                 put_oi: pm.oi,
                 put_prev_oi: pm.prev_oi.unwrap_or(pm.oi),
                 put_ltp: pm.ltp,
                 put_volume: pm.volume,
-                put_iv: put.option_greeks.map(|g| g.iv).unwrap_or(0.0),
+                put_iv: put.option_greeks.as_ref().map(|g| g.iv).unwrap_or(0.0),
+                put_delta: put.option_greeks.as_ref().map(|g| g.delta).unwrap_or(0.0),
             }
         })
         .collect();
@@ -452,8 +458,8 @@ mod tests {
 
     fn row(strike: f64, call_oi: f64, call_prev: f64, put_oi: f64, put_prev: f64) -> StrikeRow {
         StrikeRow {
-            strike, call_oi, call_prev_oi: call_prev, call_ltp: 0.0, call_volume: 0.0, call_iv: 0.0,
-            put_oi, put_prev_oi: put_prev, put_ltp: 0.0, put_volume: 0.0, put_iv: 0.0,
+            strike, call_oi, call_prev_oi: call_prev, call_ltp: 0.0, call_volume: 0.0, call_iv: 0.0, call_delta: 0.0,
+            put_oi, put_prev_oi: put_prev, put_ltp: 0.0, put_volume: 0.0, put_iv: 0.0, put_delta: 0.0,
         }
     }
 
@@ -468,6 +474,17 @@ mod tests {
         assert_eq!(agg.call_oi_chg, -750.0);
         assert_eq!(agg.put_oi_chg, 0.0);
         assert_eq!(agg.put_oi, 5636475.0);
+    }
+
+    #[test]
+    fn each_side_keeps_upstoxs_delta() {
+        let body = r#"[{"expiry":"2025-02-13","strike_price":21100,"underlying_spot_price":22976.2,
+            "call_options":{"instrument_key":"NSE_FO|1","market_data":{"oi":750},"option_greeks":{"iv":14.2,"delta":0.743}},
+            "put_options":{"instrument_key":"NSE_FO|2","market_data":{"oi":900},"option_greeks":{"iv":15.1,"delta":-0.257}}}]"#;
+        let chain: Vec<OptionChainStrike> = serde_json::from_str(body).unwrap();
+        let rows = to_strike_rows(&chain);
+        assert_eq!((rows[0].call_delta, rows[0].put_delta), (0.743, -0.257));
+        assert_eq!(rows[0].call_iv, 14.2);
     }
 
     #[test]
