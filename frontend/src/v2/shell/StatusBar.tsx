@@ -51,9 +51,8 @@ export function DesktopStatusBar({ status, unreachable, onKillSwitch }: {
   onKillSwitch: () => void;
 }) {
   const clock = useIstClock();
-  const live = status?.mode === 'LIVE';
   return (
-    <header className={`flex h-10 shrink-0 items-center gap-4 border-b border-line bg-inset px-4 ${live ? 'border-t-2 border-t-live' : ''}`}>
+    <header className="flex h-10 shrink-0 items-center gap-4 border-b border-line bg-inset px-4">
       <div className="flex min-w-0 flex-1 items-center gap-3">
         <ModeChip mode={status?.mode} />
         <span className="num-small text-fg">{clock} IST</span>
@@ -104,11 +103,10 @@ export function PhoneStatusBar({ status, unreachable, onKillSwitch }: {
 }) {
   const [open, setOpen] = useState(false);
   const { hasWriteAccess, openUnlockModal, lock } = useAuth();
-  const live = status?.mode === 'LIVE';
   const dots = DOTS.map((d) => ({ ...d, ...dotOf(status, unreachable, d.key) }));
   const worst: Level = dots.some((d) => d.level === 'down') ? 'down' : dots.every((d) => d.level === 'off') ? 'off' : 'ok';
   return (
-    <header className={`relative z-30 shrink-0 border-b border-line bg-inset pt-safe ${live ? 'border-t-2 border-t-live' : ''}`}>
+    <header className="relative z-30 shrink-0 border-b border-line bg-inset pt-safe">
       <div className="flex h-11 items-center gap-2 px-4">
         <ModeChip mode={status?.mode} />
         <button
