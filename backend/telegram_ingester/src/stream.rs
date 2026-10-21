@@ -6,7 +6,7 @@ use grammers_client::update::Update;
 use grammers_client::{Client, SignInError};
 use grammers_session::updates::UpdatesLike;
 use shared_domain::telemetry::{self, ParseResult};
-use shared_domain::{today_ist, DbWriteMessage, FeatureFlags, TradeSignal};
+use shared_domain::{today_ist, DbWriteMessage, FeatureFlags, SignalChat, TradeSignal};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::parser::{classify_with, Inbound};
@@ -92,7 +92,12 @@ pub(crate) async fn run_event_loop(
         // the tests can reach it.
         let flags_now = *flags.read().await;
         match classify_with(text, &msg_id_str, reply_to.as_deref(), today_ist(), flags_now) {
-            Inbound::Signal(signal) => {
+            Inbound::Signal(mut signal) => {
+                // Which chat it came from, kept on the position and its trades.
+                signal.chat = Some(SignalChat {
+                    id: chat_id,
+                    title: msg.peer().and_then(|p| p.name()).map(str::to_string),
+                });
                 tracing::info!(
                     instrument = %signal.instrument_name,
                     action = %signal.action,
@@ -198,6 +203,7 @@ fn reply_update(text: &str, parent: String, action: &str, entry_price: f64, stop
         source: "telegram_reply".to_string(),
         signal_id: Some(parent),
         raw_message: Some(text.to_owned()),
+        chat: None,
     }
 }
 

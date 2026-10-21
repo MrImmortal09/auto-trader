@@ -548,6 +548,44 @@ pub struct TradeSignal {
     /// The exact raw message text received, for displaying in reports.
     #[serde(default)]
     pub raw_message: Option<String>,
+    /// The Telegram chat the call came from. `None` for a scalp, the webhook,
+    /// and anything received before chats were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<SignalChat>,
+}
+
+/// The Telegram chat a call came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignalChat {
+    /// Bot-API style dialog id (`-100…` for a channel).
+    pub id: i64,
+    /// Its title, when Telegram's cache had it.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// What a trade row records about the call it belongs to, beside the fill.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TradeTag {
+    pub signal_id: Option<String>,
+    pub raw_message: Option<String>,
+    pub chat_id: Option<i64>,
+    pub chat_title: Option<String>,
+    pub option_type: Option<String>,
+    pub strike: Option<f64>,
+}
+
+impl TradeTag {
+    pub fn of(signal: &TradeSignal) -> Self {
+        Self {
+            signal_id: signal.signal_id.clone(),
+            raw_message: signal.raw_message.clone(),
+            chat_id: signal.chat.as_ref().map(|c| c.id),
+            chat_title: signal.chat.as_ref().and_then(|c| c.title.clone()),
+            option_type: signal.option_type.clone(),
+            strike: signal.strike,
+        }
+    }
 }
 
 impl TradeSignal {
@@ -1224,8 +1262,8 @@ pub enum DbWriteMessage {
         transaction_charge: f64,
         gst: f64,
         net_value: f64,
-        signal_id: Option<String>,
-        raw_message: Option<String>,
+        /// The call it belongs to: signal id, message, chat, side and strike.
+        tag: TradeTag,
         exit_reason: Option<String>,
         /// `"LIVE"` or `"PAPER"` — which engine produced this fill.
         mode: String,

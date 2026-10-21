@@ -349,6 +349,7 @@ pub fn parse_signal_on(
         source: source.to_owned(),
         signal_id,
         raw_message: Some(text.to_owned()),
+        chat: None,
     })
 }
 

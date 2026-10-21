@@ -9,7 +9,7 @@ use shared_domain::current_ist_timestamp_string;
 use trading_engine::{Exchange, FeeCalculator};
 
 use crate::AppState;
-use shared_domain::{DbWriteMessage, MonitoredPosition, TradeState};
+use shared_domain::{DbWriteMessage, MonitoredPosition, TradeState, TradeTag};
 
 pub(crate) async fn persist_positions_snapshot(state: &AppState, snapshot: &[MonitoredPosition]) {
     if let Ok(json) = serde_json::to_string(snapshot) {
@@ -187,13 +187,12 @@ pub async fn close_position_handler(
                 p.executed_qty,
                 p.avg_buy_price,
                 p.ws_scrip_key.clone(),
-                p.signal.signal_id.clone(),
-                p.signal.raw_message.clone(),
+                TradeTag::of(&p.signal),
             )
         })
     };
 
-    let Some((position_state, instrument, is_options, qty, avg_buy_price, ws_scrip_key, signal_id, raw_message)) = snapshot else {
+    let Some((position_state, instrument, is_options, qty, avg_buy_price, ws_scrip_key, tag)) = snapshot else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response();
     };
 
@@ -280,8 +279,9 @@ pub async fn close_position_handler(
          (ticker, action, qty, executed_price, timestamp,
           gross_value, brokerage, stt_charge, sebi_fee,
           stamp_duty, transaction_charge, gst, net_value,
-          signal_id, raw_message, exit_reason, mode)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          signal_id, raw_message, exit_reason, mode,
+          chat_id, chat_title, option_type, strike)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&instrument)
     .bind("SELL")
@@ -296,10 +296,14 @@ pub async fn close_position_handler(
     .bind(fees.transaction_charge)
     .bind(fees.gst)
     .bind(fees.net_value)
-    .bind(&signal_id)
-    .bind(&raw_message)
+    .bind(&tag.signal_id)
+    .bind(&tag.raw_message)
     .bind("CLOSED_VIA_FRONTEND")
     .bind("PAPER")
+    .bind(tag.chat_id)
+    .bind(&tag.chat_title)
+    .bind(&tag.option_type)
+    .bind(tag.strike)
     .execute(&mut *tx)
     .await
     {
@@ -379,14 +383,13 @@ pub async fn sell_position_handler(
                 p.executed_qty,
                 p.avg_buy_price,
                 p.ws_scrip_key.clone(),
-                p.signal.signal_id.clone(),
-                p.signal.raw_message.clone(),
+                TradeTag::of(&p.signal),
                 p.resolved_order.as_ref().and_then(|o| o.quantity.parse::<i32>().ok()).filter(|v| *v > 0),
             )
         })
     };
 
-    let Some((position_state, instrument, is_options, held_qty, avg_buy_price, ws_scrip_key, signal_id, raw_message, lot_size)) = snapshot else {
+    let Some((position_state, instrument, is_options, held_qty, avg_buy_price, ws_scrip_key, tag, lot_size)) = snapshot else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response();
     };
 
@@ -474,8 +477,9 @@ pub async fn sell_position_handler(
          (ticker, action, qty, executed_price, timestamp,
           gross_value, brokerage, stt_charge, sebi_fee,
           stamp_duty, transaction_charge, gst, net_value,
-          signal_id, raw_message, exit_reason, mode)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          signal_id, raw_message, exit_reason, mode,
+          chat_id, chat_title, option_type, strike)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&instrument)
     .bind("SELL")
@@ -490,10 +494,14 @@ pub async fn sell_position_handler(
     .bind(fees.transaction_charge)
     .bind(fees.gst)
     .bind(fees.net_value)
-    .bind(&signal_id)
-    .bind(&raw_message)
+    .bind(&tag.signal_id)
+    .bind(&tag.raw_message)
     .bind("MANUAL_SELL")
     .bind("PAPER")
+    .bind(tag.chat_id)
+    .bind(&tag.chat_title)
+    .bind(&tag.option_type)
+    .bind(tag.strike)
     .execute(&mut *tx)
     .await
     {

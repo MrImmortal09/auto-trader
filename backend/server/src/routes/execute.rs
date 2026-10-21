@@ -173,6 +173,7 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
                     source: "manual".to_string(),
                     signal_id: Some(format!("manual-{id}")),
                     raw_message: Some(format!("Manual BUY {} lot(s) {label} @ MKT (LTP {ltp:.2})", req.lots)),
+                    chat: None,
                 },
                 state: TradeState::WaitingForEntry,
                 created_at: now.clone(),
