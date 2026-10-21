@@ -4,7 +4,27 @@
 import { apiFetch } from '../../lib/api';
 import type { ReconcileApplyItem, ReconcileFinding } from '../../types';
 import type { ChartLevel } from '../../types';
-import type { ChainAnswer, DeskAnswer, FeedAnswer, Flags, GroupId, HistoryAnswer, MarksAnswer, RangeId, StatusAnswer } from './types';
+import type { TradingConfig } from '../../types';
+import type {
+  ChainAnswer,
+  DeskAnswer,
+  FeedAnswer,
+  Flags,
+  GroupId,
+  HistoryAnswer,
+  IndicatorAnswer,
+  KotakState,
+  MarketIndex,
+  MarketLive,
+  MarksAnswer,
+  ModeCheck,
+  OptionChainAnswer,
+  RangeId,
+  StatusAnswer,
+  SystemAnswer,
+  TelegramState,
+  TrendAnswer,
+} from './types';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -39,6 +59,23 @@ export const getHistory = (base: string, range: RangeId, group: GroupId) =>
 export const getFlags = (base: string) => getJson<Flags>(base, '/api/v2/flags');
 export const getChain = (base: string, index: string) => getJson<ChainAnswer>(base, `/api/v2/chain?index=${encodeURIComponent(index)}`);
 export const getMarks = (base: string) => getJson<MarksAnswer>(base, '/api/v2/marks');
+export const getSystem = (base: string) => getJson<SystemAnswer>(base, '/api/v2/system');
+export const getModeCheck = (base: string) => getJson<ModeCheck>(base, '/api/v2/mode-check');
+export const getVersion = (base: string) => getJson<{ version: string }>(base, '/api/version');
+
+export const getIndicator = (base: string) => getJson<IndicatorAnswer>(base, '/api/market/indicator');
+export const getMarketLive = (base: string) => getJson<MarketLive>(base, '/api/market/live');
+export const getOptionChain = (base: string, index: MarketIndex) =>
+  getJson<OptionChainAnswer>(base, `/api/market/option-chain?underlying=${index}`);
+/** `window` strikes each side of ATM (0 = all), checks every `interval` minutes. */
+export const getTrend = (base: string, index: MarketIndex, interval: number, window: number) =>
+  getJson<TrendAnswer>(base, `/api/market/intraday-trend?underlying=${index}&interval=${interval}&window=${window}`);
+
+/** The whole trading config, as `POST /api/settings` takes it back. */
+export const getSettings = (base: string) => getJson<TradingConfig>(base, '/api/settings');
+export const getKotak = (base: string) => getJson<KotakState>(base, '/api/auth/kotak');
+export const getTelegram = (base: string) => getJson<TelegramState>(base, '/api/auth/telegram/status');
+export const getWalletBalance = (base: string) => getJson<{ balance: number }>(base, '/api/wallet/balance');
 
 /** How an action went. `status` 202 means LIVE accepted it and the engine is
  * placing the order; 0 means the server couldn't be reached. */
@@ -84,6 +121,17 @@ export const executeExitAll = (base: string) => send(base, '/api/execute/exit-al
  * stop and target — PR 4's endpoint, behind the `chart_stops` switch. */
 export const setChartLevels = (base: string, id: string, levels: { stop?: ChartLevel | null; target?: ChartLevel | null }) =>
   send(base, `/api/v2/positions/${encodeURIComponent(id)}`, 'PATCH', levels);
+
+/** Replace the whole trading config — v1's save. Send back every field,
+ * including those v2 doesn't show. */
+export const saveSettings = (base: string, cfg: TradingConfig) => send(base, '/api/settings', 'POST', cfg);
+/** Turn one switch on or off; a switch left out stays as it is. */
+/** The paper wallet's balance — v1's virtual balance. */
+export const setWalletBalance = (base: string, balance: number) => send(base, '/api/wallet/balance', 'POST', { balance });
+export const putFlags = (base: string, change: Partial<Flags>) => send(base, '/api/v2/flags', 'PUT', change);
+/** Log in to Kotak with the server's saved credentials — v1's Auto Connect. */
+export const kotakAutoLogin = (base: string) => send(base, '/api/auth/kotak/auto-login', 'POST');
+export const kotakDisconnect = (base: string) => send(base, '/api/auth/kotak/disconnect', 'DELETE');
 
 export const engageKillSwitch = (base: string) => send(base, '/api/kill-switch', 'POST');
 export const resumeTrading = (base: string) => send(base, '/api/kill-switch/reset', 'POST');

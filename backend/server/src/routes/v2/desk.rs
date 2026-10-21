@@ -180,6 +180,33 @@ pub async fn desk_handler(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+/// The messages the monitored chats posted on `day` (`YYYY-MM-DD`), newest
+/// first and at most `limit`, each with what became of it.
+pub(crate) async fn feed_items(state: &AppState, day: &str, limit: i64) -> Result<Vec<FeedItem>, Response> {
+    let rows = sqlx::query_as::<_, FeedRow>(
+        "SELECT id, chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, edited_at
+         FROM telegram_messages WHERE sent_at >= ? AND sent_at <= ?
+         ORDER BY sent_at DESC, id DESC LIMIT ?",
+    )
+    .bind(format!("{day} 00:00:00"))
+    .bind(format!("{day} 23:59:59"))
+    .bind(limit)
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|e| server_error("telegram messages", e))?;
+    let cfg = state.trading_cfg.read().await.clone();
+    let calls = load_calls(state, &cfg.mode).await.map_err(|e| server_error("trades", e))?;
+    let positions = state.positions.read().await.clone();
+    let valid_till = |p: &MonitoredPosition| shared_domain::entry_gate::call_expires_at(&p.created_at, cfg.call_validity_minutes);
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let status = desk::feed_status(&row, &positions, &calls, valid_till);
+            FeedItem::of(row, status)
+        })
+        .collect())
+}
+
 #[derive(Deserialize)]
 pub struct FeedQuery {
     day: Option<String>,
@@ -215,42 +242,17 @@ pub async fn feed_handler(State(state): State<AppState>, Query(q): Query<FeedQue
     };
     let day = day.format("%Y-%m-%d").to_string();
     let limit = q.limit.unwrap_or(200).clamp(1, 500);
-    let rows = match sqlx::query_as::<_, FeedRow>(
-        "SELECT id, chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, edited_at
-         FROM telegram_messages WHERE sent_at >= ? AND sent_at <= ?
-         ORDER BY sent_at DESC, id DESC LIMIT ?",
-    )
-    .bind(format!("{day} 00:00:00"))
-    .bind(format!("{day} 23:59:59"))
-    .bind(limit)
-    .fetch_all(&state.db_pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(e) => return server_error("telegram messages", e),
+    let items = match feed_items(&state, &day, limit).await {
+        Ok(items) => items,
+        Err(e) => return e,
     };
-
-    let cfg = state.trading_cfg.read().await.clone();
-    let calls = match load_calls(&state, &cfg.mode).await {
-        Ok(calls) => calls,
-        Err(e) => return server_error("trades", e),
-    };
-    let positions = state.positions.read().await.clone();
-    let valid_till = |p: &MonitoredPosition| shared_domain::entry_gate::call_expires_at(&p.created_at, cfg.call_validity_minutes);
-
     let mut channels: BTreeMap<i64, Channel> = BTreeMap::new();
-    let items: Vec<FeedItem> = rows
-        .into_iter()
-        .map(|row| {
-            let status = desk::feed_status(&row, &positions, &calls, valid_till);
-            let item = FeedItem::of(row, status);
-            channels
-                .entry(item.chat_id)
-                .or_insert_with(|| Channel { chat_id: item.chat_id, title: item.channel.clone(), messages: 0 })
-                .messages += 1;
-            item
-        })
-        .collect();
+    for item in &items {
+        channels
+            .entry(item.chat_id)
+            .or_insert_with(|| Channel { chat_id: item.chat_id, title: item.channel.clone(), messages: 0 })
+            .messages += 1;
+    }
     let mut channels: Vec<Channel> = channels.into_values().collect();
     channels.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     Json(FeedAnswer { day, channels, items }).into_response()
@@ -274,6 +276,10 @@ struct StatusAnswer {
     market: &'static str,
     /// `None` until the System screen's sampler has run once.
     health: Option<desk::HealthSet>,
+    /// Seconds since the price feed's last tick, while it's connected.
+    feed_age_secs: Option<f64>,
+    /// Indices whose options are held open on their expiry day.
+    expiring: Vec<desk::Expiring>,
     /// Today's booked plus open P&L.
     day_pnl: f64,
     /// Today's trade rows after `after`, oldest first.
@@ -299,7 +305,9 @@ pub async fn status_handler(State(state): State<AppState>, Query(q): Query<Statu
     let (open, waiting) = desk_rows(&state, &positions, &cfg, &calls);
     let day_pnl = desk::kpis(desk::booked_on(&calls, &day), &open, waiting.len(), 0).net;
 
-    let health = state.pulse.latest().map(|s| {
+    let latest = state.pulse.latest();
+    let feed_age_secs = latest.as_ref().filter(|s| s.feed_connected).and_then(|s| s.feed_last_tick_age_secs);
+    let health = latest.map(|s| {
         desk::health_set(
             &desk::HealthInputs {
                 engine_heartbeat_age_secs: s.engine_heartbeat_age_secs,
@@ -343,6 +351,8 @@ pub async fn status_handler(State(state): State<AppState>, Query(q): Query<Statu
         market_open,
         market,
         health,
+        feed_age_secs,
+        expiring: desk::expiring_today(&positions, today),
         day_pnl,
         fills: q.after.map(|after| desk::fills_after(&calls, &day, after, MAX_FILLS)).unwrap_or_default(),
         last_fill_id: desk::last_leg_id(&calls),

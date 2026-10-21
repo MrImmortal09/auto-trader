@@ -7,7 +7,9 @@
 //! An open position's P&L is `(LTP − average) × held`, before exit charges,
 //! as v1's dashboard shows it.
 
-use chrono::{DateTime, FixedOffset, Timelike};
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, FixedOffset, NaiveDate, Timelike};
 use serde::Serialize;
 use shared_domain::{ChartLevels, MonitoredPosition, TradeState};
 
@@ -514,6 +516,37 @@ pub fn health_set(s: &HealthInputs, market_hours: bool) -> HealthSet {
     HealthSet { engine, feed, kotak, telegram, upstox }
 }
 
+/// An index whose options held open expire today — the expiry banner.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Expiring {
+    pub index: String,
+    /// `weekly` or `monthly`.
+    pub series: &'static str,
+    /// Open positions on that expiry.
+    pub positions: usize,
+}
+
+/// The indices whose options are held open on their expiry day `today`, by
+/// each position's resolved expiry. Waiting calls hold nothing, so they
+/// don't count.
+pub fn expiring_today(positions: &[MonitoredPosition], today: NaiveDate) -> Vec<Expiring> {
+    let mut by_index: BTreeMap<String, usize> = BTreeMap::new();
+    for p in positions {
+        let held = matches!(p.state, TradeState::Active | TradeState::Target1Hit) && p.executed_qty > 0;
+        if held && p.signal.option_type.is_some() && p.resolved_expiry == Some(today) {
+            *by_index.entry(p.signal.instrument_name.trim().to_uppercase()).or_default() += 1;
+        }
+    }
+    by_index
+        .into_iter()
+        .map(|(index, positions)| Expiring {
+            series: if telegram_ingester::parser::monthly_expires_on(&index, today) { "monthly" } else { "weekly" },
+            index,
+            positions,
+        })
+        .collect()
+}
+
 /// Whether the market is open, and the status bar's line about it: open
 /// 09:15–15:30 IST on a trading day.
 pub fn market_phase(now: DateTime<FixedOffset>, trading_day: bool) -> (bool, &'static str) {
@@ -738,6 +771,39 @@ mod tests {
         assert_eq!(health_set(&quiet, false).feed.level, Level::Off);
         assert_eq!(health_set(&quiet, false).kotak.level, Level::Off);
         assert_eq!(health_set(&HealthInputs { engine_heartbeat_age_secs: None, ..all_well }, true).engine.level, Level::Down);
+    }
+
+    #[test]
+    fn only_options_held_into_their_expiry_day_warn() {
+        let day = |d| chrono::NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        let on = |state: TradeState, index: &str, expiry: u32| {
+            let mut p = position(state, "1", -100);
+            p.signal.instrument_name = index.into();
+            p.resolved_expiry = Some(day(expiry));
+            p
+        };
+        let mut waiting = on(TradeState::WaitingForEntry, "NIFTY", 13);
+        waiting.executed_qty = 0;
+        let positions = vec![
+            on(TradeState::Active, "NIFTY", 13),
+            on(TradeState::Target1Hit, "NIFTY", 13),
+            waiting,
+            on(TradeState::Closed, "NIFTY", 13),
+            on(TradeState::Active, "SENSEX", 15),
+            on(TradeState::Active, "BANKNIFTY", 27),
+            on(TradeState::Active, "NIFTY", 27),
+        ];
+        // Tue 13 Oct 2026: NIFTY's weekly.
+        assert_eq!(expiring_today(&positions, day(13)), [Expiring { index: "NIFTY".into(), series: "weekly", positions: 2 }]);
+        // Tue 27 Oct, the month's last Tuesday: NIFTY's and BANKNIFTY's monthlies.
+        assert_eq!(
+            expiring_today(&positions, day(27)),
+            [
+                Expiring { index: "BANKNIFTY".into(), series: "monthly", positions: 1 },
+                Expiring { index: "NIFTY".into(), series: "monthly", positions: 1 },
+            ]
+        );
+        assert!(expiring_today(&positions, day(14)).is_empty());
     }
 
     #[test]

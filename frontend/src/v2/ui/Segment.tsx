@@ -6,6 +6,7 @@ export function Segment<T extends string>({
   onChange,
   size = 'sm',
   stretch = false,
+  disabled = false,
   label,
 }: {
   options: { value: T; label: string }[];
@@ -14,6 +15,7 @@ export function Segment<T extends string>({
   size?: 'sm' | 'lg';
   /** Share the width equally (phone). */
   stretch?: boolean;
+  disabled?: boolean;
   label: string;
 }) {
   const item = size === 'lg' ? 'h-10 px-4 rounded-8 type-body-strong' : 'h-7 px-3 rounded-6 type-label';
@@ -27,8 +29,9 @@ export function Segment<T extends string>({
             type="button"
             role="tab"
             aria-selected={selected}
+            disabled={disabled}
             onClick={() => onChange(o.value)}
-            className={`${item} ${stretch ? 'flex-1' : ''} whitespace-nowrap transition-colors ${selected ? 'bg-raised text-fg' : 'text-fg-muted hover:text-fg'}`}
+            className={`${item} ${stretch ? 'flex-1' : ''} whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${selected ? 'bg-raised text-fg' : 'text-fg-muted hover:text-fg disabled:hover:text-fg-muted'}`}
           >
             {o.label}
           </button>
