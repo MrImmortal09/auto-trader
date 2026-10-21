@@ -6927,7 +6927,14 @@ mod tests {
         let manual = g.iter().find(|p| p.manual).expect("manual scalp still tracked");
         assert_eq!(manual.force_exit, None);
         assert!(matches!(manual.state, TradeState::Active));
-        assert!(g.iter().any(|p| !p.manual && p.signal.option_type.as_deref() == Some("PE")), "the PE call was taken in");
+        // Past the 15:39 cutoff the call is refused instead — the clock here
+        // is real — which leaves the scalp just as alone.
+        let call_taken = g.iter().any(|p| !p.manual && p.signal.option_type.as_deref() == Some("PE"));
+        if is_entry_cutoff_passed() {
+            assert!(!call_taken, "past the cutoff the PE call is refused");
+        } else {
+            assert!(call_taken, "the PE call was taken in");
+        }
     }
 
     fn book_order(no: &str, side: &str, qty: i32) -> kotak_client::KotakOrder {
