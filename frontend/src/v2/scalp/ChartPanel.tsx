@@ -139,6 +139,12 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               note={sym.kind === 'index' ? `From ${index} futures` : "From this option's own trades"}
               onChange={(v) => onLayers({ ...layers, vwap: v })}
             />
+            <CheckboxRow
+              checked={layers.pivots}
+              title="Pivot points"
+              note="Standard, from the day before: P, R1–R5, S1–S5"
+              onChange={(v) => onLayers({ ...layers, pivots: v })}
+            />
           </Popover>
         </div>
       </header>
@@ -151,6 +157,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           lines={lines}
           markers={markers}
           vwap={layers.vwap}
+          pivots={layers.pivots}
           placing={placing}
           onPlacingDone={onPlacingDone}
           bus={bus}

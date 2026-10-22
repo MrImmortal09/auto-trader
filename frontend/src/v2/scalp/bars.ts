@@ -11,9 +11,10 @@ function isoDay(t: number): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date(t));
 }
 
-export async function fetchBars(base: string, symbol: string, tf: Tf): Promise<Bar[]> {
+/** `days` calendar days of `symbol`'s bars at `tf`, today included. */
+export async function fetchDays(base: string, symbol: string, tf: Tf, days: number): Promise<Bar[]> {
   const to = Date.now();
-  const from = to - (TF_DAYS[tf] - 1) * 86_400_000;
+  const from = to - (days - 1) * 86_400_000;
   const res = await apiFetch(base, `/api/v2/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&from=${isoDay(from)}&to=${isoDay(to)}`);
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -22,6 +23,9 @@ export async function fetchBars(base: string, symbol: string, tf: Tf): Promise<B
   const body = (await res.json()) as { bars: Bar[] };
   return body.bars;
 }
+
+/** The days of bars a chart opens with at `tf`. */
+export const fetchBars = (base: string, symbol: string, tf: Tf) => fetchDays(base, symbol, tf, TF_DAYS[tf]);
 
 /** Merge a streamed bar into a sorted list: replace its start, or append. */
 export function upsert(bars: Bar[], bar: Bar): Bar[] {

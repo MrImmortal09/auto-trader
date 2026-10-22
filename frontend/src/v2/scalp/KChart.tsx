@@ -2,9 +2,10 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { dispose, init, type AxisCreateRangeCallback, type Chart, type KLineData, type OverlayEvent } from 'klinecharts';
 import { apiUrl } from '../../lib/api';
 import { getToken } from '../../lib/auth';
-import { fetchBars, toK, upsert } from './bars';
+import { fetchBars, fetchDays, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
-import { CHART_STYLES, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
+import { CHART_STYLES, PIVOT_SERIES, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
+import { pivotsByDay } from './pivots';
 import {
   barAt,
   countdown,
@@ -71,7 +72,7 @@ function rangeWithLines(prices: { current: number[] }): AxisCreateRangeCallback 
  * bars come from the candle service and follow its stream; an index chart's
  * VWAP is its future's, moved onto the index by the basis.
  */
-export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, placing, onPlacingDone, bus, onState }: {
+export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, placing, onPlacingDone, bus, onState }: {
   chartId: string;
   serverBase: string;
   sym: ChartSym;
@@ -79,6 +80,8 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pla
   lines: ChartLine[];
   markers: ChartMarker[];
   vwap: boolean;
+  /** Standard pivot points, daily. */
+  pivots: boolean;
   placing: Placing | null;
   onPlacingDone: () => void;
   bus: CrosshairBus;
@@ -100,6 +103,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pla
   const applied = useRef(new Map<string, number>());
   const dragging = useRef<string | null>(null);
   const vwapVersion = useRef(0);
+  const pivotVersion = useRef(0);
   // The lines' prices: the price axis always takes them in, so a stop or
   // target far from the candles is still on screen.
   const linePrices = useRef<number[]>([]);
@@ -176,6 +180,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pla
       unsub();
       c.unsubscribeAction('onCrosshairChange', onCross);
       VWAP_SERIES.delete(chartId);
+      PIVOT_SERIES.delete(chartId);
       dispose(el);
       chart.current = null;
       placed.clear();
@@ -249,6 +254,44 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pla
       c.overrideIndicator({ name: 'v2Vwap', calcParams: [vwapVersion.current] });
     }
   }, [vwap, bars, futureBars, chartId, sym.kind]);
+
+  // Standard pivots, from a week of 15-minute bars so the trading day before
+  // is there on a Monday or after a holiday. Fixed for the day; read again
+  // every half hour in case the page stays open past midnight.
+  useEffect(() => {
+    const c = chart.current;
+    if (!c) return;
+    const show = () => {
+      pivotVersion.current += 1;
+      if (c.getIndicators({ name: 'v2Pivots' }).length === 0) {
+        c.createIndicator({ name: 'v2Pivots', paneId: 'candle_pane', extendData: { key: chartId }, calcParams: [pivotVersion.current] }, true);
+      } else {
+        c.overrideIndicator({ name: 'v2Pivots', calcParams: [pivotVersion.current] });
+      }
+    };
+    // Another symbol's levels never show on this one, even for a moment.
+    PIVOT_SERIES.delete(chartId);
+    if (!pivots) {
+      c.removeIndicator({ name: 'v2Pivots' });
+      return;
+    }
+    show();
+    let live = true;
+    const load = () =>
+      fetchDays(serverBase, symbol, '15m', 8)
+        .then((bars) => {
+          if (!live) return;
+          PIVOT_SERIES.set(chartId, pivotsByDay(bars));
+          show();
+        })
+        .catch(() => {});
+    void load();
+    const timer = window.setInterval(() => void load(), 30 * 60_000);
+    return () => {
+      live = false;
+      window.clearInterval(timer);
+    };
+  }, [pivots, symbol, serverBase, chartId]);
 
   // Order lines and markers, kept in step with what the screen says.
   useEffect(() => {

@@ -1,7 +1,8 @@
 // KLineChart setup for the v2 Scalp charts: the theme from the design tokens,
-// the order-line and marker overlays, and VWAP. Registered once, globally.
+// the order-line and marker overlays, VWAP and pivots. Registered once, globally.
 
 import { registerIndicator, registerOverlay, utils, type DeepPartial, type OverlayFigure, type Styles } from 'klinecharts';
+import { pivotLines, type PivotLevels } from './pivots';
 
 /** The design tokens as plain values: the chart draws on a canvas. */
 export const C = {
@@ -276,5 +277,80 @@ registerIndicator<{ vwap?: number }, number, { key: string }>({
   calc: (dataList, indicator) => {
     const series = VWAP_SERIES.get(indicator.extendData?.key ?? '');
     return dataList.map((d) => ({ vwap: series?.get(d.timestamp) }));
+  },
+});
+
+// ── Pivot points ────────────────────────────────────────────────────────── //
+
+/** Each chart's pivots by IST day number, keyed by the chart's id. */
+export const PIVOT_SERIES = new Map<string, Map<number, PivotLevels>>();
+
+const PIVOT_LINE = 'rgba(142, 151, 167, 0.7)';
+const PIVOT_P = 'rgba(232, 234, 238, 0.6)';
+// Names read clearly over the candles; the lines stay quiet.
+const PIVOT_TEXT = 'rgba(142, 151, 167, 1)';
+const PIVOT_P_TEXT = 'rgba(232, 234, 238, 0.9)';
+const IST_OFFSET = 330 * 60_000;
+const dayNumber = (t: number) => Math.floor((t + IST_OFFSET) / 86_400_000);
+
+// Standard pivots, drawn straight onto the candle pane: each day's levels
+// across that day's bars, named at the day's start. No figures, so the price
+// axis never stretches to take in a far R5 or S5.
+registerIndicator<Record<string, never>, number, { key: string }>({
+  name: 'v2Pivots',
+  shortName: 'Pivots',
+  series: 'price',
+  // Bumped to redraw when the levels change.
+  calcParams: [0],
+  figures: [],
+  calc: (dataList) => dataList.map(() => ({})),
+  // No legend row: the levels carry their own names.
+  createTooltipDataSource: () => ({ name: '', calcParamsText: '', legends: [], features: [] }),
+  draw: ({ ctx, chart, bounding, xAxis, yAxis, indicator }) => {
+    const byDay = PIVOT_SERIES.get(indicator.extendData?.key ?? '');
+    if (!byDay || byDay.size === 0) return true;
+    const data = chart.getDataList();
+    const { from, to } = chart.getVisibleRange();
+    const start = Math.max(0, from);
+    const end = Math.min(data.length - 1, to);
+    if (end < start) return true;
+    const half = Math.max(1, (xAxis.convertToPixel(start + 1) - xAxis.convertToPixel(start)) / 2);
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.font = `10px ${FONT}`;
+    ctx.textBaseline = 'bottom';
+    ctx.textAlign = 'left';
+    let i = start;
+    while (i <= end) {
+      const day = dayNumber(data[i].timestamp);
+      let j = i;
+      while (j + 1 <= end && dayNumber(data[j + 1].timestamp) === day) j++;
+      const levels = byDay.get(day);
+      if (levels) {
+        const x0 = xAxis.convertToPixel(i) - half;
+        const x1 = xAxis.convertToPixel(j) + half;
+        // The day's first bar may be off to the left: keep its names in view.
+        const firstShown = i === start && i > 0 && dayNumber(data[i - 1].timestamp) === day;
+        const labelX = Math.max(x0, 0) + 4;
+        for (const line of pivotLines(levels)) {
+          const y = Math.round(yAxis.convertToPixel(line.value)) + 0.5;
+          if (y < 0 || y > bounding.height) continue;
+          const colour = line.name === 'P' ? PIVOT_P : PIVOT_LINE;
+          ctx.strokeStyle = colour;
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath();
+          ctx.moveTo(Math.max(x0, 0), y);
+          ctx.lineTo(Math.min(x1, bounding.width), y);
+          ctx.stroke();
+          if (x1 - labelX > 70 || firstShown) {
+            ctx.fillStyle = line.name === 'P' ? PIVOT_P_TEXT : PIVOT_TEXT;
+            ctx.fillText(`${line.name} ${IN.format(line.value)}`, labelX, y - 2);
+          }
+        }
+      }
+      i = j + 1;
+    }
+    ctx.restore();
+    return true;
   },
 });

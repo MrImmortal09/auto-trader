@@ -116,6 +116,9 @@ export interface Bar {
 const IST_MS = 330 * 60_000;
 const dayOf = (t: number) => Math.floor((t + IST_MS) / 86_400_000);
 
+/** The IST calendar day of a Unix-ms instant, as a day number. */
+export const istDay = dayOf;
+
 /**
  * VWAP by bar start, restarting each IST day: the volume-weighted typical
  * price of every bar with Upstox's official volume (a forming bar has none
