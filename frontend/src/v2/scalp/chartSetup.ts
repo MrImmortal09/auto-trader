@@ -315,11 +315,13 @@ registerIndicator<Record<string, never>, number, { key: string }>({
     const end = Math.min(data.length - 1, to);
     if (end < start) return true;
     const half = Math.max(1, (xAxis.convertToPixel(start + 1) - xAxis.convertToPixel(start)) / 2);
+    // The latest day's levels run on to the right edge, named there: early in
+    // the session its own bars are too few to carry the names.
+    const latest = dayNumber(data[data.length - 1].timestamp);
     ctx.save();
     ctx.lineWidth = 1;
     ctx.font = `10px ${FONT}`;
     ctx.textBaseline = 'bottom';
-    ctx.textAlign = 'left';
     let i = start;
     while (i <= end) {
       const day = dayNumber(data[i].timestamp);
@@ -327,23 +329,25 @@ registerIndicator<Record<string, never>, number, { key: string }>({
       while (j + 1 <= end && dayNumber(data[j + 1].timestamp) === day) j++;
       const levels = byDay.get(day);
       if (levels) {
-        const x0 = xAxis.convertToPixel(i) - half;
-        const x1 = xAxis.convertToPixel(j) + half;
-        // The day's first bar may be off to the left: keep its names in view.
-        const firstShown = i === start && i > 0 && dayNumber(data[i - 1].timestamp) === day;
-        const labelX = Math.max(x0, 0) + 4;
+        const current = day === latest;
+        const x0 = Math.max(xAxis.convertToPixel(i) - half, 0);
+        const x1 = current ? bounding.width : Math.min(xAxis.convertToPixel(j) + half, bounding.width);
+        // A past day's names go at its start, where there's room for them.
+        const named = current || x1 - x0 > 80;
+        ctx.textAlign = current ? 'right' : 'left';
+        const labelX = current ? bounding.width - 4 : x0 + 4;
         for (const line of pivotLines(levels)) {
           const y = Math.round(yAxis.convertToPixel(line.value)) + 0.5;
           if (y < 0 || y > bounding.height) continue;
-          const colour = line.name === 'P' ? PIVOT_P : PIVOT_LINE;
-          ctx.strokeStyle = colour;
+          const p = line.name === 'P';
+          ctx.strokeStyle = p ? PIVOT_P : PIVOT_LINE;
           ctx.setLineDash([2, 3]);
           ctx.beginPath();
-          ctx.moveTo(Math.max(x0, 0), y);
-          ctx.lineTo(Math.min(x1, bounding.width), y);
+          ctx.moveTo(x0, y);
+          ctx.lineTo(x1, y);
           ctx.stroke();
-          if (x1 - labelX > 70 || firstShown) {
-            ctx.fillStyle = line.name === 'P' ? PIVOT_P_TEXT : PIVOT_TEXT;
+          if (named) {
+            ctx.fillStyle = p ? PIVOT_P_TEXT : PIVOT_TEXT;
             ctx.fillText(`${line.name} ${IN.format(line.value)}`, labelX, y - 2);
           }
         }
