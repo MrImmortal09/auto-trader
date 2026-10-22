@@ -1,8 +1,8 @@
 import { useState, type KeyboardEvent } from 'react';
 
 // Figma "Input": a well with the value and its unit (%, ×, ₹). Edits are
-// kept here until Enter or leaving the field; only a valid, changed number
-// is committed. Escape puts the saved value back.
+// kept here until Enter or leaving the field; only a number actually typed,
+// valid and different, is committed. Escape puts the saved value back.
 
 const GROUPED = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 });
 
@@ -23,20 +23,24 @@ export function NumberInput({ value, onCommit, unit, min, max, decimals = 0, gro
 }) {
   // `null` while not being edited: the saved value shows.
   const [draft, setDraft] = useState<string | null>(null);
+  // Typed into since focus. Focusing and leaving alone never saves.
+  const [typed, setTyped] = useState(false);
   const shown = grouped ? GROUPED.format(value) : value.toFixed(decimals);
   const text = draft ?? shown;
   const parsed = draft == null ? value : Number(draft.replace(/,/g, '').trim());
   const valid = draft == null || (draft.trim() !== '' && Number.isFinite(parsed) && parsed >= min && parsed <= max);
 
   function commit() {
-    if (draft != null && valid && parsed !== value) onCommit(parsed);
+    if (draft != null && typed && valid && parsed !== value) onCommit(parsed);
     setDraft(null);
+    setTyped(false);
   }
 
   function onKey(e: KeyboardEvent<HTMLInputElement>) {
     if (e.key === 'Enter') e.currentTarget.blur();
     if (e.key === 'Escape') {
       setDraft(null);
+      setTyped(false);
       e.currentTarget.blur();
     }
   }
@@ -55,8 +59,12 @@ export function NumberInput({ value, onCommit, unit, min, max, decimals = 0, gro
           aria-invalid={!valid}
           disabled={disabled}
           value={text}
-          onFocus={() => setDraft(grouped ? String(value) : shown)}
-          onChange={(e) => setDraft(e.target.value)}
+          // The exact saved value, never the rounded one shown: 0.55 is 0.55.
+          onFocus={() => setDraft(String(value))}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setTyped(true);
+          }}
           onBlur={commit}
           onKeyDown={onKey}
           className="min-w-0 flex-1 bg-transparent num-medium text-fg outline-none"
