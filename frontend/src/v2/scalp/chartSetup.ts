@@ -315,6 +315,8 @@ registerIndicator<Record<string, never>, number, { key: string }>({
     // The latest day's levels run on to the right edge, and are always named.
     const latest = dayNumber(data[data.length - 1].timestamp);
     ctx.save();
+    // Solid: the canvas can carry a dash over from what was drawn before.
+    ctx.setLineDash([]);
     ctx.lineWidth = 1;
     ctx.strokeStyle = PIVOT_ORANGE;
     ctx.fillStyle = PIVOT_ORANGE;
