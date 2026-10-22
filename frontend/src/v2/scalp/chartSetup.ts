@@ -285,17 +285,14 @@ registerIndicator<{ vwap?: number }, number, { key: string }>({
 /** Each chart's pivots by IST day number, keyed by the chart's id. */
 export const PIVOT_SERIES = new Map<string, Map<number, PivotLevels>>();
 
-const PIVOT_LINE = 'rgba(142, 151, 167, 0.7)';
-const PIVOT_P = 'rgba(232, 234, 238, 0.6)';
-// Names read clearly over the candles; the lines stay quiet.
-const PIVOT_TEXT = 'rgba(142, 151, 167, 1)';
-const PIVOT_P_TEXT = 'rgba(232, 234, 238, 0.9)';
+/** TradingView's pivot orange, for every level and its name. */
+const PIVOT_ORANGE = '#fb8c00';
 const IST_OFFSET = 330 * 60_000;
 const dayNumber = (t: number) => Math.floor((t + IST_OFFSET) / 86_400_000);
 
-// Standard pivots, drawn straight onto the candle pane: each day's levels
-// across that day's bars, named at the day's start. No figures, so the price
-// axis never stretches to take in a far R5 or S5.
+// Standard pivots, drawn straight onto the candle pane the way TradingView
+// draws them: solid orange levels across each day, named at the day's start.
+// No figures, so the price axis never stretches to take in a far R5 or S5.
 registerIndicator<Record<string, never>, number, { key: string }>({
   name: 'v2Pivots',
   shortName: 'Pivots',
@@ -315,13 +312,15 @@ registerIndicator<Record<string, never>, number, { key: string }>({
     const end = Math.min(data.length - 1, to);
     if (end < start) return true;
     const half = Math.max(1, (xAxis.convertToPixel(start + 1) - xAxis.convertToPixel(start)) / 2);
-    // The latest day's levels run on to the right edge, named there: early in
-    // the session its own bars are too few to carry the names.
+    // The latest day's levels run on to the right edge, and are always named.
     const latest = dayNumber(data[data.length - 1].timestamp);
     ctx.save();
     ctx.lineWidth = 1;
+    ctx.strokeStyle = PIVOT_ORANGE;
+    ctx.fillStyle = PIVOT_ORANGE;
     ctx.font = `10px ${FONT}`;
     ctx.textBaseline = 'bottom';
+    ctx.textAlign = 'left';
     let i = start;
     while (i <= end) {
       const day = dayNumber(data[i].timestamp);
@@ -332,24 +331,16 @@ registerIndicator<Record<string, never>, number, { key: string }>({
         const current = day === latest;
         const x0 = Math.max(xAxis.convertToPixel(i) - half, 0);
         const x1 = current ? bounding.width : Math.min(xAxis.convertToPixel(j) + half, bounding.width);
-        // A past day's names go at its start, where there's room for them.
+        // A past day is named only where there's room for the names.
         const named = current || x1 - x0 > 80;
-        ctx.textAlign = current ? 'right' : 'left';
-        const labelX = current ? bounding.width - 4 : x0 + 4;
         for (const line of pivotLines(levels)) {
           const y = Math.round(yAxis.convertToPixel(line.value)) + 0.5;
           if (y < 0 || y > bounding.height) continue;
-          const p = line.name === 'P';
-          ctx.strokeStyle = p ? PIVOT_P : PIVOT_LINE;
-          ctx.setLineDash([2, 3]);
           ctx.beginPath();
           ctx.moveTo(x0, y);
           ctx.lineTo(x1, y);
           ctx.stroke();
-          if (named) {
-            ctx.fillStyle = p ? PIVOT_P_TEXT : PIVOT_TEXT;
-            ctx.fillText(`${line.name} ${IN.format(line.value)}`, labelX, y - 2);
-          }
+          if (named) ctx.fillText(`${line.name} (${IN.format(line.value)})`, x0 + 4, y - 2);
         }
       }
       i = j + 1;
