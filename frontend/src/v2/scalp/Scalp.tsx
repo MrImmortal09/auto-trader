@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Columns2, Columns3, Square } from 'lucide-react';
+import { ChartCandlestick, ChevronDown, Columns2, Columns3, Square } from 'lucide-react';
 import type { ChartLevel, ExecutePosition } from '../../types';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, daysLeftLabel, expiryLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
@@ -16,7 +16,7 @@ import { CrosshairBus } from './bus';
 import type { Placing } from './KChart';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, type LevelActions, type LevelKind, type Layers } from './lines';
-import { approxMoney, istClock, levelCrossed, levelPnl, toTick, type ChartSym, type Tf } from './model';
+import { approxMoney, istClock, levelCrossed, levelPnl, symbolLabel, toTick, type ChartSym, type Tf } from './model';
 import { PositionSheet, ScalpBar, ScalpPositionsPanel, type PositionHandlers } from './ScalpPositions';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -32,11 +32,13 @@ interface Saved {
   slots: Slot[];
   index: string;
   lots: Record<string, number>;
+  /** Phone: the chart folded away, the whole ladder shown instead. */
+  chartHidden: boolean;
 }
 
 const STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {} };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false };
 
 /** The saved layout, with any option that has since expired back on its index. */
 function loadSaved(): Saved {
@@ -53,6 +55,7 @@ function loadSaved(): Saved {
     slots,
     index: INDEX_ORDER.includes(saved.index ?? '') ? saved.index! : 'NIFTY',
     lots: saved.lots ?? {},
+    chartHidden: saved.chartHidden === true,
   };
 }
 
@@ -272,12 +275,16 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
   const setSlot = (i: number, change: Partial<Slot>) =>
     save((s) => ({ ...s, slots: s.slots.map((slot, n) => (n === i ? { ...slot, ...change } : slot)) }));
 
+  const showChart = (shown: boolean) => save((s) => ({ ...s, chartHidden: !shown }));
+  const chartHidden = !desktop && saved.chartHidden;
+
   /** A price tapped on the ladder: chart that contract where its index is. */
   function chartContract(strike: number, side: 'CE' | 'PE') {
     if (!board) return;
     const sym: ChartSym = { kind: 'option', index: board.index, expiry: board.expiry, strike, side };
     const at = shownSlots.findIndex((s) => s.sym.index === board.index);
     setSlot(at >= 0 ? at : 0, { sym });
+    if (!desktop) showChart(true);
   }
 
   function selectIndex(index: string) {
@@ -322,6 +329,7 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
         onCancelPlacing={() => setPlacingAt(null)}
         bus={bus}
         compact={!desktop}
+        onHide={desktop ? undefined : () => showChart(false)}
       />
     );
   });
@@ -336,7 +344,7 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
       sending={sending}
       onBuy={(sym, label) => void buy(sym, label)}
       onChart={chartContract}
-      rows={desktop ? 5 : 2}
+      rows={desktop ? 5 : chartHidden ? board.rows.length : 2}
       desktop={desktop}
     />
   ) : (
@@ -359,6 +367,7 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
         setSheet(false);
         // Phone's one chart: put it on this scalp's index, and place there.
         if (saved.slots[0].sym.index !== p.index || saved.slots[0].sym.kind !== 'index') setSlot(0, { sym: { kind: 'index', index: p.index } });
+        showChart(true);
         setPlacingAt({ slot: 0, id: p.id, kind, trigger: 'index' });
       }}
       onClose={() => setSheet(false)}
@@ -371,7 +380,20 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
         <div className="shrink-0 px-4 pt-3 pb-2">
           <IndexTabs indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
         </div>
-        <div className="flex h-[260px] shrink-0 px-2">{charts[0]}</div>
+        {chartHidden ? (
+          <div className="shrink-0 px-2">
+            <button type="button" onClick={() => showChart(true)} className="flex h-10 w-full items-center gap-2 rounded-12 border border-line bg-inset px-3 text-left">
+              <ChartCandlestick size={16} className="text-fg-muted" />
+              <span className="type-label text-fg">Show chart</span>
+              <span className="min-w-0 flex-1 truncate type-caption text-fg-muted">
+                {symbolLabel(saved.slots[0].sym)} · {saved.slots[0].tf}
+              </span>
+              <ChevronDown size={16} className="text-fg-muted" />
+            </button>
+          </div>
+        ) : (
+          <div className="flex h-[260px] shrink-0 px-2">{charts[0]}</div>
+        )}
         <div className="min-h-0 flex-1 overflow-y-auto pt-3">{ladder}</div>
         <ScalpBar scalps={scalps} h={handlers} onOpen={() => setSheet(true)} />
         {sheetEl}

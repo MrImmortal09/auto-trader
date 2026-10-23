@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import { ChevronDown, Layers as LayersIcon } from 'lucide-react';
+import { ChevronDown, ChevronUp, Layers as LayersIcon } from 'lucide-react';
 import { INDEX_ORDER } from '../../lib/execute';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
@@ -14,7 +14,7 @@ const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg'
 const TFS: Tf[] = ['1m', '5m', '15m'];
 
 /** One chart: its header (instrument, timeframe, Layers) and the chart. */
-export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, spot, change, chain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, compact }: {
+export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, spot, change, chain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, compact, onHide }: {
   chartId: string;
   serverBase: string;
   sym: ChartSym;
@@ -36,6 +36,8 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   bus: CrosshairBus;
   /** Phone: a timeframe menu instead of the switch. */
   compact: boolean;
+  /** Phone: folds the chart away, for more of the ladder. */
+  onHide?: () => void;
 }) {
   const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | null>(null);
   const [chartState, setChartState] = useState<{ loading: boolean; error: string | null; last: Bar | null }>({ loading: true, error: null, last: null });
@@ -147,6 +149,11 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             />
           </Popover>
         </div>
+        {onHide && (
+          <button type="button" aria-label="Hide chart" title="Hide chart" onClick={onHide} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
+            <ChevronUp size={16} />
+          </button>
+        )}
       </header>
       <div className="relative min-h-0 flex-1">
         <KChart
