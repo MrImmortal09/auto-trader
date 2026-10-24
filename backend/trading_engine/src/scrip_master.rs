@@ -76,7 +76,7 @@ pub struct ChainStrike {
     pub pe: Option<ScripRecord>,
 }
 
-/// Every strike of one index's nearest expiry, sorted by strike.
+/// Every strike of one index's expiry, sorted by strike.
 #[derive(Debug, Clone)]
 pub struct OptionChain {
     pub index: String,
@@ -235,28 +235,40 @@ impl ScripStore {
             .cloned()
     }
 
-    /// `index`'s option chain for its nearest expiry on or after `today`, in
-    /// the index's own F&O segment. `None` when the store holds no options
-    /// for it.
-    pub fn nearest_expiry_chain(&self, index: &str, today: NaiveDate) -> Option<OptionChain> {
+    /// The expiries `index`'s options are listed for on or after `today`, in
+    /// the index's own F&O segment, earliest first. Empty when the store
+    /// holds no options for it.
+    pub fn expiries(&self, index: &str, today: NaiveDate) -> Vec<NaiveDate> {
         let segment = index_fo_segment(index);
-        let options: Vec<(&ScripRecord, f64)> = self
+        let mut out: Vec<NaiveDate> = self
             .records
-            .get(index)?
-            .iter()
-            .filter(|r| r.exchange_segment_code == segment && r.expiry_date >= today)
-            .filter_map(|r| r.normalized_strike().map(|s| (r, s)))
-            .collect();
-        let expiry = options.iter().map(|(r, _)| r.expiry_date).min()?;
+            .get(index)
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|r| r.exchange_segment_code == segment && r.expiry_date >= today && r.normalized_strike().is_some())
+                    .map(|r| r.expiry_date)
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out.dedup();
+        out
+    }
 
+    /// `index`'s option chain for one `expiry`, in the index's own F&O
+    /// segment. `None` when nothing is listed for that expiry.
+    pub fn chain_for_expiry(&self, index: &str, expiry: NaiveDate) -> Option<OptionChain> {
+        let segment = index_fo_segment(index);
         let mut by_strike: BTreeMap<i64, ChainStrike> = BTreeMap::new();
-        for (r, strike) in options.iter().filter(|(r, _)| r.expiry_date == expiry) {
+        for r in self.records.get(index)?.iter().filter(|r| r.exchange_segment_code == segment && r.expiry_date == expiry) {
+            let Some(strike) = r.normalized_strike() else { continue };
             let row = by_strike
                 .entry((strike * 100.0).round() as i64)
-                .or_insert_with(|| ChainStrike { strike: *strike, ce: None, pe: None });
+                .or_insert_with(|| ChainStrike { strike, ce: None, pe: None });
             let slot = if r.option_type == "CE" { &mut row.ce } else { &mut row.pe };
             if slot.is_none() {
-                *slot = Some((*r).clone());
+                *slot = Some(r.clone());
             }
         }
         let first = by_strike.values().find_map(|s| s.ce.as_ref().or(s.pe.as_ref()))?;
@@ -267,6 +279,14 @@ impl ScripStore {
             tick_size: first.tick_size,
             strikes: by_strike.into_values().collect(),
         })
+    }
+
+    /// `index`'s option chain for its nearest expiry on or after `today`, in
+    /// the index's own F&O segment. `None` when the store holds no options
+    /// for it.
+    pub fn nearest_expiry_chain(&self, index: &str, today: NaiveDate) -> Option<OptionChain> {
+        let expiry = self.expiries(index, today).into_iter().next()?;
+        self.chain_for_expiry(index, expiry)
     }
 
     pub fn resolve_signal(&self, signal: &TradeSignal) -> Option<ScripRecord> {
@@ -401,5 +421,48 @@ mod tests {
         let chain = store.nearest_expiry_chain("NIFTY", NaiveDate::from_ymd_opt(2026, 10, 20).unwrap()).unwrap();
         assert_eq!(chain.expiry, NaiveDate::from_ymd_opt(2026, 10, 27).unwrap());
         assert!(store.nearest_expiry_chain("SENSEX", today).is_none());
+    }
+
+    fn two_expiry_store() -> ScripStore {
+        let mut store = ScripStore::default();
+        store.records.insert("NIFTY".to_string(), vec![
+            rec("NIFTY26O2722900CE", "nse_fo", 2290000.0, "CE", (2026, 10, 27)),
+            rec("NIFTY26O2722900PE", "nse_fo", 2290000.0, "PE", (2026, 10, 27)),
+            rec("NIFTY26N0322900CE", "nse_fo", 2290000.0, "CE", (2026, 11, 3)),
+            rec("NIFTY26N0323000CE", "nse_fo", 2300000.0, "CE", (2026, 11, 3)),
+            rec("NIFTY26N0323000PE", "nse_fo", 2300000.0, "PE", (2026, 11, 3)),
+            // The future shares the symbol name but is not an option.
+            rec("NIFTY26NOVFUT", "nse_fo", 0.0, "XX", (2026, 11, 24)),
+            // Already expired.
+            rec("NIFTY26O1922900CE", "nse_fo", 2290000.0, "CE", (2026, 10, 19)),
+        ]);
+        store
+    }
+
+    #[test]
+    fn expiries_are_listed_from_today_earliest_first() {
+        let store = two_expiry_store();
+        let d = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        assert_eq!(store.expiries("NIFTY", d(10, 20)), vec![d(10, 27), d(11, 3)]);
+        // On expiry day the expiring contracts still count; the day after they are gone.
+        assert_eq!(store.expiries("NIFTY", d(10, 27)), vec![d(10, 27), d(11, 3)]);
+        assert_eq!(store.expiries("NIFTY", d(10, 28)), vec![d(11, 3)]);
+        assert!(store.expiries("SENSEX", d(10, 20)).is_empty());
+    }
+
+    #[test]
+    fn chain_for_expiry_holds_only_that_expiry() {
+        let store = two_expiry_store();
+        let d = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        let next = store.chain_for_expiry("NIFTY", d(11, 3)).unwrap();
+        assert_eq!(next.expiry, d(11, 3));
+        assert_eq!(next.strikes.iter().map(|s| s.strike).collect::<Vec<_>>(), vec![22900.0, 23000.0]);
+        assert!(next.strikes[0].pe.is_none());
+        assert_eq!(next.strikes[1].pe.as_ref().unwrap().trading_symbol, "NIFTY26N0323000PE");
+        // The nearest chain is still the earliest expiry only.
+        let nearest = store.nearest_expiry_chain("NIFTY", d(10, 20)).unwrap();
+        assert_eq!(nearest.expiry, d(10, 27));
+        assert_eq!(nearest.strikes.len(), 1);
+        assert!(store.chain_for_expiry("NIFTY", d(11, 24)).is_none());
     }
 }

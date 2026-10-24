@@ -15,5 +15,5 @@ pub use desk::{desk_handler, feed_handler, status_handler};
 pub use flags::{get_flags_handler, put_flags_handler};
 pub use history::history_handler;
 pub use positions::{chart_index_subscriptions, patch_position_levels_handler};
-pub use scalp::{chain_handler, marks_handler};
+pub use scalp::{chain_handler, expiries_handler, marks_handler};
 pub use system::{mode_check_handler, system_handler};
