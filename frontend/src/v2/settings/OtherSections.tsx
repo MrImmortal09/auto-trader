@@ -9,12 +9,12 @@ import { Row, Section } from './parts';
 import { uptimeText } from './summary';
 import type { SettingsState } from './useSettings';
 
-/** Scalp: how its orders go, which is fixed. */
-export function ScalpNotes({ flags, id, title }: { flags: Flags | null; id?: string; title?: string }) {
+/** Trade: how its orders go, which is fixed. */
+export function TradeNotes({ flags, id, title }: { flags: Flags | null; id?: string; title?: string }) {
   return (
     <Section id={id} title={title}>
-      <Row title="One-tap buy" caption="A tap on the ladder buys at market, with no confirm. Lots per tap are set on the Scalp screen." />
-      <Row title="Hold to exit all" caption="Holding Exit all for a second sells every scalp at market." />
+      <Row title="One-tap buy" caption="A tap on the ladder buys at market, with no confirm. Any strike of any listed expiry; lots per tap are set on the Trade screen." />
+      <Row title="Hold to exit all" caption="Holding Exit all for a second sells every manual trade at market. Telegram positions are left alone." />
       <Row title="Pointer only" caption="No key on the keyboard ever sends an order." />
       <Row title="Chart stops and targets" caption={flags?.chart_stops ? 'On: drag a scalp’s stop and target on its charts.' : 'Off: turn it on in Beta to drag levels on the charts.'} />
     </Section>
@@ -83,7 +83,7 @@ export function Beta({ serverBase, flags, onSaved, id, title }: { serverBase: st
       <Row title="Index options only" caption="Skip calls for anything but index options; they show as skipped in the Telegram feed.">
         <Toggle label="Index options only" checked={flags?.index_options_only ?? false} disabled={!flags} onChange={(on) => void flip({ index_options_only: on }, `Index options only ${on ? 'on' : 'off'}`)} />
       </Row>
-      <Row title="Chart stops" caption="Set a scalp's stop and target by dragging on the Scalp charts. A level crossed sells the whole holding at market.">
+      <Row title="Chart stops" caption="Set a manual trade's stop and target by dragging on the Trade charts. A level crossed sells the whole holding at market.">
         <Toggle label="Chart stops" checked={flags?.chart_stops ?? false} disabled={!flags} onChange={(on) => void flip({ chart_stops: on }, `Chart stops ${on ? 'on' : 'off'}`)} />
       </Row>
     </Section>

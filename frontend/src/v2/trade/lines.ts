@@ -1,4 +1,4 @@
-// What each Scalp chart draws: a scalp's position line with its stop and
+// What each Trade chart draws: a scalp's position line with its stop and
 // target, Telegram trades' read-only lines, and the day's markers.
 
 import type { ChartLevel, ExecutePosition } from '../../types';
@@ -138,7 +138,8 @@ export function chartLines(cx: LineContext): ChartLine[] {
   if (cx.layers.myTrades) {
     for (const p of cx.scalps) {
       if (p.qty <= 0) continue;
-      const expiry = cx.chains[p.index]?.expiry;
+      // The position's own expiry; the nearest only for rows from before it was recorded.
+      const expiry = p.expiry ?? cx.chains[p.index]?.expiry;
       const option = expiry ? optionOf(p, expiry) : null;
       const onOption = option != null && sameSym(option, cx.sym);
       const onIndex = cx.sym.kind === 'index' && cx.sym.index === p.index;

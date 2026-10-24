@@ -3,7 +3,7 @@
 // Registered once, globally.
 
 import { registerIndicator } from 'klinecharts';
-import { C, FONT } from '../scalp/chartSetup';
+import { C, FONT } from '../trade/chartSetup';
 
 export interface PcrSeries {
   /** PCR by bar start (Unix ms): the latest check at that bar's close. */
