@@ -2,22 +2,23 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChartCandlestick, ChevronDown, Columns2, Columns3, Square } from 'lucide-react';
 import type { ChartLevel, ExecutePosition } from '../../types';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
-import { buyBlockedReason, contractLabel, daysLeftLabel, expiryLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
-import { executeBuy, executeExitAll, exitPosition, getChain, getFlags, getMarks, sellQty, setChartLevels, type Sent } from '../lib/api';
+import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
+import { executeBuy, executeExitAll, exitPosition, getChain, getExpiries, getFlags, getMarks, sellQty, setChartLevels, type Sent } from '../lib/api';
 import { price, signedPct, toneOf, todayIst } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
-import type { ChainAnswer } from '../lib/types';
+import type { ChainAnswer, ExpiriesAnswer } from '../lib/types';
 import { useGuard } from '../shell/useGuard';
-import { Chip } from '../ui/Chip';
+import { Segment } from '../ui/Segment';
 import { useToast } from '../ui/toast';
 import { C, type OrderLineData } from './chartSetup';
 import { ChartPanel } from './ChartPanel';
 import { CrosshairBus } from './bus';
+import { ExpiryPicker } from './ExpiryPicker';
 import type { Placing } from './KChart';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, type LevelActions, type LevelKind, type Layers } from './lines';
-import { approxMoney, istClock, levelCrossed, levelPnl, symbolLabel, toTick, type ChartSym, type Tf } from './model';
-import { PositionSheet, ScalpBar, ScalpPositionsPanel, type PositionHandlers } from './ScalpPositions';
+import { approxMoney, CHART_LIBS, istClock, levelCrossed, levelPnl, optionOf, sameSym, symbolLabel, toTick, type ChartLib, type ChartSym, type Tf } from './model';
+import { PositionSheet, ScalpBar, ScalpPositionsPanel, type PositionHandlers } from './Positions';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 
@@ -34,15 +35,22 @@ interface Saved {
   lots: Record<string, number>;
   /** Phone: the chart folded away, the whole ladder shown instead. */
   chartHidden: boolean;
+  /** The ladder's expiry per index, `YYYY-MM-DD`; missing means the nearest. */
+  expiry: Record<string, string | null>;
+  /** Which library draws every chart. */
+  chartLib: ChartLib;
 }
 
-const STORE_KEY = 'v2.scalp';
+const STORE_KEY = 'v2.trade';
+/** The screen's name before it became Trade; read once, for its saved layout. */
+const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, expiry: {}, chartLib: 'kline' };
 
-/** The saved layout, with any option that has since expired back on its index. */
+/** The saved layout, with any option that has since expired back on its
+ * index, and any chosen expiry that has passed back to the nearest. */
 function loadSaved(): Saved {
-  const saved = readStored<Partial<Saved>>(STORE_KEY, {});
+  const saved = readStored<Partial<Saved>>(STORE_KEY, readStored<Partial<Saved>>(OLD_STORE_KEY, {}));
   const today = todayIst();
   const slots = DEFAULTS.slots.map((d, i) => {
     const s = saved.slots?.[i];
@@ -50,12 +58,15 @@ function loadSaved(): Saved {
     const sym = s.sym.kind === 'option' && s.sym.expiry < today ? { kind: 'index' as const, index: s.sym.index } : s.sym;
     return { sym, tf: s.tf ?? '5m', layers: { ...DEFAULT_LAYERS, ...s.layers } };
   });
+  const expiry = Object.fromEntries(Object.entries(saved.expiry ?? {}).filter(([index, date]) => INDEX_ORDER.includes(index) && typeof date === 'string' && date >= today));
   return {
     layout: saved.layout === 1 || saved.layout === 3 ? saved.layout : 2,
     slots,
     index: INDEX_ORDER.includes(saved.index ?? '') ? saved.index! : 'NIFTY',
     lots: saved.lots ?? {},
     chartHidden: saved.chartHidden === true,
+    expiry,
+    chartLib: saved.chartLib === 'vela' ? 'vela' : 'kline',
   };
 }
 
@@ -105,13 +116,17 @@ function IndexTabs({ indices, selected, onSelect }: { indices: { index: string; 
   );
 }
 
+/** `NIFTY:2026-11-03`: how a chain other than an index's nearest is keyed. */
+const chainKeyOf = (index: string, expiry: string) => `${index}:${expiry}`;
+
 /**
- * Scalp: up to three charts (index or option, 1m/5m/15m) with each scalp's
- * position line, stop and target — dragged to move, behind `chart_stops` —
- * the nearest expiry's ladder (one tap = market buy), and the scalps
- * themselves with −1 lot, Exit and a held Exit all.
+ * Trade: up to three charts (an index or any of its options, 1m/5m/15m)
+ * with each manual trade's position line, stop and target — dragged to
+ * move, behind `chart_stops` — the ladder of any listed expiry, every
+ * strike (one tap = market buy), and the trades themselves with −1 lot,
+ * Exit and a held Exit all.
  */
-export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
+export function Trade({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
   const [saved, setSaved] = useState<Saved>(loadSaved);
   const [bus] = useState(() => new CrosshairBus());
   const [pending, setPending] = useState<Record<string, Pending>>({});
@@ -119,6 +134,10 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [exitAllBusy, setExitAllBusy] = useState(false);
   const [placingAt, setPlacingAt] = useState<{ slot: number; id: string; kind: LevelKind; trigger: ChartLevel['trigger'] } | null>(null);
   const [sheet, setSheet] = useState(false);
+  // The strike the ladder scrolled to, for the ladder it was scrolled on.
+  const [centreAt, setCentreAt] = useState<{ key: string; strike: number } | null>(null);
+  // Chains the chart pickers asked for, beyond the nearest: `INDEX:EXPIRY`.
+  const [asked, setAsked] = useState<Record<string, true>>({});
   const guard = useGuard();
   const toast = useToast();
 
@@ -130,28 +149,86 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
     });
   }, []);
 
-  const { frame, stale, now } = useExecuteStream(serverBase, saved.index);
+  const ladderExpiry = saved.expiry[saved.index] ?? null;
+  const ladderKey = `${saved.index}:${ladderExpiry ?? ''}`;
+  const centre = centreAt?.key === ladderKey ? centreAt.strike : null;
+  const { frame, stale, now } = useExecuteStream(serverBase, saved.index, ladderExpiry, centre);
   const flags = usePoll(() => getFlags(serverBase), 15_000, serverBase);
   const marks = usePoll(() => getMarks(serverBase), 5_000, serverBase);
   const chartStopsOn = flags.data?.chart_stops ?? false;
 
   const scalps = useMemo(() => (frame?.positions ?? []).filter((p) => p.manual).map((p) => withPending(p, pending, now)), [frame, pending, now]);
   const shownSlots = desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1);
-  const wantedChains = [...new Set([saved.index, ...shownSlots.map((s) => s.sym.index), ...scalps.map((p) => p.index)])].sort();
-  const chainKey = `${serverBase}|${wantedChains.join(',')}`;
+  const board = frame?.board && frame.board.index === saved.index ? frame.board : null;
+
+  // Each index in use: its nearest chain (deltas, tick size) and its expiries.
+  const wantedIndices = [...new Set([saved.index, ...shownSlots.map((s) => s.sym.index), ...scalps.map((p) => p.index)])].sort();
+  const indicesKey = `${serverBase}|${wantedIndices.join(',')}`;
   const chainsPoll = usePoll(
     async () => {
-      const got = await Promise.all(wantedChains.map((i) => getChain(serverBase, i).catch(() => undefined)));
-      return Object.fromEntries(wantedChains.map((i, n) => [i, got[n]])) as Record<string, ChainAnswer | undefined>;
+      const got = await Promise.all(wantedIndices.map((i) => getChain(serverBase, i).catch(() => undefined)));
+      return Object.fromEntries(wantedIndices.map((i, n) => [i, got[n]])) as Record<string, ChainAnswer | undefined>;
     },
     60_000,
-    chainKey,
+    indicesKey,
   );
   const chains = chainsPoll.data ?? {};
+  const expiriesPoll = usePoll(
+    async () => {
+      const got = await Promise.all(wantedIndices.map((i) => getExpiries(serverBase, i).catch(() => undefined)));
+      return Object.fromEntries(wantedIndices.map((i, n) => [i, got[n]])) as Record<string, ExpiriesAnswer | undefined>;
+    },
+    60_000,
+    `exp|${indicesKey}`,
+  );
+  const expiries = expiriesPoll.data ?? {};
+
+  // Chains other than the nearest: the ladder's expiry, charted options,
+  // positions on later expiries, and whatever a picker is looking at.
+  const extraKeys = [
+    ...new Set([
+      ...(board ? [chainKeyOf(board.index, board.expiry)] : []),
+      ...(ladderExpiry ? [chainKeyOf(saved.index, ladderExpiry)] : []),
+      ...shownSlots.flatMap((s) => (s.sym.kind === 'option' ? [chainKeyOf(s.sym.index, s.sym.expiry)] : [])),
+      ...scalps.flatMap((p) => (p.expiry ? [chainKeyOf(p.index, p.expiry)] : [])),
+      ...Object.keys(asked),
+    ]),
+  ]
+    .filter((key) => {
+      const [index, expiry] = key.split(':');
+      return chains[index]?.expiry !== expiry;
+    })
+    .sort();
+  const extraPoll = usePoll(
+    async () => {
+      const got = await Promise.all(
+        extraKeys.map((key) => {
+          const [index, expiry] = key.split(':');
+          return getChain(serverBase, index, expiry).catch(() => undefined);
+        }),
+      );
+      return Object.fromEntries(extraKeys.map((key, n) => [key, got[n]])) as Record<string, ChainAnswer | undefined>;
+    },
+    60_000,
+    `at|${serverBase}|${extraKeys.join(',')}`,
+    extraKeys.length > 0,
+  );
+  const chainsAt = extraPoll.data ?? {};
+
+  /** An index's strikes on `expiry` (null: the nearest), once loaded. */
+  const chainAt = (index: string, expiry: string | null): ChainAnswer | undefined => {
+    const near = chains[index];
+    if (!expiry || near?.expiry === expiry) return near;
+    return chainsAt[chainKeyOf(index, expiry)];
+  };
+  const needChain = useCallback((index: string, expiry: string | null) => {
+    if (!expiry) return;
+    const key = chainKeyOf(index, expiry);
+    setAsked((a) => (a[key] ? a : { ...a, [key]: true }));
+  }, []);
 
   const spot: Record<string, number | null> = Object.fromEntries((frame?.indices ?? []).map((i) => [i.index, i.spot]));
   const change: Record<string, number | null> = Object.fromEntries((frame?.indices ?? []).map((i) => [i.index, i.change_pct]));
-  const board = frame?.board && frame.board.index === saved.index ? frame.board : null;
   const held = new Map(scalps.map((p) => [p.symbol, p]));
   const blocked = buyBlockedReason(frame, stale);
   const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[saved.index] ?? 1));
@@ -226,12 +303,12 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
     }
   }
 
-  const tick = (index: string) => chains[index]?.tick_size ?? 0.05;
+  const tick = (p: ExecutePosition) => chainAt(p.index, p.expiry)?.tick_size ?? chains[p.index]?.tick_size ?? 0.05;
 
   /** Set a level where it was dropped, on the tick. One past the price sells
    * the whole holding at market on the engine's next tick — a quick exit. */
   function trySet(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel): boolean {
-    void sendLevel(p, kind, { ...lvl, price: toTick(lvl.price, lvl.trigger === 'premium' ? tick(p.index) : 0.05) });
+    void sendLevel(p, kind, { ...lvl, price: toTick(lvl.price, lvl.trigger === 'premium' ? tick(p) : 0.05) });
     return true;
   }
 
@@ -274,6 +351,23 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   const setSlot = (i: number, change: Partial<Slot>) =>
     save((s) => ({ ...s, slots: s.slots.map((slot, n) => (n === i ? { ...slot, ...change } : slot)) }));
+  const setLib = (chartLib: ChartLib) => save((s) => ({ ...s, chartLib }));
+
+  /** "+ Stop" from the positions panel: placed on the chart showing the
+   * trade's option (a premium level), else its index (an index level) — the
+   * first chart is put on the index when none shows either. */
+  function placeFromPanel(p: ExecutePosition, kind: LevelKind) {
+    const option = p.expiry ? optionOf(p, p.expiry) : null;
+    const onOption = option ? shownSlots.findIndex((s) => sameSym(s.sym, option)) : -1;
+    if (onOption >= 0) return setPlacingAt({ slot: onOption, id: p.id, kind, trigger: 'premium' });
+    let onIndex = shownSlots.findIndex((s) => s.sym.kind === 'index' && s.sym.index === p.index);
+    if (onIndex < 0) {
+      onIndex = 0;
+      setSlot(0, { sym: { kind: 'index', index: p.index } });
+    }
+    if (!desktop) showChart(true);
+    setPlacingAt({ slot: onIndex, id: p.id, kind, trigger: 'index' });
+  }
 
   const showChart = (shown: boolean) => save((s) => ({ ...s, chartHidden: !shown }));
   const chartHidden = !desktop && saved.chartHidden;
@@ -296,6 +390,15 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
     });
   }
 
+  /** The ladder's expiry: null is the nearest, which the server picks. */
+  const selectExpiry = (date: string | null) =>
+    save((s) => {
+      const expiry = { ...s.expiry };
+      if (date) expiry[s.index] = date;
+      else delete expiry[s.index];
+      return { ...s, expiry };
+    });
+
   const charts = shownSlots.map((slot, i) => {
     const cx = {
       sym: slot.sym,
@@ -308,10 +411,11 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
       layers: slot.layers,
       actions: actions(i),
     };
+    const index = slot.sym.index;
     return (
       <ChartPanel
         key={i}
-        chartId={`scalp-${i}`}
+        chartId={`trade-${i}`}
         serverBase={serverBase}
         sym={slot.sym}
         tf={slot.tf}
@@ -321,22 +425,31 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
         onLayers={(layers) => setSlot(i, { layers })}
         spot={spot}
         change={change}
-        chain={chains[slot.sym.index]}
+        expiries={expiries[index]?.expiries}
+        chainAt={(expiry) => chainAt(index, expiry)}
+        onNeedChain={(expiry) => needChain(index, expiry)}
         lines={chartLines(cx)}
         markers={chartMarkers(cx)}
         placing={placingAt?.slot === i ? placing : null}
         onPlacingDone={() => setPlacingAt(null)}
         onCancelPlacing={() => setPlacingAt(null)}
         bus={bus}
+        lib={saved.chartLib}
+        onLib={desktop ? undefined : setLib}
         compact={!desktop}
         onHide={desktop ? undefined : () => showChart(false)}
       />
     );
   });
 
+  const expiryPicker = (size: 'sm' | 'lg') => (
+    <ExpiryPicker expiries={expiries[saved.index]?.expiries} value={board?.expiry ?? ladderExpiry} onChange={selectExpiry} size={size} align={size === 'lg' ? 'left' : 'right'} />
+  );
+
   const ladder = board ? (
     <Ladder
       board={board}
+      chain={chainAt(board.index, board.expiry)}
       held={held}
       lots={lots}
       onLots={(n) => save((s) => ({ ...s, lots: { ...s.lots, [s.index]: n } }))}
@@ -344,8 +457,9 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
       sending={sending}
       onBuy={(sym, label) => void buy(sym, label)}
       onChart={chartContract}
-      rows={desktop ? 5 : chartHidden ? board.rows.length : 2}
+      onCentre={(strike) => setCentreAt(strike == null ? null : { key: ladderKey, strike })}
       desktop={desktop}
+      header={desktop ? undefined : expiryPicker('lg')}
     />
   ) : (
     <p className="px-4 py-6 type-body text-fg-muted">{frame?.board_error ?? (frame ? 'No option chain yet — it loads after the Kotak login.' : 'Connecting…')}</p>
@@ -394,7 +508,7 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
         ) : (
           <div className="flex h-[260px] shrink-0 px-2">{charts[0]}</div>
         )}
-        <div className="min-h-0 flex-1 overflow-y-auto pt-3">{ladder}</div>
+        <div className="flex min-h-0 flex-1 flex-col pt-3">{ladder}</div>
         <ScalpBar scalps={scalps} h={handlers} onOpen={() => setSheet(true)} />
         {sheetEl}
       </div>
@@ -411,6 +525,7 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
       <div className="flex shrink-0 items-center gap-3">
         <IndexTabs indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
         <span className="flex-1" />
+        <Segment label="Chart library" size="sm" value={saved.chartLib} onChange={setLib} options={CHART_LIBS} />
         <span className="type-label text-fg-muted">Charts</span>
         <div role="tablist" aria-label="Charts" className="flex gap-1 rounded-8 bg-inset p-1">
           {layouts.map(({ n, icon: Icon, label }) => (
@@ -422,20 +537,16 @@ export function Scalp({ serverBase, desktop }: { serverBase: string; desktop: bo
       </div>
       <div className="flex min-h-[420px] flex-1 gap-3">
         <div className="flex min-w-0 flex-1 gap-3">{charts}</div>
-        <aside className="flex w-[380px] shrink-0 flex-col overflow-y-auto rounded-12 border border-line bg-panel py-3">
+        <aside className="flex w-[380px] shrink-0 flex-col rounded-12 border border-line bg-panel py-3">
           <div className="flex items-center gap-2 px-3 pb-3">
             <h2 className="type-title text-fg">{saved.index} options</h2>
-            {board && (
-              <Chip kind="outline" className="ml-auto">
-                Expiry {expiryLabel(board.expiry)} · {daysLeftLabel(board.days_to_expiry)}
-              </Chip>
-            )}
+            <span className="ml-auto">{expiryPicker('sm')}</span>
           </div>
           {ladder}
-          {blocked && board && <p className="px-3 pt-2 type-caption text-loss">{blocked}</p>}
+          {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
         </aside>
       </div>
-      <ScalpPositionsPanel scalps={scalps} h={handlers} />
+      <ScalpPositionsPanel scalps={scalps} h={handlers} canSet={chartStopsOn} onAdd={placeFromPanel} onRemove={(p, kind) => void sendLevel(p, kind, null)} />
       {!chartStopsOn && scalps.length > 0 && (
         <p className="shrink-0 type-caption text-fg-muted">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
       )}

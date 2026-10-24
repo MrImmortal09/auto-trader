@@ -509,15 +509,20 @@ export interface ExecuteRow {
 
 export interface ExecuteBoard {
   index: string;
-  /** `YYYY-MM-DD`. */
+  /** `YYYY-MM-DD`: the expiry the rows are from. */
   expiry: string;
   days_to_expiry: number;
+  /** Every expiry this index's options are listed for, earliest first. */
+  expiries: string[];
   lot_size: number;
   spot: number | null;
   /** Live Kotak index tick, Upstox's 60 s poll, or put-call parity. */
   spot_source: 'kotak' | 'upstox' | 'parity' | null;
   atm: number | null;
-  /** ATM ± 7 strikes; the screen shows 11 of them. */
+  /** The strikes `rows` run from and to. */
+  window: { from: number; to: number };
+  /** The subscribed window: 7 strikes each side of ATM, or of the strike the
+   * stream was asked to centre on. v1 shows 11 of them. */
   rows: ExecuteRow[];
 }
 
@@ -527,6 +532,8 @@ export interface ExecutePosition {
   index: string;
   strike: number | null;
   option_type: string | null;
+  /** `YYYY-MM-DD`, once the contract is resolved. */
+  expiry: string | null;
   symbol: string;
   lot_size: number;
   qty: number;
