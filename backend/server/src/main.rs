@@ -1057,6 +1057,7 @@ async fn main() {
         .route("/api/v2/desk",                      get(routes::v2::desk_handler))
         .route("/api/v2/feed",                      get(routes::v2::feed_handler))
         .route("/api/v2/status",                    get(routes::v2::status_handler))
+        .route("/api/v2/expiries",                  get(routes::v2::expiries_handler))
         .route("/api/v2/chain",                     get(routes::v2::chain_handler))
         .route("/api/v2/marks",                     get(routes::v2::marks_handler))
         .route("/api/v2/system",                    get(routes::v2::system_handler))
