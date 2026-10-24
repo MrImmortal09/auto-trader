@@ -1,118 +1,33 @@
-import type { ChartLevel, ExecutePosition } from '../../types';
+import { useState } from 'react';
+import type { ExecutePosition } from '../../types';
 import { contractLabel, expiryLabel } from '../../lib/execute';
 import { price, signedMoney, signedPct, toneOf } from '../lib/format';
-import type { DeskPosition } from '../lib/types';
+import type { Call, DeskAnswer, DeskPosition, FillMark } from '../lib/types';
 import { PositionRail } from '../desk/PositionRail';
 import { railFor } from '../desk/rail';
 import { Button } from '../ui/Button';
 import { SourceChip } from '../ui/Chip';
 import { HoldButton } from '../ui/HoldButton';
 import { Modal } from '../ui/Modal';
+import { Segment } from '../ui/Segment';
 import type { LevelKind } from './lines';
 import { approxMoney, levelPnl } from './model';
+import { AccountColumn } from './panel/TradingPanel';
+import { activityEvents, type EngineError } from './panel/activity';
+import { ActivityList, HistoryList } from './panel/lists';
+import { busyNote, levelWords } from './words';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
-
-/** What a scalp is doing, if anything. */
-function busyNote(p: ExecutePosition, sending: boolean): string | null {
-  if (p.halted) return 'Halted by the engine — see System';
-  if (p.placing) return 'Buying…';
-  if (p.adding) return 'Adding…';
-  if (p.exiting) return 'Exiting…';
-  return sending ? 'Sending…' : null;
-}
-
-/** "NIFTY ≤ 25,060.00" or "₹92.50". */
-function levelWords(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel): string {
-  if (lvl.trigger === 'premium') return `₹${price(lvl.price)}`;
-  const falls = (kind === 'stop') === (p.option_type === 'CE');
-  return `${p.index} ${falls ? '≤' : '≥'} ${price(lvl.price)}`;
-}
 
 export interface PositionHandlers {
   /** Positions with a sell in flight from here. */
   sending: Record<string, boolean>;
   onLessLot: (p: ExecutePosition) => void;
   onExit: (p: ExecutePosition) => void;
+  /** A first buy still being placed: abandon it. */
+  onCancel: (p: ExecutePosition) => void;
   onExitAll: () => void;
   exitAllBusy: boolean;
-}
-
-/** Desktop: the open manual trades, each with its stop and target (added or
- * removed from here, dragged on the charts), −1 lot and Exit; Exit all held. */
-export function ScalpPositionsPanel({ scalps, h, canSet, onAdd, onRemove }: {
-  scalps: ExecutePosition[];
-  h: PositionHandlers;
-  /** Levels can be set (`chart_stops` on); removing works either way. */
-  canSet: boolean;
-  /** "+ Stop": put the level on a chart with the next click. */
-  onAdd: (p: ExecutePosition, kind: LevelKind) => void;
-  onRemove: (p: ExecutePosition, kind: LevelKind) => void;
-}) {
-  const open = scalps.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
-  return (
-    <section className="shrink-0 rounded-12 border border-line bg-panel px-4 py-3">
-      <header className="flex items-center gap-3 pb-1">
-        <h2 className="flex items-baseline gap-2 type-title text-fg">
-          Positions <span className="type-caption text-fg-muted tnum">{scalps.length}</span>
-        </h2>
-        <span className="flex-1" />
-        <span className="type-label text-fg-muted">Open</span>
-        <span className={`num-medium ${TONE_TEXT[toneOf(open)]}`}>{signedMoney(open)}</span>
-        <HoldButton size="sm" disabled={scalps.length === 0 || h.exitAllBusy} onFire={h.onExitAll}>
-          {h.exitAllBusy ? 'Exiting…' : 'Hold to exit all'}
-        </HoldButton>
-      </header>
-      {scalps.length === 0 && <p className="py-2 type-body text-fg-muted">No open trade. Tap Buy on the ladder to open one.</p>}
-      {scalps.map((p) => {
-        const note = busyNote(p, !!h.sending[p.id]);
-        const locked = note != null || p.qty <= 0;
-        const meta = [p.expiry ? expiryLabel(p.expiry) : null, `${p.qty} qty`, `avg ${price(p.avg)}`].filter(Boolean).join(' · ');
-        const level = (kind: LevelKind) => {
-          const lvl = p.chart?.[kind] ?? null;
-          const word = kind === 'stop' ? 'Stop' : 'Target';
-          if (lvl) {
-            return (
-              <span className={`inline-flex items-center gap-1 type-caption tnum ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-                {word.toLowerCase()} {levelWords(p, kind, lvl)}
-                <button type="button" disabled={locked} title={`Remove the ${kind}`} aria-label={`Remove the ${kind}`} onClick={() => onRemove(p, kind)} className="grid size-5 place-items-center rounded-4 border border-current/40 hover:bg-raised disabled:opacity-40">
-                  ×
-                </button>
-              </span>
-            );
-          }
-          if (!canSet) return <span className="type-caption text-fg-muted">no {kind}</span>;
-          return (
-            <button type="button" disabled={locked} onClick={() => onAdd(p, kind)} className={`type-caption hover:underline disabled:opacity-40 ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-              + {word}
-            </button>
-          );
-        };
-        return (
-          <div key={p.id} className="flex items-center gap-6 border-t border-line py-2.5">
-            <span className="w-44 shrink-0 type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
-            <span className="flex min-w-0 flex-1 items-center gap-3 type-caption text-fg-muted tnum">
-              <span className="truncate">
-                {meta}
-                {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
-              </span>
-              {level('stop')}
-              {level('target')}
-            </span>
-            <span className={`w-28 shrink-0 text-right num-medium ${TONE_TEXT[toneOf(p.pnl)]}`}>{p.pnl == null ? '—' : signedMoney(p.pnl)}</span>
-            <div className="flex shrink-0 gap-2">
-              <Button pointerOnly kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)} title={`Sell ${p.lot_size} at market`}>
-                −1 lot
-              </Button>
-              <Button pointerOnly kind="loss" disabled={locked} onClick={() => h.onExit(p)} title={`Sell all ${p.qty} at market`}>
-                Exit
-              </Button>
-            </div>
-          </div>
-        );
-      })}
-    </section>
-  );
 }
 
 /** Phone: the bar under the ladder — open P&L, and Exit all held. */
@@ -120,7 +35,7 @@ export function ScalpBar({ scalps, h, onOpen }: { scalps: ExecutePosition[]; h: 
   const open = scalps.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
   return (
     <div className="flex shrink-0 items-center gap-3 border-t border-line bg-inset px-4 py-2">
-      <button type="button" onClick={onOpen} disabled={scalps.length === 0} className="min-w-0 flex-1 text-left disabled:opacity-60">
+      <button type="button" onClick={onOpen} className="min-w-0 flex-1 text-left">
         <div className="type-caption text-fg-muted">Open · {scalps.length === 1 ? '1 trade' : `${scalps.length} trades`}</div>
         <div className={`num-medium ${TONE_TEXT[toneOf(open)]}`}>{signedMoney(open)}</div>
       </button>
@@ -165,10 +80,22 @@ function railOf(p: ExecutePosition, indexNow: number | null) {
   } satisfies DeskPosition);
 }
 
-/** Figma "Scalp · position sheet": each scalp, its stop and target, −1 lot and Exit. */
-export function PositionSheet({ scalps, h, indexNow, deltaOf, since, canSet, onRemove, onAdd, onClose }: {
+type SheetTab = 'positions' | 'history' | 'activity';
+
+/**
+ * Phone: the trading panel as a bottom sheet — the account's figures, then
+ * Positions (each trade, its stop and target, −1 lot and Exit), History
+ * (today's closed trades) and Activity (fills and engine errors).
+ */
+export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, indexNow, deltaOf, since, canSet, onRemove, onAdd, onClose }: {
   scalps: ExecutePosition[];
   h: PositionHandlers;
+  mode: string;
+  desk: DeskAnswer | null;
+  /** Today's closed calls, every channel. */
+  history: Call[];
+  fills: FillMark[];
+  errors: EngineError[];
   indexNow: (index: string) => number | null;
   deltaOf: (p: ExecutePosition) => { value: number; assumed: boolean };
   /** When each was first bought today, IST `HH:MM`. */
@@ -179,84 +106,112 @@ export function PositionSheet({ scalps, h, indexNow, deltaOf, since, canSet, onR
   onAdd: (p: ExecutePosition, kind: LevelKind) => void;
   onClose: () => void;
 }) {
+  const [tab, setTab] = useState<SheetTab>('positions');
+  const active = scalps.filter((p) => !p.placing);
+  const openPnl = active.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
+  const closed = history.filter((c) => c.channel === 'Scalps');
   return (
-    <Modal open onClose={onClose} label="Positions">
-      <div className="flex flex-col gap-5 overflow-y-auto px-4 pt-3 pb-4">
-        {scalps.length === 0 && <p className="type-body text-fg-muted">No open trade.</p>}
-        {scalps.map((p) => {
-          const note = busyNote(p, !!h.sending[p.id]);
-          const locked = note != null || p.qty <= 0;
-          const delta = deltaOf(p);
-          const pct = p.ltp != null && p.avg > 0 ? ((p.ltp - p.avg) / p.avg) * 100 : null;
-          const lots = p.lot_size > 0 ? Math.round(p.qty / p.lot_size) : 0;
-          const bought = since(p);
-          const row = (kind: LevelKind) => {
-            const lvl = p.chart?.[kind] ?? null;
-            const word = kind === 'stop' ? 'Stop' : 'Target';
-            return (
-              <div className="flex items-center gap-3 border-t border-line py-3">
-                <div className="min-w-0 flex-1">
-                  <div className="type-label text-fg-muted">{word}</div>
+    <Modal open onClose={onClose} label="Trading">
+      <div className="flex flex-col gap-4 overflow-y-auto px-4 pt-3 pb-4">
+        <AccountColumn mode={mode} desk={desk} openPnl={openPnl} openCount={active.length} vertical={false} />
+        <Segment
+          label="Trading panel"
+          size="lg"
+          stretch
+          value={tab}
+          onChange={setTab}
+          options={[
+            { value: 'positions', label: `Positions · ${scalps.length}` },
+            { value: 'history', label: `History · ${closed.length}` },
+            { value: 'activity', label: 'Activity' },
+          ]}
+        />
+        {tab === 'history' && <HistoryList calls={closed} large />}
+        {tab === 'activity' && <ActivityList events={activityEvents(fills, errors)} large />}
+        {tab === 'positions' && scalps.length === 0 && <p className="type-body text-fg-muted">No open trade.</p>}
+        {tab === 'positions' &&
+          scalps.map((p) => {
+            const note = busyNote(p, !!h.sending[p.id]);
+            const locked = note != null || p.qty <= 0;
+            const delta = deltaOf(p);
+            const pct = p.ltp != null && p.avg > 0 ? ((p.ltp - p.avg) / p.avg) * 100 : null;
+            const lots = p.lot_size > 0 ? Math.round(p.qty / p.lot_size) : 0;
+            const bought = since(p);
+            const row = (kind: LevelKind) => {
+              const lvl = p.chart?.[kind] ?? null;
+              const word = kind === 'stop' ? 'Stop' : 'Target';
+              return (
+                <div className="flex items-center gap-3 border-t border-line py-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="type-label text-fg-muted">{word}</div>
+                    {lvl ? (
+                      <div className={`type-body-strong tnum ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
+                        {levelWords(p, kind, lvl)} · {approxMoney(levelPnl(lvl, p, indexNow(p.index), delta.value))}
+                      </div>
+                    ) : (
+                      <div className="type-body text-fg-muted">None</div>
+                    )}
+                  </div>
                   {lvl ? (
-                    <div className={`type-body-strong tnum ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-                      {levelWords(p, kind, lvl)} · {approxMoney(levelPnl(lvl, p, indexNow(p.index), delta.value))}
-                    </div>
+                    <Button size="lg" kind="ghost" disabled={locked} onClick={() => onRemove(p, kind)}>
+                      Remove
+                    </Button>
                   ) : (
-                    <div className="type-body text-fg-muted">None</div>
+                    canSet && (
+                      <Button size="lg" kind="ghost" disabled={locked} onClick={() => onAdd(p, kind)}>
+                        Add {kind}
+                      </Button>
+                    )
                   )}
                 </div>
-                {lvl ? (
-                  <Button size="lg" kind="ghost" disabled={locked} onClick={() => onRemove(p, kind)}>
-                    Remove
+              );
+            };
+            return (
+              <article key={p.id} className="flex flex-col gap-3">
+                <header className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
+                      <SourceChip source={{ kind: 'scalp', title: 'Scalp' }} />
+                    </div>
+                    <div className="mt-1 type-caption text-fg-muted tnum">
+                      {[p.expiry ? expiryLabel(p.expiry) : null, `${p.qty} qty (${lots} ${lots === 1 ? 'lot' : 'lots'})`, `avg ${price(p.avg)}`, bought ? `since ${bought}` : null].filter(Boolean).join(' · ')}
+                      {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
+                    </div>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <div className={`num-large ${TONE_TEXT[toneOf(p.pnl)]}`}>{p.pnl == null ? '—' : signedMoney(p.pnl)}</div>
+                    {pct != null && <div className={`type-caption tnum ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</div>}
+                  </div>
+                </header>
+                {p.placing ? (
+                  <Button pointerOnly size="lg" kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
+                    Cancel the buy
                   </Button>
                 ) : (
-                  canSet && (
-                    <Button size="lg" kind="ghost" disabled={locked} onClick={() => onAdd(p, kind)}>
-                      Add {kind}
-                    </Button>
-                  )
+                  <>
+                    <PositionRail spec={railOf(p, indexNow(p.index))} />
+                    <div>
+                      {row('stop')}
+                      {row('target')}
+                    </div>
+                    <p className="type-caption text-fg-muted">
+                      Drag the lines on the {p.index} chart to move them. ≈ amounts use{' '}
+                      {delta.assumed ? 'an assumed option delta (0.50) — Upstox has none for this contract' : `the option delta (${Math.abs(delta.value).toFixed(2)})`}.
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button pointerOnly size="lg" kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)}>
+                        −1 lot ({p.lot_size})
+                      </Button>
+                      <Button pointerOnly size="lg" kind="loss" disabled={locked} onClick={() => h.onExit(p)}>
+                        Exit {p.qty}
+                      </Button>
+                    </div>
+                  </>
                 )}
-              </div>
+              </article>
             );
-          };
-          return (
-            <article key={p.id} className="flex flex-col gap-3">
-              <header className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
-                    <SourceChip source={{ kind: 'scalp', title: 'Scalp' }} />
-                  </div>
-                  <div className="mt-1 type-caption text-fg-muted tnum">
-                    {[p.expiry ? expiryLabel(p.expiry) : null, `${p.qty} qty (${lots} ${lots === 1 ? 'lot' : 'lots'})`, `avg ${price(p.avg)}`, bought ? `since ${bought}` : null].filter(Boolean).join(' · ')}
-                    {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
-                  </div>
-                </div>
-                <div className="shrink-0 text-right">
-                  <div className={`num-large ${TONE_TEXT[toneOf(p.pnl)]}`}>{p.pnl == null ? '—' : signedMoney(p.pnl)}</div>
-                  {pct != null && <div className={`type-caption tnum ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</div>}
-                </div>
-              </header>
-              <PositionRail spec={railOf(p, indexNow(p.index))} />
-              <div>
-                {row('stop')}
-                {row('target')}
-              </div>
-              <p className="type-caption text-fg-muted">
-                Drag the lines on the {p.index} chart to move them. ≈ amounts use{' '}
-                {delta.assumed ? 'an assumed option delta (0.50) — Upstox has none for this contract' : `the option delta (${Math.abs(delta.value).toFixed(2)})`}.
-              </p>
-              <div className="grid grid-cols-2 gap-2">
-                <Button pointerOnly size="lg" kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)}>
-                  −1 lot ({p.lot_size})
-                </Button>
-                <Button pointerOnly size="lg" kind="loss" disabled={locked} onClick={() => h.onExit(p)}>
-                  Exit {p.qty}
-                </Button>
-              </div>
-            </article>
-          );
-        })}
+          })}
       </div>
     </Modal>
   );

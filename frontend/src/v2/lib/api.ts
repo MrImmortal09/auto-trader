@@ -21,6 +21,7 @@ import type {
   ModeCheck,
   OptionChainAnswer,
   RangeId,
+  RawPosition,
   StatusAnswer,
   SystemAnswer,
   TelegramState,
@@ -58,6 +59,7 @@ export const getStatus = (base: string, after: number | null) =>
 export const getHistory = (base: string, range: RangeId, group: GroupId) =>
   getJson<HistoryAnswer>(base, `/api/v2/history?range=${range}&group=${group}`);
 export const getFlags = (base: string) => getJson<Flags>(base, '/api/v2/flags');
+export const getPositionsRaw = (base: string) => getJson<RawPosition[]>(base, '/api/positions');
 export const getExpiries = (base: string, index: string) => getJson<ExpiriesAnswer>(base, `/api/v2/expiries?index=${encodeURIComponent(index)}`);
 /** One expiry's strikes; the nearest when `expiry` is left out. */
 export const getChain = (base: string, index: string, expiry?: string | null) =>
