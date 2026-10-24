@@ -7,6 +7,13 @@ import { level, signedMoney } from '../lib/format';
 export type Tf = '1m' | '5m' | '15m';
 /** Which library draws the charts: KLineChart (the default) or Vela. */
 export type ChartLib = 'kline' | 'vela';
+/** How the price series is drawn, on either library. */
+export type CandleStyle = 'candles' | 'bars' | 'line';
+export const CANDLE_STYLES: { value: CandleStyle; label: string }[] = [
+  { value: 'candles', label: 'Candles' },
+  { value: 'bars', label: 'Bars' },
+  { value: 'line', label: 'Line' },
+];
 export const CHART_LIBS: { value: ChartLib; label: string }[] = [
   { value: 'kline', label: 'KLine' },
   { value: 'vela', label: 'Vela' },

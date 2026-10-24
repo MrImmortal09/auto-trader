@@ -3,7 +3,7 @@ import { ChartCandlestick, ChevronDown, Columns2, Columns3, Square } from 'lucid
 import type { ChartLevel, ExecutePosition } from '../../types';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
-import { executeBuy, executeExitAll, exitPosition, getChain, getExpiries, getFlags, getMarks, sellQty, setChartLevels, type Sent } from '../lib/api';
+import { cancelPosition, executeBuy, executeExitAll, exitPosition, getChain, getDesk, getExpiries, getFlags, getHistory, getMarks, sellQty, setChartLevels, type Sent } from '../lib/api';
 import { price, signedPct, toneOf, todayIst } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { ChainAnswer, ExpiriesAnswer } from '../lib/types';
@@ -17,8 +17,9 @@ import { ExpiryPicker } from './ExpiryPicker';
 import type { Placing } from './KChart';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, type LevelActions, type LevelKind, type Layers } from './lines';
-import { approxMoney, CHART_LIBS, istClock, levelCrossed, levelPnl, optionOf, sameSym, symbolLabel, toTick, type ChartLib, type ChartSym, type Tf } from './model';
-import { PositionSheet, ScalpBar, ScalpPositionsPanel, type PositionHandlers } from './Positions';
+import { approxMoney, CHART_LIBS, istClock, levelCrossed, levelPnl, optionOf, sameSym, symbolLabel, toTick, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { TradingPanel } from './panel/TradingPanel';
+import { PositionSheet, ScalpBar, type PositionHandlers } from './Positions';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 
@@ -26,6 +27,7 @@ interface Slot {
   sym: ChartSym;
   tf: Tf;
   layers: Layers;
+  style: CandleStyle;
 }
 
 interface Saved {
@@ -39,13 +41,15 @@ interface Saved {
   expiry: Record<string, string | null>;
   /** Which library draws every chart. */
   chartLib: ChartLib;
+  /** Desktop: the trading panel's body shown under the charts. */
+  panelOpen: boolean;
 }
 
 const STORE_KEY = 'v2.trade';
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
-const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, expiry: {}, chartLib: 'kline' };
+const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, expiry: {}, chartLib: 'kline', panelOpen: true };
 
 /** The saved layout, with any option that has since expired back on its
  * index, and any chosen expiry that has passed back to the nearest. */
@@ -56,7 +60,8 @@ function loadSaved(): Saved {
     const s = saved.slots?.[i];
     if (!s?.sym) return d;
     const sym = s.sym.kind === 'option' && s.sym.expiry < today ? { kind: 'index' as const, index: s.sym.index } : s.sym;
-    return { sym, tf: s.tf ?? '5m', layers: { ...DEFAULT_LAYERS, ...s.layers } };
+    const style: CandleStyle = s.style === 'bars' || s.style === 'line' ? s.style : 'candles';
+    return { sym, tf: s.tf ?? '5m', layers: { ...DEFAULT_LAYERS, ...s.layers }, style };
   });
   const expiry = Object.fromEntries(Object.entries(saved.expiry ?? {}).filter(([index, date]) => INDEX_ORDER.includes(index) && typeof date === 'string' && date >= today));
   return {
@@ -67,6 +72,7 @@ function loadSaved(): Saved {
     chartHidden: saved.chartHidden === true,
     expiry,
     chartLib: saved.chartLib === 'vela' ? 'vela' : 'kline',
+    panelOpen: saved.panelOpen !== false,
   };
 }
 
@@ -155,6 +161,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const { frame, stale, now } = useExecuteStream(serverBase, saved.index, ladderExpiry, centre);
   const flags = usePoll(() => getFlags(serverBase), 15_000, serverBase);
   const marks = usePoll(() => getMarks(serverBase), 5_000, serverBase);
+  // The panel's account column and History tab.
+  const desk = usePoll(() => getDesk(serverBase), 5_000, serverBase);
+  const history = usePoll(() => getHistory(serverBase, 'today', 'channel'), 30_000, serverBase);
   const chartStopsOn = flags.data?.chart_stops ?? false;
 
   const scalps = useMemo(() => (frame?.positions ?? []).filter((p) => p.manual).map((p) => withPending(p, pending, now)), [frame, pending, now]);
@@ -273,6 +282,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     onExit: (p) => {
       const label = contractLabel(p.index, p.strike, p.option_type);
       void busy(p.id, () => guard('Exiting needs write access.', () => exitPosition(serverBase, p.id), `${label} not exited`));
+    },
+    onCancel: (p) => {
+      const label = contractLabel(p.index, p.strike, p.option_type);
+      void busy(p.id, () => guard('Cancelling needs write access.', () => cancelPosition(serverBase, p.id), `${label} not cancelled`));
     },
     onExitAll: () => {
       setExitAllBusy(true);
@@ -423,6 +436,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         onTf={(tf) => setSlot(i, { tf })}
         layers={slot.layers}
         onLayers={(layers) => setSlot(i, { layers })}
+        style={slot.style}
+        onStyle={(style) => setSlot(i, { style })}
         spot={spot}
         change={change}
         expiries={expiries[index]?.expiries}
@@ -469,6 +484,11 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     <PositionSheet
       scalps={scalps}
       h={handlers}
+      mode={frame?.mode ?? 'PAPER'}
+      desk={desk.data}
+      history={history.data?.calls ?? []}
+      fills={marks.data?.fills ?? []}
+      errors={frame?.errors ?? []}
       indexNow={(i) => spot[i] ?? null}
       deltaOf={(p) => deltaFor(p, chains)}
       since={(p) => {
@@ -509,7 +529,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           <div className="flex h-[260px] shrink-0 px-2">{charts[0]}</div>
         )}
         <div className="flex min-h-0 flex-1 flex-col pt-3">{ladder}</div>
-        <ScalpBar scalps={scalps} h={handlers} onOpen={() => setSheet(true)} />
+        <ScalpBar scalps={scalps.filter((p) => !p.placing)} h={handlers} onOpen={() => setSheet(true)} />
         {sheetEl}
       </div>
     );
@@ -546,7 +566,21 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
         </aside>
       </div>
-      <ScalpPositionsPanel scalps={scalps} h={handlers} canSet={chartStopsOn} onAdd={placeFromPanel} onRemove={(p, kind) => void sendLevel(p, kind, null)} />
+      <TradingPanel
+        serverBase={serverBase}
+        mode={frame?.mode ?? 'PAPER'}
+        desk={desk.data}
+        scalps={scalps}
+        errors={frame?.errors ?? []}
+        fills={marks.data?.fills ?? []}
+        history={history.data?.calls ?? []}
+        h={handlers}
+        canSet={chartStopsOn}
+        onAdd={placeFromPanel}
+        onRemove={(p, kind) => void sendLevel(p, kind, null)}
+        open={saved.panelOpen}
+        onToggle={() => save((s) => ({ ...s, panelOpen: !s.panelOpen }))}
+      />
       {!chartStopsOn && scalps.length > 0 && (
         <p className="shrink-0 type-caption text-fg-muted">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
       )}
