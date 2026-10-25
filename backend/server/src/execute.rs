@@ -1,6 +1,8 @@
-//! Execute screen ("Scalp Desk"): each index's nearest-expiry option ladder —
-//! the strikes around ATM with live Kotak prices — streamed to the
-//! dashboard, and the board the manual-order routes check a tap against.
+//! Execute screen ("Scalp Desk" in v1, the Trade window in v2): an index's
+//! option ladder for one expiry (the nearest unless asked otherwise) — the
+//! strikes around ATM, or around a strike the screen scrolled to, with live
+//! Kotak prices — streamed to the dashboard, and the board the manual-order
+//! routes check a tap against.
 //!
 //! Everything here reads in-memory state only (scrip master, the shared price
 //! map, positions, telemetry). It never calls Kotak; the only thing it sends
@@ -14,7 +16,7 @@ use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::Serialize;
 use shared_domain::{telemetry, ChartLevels, MonitoredPosition, TradeState, INDEX_NAMES};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
-use trading_engine::{ChainStrike, OptionChain, ScripRecord};
+use trading_engine::{index_fo_segment, ChainStrike, OptionChain, ScripRecord};
 
 use crate::AppState;
 
@@ -22,6 +24,12 @@ use crate::AppState;
 /// them; the spare two each side let it hold its rows still while the user's
 /// finger is on the ladder, and give a re-centred ladder prices at once.
 const SUBSCRIBE_HALF: usize = 7;
+/// Ladder scrips subscribed per day at most. Subscriptions are never
+/// withdrawn, and the feed's own cap (200 on the retired HSM feed; unknown
+/// on the native one) must keep room for positions' contracts, whose stops
+/// depend on their ticks. Past the budget a row shows no price, and the buy
+/// route refuses a contract with no recent price: it fails toward not trading.
+const MAX_LADDER_SCRIPS: usize = 120;
 /// How often the stream pushes a frame.
 pub const STREAM_EVERY: Duration = Duration::from_millis(250);
 /// A feed quieter than this is stale: no manual buy is accepted on it.
@@ -33,11 +41,26 @@ pub const MAX_CONTRACT_AGE_SECS: f64 = 10.0;
 /// Engine errors are kept this long, so a failed tap can say why.
 const RECENT_ERROR_MS: i64 = 60_000;
 
-/// One index's chain as last built, with what it was built from.
+/// One index's chain for one expiry as last built, with what it was built from.
 struct CachedChain {
     chain: Arc<OptionChain>,
     loaded_at: Option<DateTime<FixedOffset>>,
     day: NaiveDate,
+}
+
+/// One index's listed expiries, each with its lot size, as last read, with
+/// what they were read from.
+struct CachedExpiries {
+    list: Arc<Vec<(NaiveDate, u32)>>,
+    loaded_at: Option<DateTime<FixedOffset>>,
+    day: NaiveDate,
+}
+
+/// The strikes a board's rows cover.
+#[derive(Serialize)]
+struct Window {
+    from: f64,
+    to: f64,
 }
 
 #[derive(Default)]
@@ -66,7 +89,8 @@ pub struct RecentError {
 
 #[derive(Default)]
 pub struct ExecuteBoard {
-    chains: RwLock<HashMap<String, CachedChain>>,
+    chains: RwLock<HashMap<(String, NaiveDate), CachedChain>>,
+    expiries: RwLock<HashMap<String, CachedExpiries>>,
     subs: Mutex<Subscriptions>,
     errors: std::sync::Mutex<Vec<RecentError>>,
 }
@@ -115,45 +139,69 @@ impl ExecuteBoard {
         errors.iter().filter(|e| now - e.ts < RECENT_ERROR_MS).cloned().collect()
     }
 
-    /// `index`'s nearest-expiry chain, rebuilt whenever the scrip master is
-    /// reloaded or the IST date rolls over (yesterday's expiry is gone).
-    pub async fn chain(&self, state: &AppState, index: &str) -> Option<Arc<OptionChain>> {
+    /// The expiries `index`'s options are listed for, from today, earliest
+    /// first, each with its lot size — read again whenever the scrip master
+    /// is reloaded or the IST date rolls over (yesterday's expiry is gone).
+    pub async fn expiries(&self, state: &AppState, index: &str) -> Arc<Vec<(NaiveDate, u32)>> {
         let loaded_at = *state.scrip_loaded_at.read().await;
         let today = shared_domain::today_ist();
-        if let Some(c) = self.chains.read().await.get(index) {
+        if let Some(c) = self.expiries.read().await.get(index) {
+            if c.loaded_at == loaded_at && c.day == today {
+                return Arc::clone(&c.list);
+            }
+        }
+        let list = {
+            let store = state.scrip_store.read().await;
+            Arc::new(store.as_ref().map(|s| s.expiry_lots(index, today)).unwrap_or_default())
+        };
+        self.expiries.write().await.insert(
+            index.to_string(),
+            CachedExpiries { list: Arc::clone(&list), loaded_at, day: today },
+        );
+        list
+    }
+
+    /// `index`'s chain for `expiry`, rebuilt whenever the scrip master is
+    /// reloaded or the IST date rolls over. `None` once the expiry has passed
+    /// or nothing is listed for it.
+    pub async fn chain_at(&self, state: &AppState, index: &str, expiry: NaiveDate) -> Option<Arc<OptionChain>> {
+        let loaded_at = *state.scrip_loaded_at.read().await;
+        let today = shared_domain::today_ist();
+        if expiry < today {
+            return None;
+        }
+        let key = (index.to_string(), expiry);
+        if let Some(c) = self.chains.read().await.get(&key) {
             if c.loaded_at == loaded_at && c.day == today {
                 return Some(Arc::clone(&c.chain));
             }
         }
         let chain = {
             let store = state.scrip_store.read().await;
-            Arc::new(store.as_ref()?.nearest_expiry_chain(index, today)?)
+            Arc::new(store.as_ref()?.chain_for_expiry(index, expiry)?)
         };
-        self.chains.write().await.insert(
-            index.to_string(),
-            CachedChain { chain: Arc::clone(&chain), loaded_at, day: today },
-        );
+        let mut chains = self.chains.write().await;
+        // Yesterday's and a reloaded scrip master's chains are never read again.
+        chains.retain(|_, c| c.loaded_at == loaded_at && c.day == today);
+        chains.insert(key, CachedChain { chain: Arc::clone(&chain), loaded_at, day: today });
         Some(chain)
     }
 
-    /// The contract `trading_symbol` names, if it is one of an index's
-    /// nearest-expiry options — the only contracts the Execute screen trades.
+    /// `index`'s nearest-expiry chain.
+    pub async fn chain(&self, state: &AppState, index: &str) -> Option<Arc<OptionChain>> {
+        let (expiry, _) = *self.expiries(state, index).await.first()?;
+        self.chain_at(state, index, expiry).await
+    }
+
+    /// The contract `trading_symbol` names, if it is a listed index option
+    /// on any expiry from today — what the Execute screen trades. Comes with
+    /// its index and that expiry's chain. Only the six indices' records are
+    /// searched, never a stock's.
     pub async fn find_contract(&self, state: &AppState, trading_symbol: &str) -> Option<(String, Arc<OptionChain>, ScripRecord)> {
-        let wanted = trading_symbol.trim();
-        for index in INDEX_NAMES {
-            let Some(chain) = self.chain(state, index).await else { continue };
-            let hit = chain
-                .strikes
-                .iter()
-                .flat_map(|s| [s.ce.as_ref(), s.pe.as_ref()])
-                .flatten()
-                .find(|r| r.trading_symbol.trim() == wanted)
-                .cloned();
-            if let Some(record) = hit {
-                return Some((index.to_string(), chain, record));
-            }
-        }
-        None
+        let record = state.scrip_store.read().await.as_ref()?.find_index_option(trading_symbol)?;
+        let index = index_option(&record, shared_domain::today_ist())?;
+        let chain = self.chain_at(state, index, record.expiry_date).await?;
+        Some((index.to_string(), chain, record))
     }
 
     /// Make sure the feed streams every index's spot value and `keys`.
@@ -174,7 +222,19 @@ impl ExecuteBoard {
             let msg = serde_json::json!({ "action": "subscribe_indices", "indices": indices.join(",") });
             subs.indices_sent = tx.send(msg.to_string()).is_ok();
         }
-        let fresh: Vec<String> = keys.iter().filter(|k| !subs.scrips.contains(*k)).cloned().collect();
+        let wanted: Vec<&String> = keys.iter().filter(|k| !subs.scrips.contains(*k)).collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let room = MAX_LADDER_SCRIPS.saturating_sub(subs.scrips.len());
+        if wanted.len() > room {
+            tracing::warn!(
+                "Ladder subscription budget reached: {} of {MAX_LADDER_SCRIPS} scrips subscribed today, {} more asked for; the rest show no price until tomorrow",
+                subs.scrips.len(),
+                wanted.len()
+            );
+        }
+        let fresh: Vec<String> = wanted.into_iter().take(room).cloned().collect();
         if fresh.is_empty() {
             return;
         }
@@ -185,6 +245,16 @@ impl ExecuteBoard {
             subs.scrips.extend(fresh);
         }
     }
+}
+
+/// The index `record` is an option of, if it is one the Execute screen may
+/// trade: a CE/PE with a readable strike, in that index's own F&O segment,
+/// expiring on or after `today`. Stocks, futures and expired contracts give
+/// `None`.
+fn index_option(record: &ScripRecord, today: NaiveDate) -> Option<&'static str> {
+    let index = INDEX_NAMES.iter().copied().find(|i| *i == record.symbol_name)?;
+    let listed = record.exchange_segment_code == index_fo_segment(index) && record.normalized_strike().is_some() && record.expiry_date >= today;
+    listed.then_some(index)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,15 +297,21 @@ struct IndexHeadline {
 #[derive(Serialize)]
 struct Board {
     index: String,
-    /// `YYYY-MM-DD`.
+    /// `YYYY-MM-DD`: the expiry the rows are from.
     expiry: String,
     days_to_expiry: i64,
+    /// Every expiry this index's options are listed for, `YYYY-MM-DD`,
+    /// earliest first.
+    expiries: Vec<String>,
     lot_size: u32,
     spot: Option<f64>,
     /// `"kotak"` (live index tick), `"upstox"` (60 s option-chain poll) or
     /// `"parity"` (estimated from the ladder's own call/put prices).
     spot_source: Option<&'static str>,
     atm: Option<f64>,
+    /// The strikes `rows` run from and to: the subscribed window, around ATM
+    /// or around the strike the stream was asked to centre on.
+    window: Window,
     rows: Vec<Row>,
 }
 
@@ -261,6 +337,8 @@ struct PositionRow {
     index: String,
     strike: Option<f64>,
     option_type: Option<String>,
+    /// `YYYY-MM-DD`, once the contract is resolved.
+    expiry: Option<String>,
     symbol: String,
     lot_size: i32,
     qty: i32,
@@ -362,13 +440,25 @@ fn window(len: usize, atm: usize, half: usize) -> std::ops::Range<usize> {
     atm.saturating_sub(half)..(atm + half + 1).min(len)
 }
 
-async fn build_board(state: &AppState, index: &str) -> Result<Board, String> {
+/// The board for `index`: its `expiry`'s chain (the nearest when `None`; an
+/// unlisted one is an error), with the window subscribed and streamed
+/// around `centre` (ATM when `None`).
+async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>) -> Result<Board, String> {
     if state.scrip_store.read().await.is_none() {
         return Err("Scrip Master not loaded yet — connect Kotak first".to_string());
     }
+    let expiries = state.execute.expiries(state, index).await;
+    let listed = |e: NaiveDate| expiries.iter().any(|(d, _)| *d == e);
+    // An expiry asked for by name must exist: a ladder quietly swapped to
+    // another expiry could sell a tap the wrong contract.
+    let expiry = match expiry {
+        Some(e) if listed(e) => e,
+        Some(e) => return Err(format!("No {index} options listed for {}", e.format("%Y-%m-%d"))),
+        None => expiries.first().map(|(d, _)| *d).ok_or_else(|| format!("No {index} option contracts in the Scrip Master"))?,
+    };
     let chain = state
         .execute
-        .chain(state, index)
+        .chain_at(state, index, expiry)
         .await
         .ok_or_else(|| format!("No {index} option contracts in the Scrip Master"))?;
 
@@ -386,7 +476,10 @@ async fn build_board(state: &AppState, index: &str) -> Result<Board, String> {
     // Without any spot yet, centre on the middle of the chain so prices start
     // flowing; parity takes over as soon as they do.
     let atm = spot.and_then(|s| atm_index(&chain.strikes, s)).unwrap_or(chain.strikes.len() / 2);
-    let keys: Vec<String> = chain.strikes[window(chain.strikes.len(), atm, SUBSCRIBE_HALF)]
+    // The screen may have scrolled away from ATM: its window is what gets prices.
+    let centre = centre.and_then(|c| atm_index(&chain.strikes, c)).unwrap_or(atm);
+    let range = window(chain.strikes.len(), centre, SUBSCRIBE_HALF);
+    let keys: Vec<String> = chain.strikes[range.clone()]
         .iter()
         .flat_map(|s| [s.ce.as_ref(), s.pe.as_ref()])
         .flatten()
@@ -404,22 +497,29 @@ async fn build_board(state: &AppState, index: &str) -> Result<Board, String> {
             }
         })
     };
-    // The whole subscribed window goes out: the screen shows ATM ± 5 of
-    // it, and while a finger is on the ladder it holds its
-    // rows still — the spare strikes keep their prices live meanwhile.
-    let rows = chain.strikes[window(chain.strikes.len(), atm, SUBSCRIBE_HALF)]
+    // The whole subscribed window goes out: v1 shows ATM ± 5 of it and v2
+    // merges it into the full strike list, and while a finger is on the
+    // ladder it holds its rows still — the spare strikes keep their prices
+    // live meanwhile.
+    let rows: Vec<Row> = chain.strikes[range]
         .iter()
         .map(|s| Row { strike: s.strike, ce: quote(&s.ce), pe: quote(&s.pe) })
         .collect();
+    let window = Window {
+        from: rows.first().map(|r| r.strike).unwrap_or(0.0),
+        to: rows.last().map(|r| r.strike).unwrap_or(0.0),
+    };
 
     Ok(Board {
         index: index.to_string(),
         expiry: chain.expiry.format("%Y-%m-%d").to_string(),
         days_to_expiry: (chain.expiry - shared_domain::today_ist()).num_days(),
+        expiries: expiries.iter().map(|(d, _)| d.format("%Y-%m-%d").to_string()).collect(),
         lot_size: chain.lot_size,
         spot,
         spot_source,
         atm: spot.map(|_| chain.strikes[atm].strike),
+        window,
         rows,
     })
 }
@@ -442,6 +542,7 @@ fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
         index: p.signal.instrument_name.clone(),
         strike: p.signal.strike,
         option_type: p.signal.option_type.clone(),
+        expiry: p.resolved_expiry.map(|d| d.format("%Y-%m-%d").to_string()),
         symbol: p.resolved_order.as_ref().map(|o| o.trading_symbol.clone()).unwrap_or_default(),
         lot_size,
         qty: p.executed_qty,
@@ -456,8 +557,10 @@ fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
     }
 }
 
-/// One frame of the Execute screen for `index`.
-pub async fn build_frame(state: &AppState, index: &str) -> ExecuteFrame {
+/// One frame of the Execute screen for `index`: its `expiry`'s ladder (the
+/// nearest when `None`), the subscribed window around `centre` (ATM when
+/// `None`).
+pub async fn build_frame(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>) -> ExecuteFrame {
     let (mode, kill_switch) = {
         let cfg = state.trading_cfg.read().await;
         (cfg.mode.clone(), cfg.kill_switch_active)
@@ -472,7 +575,7 @@ pub async fn build_frame(state: &AppState, index: &str) -> ExecuteFrame {
         indices.push(IndexHeadline { index: name, spot, change_pct });
     }
 
-    let (board, board_error) = match build_board(state, index).await {
+    let (board, board_error) = match build_board(state, index, expiry, centre).await {
         Ok(b) => (Some(b), None),
         Err(e) => (None, Some(e)),
     };
@@ -531,5 +634,46 @@ mod tests {
         assert_eq!(atm_index(&chain, 22976.0), Some(3));
         assert_eq!(atm_index(&chain, 10.0), Some(0));
         assert_eq!(atm_index(&[], 22963.6), None);
+    }
+
+    #[test]
+    fn the_window_follows_the_strike_the_screen_scrolled_to() {
+        let chain: Vec<ChainStrike> = (0..40).map(|i| strike(22000.0 + 50.0 * i as f64)).collect();
+        let atm = atm_index(&chain, 22980.0).unwrap();
+        assert_eq!(window(chain.len(), atm, 2), 18..23);
+        // Centred far above ATM, the window moves there; off the end it clamps.
+        let centre = atm_index(&chain, 23800.0).unwrap();
+        assert_eq!(window(chain.len(), centre, 2), 34..39);
+        let centre = atm_index(&chain, 99999.0).unwrap();
+        assert_eq!(window(chain.len(), centre, 2), 37..40);
+    }
+
+    fn record(symbol_name: &str, trading_symbol: &str, segment: &str, raw_strike: f64, opt: &str, expiry: (i32, u32, u32)) -> ScripRecord {
+        ScripRecord {
+            instrument_token: "1".to_string(),
+            trading_symbol: trading_symbol.to_string(),
+            symbol_name: symbol_name.to_string(),
+            exchange_segment_code: segment.to_string(),
+            strike_price: raw_strike,
+            option_type: opt.to_string(),
+            expiry_date: NaiveDate::from_ymd_opt(expiry.0, expiry.1, expiry.2).unwrap(),
+            lot_size: 65,
+            tick_size: 0.05,
+        }
+    }
+
+    #[test]
+    fn only_listed_index_options_can_be_bought() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 24).unwrap();
+        // Any expiry from today, weekly or monthly.
+        assert_eq!(index_option(&record("NIFTY", "NIFTY26O2725100CE", "nse_fo", 2510000.0, "CE", (2026, 10, 27)), today), Some("NIFTY"));
+        assert_eq!(index_option(&record("NIFTY", "NIFTY26N0325100PE", "nse_fo", 2510000.0, "PE", (2026, 11, 3)), today), Some("NIFTY"));
+        assert_eq!(index_option(&record("NIFTY", "NIFTY26NOV25100CE", "nse_fo", 2510000.0, "CE", (2026, 11, 24)), today), Some("NIFTY"));
+        assert_eq!(index_option(&record("SENSEX", "SENSEX26O2982000CE", "bse_fo", 8200000.0, "CE", (2026, 10, 29)), today), Some("SENSEX"));
+        // Expired, a future, a stock option, or an index option in the wrong segment.
+        assert_eq!(index_option(&record("NIFTY", "NIFTY26O2225100CE", "nse_fo", 2510000.0, "CE", (2026, 10, 22)), today), None);
+        assert_eq!(index_option(&record("NIFTY", "NIFTY26OCTFUT", "nse_fo", 0.0, "XX", (2026, 10, 27)), today), None);
+        assert_eq!(index_option(&record("RELIANCE", "RELIANCE26OCT1400CE", "nse_fo", 140000.0, "CE", (2026, 10, 27)), today), None);
+        assert_eq!(index_option(&record("SENSEX", "SENSEX26O2982000CE", "nse_fo", 8200000.0, "CE", (2026, 10, 29)), today), None);
     }
 }

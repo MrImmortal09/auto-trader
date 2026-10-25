@@ -1,7 +1,7 @@
-//! `GET /api/v2/chain` and `GET /api/v2/marks` — what the v2 Scalp charts
-//! need beyond bars: an index's nearest-expiry strikes with each option's
-//! delta, and today's fills, Telegram calls and Telegram positions to draw.
-//! Read-only.
+//! `GET /api/v2/expiries`, `GET /api/v2/chain` and `GET /api/v2/marks` —
+//! what the v2 Trade charts need beyond bars: an index's listed expiries,
+//! one expiry's strikes with each option's delta, and today's fills,
+//! Telegram calls and Telegram positions to draw. Read-only.
 
 use std::collections::HashMap;
 
@@ -69,18 +69,74 @@ struct ChainAnswer {
 #[derive(Deserialize)]
 pub struct ChainQuery {
     index: String,
+    /// `YYYY-MM-DD`; left out, the nearest expiry.
+    expiry: Option<String>,
 }
 
-/// `GET /api/v2/chain?index=NIFTY` — the nearest expiry's strikes, as the
-/// Execute screen trades them, each side with its symbol and delta (Upstox's,
-/// read once a minute, or an assumed ±0.50).
-pub async fn chain_handler(State(state): State<AppState>, Query(q): Query<ChainQuery>) -> Response {
-    let wanted = q.index.trim().to_uppercase();
-    let Some(index) = INDEX_NAMES.iter().copied().find(|i| *i == wanted) else {
+fn index_named(wanted: &str) -> Option<&'static str> {
+    let wanted = wanted.trim().to_uppercase();
+    INDEX_NAMES.iter().copied().find(|i| *i == wanted)
+}
+
+#[derive(Serialize)]
+struct ExpiryOut {
+    /// `YYYY-MM-DD`.
+    date: String,
+    days_to_expiry: i64,
+    lot_size: u32,
+}
+
+#[derive(Serialize)]
+struct ExpiriesAnswer {
+    index: String,
+    /// `YYYY-MM-DD`, IST.
+    today: String,
+    /// Earliest first; the first is the nearest.
+    expiries: Vec<ExpiryOut>,
+}
+
+/// `GET /api/v2/expiries?index=NIFTY` — every expiry this index's options
+/// are listed for from today, earliest first, with each one's lot size
+/// (read in one pass; no chain is built for it).
+pub async fn expiries_handler(State(state): State<AppState>, Query(q): Query<ChainQuery>) -> Response {
+    let Some(index) = index_named(&q.index) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "index must be one of the six indices" }))).into_response();
     };
-    let Some(chain) = state.execute.chain(&state, index).await else {
+    if state.scrip_store.read().await.is_none() {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "no option chain yet — the scrip master loads after the Kotak login" }))).into_response();
+    }
+    let today = shared_domain::today_ist();
+    let expiries = state
+        .execute
+        .expiries(&state, index)
+        .await
+        .iter()
+        .map(|&(date, lot_size)| ExpiryOut { date: date.format("%Y-%m-%d").to_string(), days_to_expiry: (date - today).num_days(), lot_size })
+        .collect();
+    Json(ExpiriesAnswer { index: index.to_string(), today: today.format("%Y-%m-%d").to_string(), expiries }).into_response()
+}
+
+/// `GET /api/v2/chain?index=NIFTY&expiry=` — one expiry's strikes (the
+/// nearest by default), as the Execute screen trades them, each side with
+/// its symbol and delta (Upstox's, read once a minute, or an assumed ±0.50).
+pub async fn chain_handler(State(state): State<AppState>, Query(q): Query<ChainQuery>) -> Response {
+    let Some(index) = index_named(&q.index) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "index must be one of the six indices" }))).into_response();
+    };
+    let chain = match q.expiry.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") else {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": "expiry must be YYYY-MM-DD" }))).into_response();
+            };
+            match state.execute.chain_at(&state, index, date).await {
+                Some(c) => c,
+                None => return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("no {index} options listed for {s}") }))).into_response(),
+            }
+        }
+        None => match state.execute.chain(&state, index).await {
+            Some(c) => c,
+            None => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no option chain yet — the scrip master loads after the Kotak login" }))).into_response(),
+        },
     };
     let expiry = chain.expiry.format("%Y-%m-%d").to_string();
     // Upstox's deltas only count for the same expiry.

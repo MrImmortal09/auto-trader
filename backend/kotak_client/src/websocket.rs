@@ -236,6 +236,18 @@ pub async fn start_market_data_stream(
                                     }
                                 }
                             }
+                        } else if parsed["event"] == "subscribed" {
+                            // The feed's ack: a non-zero code means the scrips were refused
+                            // (its cap reached, say) and will never tick.
+                            let code = &parsed["error_code"];
+                            let refused = code.as_i64().is_some_and(|c| c != 0) || code.as_str().is_some_and(|c| !c.is_empty() && c != "0");
+                            if refused {
+                                warn!(
+                                    "Kotak feed refused a subscription (error_code {code}): {} — scrips {}",
+                                    parsed["description"].as_str().unwrap_or(""),
+                                    parsed["scrips"]
+                                );
+                            }
                         } else if parsed["event"] == "connected" {
                             telemetry::FEED_CONNECTED.set(1);
                         } else if parsed["event"] == "closed" {

@@ -18,6 +18,7 @@ use axum::{
     },
     Json,
 };
+use chrono::NaiveDate;
 use futures::stream::Stream;
 use serde::Deserialize;
 use serde_json::json;
@@ -34,22 +35,31 @@ pub const MAX_LOTS_PER_TAP: i32 = 10;
 #[derive(Deserialize)]
 pub struct StreamQuery {
     index: Option<String>,
+    /// `YYYY-MM-DD`; missing, the nearest expiry. An unlisted one gives a
+    /// board error rather than another expiry's ladder.
+    expiry: Option<String>,
+    /// A strike to centre the subscribed window on; missing, ATM.
+    centre: Option<f64>,
 }
 
-/// `GET /api/execute/stream?index=NIFTY` — SSE, one frame every 250 ms: every
-/// index's spot, the chosen index's ladder, and the open positions.
+/// `GET /api/execute/stream?index=NIFTY&expiry=&centre=` — SSE, one frame
+/// every 250 ms: every index's spot, the chosen index's ladder for that
+/// expiry (nearest by default) around that strike (ATM by default), and the
+/// open positions.
 pub async fn execute_stream_handler(
     State(state): State<AppState>,
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let wanted = q.index.unwrap_or_default().trim().to_uppercase();
     let index = INDEX_NAMES.iter().copied().find(|i| *i == wanted).unwrap_or("NIFTY");
+    let expiry = q.expiry.as_deref().and_then(|s| NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok());
+    let centre = q.centre.filter(|c| c.is_finite() && *c > 0.0);
 
     let mut tick = tokio::time::interval(STREAM_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let stream = futures::stream::unfold((state, tick), move |(state, mut tick)| async move {
         tick.tick().await;
-        let frame = execute::build_frame(&state, index).await;
+        let frame = execute::build_frame(&state, index, expiry, centre).await;
         let event = Event::default().data(serde_json::to_string(&frame).unwrap_or_default());
         Some((Ok(event), (state, tick)))
     });
@@ -93,7 +103,7 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
     let Some((index, chain, record)) = state.execute.find_contract(&state, &req.trading_symbol).await else {
         return refuse(
             StatusCode::BAD_REQUEST,
-            format!("{} is not a nearest-expiry index option on the Execute board", req.trading_symbol.trim()),
+            format!("{} is not a listed index option", req.trading_symbol.trim()),
         );
     };
     let ws_key = record.ws_key();
