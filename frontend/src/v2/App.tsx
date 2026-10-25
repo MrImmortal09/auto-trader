@@ -17,8 +17,8 @@ import { Settings } from './settings/Settings';
 import { System } from './system/System';
 import { Segment } from './ui/Segment';
 
-// The charts are heavy (KLineChart): only loaded once Scalp or Market is opened.
-const Scalp = lazy(() => import('./scalp/Scalp').then((m) => ({ default: m.Scalp })));
+// The charts are heavy (KLineChart): only loaded once Trade or Market is opened.
+const Trade = lazy(() => import('./trade/Trade').then((m) => ({ default: m.Trade })));
 const Market = lazy(() => import('./market/Market').then((m) => ({ default: m.Market })));
 
 /** "Kill switch: 3 positions exited and the waiting call cancelled." */
@@ -42,7 +42,7 @@ export default function App() {
   const guard = useGuard();
   useEngineErrors(serverBase);
 
-  // The screen is mirrored in the hash (`/v2/#scalp`): there are no deep paths.
+  // The screen is mirrored in the hash (`/v2/#trade`): there are no deep paths.
   useEffect(() => {
     const onHash = () => setScreen(screenFromHash());
     window.addEventListener('hashchange', onHash);
@@ -68,9 +68,9 @@ export default function App() {
   const content =
     screen === 'desk' ? (
       <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} />
-    ) : screen === 'scalp' ? (
+    ) : screen === 'trade' ? (
       <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>
-        <Scalp serverBase={serverBase} desktop={desktop} />
+        <Trade serverBase={serverBase} desktop={desktop} />
       </Suspense>
     ) : screen === 'market' ? (
       <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>

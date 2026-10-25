@@ -8,13 +8,13 @@ import { IndicatorSizing, TelegramCalls } from './CallSections';
 import { Connections } from './Connections';
 import { Exits } from './Exits';
 import { Lots } from './Lots';
-import { Beta, ScalpNotes, ServerData } from './OtherSections';
+import { Beta, ServerData, TradeNotes } from './OtherSections';
 import { NavItem } from './parts';
 import { betaLine, connectionsLine, exitsLine, indicatorLine, lotsLine, serverLine, telegramLine, tradingLine } from './summary';
 import { Trading } from './Trading';
 import { useSettings } from './useSettings';
 
-type SectionId = 'connections' | 'trading' | 'lots' | 'exits' | 'telegram' | 'indicator' | 'scalp' | 'server' | 'beta';
+type SectionId = 'connections' | 'trading' | 'lots' | 'exits' | 'telegram' | 'indicator' | 'trade' | 'server' | 'beta';
 
 const SECTIONS: { id: SectionId; title: string }[] = [
   { id: 'connections', title: 'Connections' },
@@ -23,7 +23,7 @@ const SECTIONS: { id: SectionId; title: string }[] = [
   { id: 'exits', title: 'Exits' },
   { id: 'telegram', title: 'Telegram calls' },
   { id: 'indicator', title: 'Indicator sizing' },
-  { id: 'scalp', title: 'Scalp' },
+  { id: 'trade', title: 'Trade' },
   { id: 'server', title: 'Server and data' },
   { id: 'beta', title: 'Beta' },
 ];
@@ -92,8 +92,8 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
         return <TelegramCalls id={sid} title={title} settings={settings} indexOnly={indexOnly} large={large} />;
       case 'indicator':
         return <IndicatorSizing id={sid} title={title} settings={settings} large={large} />;
-      case 'scalp':
-        return <ScalpNotes id={sid} title={title} flags={flags.data} />;
+      case 'trade':
+        return <TradeNotes id={sid} title={title} flags={flags.data} />;
       case 'server':
         return <ServerData id={sid} title={title} serverBase={serverBase} settings={settings} system={system.data} large={large} />;
       case 'beta':
@@ -124,7 +124,7 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
       exits: exitsLine(cfg),
       telegram: telegramLine(cfg, flags.data),
       indicator: indicatorLine(cfg),
-      scalp: 'One-tap buy · hold to exit all',
+      trade: 'One-tap buy · any strike, any expiry · hold to exit all',
       server: serverLine(system.data),
       beta: betaLine(flags.data),
     };

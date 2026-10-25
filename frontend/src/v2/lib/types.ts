@@ -228,7 +228,15 @@ export interface ChainSide {
   delta: { value: number; assumed: boolean };
 }
 
-/** `GET /api/v2/chain?index=`: the nearest expiry, as the Execute screen trades it. */
+/** `GET /api/v2/expiries?index=`: every expiry the index's options are listed for, earliest first. */
+export interface ExpiriesAnswer {
+  index: string;
+  /** `YYYY-MM-DD`, IST. */
+  today: string;
+  expiries: { date: string; days_to_expiry: number; lot_size: number }[];
+}
+
+/** `GET /api/v2/chain?index=&expiry=`: one expiry's strikes (the nearest by default), as the Execute screen trades them. */
 export interface ChainAnswer {
   index: string;
   expiry: string;
