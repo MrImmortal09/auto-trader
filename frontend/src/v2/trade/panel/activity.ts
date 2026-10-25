@@ -1,4 +1,5 @@
-// Today's manual fills and the engine's recent errors, as one list of events.
+// Today's manual fills and the last minute's engine errors (the stream keeps
+// no more), as one list of events.
 
 import { contractLabel } from '../../../lib/execute';
 import { price } from '../../lib/format';
@@ -30,8 +31,8 @@ export function activityEvents(fills: FillMark[], errors: EngineError[]): Activi
     const why = f.reason ? ` · ${f.reason.toLowerCase().replace(/_/g, ' ')}` : '';
     out.push({ key: `fill:${f.id}`, t, text: `${what} ${f.qty} ${contractLabel(f.index, f.strike, f.side)} @ ${price(f.price)}${why}`, tone: f.action === 'BUY' ? 'neutral' : 'profit' });
   }
-  for (const e of errors) {
-    out.push({ key: `err:${e.ts}:${e.instrument}`, t: e.ts, text: `${e.instrument}: ${e.message}`, tone: 'loss' });
-  }
+  errors.forEach((e, i) => {
+    out.push({ key: `err:${e.ts}:${e.instrument}:${e.position_id ?? ''}:${i}`, t: e.ts, text: `${e.instrument}: ${e.message}`, tone: 'loss' });
+  });
   return out.sort((a, b) => b.t - a.t);
 }

@@ -93,7 +93,17 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   const events = activityEvents(fills, errors);
   // Resting orders only matter while that tab is open.
   const raw = usePoll(() => getPositionsRaw(serverBase), 5_000, serverBase, open && tab === 'orders');
-  const resting = (raw.data ?? []).filter((p) => p.manual && p.sl_order_id);
+  // Every order of a manual trade that is at Kotak right now.
+  const atKotak = (raw.data ?? [])
+    .filter((p) => p.manual && p.state !== 'Closed')
+    .flatMap((p) => {
+      const contract = contractLabel(p.signal.instrument_name, p.signal.strike, p.signal.option_type);
+      const rows: { key: string; contract: string; what: string; id: string }[] = [];
+      if (p.entry_order_id && p.executed_qty <= 0) rows.push({ key: `${p.id}:entry`, contract, what: 'Buy · filling', id: p.entry_order_id });
+      if (p.pending_exit_order_id) rows.push({ key: `${p.id}:exit`, contract, what: 'Sell · filling', id: p.pending_exit_order_id });
+      if (p.sl_order_id) rows.push({ key: `${p.id}:sl`, contract, what: `SL-M · trigger ${price(p.sl_order_trigger ?? 0)} · ${p.sl_order_qty ?? 0} qty`, id: p.sl_order_id });
+      return rows;
+    });
 
   const level = (p: ExecutePosition, kind: LevelKind, locked: boolean) => {
     const lvl = p.chart?.[kind] ?? null;
@@ -171,26 +181,36 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
           <li key={p.id} className="flex items-center gap-3 border-t border-line px-1 py-2">
             <span className="min-w-0 flex-1 type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
             <span className="type-caption text-fg">{p.halted ? 'Halted by the engine — see System' : 'Buying at market…'}</span>
-            <Button pointerOnly kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
-              Cancel
-            </Button>
+            {mode === 'LIVE' ? (
+              // In LIVE the row can't be dropped safely while the engine may be mid-send:
+              // the engine abandons a buy it couldn't send within 15 s.
+              <span className="type-caption text-fg-muted">Dropped by the engine if not sent in 15 s</span>
+            ) : (
+              <Button pointerOnly kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
+                Cancel
+              </Button>
+            )}
           </li>
         ))}
       </ul>
     );
 
   const orders =
-    resting.length === 0 ? (
+    atKotak.length === 0 ? (
       <p className="py-3 type-body text-fg-muted">
-        {raw.data ? 'Nothing rests at Kotak. Chart stops and targets are watched by the engine and sent at market when hit.' : 'Loading…'}
+        {raw.data
+          ? mode === 'LIVE'
+            ? 'Nothing is at Kotak right now. A buy or an exit shows here while it fills; chart stops and targets are watched by the engine and sent at market when hit.'
+            : 'Paper trades place no orders at Kotak.'
+          : 'Loading…'}
       </p>
     ) : (
       <ul className="flex flex-col">
-        {resting.map((p) => (
-          <li key={p.id} className="flex items-center gap-3 border-t border-line px-1 py-2">
-            <span className="min-w-0 flex-1 type-body-strong text-fg">{contractLabel(p.signal.instrument_name, p.signal.strike, p.signal.option_type)}</span>
-            <span className="type-caption text-fg-muted tnum">SL-M · trigger {price(p.sl_order_trigger ?? 0)} · {p.sl_order_qty ?? 0} qty</span>
-            <span className="type-caption text-fg-muted tnum">#{p.sl_order_id}</span>
+        {atKotak.map((o) => (
+          <li key={o.key} className="flex items-center gap-3 border-t border-line px-1 py-2">
+            <span className="min-w-0 flex-1 type-body-strong text-fg">{o.contract}</span>
+            <span className="type-caption text-fg-muted tnum">{o.what}</span>
+            <span className="type-caption text-fg-muted tnum">#{o.id}</span>
           </li>
         ))}
       </ul>

@@ -60,7 +60,7 @@ function loadSaved(): Saved {
     const s = saved.slots?.[i];
     if (!s?.sym) return d;
     const sym = s.sym.kind === 'option' && s.sym.expiry < today ? { kind: 'index' as const, index: s.sym.index } : s.sym;
-    const style: CandleStyle = s.style === 'bars' || s.style === 'line' ? s.style : 'candles';
+    const style: CandleStyle = s.style === 'bars' || s.style === 'area' ? s.style : 'candles';
     return { sym, tf: s.tf ?? '5m', layers: { ...DEFAULT_LAYERS, ...s.layers }, style };
   });
   const expiry = Object.fromEntries(Object.entries(saved.expiry ?? {}).filter(([index, date]) => INDEX_ORDER.includes(index) && typeof date === 'string' && date >= today));

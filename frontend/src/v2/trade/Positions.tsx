@@ -121,7 +121,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
           value={tab}
           onChange={setTab}
           options={[
-            { value: 'positions', label: `Positions · ${scalps.length}` },
+            { value: 'positions', label: `Positions · ${active.length}` },
             { value: 'history', label: `History · ${closed.length}` },
             { value: 'activity', label: 'Activity' },
           ]}
@@ -185,9 +185,13 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                   </div>
                 </header>
                 {p.placing ? (
-                  <Button pointerOnly size="lg" kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
-                    Cancel the buy
-                  </Button>
+                  mode === 'LIVE' ? (
+                    <p className="type-caption text-fg-muted">Buying at market. The engine drops a buy it couldn't send within 15 s.</p>
+                  ) : (
+                    <Button pointerOnly size="lg" kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
+                      Cancel the buy
+                    </Button>
+                  )
                 ) : (
                   <>
                     <PositionRail spec={railOf(p, indexNow(p.index))} />

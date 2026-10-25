@@ -21,7 +21,7 @@ import {
   type Tf,
 } from './model';
 
-const KLINE_CANDLE: Record<CandleStyle, 'candle_solid' | 'ohlc' | 'area'> = { candles: 'candle_solid', bars: 'ohlc', line: 'area' };
+const KLINE_CANDLE: Record<CandleStyle, 'candle_solid' | 'ohlc' | 'area'> = { candles: 'candle_solid', bars: 'ohlc', area: 'area' };
 
 /** A horizontal order line: at a price, or at the bar close at a time (where
  * the index was when a scalp was bought). */

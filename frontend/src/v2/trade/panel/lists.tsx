@@ -27,9 +27,9 @@ export function HistoryList({ calls, large = false }: { calls: Call[]; large?: b
   );
 }
 
-/** Today's manual fills and the engine's recent errors, newest first. */
+/** Today's manual fills and the last minute's engine errors, newest first. */
 export function ActivityList({ events, large = false }: { events: ActivityEvent[]; large?: boolean }) {
-  if (events.length === 0) return <p className="py-3 type-body text-fg-muted">Nothing yet today.</p>;
+  if (events.length === 0) return <p className="py-3 type-body text-fg-muted">Nothing yet today. Engine errors show here for a minute; the System log keeps them.</p>;
   return (
     <ul className="flex flex-col">
       {events.map((e) => (
