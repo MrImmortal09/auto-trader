@@ -149,7 +149,22 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     });
   }, []);
 
-  const ladderExpiry = saved.expiry[saved.index] ?? null;
+  // Each index on screen: its listed expiries, before the stream opens.
+  const shownSlots = desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1);
+  const expiryIndices = [...new Set([saved.index, ...shownSlots.map((s) => s.sym.index)])].sort();
+  const expiriesPoll = usePoll(
+    async () => {
+      const got = await Promise.all(expiryIndices.map((i) => getExpiries(serverBase, i).catch(() => undefined)));
+      return Object.fromEntries(expiryIndices.map((i, n) => [i, got[n]])) as Record<string, ExpiriesAnswer | undefined>;
+    },
+    60_000,
+    `exp|${serverBase}|${expiryIndices.join(',')}`,
+  );
+  const expiries = expiriesPoll.data ?? {};
+  // The chosen expiry, while the index's list still has it; else the nearest.
+  const listedExpiries = expiries[saved.index]?.expiries;
+  const chosenExpiry = saved.expiry[saved.index] ?? null;
+  const ladderExpiry = chosenExpiry && (!listedExpiries || listedExpiries.some((e) => e.date === chosenExpiry)) ? chosenExpiry : null;
   const ladderKey = `${saved.index}:${ladderExpiry ?? ''}`;
   const centre = centreAt?.key === ladderKey ? centreAt.strike : null;
   const { frame, stale, now } = useExecuteStream(serverBase, saved.index, ladderExpiry, centre);
@@ -158,10 +173,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const chartStopsOn = flags.data?.chart_stops ?? false;
 
   const scalps = useMemo(() => (frame?.positions ?? []).filter((p) => p.manual).map((p) => withPending(p, pending, now)), [frame, pending, now]);
-  const shownSlots = desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1);
   const board = frame?.board && frame.board.index === saved.index ? frame.board : null;
 
-  // Each index in use: its nearest chain (deltas, tick size) and its expiries.
+  // Each index in use: its nearest chain (deltas, tick size).
   const wantedIndices = [...new Set([saved.index, ...shownSlots.map((s) => s.sym.index), ...scalps.map((p) => p.index)])].sort();
   const indicesKey = `${serverBase}|${wantedIndices.join(',')}`;
   const chainsPoll = usePoll(
@@ -173,15 +187,6 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     indicesKey,
   );
   const chains = chainsPoll.data ?? {};
-  const expiriesPoll = usePoll(
-    async () => {
-      const got = await Promise.all(wantedIndices.map((i) => getExpiries(serverBase, i).catch(() => undefined)));
-      return Object.fromEntries(wantedIndices.map((i, n) => [i, got[n]])) as Record<string, ExpiriesAnswer | undefined>;
-    },
-    60_000,
-    `exp|${indicesKey}`,
-  );
-  const expiries = expiriesPoll.data ?? {};
 
   // Chains other than the nearest: the ladder's expiry, charted options,
   // positions on later expiries, and whatever a picker is looking at.
@@ -221,6 +226,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     if (!expiry || near?.expiry === expiry) return near;
     return chainsAt[chainKeyOf(index, expiry)];
   };
+  /** A position's own expiry's chain, for its delta and tick. */
+  const chainFor = (p: ExecutePosition) => chainAt(p.index, p.expiry);
   const needChain = useCallback((index: string, expiry: string | null) => {
     if (!expiry) return;
     const key = chainKeyOf(index, expiry);
@@ -303,7 +310,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     }
   }
 
-  const tick = (p: ExecutePosition) => chainAt(p.index, p.expiry)?.tick_size ?? chains[p.index]?.tick_size ?? 0.05;
+  const tick = (p: ExecutePosition) => chainFor(p)?.tick_size ?? chains[p.index]?.tick_size ?? 0.05;
 
   /** Set a level where it was dropped, on the tick. One past the price sells
    * the whole holding at market on the engine's next tick — a quick exit. */
@@ -327,7 +334,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     const { kind, trigger } = placingAt;
     const p = placingPos;
     const color = kind === 'stop' ? C.loss : C.profit;
-    const delta = deltaFor(p, chains).value;
+    const delta = deltaFor(p, chainFor(p)).value;
     const word = kind === 'stop' ? 'Stop' : 'Target';
     const data: OrderLineData = {
       color,
@@ -404,6 +411,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       sym: slot.sym,
       scalps,
       chains,
+      chainFor,
       spot,
       fills: marks.data?.fills ?? [],
       calls: marks.data?.calls ?? [],
@@ -470,7 +478,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       scalps={scalps}
       h={handlers}
       indexNow={(i) => spot[i] ?? null}
-      deltaOf={(p) => deltaFor(p, chains)}
+      deltaOf={(p) => deltaFor(p, chainFor(p))}
       since={(p) => {
         const t = firstBuy(p, marks.data?.fills ?? []);
         return t == null ? null : istClock(t);

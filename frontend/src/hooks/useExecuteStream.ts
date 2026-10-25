@@ -16,8 +16,13 @@ export const STREAM_STALE_AFTER_MS = 2_000;
 export function useExecuteStream(serverBase: string, index: string, expiry: string | null = null, centre: number | null = null) {
   const [frame, setFrame] = useState<ExecuteFrame | null>(null);
   const [connected, setConnected] = useState(false);
-  // Local receipt time, so browser/VM clock skew can't make a live stream look stale.
-  const [receivedAt, setReceivedAt] = useState<number | null>(null);
+  // Local receipt time, so browser/VM clock skew can't make a live stream look
+  // stale — kept per index and expiry, so after a switch the stream counts as
+  // stale (and nothing is bought off the previous one's frame) until the new
+  // stream's first frame arrives.
+  const key = `${serverBase}|${index}|${expiry ?? ''}`;
+  const [received, setReceived] = useState<{ key: string; at: number } | null>(null);
+  const receivedAt = received?.key === key ? received.at : null;
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -42,12 +47,12 @@ export function useExecuteStream(serverBase: string, index: string, expiry: stri
       }
       setConnected(true);
       setFrame(next);
-      setReceivedAt(Date.now());
+      setReceived({ key, at: Date.now() });
     };
     // EventSource reconnects on its own; this only flips the badge meanwhile.
     es.onerror = () => setConnected(false);
     return () => es.close();
-  }, [serverBase, index, expiry, centre]);
+  }, [serverBase, index, expiry, centre, key]);
 
   const ageMs = receivedAt == null ? null : Math.max(0, now - receivedAt);
   const stale = !connected || ageMs == null || ageMs > STREAM_STALE_AFTER_MS;

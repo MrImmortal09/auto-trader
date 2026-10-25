@@ -74,6 +74,13 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
   const owned = useRef(new Map<string, string>());
   const handlers = useRef(new Map<string, ChartLine>());
   const applied = useRef(new Map<string, { price: number; text: string; time: number }>());
+  const appliedPivots = useRef(new Map<string, { price: number; text: string; time: number }>());
+  const appliedVwap = useRef('');
+  // A level moves only under a pointer: Vela reports its own nudges and our
+  // updates as edits too, and no key may ever move a stop.
+  const pointerDown = useRef(false);
+  const pointerUpAt = useRef(0);
+  const byPointer = useRef(new Set<string>());
   // Bumped (once a frame) as the view pans or zooms, so anchors follow it.
   const [view, setView] = useState(0);
   const [pivotLevels, setPivotLevels] = useState<Keyed<{ name: string; value: number }[]> | null>(null);
@@ -122,12 +129,27 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     c.data.registerProvider(PROVIDER, p);
     // The axis and readouts in IST, whatever the browser's zone.
     c.renderer.set('timezone', 'Asia/Kolkata');
+    // Pointer only: Vela's arrow keys would nudge a selected stop or target,
+    // and a nudge is sent like a drag. This drops its key listener and tabindex.
+    c.renderer.set('keyboard', false);
+    const onDown = () => {
+      pointerDown.current = true;
+    };
+    const onUp = () => {
+      pointerDown.current = false;
+      pointerUpAt.current = performance.now();
+    };
+    el.addEventListener('pointerdown', onDown, true);
+    window.addEventListener('pointerup', onUp, true);
+    window.addEventListener('pointercancel', onUp, true);
     c.marks.defineGroup({ id: 'fills', label: 'Trades' }).defineGroup({ id: 'calls', label: 'Telegram calls' });
     chart.current = c;
     const settle = settling.current;
     const ownedMap = owned.current;
     const handlerMap = handlers.current;
     const appliedMap = applied.current;
+    const pivotMap = appliedPivots.current;
+    const pointerEdits = byPointer.current;
     let frame = 0;
     const offs = [
       c.on('load:end', ({ bars: n }) => setPainted({ key: want.current.key, value: n > 0 })),
@@ -142,16 +164,19 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       c.on('drawing:edited', ({ id }) => {
         const line = handlers.current.get(id);
         if (!line?.onMove) return;
+        // Only an edit made while a pointer is down (or just released) is a drag.
+        if (pointerDown.current || performance.now() - pointerUpAt.current < 250) byPointer.current.add(id);
         const prev = settle.get(id);
         if (prev != null) window.clearTimeout(prev);
         settle.set(
           id,
           window.setTimeout(() => {
             settle.delete(id);
+            const dragged = byPointer.current.delete(id);
             const price = c.drawings.all().find((d) => d.id === id)?.anchors[0]?.price;
             const was = applied.current.get(id)?.price;
-            // Our own updates echo as edits: only a price that moved is a drag.
-            if (price == null || (was != null && Math.abs(price - was) < 1e-9)) return;
+            // Our own updates echo as edits: only a price a pointer moved is a drag.
+            if (!dragged || price == null || (was != null && Math.abs(price - was) < 1e-9)) return;
             applied.current.delete(id);
             handlers.current.get(id)?.onMove?.(price);
           }, MOVE_SETTLE_MS),
@@ -182,6 +207,9 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     ];
     return () => {
       offs.forEach((off) => off());
+      el.removeEventListener('pointerdown', onDown, true);
+      window.removeEventListener('pointerup', onUp, true);
+      window.removeEventListener('pointercancel', onUp, true);
       if (frame) cancelAnimationFrame(frame);
       for (const t of settle.values()) window.clearTimeout(t);
       settle.clear();
@@ -191,6 +219,9 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       ownedMap.clear();
       handlerMap.clear();
       appliedMap.clear();
+      pivotMap.clear();
+      appliedVwap.current = '';
+      pointerEdits.clear();
       extras.current = { vwap: null, pivots: new Map() };
     };
   }, [bus, chartId]);
@@ -326,9 +357,13 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     const anchors = [...series].sort((a, b) => a[0] - b[0]).map(([time, price]) => ({ time, price }));
     if (anchors.length < 2) return;
     const present = ex.vwap && c.drawings.all().some((d) => d.id === ex.vwap);
+    // Every update costs Vela an undo copy of all drawings: only a changed line is redrawn.
+    const signature = anchors.map((a) => `${a.time}:${a.price.toFixed(2)}`).join(',');
     if (present && ex.vwap) {
-      c.drawings.update(ex.vwap, { anchors });
+      if (signature !== appliedVwap.current) c.drawings.update(ex.vwap, { anchors });
+      appliedVwap.current = signature;
     } else {
+      appliedVwap.current = signature;
       const d = c.drawings.add('polyline', { anchors, style: { lineColor: C.indicator, lineWidth: 1, lineStyle: 'solid' } });
       if (!d) return;
       ex.vwap = d.id;
@@ -373,11 +408,18 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       const text = `${name} (${value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`;
       const vid = ex.pivots.get(name);
       if (vid && present.has(vid)) {
-        c.drawings.update(vid, { anchors: [{ time: at, price: value }], text: pivotText(text) });
+        // Only what changed: every update costs Vela an undo copy of all drawings.
+        const prev = appliedPivots.current.get(vid);
+        const patch: Partial<SerializedDrawing> = {};
+        if (prev?.price !== value || prev?.time !== at) patch.anchors = [{ time: at, price: value }];
+        if (prev?.text !== text) patch.text = pivotText(text);
+        if (Object.keys(patch).length > 0) c.drawings.update(vid, patch);
+        appliedPivots.current.set(vid, { price: value, text, time: at });
       } else {
         const d = c.drawings.add('hline', { anchors: [{ time: at, price: value }], style: { lineColor: PIVOT, lineWidth: 1, lineStyle: 'solid' }, text: pivotText(text) });
         if (!d) continue;
         ex.pivots.set(name, d.id);
+        appliedPivots.current.set(d.id, { price: value, text, time: at });
         c.drawings.lock(d.id, true);
       }
     }
@@ -385,6 +427,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       if (wanted.has(name)) continue;
       c.drawings.remove(vid);
       ex.pivots.delete(name);
+      appliedPivots.current.delete(vid);
     }
   }, [pivots, pivotLevels, key, bars, loaded, view]);
 
