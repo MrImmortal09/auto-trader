@@ -1,10 +1,16 @@
-// The Scalp screen's model: what a chart shows, a level's estimated rupees,
+// The Trade screen's model: what a chart shows, a level's estimated rupees,
 // the words for a level, and VWAP.
 
 import type { ChartLevel, ExecutePosition } from '../../types';
 import { level, signedMoney } from '../lib/format';
 
 export type Tf = '1m' | '5m' | '15m';
+/** Which library draws the charts: KLineChart (the default) or Vela. */
+export type ChartLib = 'kline' | 'vela';
+export const CHART_LIBS: { value: ChartLib; label: string }[] = [
+  { value: 'kline', label: 'KLine' },
+  { value: 'vela', label: 'Vela' },
+];
 export const TF_MS: Record<Tf, number> = { '1m': 60_000, '5m': 300_000, '15m': 900_000 };
 /** Days of bars a chart opens with, under each timeframe's server cap. */
 export const TF_DAYS: Record<Tf, number> = { '1m': 2, '5m': 5, '15m': 10 };
@@ -34,7 +40,7 @@ export function sameSym(a: ChartSym, b: ChartSym): boolean {
   return symbolName(a) === symbolName(b);
 }
 
-/** A scalp's option, as a chart symbol — `expiry` is its index's nearest. */
+/** A scalp's option, as a chart symbol, on `expiry` (its own). */
 export function optionOf(p: Pick<ExecutePosition, 'index' | 'strike' | 'option_type'>, expiry: string): ChartSym | null {
   if (p.strike == null || (p.option_type !== 'CE' && p.option_type !== 'PE')) return null;
   return { kind: 'option', index: p.index, expiry, strike: p.strike, side: p.option_type };

@@ -7,6 +7,7 @@ import type { ChartLevel } from '../../types';
 import type { TradingConfig } from '../../types';
 import type {
   ChainAnswer,
+  ExpiriesAnswer,
   DeskAnswer,
   FeedAnswer,
   Flags,
@@ -57,7 +58,10 @@ export const getStatus = (base: string, after: number | null) =>
 export const getHistory = (base: string, range: RangeId, group: GroupId) =>
   getJson<HistoryAnswer>(base, `/api/v2/history?range=${range}&group=${group}`);
 export const getFlags = (base: string) => getJson<Flags>(base, '/api/v2/flags');
-export const getChain = (base: string, index: string) => getJson<ChainAnswer>(base, `/api/v2/chain?index=${encodeURIComponent(index)}`);
+export const getExpiries = (base: string, index: string) => getJson<ExpiriesAnswer>(base, `/api/v2/expiries?index=${encodeURIComponent(index)}`);
+/** One expiry's strikes; the nearest when `expiry` is left out. */
+export const getChain = (base: string, index: string, expiry?: string | null) =>
+  getJson<ChainAnswer>(base, `/api/v2/chain?index=${encodeURIComponent(index)}${expiry ? `&expiry=${encodeURIComponent(expiry)}` : ''}`);
 export const getMarks = (base: string) => getJson<MarksAnswer>(base, '/api/v2/marks');
 export const getSystem = (base: string) => getJson<SystemAnswer>(base, '/api/v2/system');
 export const getModeCheck = (base: string) => getJson<ModeCheck>(base, '/api/v2/mode-check');
