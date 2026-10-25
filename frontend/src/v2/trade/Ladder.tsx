@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import type { ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
-import { CONTRACT_STALE_MS } from '../../lib/execute';
+import { CONTRACT_STALE_MS, expiryLabel } from '../../lib/execute';
 import { level, price, signedMoney } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
 import { Button } from '../ui/Button';
@@ -78,7 +78,9 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
   const [atmVisible, setAtmVisible] = useState(true);
   // Centred once per ladder (index + expiry), when ATM is first known.
   const centredFor = useRef<string | null>(null);
-  const ladderKey = `${board.index}:${board.expiry}:${rows.length > 0 ? 'rows' : 'none'}`;
+  // Centred again when the full chain replaces the board's own rows.
+  const fromChain = chain != null && chain.expiry === board.expiry;
+  const ladderKey = `${board.index}:${board.expiry}:${fromChain ? 'chain' : rows.length > 0 ? 'board' : 'none'}`;
 
   const rowOf = (strike: number) => rowEls.current.get(strike) ?? null;
 
@@ -141,7 +143,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
   );
 
   const side = (q: ExecuteQuote | null, strike: number, kind: 'CE' | 'PE', itm: boolean) => {
-    const label = `${board.index} ${strike} ${kind}`;
+    const label = `${board.index} ${strike} ${kind} (${expiryLabel(board.expiry)})`;
     const position = q ? held.get(q.sym) : undefined;
     const why = quoteBlocked(q, blocked);
     const busy = q ? !!sending[q.sym] : false;
