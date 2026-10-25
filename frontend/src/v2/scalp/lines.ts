@@ -1,4 +1,4 @@
-// What each Trade chart draws: a scalp's position line with its stop and
+// What each Scalp chart draws: a scalp's position line with its stop and
 // target, Telegram trades' read-only lines, and the day's markers.
 
 import type { ChartLevel, ExecutePosition } from '../../types';
@@ -36,10 +36,7 @@ export interface LineContext {
   sym: ChartSym;
   /** Scalps, with any level just set or cleared already applied. */
   scalps: ExecutePosition[];
-  /** Each index's nearest chain: the expiry a row from before expiries were recorded falls back to. */
   chains: Record<string, ChainAnswer | undefined>;
-  /** A position's own expiry's chain, for its delta. */
-  chainFor: (p: ExecutePosition) => ChainAnswer | undefined;
   /** Each index's value now. */
   spot: Record<string, number | null>;
   fills: FillMark[];
@@ -49,10 +46,10 @@ export interface LineContext {
   actions: LevelActions;
 }
 
-/** The delta of `p`'s option on `chain` (its own expiry's), and whether it is only assumed. */
-export function deltaFor(p: Pick<ExecutePosition, 'strike' | 'option_type'>, chain: ChainAnswer | undefined): { value: number; assumed: boolean } {
+/** The delta of `p`'s option, and whether it is only assumed. */
+export function deltaFor(p: Pick<ExecutePosition, 'index' | 'strike' | 'option_type'>, chains: LineContext['chains']): { value: number; assumed: boolean } {
   const side = p.option_type === 'PE' ? 'pe' : 'ce';
-  const row = chain?.strikes.find((s) => s.strike === p.strike);
+  const row = chains[p.index]?.strikes.find((s) => s.strike === p.strike);
   return row?.[side]?.delta ?? { value: p.option_type === 'PE' ? -0.5 : 0.5, assumed: true };
 }
 
@@ -70,7 +67,7 @@ function editable(p: ExecutePosition): boolean {
 function levelLine(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel, cx: LineContext): ChartLine {
   const color = kind === 'stop' ? C.loss : C.profit;
   const word = kind === 'stop' ? 'Stop' : 'Target';
-  const delta = deltaFor(p, cx.chainFor(p)).value;
+  const delta = deltaFor(p, cx.chains).value;
   const draggable = cx.actions.canSet && editable(p);
   const data: OrderLineData = {
     color,
@@ -141,8 +138,7 @@ export function chartLines(cx: LineContext): ChartLine[] {
   if (cx.layers.myTrades) {
     for (const p of cx.scalps) {
       if (p.qty <= 0) continue;
-      // The position's own expiry; the nearest only for rows from before it was recorded.
-      const expiry = p.expiry ?? cx.chains[p.index]?.expiry;
+      const expiry = cx.chains[p.index]?.expiry;
       const option = expiry ? optionOf(p, expiry) : null;
       const onOption = option != null && sameSym(option, cx.sym);
       const onIndex = cx.sym.kind === 'index' && cx.sym.index === p.index;

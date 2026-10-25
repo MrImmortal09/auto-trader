@@ -28,7 +28,7 @@ export function NavRail({ screen, onSelect }: { screen: ScreenId; onSelect: (s: 
   );
 }
 
-/** Phone: Desk, Trade, Market, and More (System and Settings). */
+/** Phone: Desk, Scalp, Market, and More (System and Settings). */
 export function TabBar({ screen, onSelect }: { screen: ScreenId; onSelect: (s: ScreenId) => void }) {
   const tabs = SCREENS.slice(0, 3);
   const more = screen === 'system' || screen === 'settings';

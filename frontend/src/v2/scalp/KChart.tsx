@@ -67,8 +67,12 @@ function rangeWithLines(prices: { current: number[] }): AxisCreateRangeCallback 
   };
 }
 
-/** What either chart (KLineChart or Vela) is given. */
-export interface ChartProps {
+/**
+ * One KLineChart: `sym` at `tf`, with its order lines, markers and VWAP. The
+ * bars come from the candle service and follow its stream; an index chart's
+ * VWAP is its future's, moved onto the index by the basis.
+ */
+export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, placing, onPlacingDone, bus, onState }: {
   chartId: string;
   serverBase: string;
   sym: ChartSym;
@@ -83,14 +87,7 @@ export interface ChartProps {
   bus: CrosshairBus;
   /** Loading, an error, or the latest bar's close. */
   onState?: (s: { loading: boolean; error: string | null; last: Bar | null }) => void;
-}
-
-/**
- * One KLineChart: `sym` at `tf`, with its order lines, markers and VWAP. The
- * bars come from the candle service and follow its stream; an index chart's
- * VWAP is its future's, moved onto the index by the basis.
- */
-export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, placing, onPlacingDone, bus, onState }: ChartProps) {
+}) {
   const host = useRef<HTMLDivElement>(null);
   const chart = useRef<Chart | null>(null);
   const pushBar = useRef<((k: KLineData) => void) | null>(null);

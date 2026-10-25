@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { getIndicator, getMarketLive, getOptionChain, getSettings, getTrend } from '../lib/api';
 import { usePoll } from '../lib/usePoll';
 import type { IndicatorReading, MarketIndex, TrendAnswer, TrendRow } from '../lib/types';
-import { istMs, type Tf } from '../trade/model';
+import { istMs, type Tf } from '../scalp/model';
 import { Segment } from '../ui/Segment';
 import { BiasCard } from './BiasCard';
 import { Checks } from './Checks';

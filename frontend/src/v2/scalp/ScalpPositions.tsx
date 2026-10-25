@@ -1,5 +1,5 @@
 import type { ChartLevel, ExecutePosition } from '../../types';
-import { contractLabel, expiryLabel } from '../../lib/execute';
+import { contractLabel } from '../../lib/execute';
 import { price, signedMoney, signedPct, toneOf } from '../lib/format';
 import type { DeskPosition } from '../lib/types';
 import { PositionRail } from '../desk/PositionRail';
@@ -38,23 +38,14 @@ export interface PositionHandlers {
   exitAllBusy: boolean;
 }
 
-/** Desktop: the open manual trades, each with its stop and target (added or
- * removed from here, dragged on the charts), −1 lot and Exit; Exit all held. */
-export function ScalpPositionsPanel({ scalps, h, canSet, onAdd, onRemove }: {
-  scalps: ExecutePosition[];
-  h: PositionHandlers;
-  /** Levels can be set (`chart_stops` on); removing works either way. */
-  canSet: boolean;
-  /** "+ Stop": put the level on a chart with the next click. */
-  onAdd: (p: ExecutePosition, kind: LevelKind) => void;
-  onRemove: (p: ExecutePosition, kind: LevelKind) => void;
-}) {
+/** Desktop: "Scalp positions", with −1 lot and Exit on each, Exit all held. */
+export function ScalpPositionsPanel({ scalps, h }: { scalps: ExecutePosition[]; h: PositionHandlers }) {
   const open = scalps.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
   return (
     <section className="shrink-0 rounded-12 border border-line bg-panel px-4 py-3">
       <header className="flex items-center gap-3 pb-1">
         <h2 className="flex items-baseline gap-2 type-title text-fg">
-          Positions <span className="type-caption text-fg-muted tnum">{scalps.length}</span>
+          Scalp positions <span className="type-caption text-fg-muted tnum">{scalps.length}</span>
         </h2>
         <span className="flex-1" />
         <span className="type-label text-fg-muted">Open</span>
@@ -63,41 +54,22 @@ export function ScalpPositionsPanel({ scalps, h, canSet, onAdd, onRemove }: {
           {h.exitAllBusy ? 'Exiting…' : 'Hold to exit all'}
         </HoldButton>
       </header>
-      {scalps.length === 0 && <p className="py-2 type-body text-fg-muted">No open trade. Tap Buy on the ladder to open one.</p>}
+      {scalps.length === 0 && <p className="py-2 type-body text-fg-muted">No scalp open. Tap Buy on the ladder to open one.</p>}
       {scalps.map((p) => {
         const note = busyNote(p, !!h.sending[p.id]);
         const locked = note != null || p.qty <= 0;
-        const meta = [p.expiry ? expiryLabel(p.expiry) : null, `${p.qty} qty`, `avg ${price(p.avg)}`].filter(Boolean).join(' · ');
-        const level = (kind: LevelKind) => {
-          const lvl = p.chart?.[kind] ?? null;
-          const word = kind === 'stop' ? 'Stop' : 'Target';
-          if (lvl) {
-            return (
-              <span className={`inline-flex items-center gap-1 type-caption tnum ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-                {word.toLowerCase()} {levelWords(p, kind, lvl)}
-                <button type="button" disabled={locked} title={`Remove the ${kind}`} aria-label={`Remove the ${kind}`} onClick={() => onRemove(p, kind)} className="grid size-5 place-items-center rounded-4 border border-current/40 hover:bg-raised disabled:opacity-40">
-                  ×
-                </button>
-              </span>
-            );
-          }
-          if (!canSet) return <span className="type-caption text-fg-muted">no {kind}</span>;
-          return (
-            <button type="button" disabled={locked} onClick={() => onAdd(p, kind)} className={`type-caption hover:underline disabled:opacity-40 ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-              + {word}
-            </button>
-          );
-        };
+        const meta = [
+          `${p.qty} qty`,
+          `avg ${price(p.avg)}`,
+          p.chart?.stop ? `stop ${levelWords(p, 'stop', p.chart.stop)}` : 'no stop',
+          p.chart?.target ? `target ${levelWords(p, 'target', p.chart.target)}` : 'no target',
+        ].join(' · ');
         return (
           <div key={p.id} className="flex items-center gap-6 border-t border-line py-2.5">
             <span className="w-44 shrink-0 type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
-            <span className="flex min-w-0 flex-1 items-center gap-3 type-caption text-fg-muted tnum">
-              <span className="truncate">
-                {meta}
-                {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
-              </span>
-              {level('stop')}
-              {level('target')}
+            <span className="min-w-0 flex-1 truncate type-caption text-fg-muted tnum">
+              {meta}
+              {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
             </span>
             <span className={`w-28 shrink-0 text-right num-medium ${TONE_TEXT[toneOf(p.pnl)]}`}>{p.pnl == null ? '—' : signedMoney(p.pnl)}</span>
             <div className="flex shrink-0 gap-2">
@@ -121,7 +93,7 @@ export function ScalpBar({ scalps, h, onOpen }: { scalps: ExecutePosition[]; h: 
   return (
     <div className="flex shrink-0 items-center gap-3 border-t border-line bg-inset px-4 py-2">
       <button type="button" onClick={onOpen} disabled={scalps.length === 0} className="min-w-0 flex-1 text-left disabled:opacity-60">
-        <div className="type-caption text-fg-muted">Open · {scalps.length === 1 ? '1 trade' : `${scalps.length} trades`}</div>
+        <div className="type-caption text-fg-muted">Open · {scalps.length === 1 ? '1 scalp' : `${scalps.length} scalps`}</div>
         <div className={`num-medium ${TONE_TEXT[toneOf(open)]}`}>{signedMoney(open)}</div>
       </button>
       <HoldButton size="lg" disabled={scalps.length === 0 || h.exitAllBusy} onFire={h.onExitAll}>
@@ -180,9 +152,9 @@ export function PositionSheet({ scalps, h, indexNow, deltaOf, since, canSet, onR
   onClose: () => void;
 }) {
   return (
-    <Modal open onClose={onClose} label="Positions">
+    <Modal open onClose={onClose} label="Scalp positions">
       <div className="flex flex-col gap-5 overflow-y-auto px-4 pt-3 pb-4">
-        {scalps.length === 0 && <p className="type-body text-fg-muted">No open trade.</p>}
+        {scalps.length === 0 && <p className="type-body text-fg-muted">No scalp open.</p>}
         {scalps.map((p) => {
           const note = busyNote(p, !!h.sending[p.id]);
           const locked = note != null || p.qty <= 0;
@@ -228,7 +200,7 @@ export function PositionSheet({ scalps, h, indexNow, deltaOf, since, canSet, onR
                     <SourceChip source={{ kind: 'scalp', title: 'Scalp' }} />
                   </div>
                   <div className="mt-1 type-caption text-fg-muted tnum">
-                    {[p.expiry ? expiryLabel(p.expiry) : null, `${p.qty} qty (${lots} ${lots === 1 ? 'lot' : 'lots'})`, `avg ${price(p.avg)}`, bought ? `since ${bought}` : null].filter(Boolean).join(' · ')}
+                    {[`${p.qty} qty (${lots} ${lots === 1 ? 'lot' : 'lots'})`, `avg ${price(p.avg)}`, bought ? `since ${bought}` : null].filter(Boolean).join(' · ')}
                     {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
                   </div>
                 </div>

@@ -1,4 +1,4 @@
-// KLineChart setup for the v2 Trade charts: the theme from the design tokens,
+// KLineChart setup for the v2 Scalp charts: the theme from the design tokens,
 // the order-line and marker overlays, VWAP and pivots. Registered once, globally.
 
 import { registerIndicator, registerOverlay, utils, type DeepPartial, type OverlayFigure, type Styles } from 'klinecharts';

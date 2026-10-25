@@ -10,7 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@luxalgo/vela": "0.9.0",
     "klinecharts": "10.0.4",
     "lucide-react": "^1.24.0",
     "react": "^19.2.7",

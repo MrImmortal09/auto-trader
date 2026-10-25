@@ -7,22 +7,15 @@ import { getToken } from '../lib/auth';
 export const STREAM_STALE_AFTER_MS = 2_000;
 
 /**
- * Live Execute-screen frames for `index` (SSE, one every 250 ms): the
- * ladder of `expiry` (the nearest when null) around `centre` (ATM when
- * null). Switching any of them reopens the stream; the last frame is kept
- * meanwhile so the page never blanks. `now` ticks so the caller can tell how
- * old the frame is.
+ * Live Execute-screen frames for `index` (SSE, one every 250 ms). Switching
+ * index reopens the stream; the last frame is kept meanwhile so the page
+ * never blanks. `now` ticks so the caller can tell how old the frame is.
  */
-export function useExecuteStream(serverBase: string, index: string, expiry: string | null = null, centre: number | null = null) {
+export function useExecuteStream(serverBase: string, index: string) {
   const [frame, setFrame] = useState<ExecuteFrame | null>(null);
   const [connected, setConnected] = useState(false);
-  // Local receipt time, so browser/VM clock skew can't make a live stream look
-  // stale — kept per index and expiry, so after a switch the stream counts as
-  // stale (and nothing is bought off the previous one's frame) until the new
-  // stream's first frame arrives.
-  const key = `${serverBase}|${index}|${expiry ?? ''}`;
-  const [received, setReceived] = useState<{ key: string; at: number } | null>(null);
-  const receivedAt = received?.key === key ? received.at : null;
+  // Local receipt time, so browser/VM clock skew can't make a live stream look stale.
+  const [receivedAt, setReceivedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -33,8 +26,6 @@ export function useExecuteStream(serverBase: string, index: string, expiry: stri
   useEffect(() => {
     const token = getToken();
     const params = new URLSearchParams({ index });
-    if (expiry) params.set('expiry', expiry);
-    if (centre != null) params.set('centre', String(centre));
     if (token) params.set('token', token);
     const es = new EventSource(`${apiUrl(serverBase, '/api/execute/stream')}?${params}`);
     es.onopen = () => setConnected(true);
@@ -47,12 +38,12 @@ export function useExecuteStream(serverBase: string, index: string, expiry: stri
       }
       setConnected(true);
       setFrame(next);
-      setReceived({ key, at: Date.now() });
+      setReceivedAt(Date.now());
     };
     // EventSource reconnects on its own; this only flips the badge meanwhile.
     es.onerror = () => setConnected(false);
     return () => es.close();
-  }, [serverBase, index, expiry, centre, key]);
+  }, [serverBase, index]);
 
   const ageMs = receivedAt == null ? null : Math.max(0, now - receivedAt);
   const stale = !connected || ageMs == null || ageMs > STREAM_STALE_AFTER_MS;
