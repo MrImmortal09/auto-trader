@@ -236,24 +236,36 @@ impl ScripStore {
     }
 
     /// The expiries `index`'s options are listed for on or after `today`, in
-    /// the index's own F&O segment, earliest first. Empty when the store
-    /// holds no options for it.
-    pub fn expiries(&self, index: &str, today: NaiveDate) -> Vec<NaiveDate> {
+    /// the index's own F&O segment, earliest first, each with its lot size.
+    /// One pass over the index's records; nothing is built per expiry.
+    /// Empty when the store holds no options for it.
+    pub fn expiry_lots(&self, index: &str, today: NaiveDate) -> Vec<(NaiveDate, u32)> {
         let segment = index_fo_segment(index);
-        let mut out: Vec<NaiveDate> = self
-            .records
-            .get(index)
-            .map(|records| {
-                records
-                    .iter()
-                    .filter(|r| r.exchange_segment_code == segment && r.expiry_date >= today && r.normalized_strike().is_some())
-                    .map(|r| r.expiry_date)
-                    .collect()
-            })
-            .unwrap_or_default();
-        out.sort();
-        out.dedup();
-        out
+        let mut by_expiry: BTreeMap<NaiveDate, u32> = BTreeMap::new();
+        for r in self.records.get(index).map(|v| v.as_slice()).unwrap_or_default() {
+            if r.exchange_segment_code == segment && r.expiry_date >= today && r.normalized_strike().is_some() {
+                by_expiry.entry(r.expiry_date).or_insert(r.lot_size);
+            }
+        }
+        by_expiry.into_iter().collect()
+    }
+
+    /// The expiries of [`Self::expiry_lots`], dates only.
+    pub fn expiries(&self, index: &str, today: NaiveDate) -> Vec<NaiveDate> {
+        self.expiry_lots(index, today).into_iter().map(|(d, _)| d).collect()
+    }
+
+    /// The index option `trading_symbol` names, looking only at the six
+    /// indices' records (a manual buy never needs a stock's) — any expiry,
+    /// any segment; the caller checks it is one it may trade.
+    pub fn find_index_option(&self, trading_symbol: &str) -> Option<ScripRecord> {
+        let needle = trading_symbol.trim();
+        shared_domain::INDEX_NAMES
+            .iter()
+            .filter_map(|i| self.records.get(*i))
+            .flatten()
+            .find(|r| r.trading_symbol.trim() == needle)
+            .cloned()
     }
 
     /// `index`'s option chain for one `expiry`, in the index's own F&O
@@ -444,6 +456,11 @@ mod tests {
         let store = two_expiry_store();
         let d = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
         assert_eq!(store.expiries("NIFTY", d(10, 20)), vec![d(10, 27), d(11, 3)]);
+        assert_eq!(store.expiry_lots("NIFTY", d(10, 20)), vec![(d(10, 27), 65), (d(11, 3), 65)]);
+        // Found among the index's records on any expiry; a stock's symbol is never looked at.
+        assert_eq!(store.find_index_option("NIFTY26N0323000PE").map(|r| r.expiry_date), Some(d(11, 3)));
+        assert!(store.find_index_option("NIFTY26NOVFUT").is_some());
+        assert!(store.find_index_option("RELIANCE26OCT1400CE").is_none());
         // On expiry day the expiring contracts still count; the day after they are gone.
         assert_eq!(store.expiries("NIFTY", d(10, 27)), vec![d(10, 27), d(11, 3)]);
         assert_eq!(store.expiries("NIFTY", d(10, 28)), vec![d(11, 3)]);

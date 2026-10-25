@@ -24,6 +24,12 @@ use crate::AppState;
 /// them; the spare two each side let it hold its rows still while the user's
 /// finger is on the ladder, and give a re-centred ladder prices at once.
 const SUBSCRIBE_HALF: usize = 7;
+/// Ladder scrips subscribed per day at most. Subscriptions are never
+/// withdrawn, and the feed's own cap (200 on the retired HSM feed; unknown
+/// on the native one) must keep room for positions' contracts, whose stops
+/// depend on their ticks. Past the budget a row shows no price, and the buy
+/// route refuses a contract with no recent price: it fails toward not trading.
+const MAX_LADDER_SCRIPS: usize = 120;
 /// How often the stream pushes a frame.
 pub const STREAM_EVERY: Duration = Duration::from_millis(250);
 /// A feed quieter than this is stale: no manual buy is accepted on it.
@@ -42,9 +48,10 @@ struct CachedChain {
     day: NaiveDate,
 }
 
-/// One index's listed expiries as last read, with what they were read from.
+/// One index's listed expiries, each with its lot size, as last read, with
+/// what they were read from.
 struct CachedExpiries {
-    list: Arc<Vec<NaiveDate>>,
+    list: Arc<Vec<(NaiveDate, u32)>>,
     loaded_at: Option<DateTime<FixedOffset>>,
     day: NaiveDate,
 }
@@ -133,9 +140,9 @@ impl ExecuteBoard {
     }
 
     /// The expiries `index`'s options are listed for, from today, earliest
-    /// first — read again whenever the scrip master is reloaded or the IST
-    /// date rolls over (yesterday's expiry is gone).
-    pub async fn expiries(&self, state: &AppState, index: &str) -> Arc<Vec<NaiveDate>> {
+    /// first, each with its lot size — read again whenever the scrip master
+    /// is reloaded or the IST date rolls over (yesterday's expiry is gone).
+    pub async fn expiries(&self, state: &AppState, index: &str) -> Arc<Vec<(NaiveDate, u32)>> {
         let loaded_at = *state.scrip_loaded_at.read().await;
         let today = shared_domain::today_ist();
         if let Some(c) = self.expiries.read().await.get(index) {
@@ -145,7 +152,7 @@ impl ExecuteBoard {
         }
         let list = {
             let store = state.scrip_store.read().await;
-            Arc::new(store.as_ref().map(|s| s.expiries(index, today)).unwrap_or_default())
+            Arc::new(store.as_ref().map(|s| s.expiry_lots(index, today)).unwrap_or_default())
         };
         self.expiries.write().await.insert(
             index.to_string(),
@@ -182,15 +189,16 @@ impl ExecuteBoard {
 
     /// `index`'s nearest-expiry chain.
     pub async fn chain(&self, state: &AppState, index: &str) -> Option<Arc<OptionChain>> {
-        let expiry = *self.expiries(state, index).await.first()?;
+        let (expiry, _) = *self.expiries(state, index).await.first()?;
         self.chain_at(state, index, expiry).await
     }
 
     /// The contract `trading_symbol` names, if it is a listed index option
     /// on any expiry from today — what the Execute screen trades. Comes with
-    /// its index and that expiry's chain.
+    /// its index and that expiry's chain. Only the six indices' records are
+    /// searched, never a stock's.
     pub async fn find_contract(&self, state: &AppState, trading_symbol: &str) -> Option<(String, Arc<OptionChain>, ScripRecord)> {
-        let record = state.scrip_store.read().await.as_ref()?.find_by_trading_symbol(trading_symbol)?;
+        let record = state.scrip_store.read().await.as_ref()?.find_index_option(trading_symbol)?;
         let index = index_option(&record, shared_domain::today_ist())?;
         let chain = self.chain_at(state, index, record.expiry_date).await?;
         Some((index.to_string(), chain, record))
@@ -214,7 +222,19 @@ impl ExecuteBoard {
             let msg = serde_json::json!({ "action": "subscribe_indices", "indices": indices.join(",") });
             subs.indices_sent = tx.send(msg.to_string()).is_ok();
         }
-        let fresh: Vec<String> = keys.iter().filter(|k| !subs.scrips.contains(*k)).cloned().collect();
+        let wanted: Vec<&String> = keys.iter().filter(|k| !subs.scrips.contains(*k)).collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let room = MAX_LADDER_SCRIPS.saturating_sub(subs.scrips.len());
+        if wanted.len() > room {
+            tracing::warn!(
+                "Ladder subscription budget reached: {} of {MAX_LADDER_SCRIPS} scrips subscribed today, {} more asked for; the rest show no price until tomorrow",
+                subs.scrips.len(),
+                wanted.len()
+            );
+        }
+        let fresh: Vec<String> = wanted.into_iter().take(room).cloned().collect();
         if fresh.is_empty() {
             return;
         }
@@ -420,17 +440,21 @@ fn window(len: usize, atm: usize, half: usize) -> std::ops::Range<usize> {
     atm.saturating_sub(half)..(atm + half + 1).min(len)
 }
 
-/// The board for `index`: its `expiry`'s chain (the nearest when `None` or
-/// unlisted), with the window subscribed and streamed around `centre` (ATM
-/// when `None`).
+/// The board for `index`: its `expiry`'s chain (the nearest when `None`; an
+/// unlisted one is an error), with the window subscribed and streamed
+/// around `centre` (ATM when `None`).
 async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>) -> Result<Board, String> {
     if state.scrip_store.read().await.is_none() {
         return Err("Scrip Master not loaded yet — connect Kotak first".to_string());
     }
     let expiries = state.execute.expiries(state, index).await;
+    let listed = |e: NaiveDate| expiries.iter().any(|(d, _)| *d == e);
+    // An expiry asked for by name must exist: a ladder quietly swapped to
+    // another expiry could sell a tap the wrong contract.
     let expiry = match expiry {
-        Some(e) if expiries.contains(&e) => e,
-        _ => *expiries.first().ok_or_else(|| format!("No {index} option contracts in the Scrip Master"))?,
+        Some(e) if listed(e) => e,
+        Some(e) => return Err(format!("No {index} options listed for {}", e.format("%Y-%m-%d"))),
+        None => expiries.first().map(|(d, _)| *d).ok_or_else(|| format!("No {index} option contracts in the Scrip Master"))?,
     };
     let chain = state
         .execute
@@ -490,7 +514,7 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
         index: index.to_string(),
         expiry: chain.expiry.format("%Y-%m-%d").to_string(),
         days_to_expiry: (chain.expiry - shared_domain::today_ist()).num_days(),
-        expiries: expiries.iter().map(|d| d.format("%Y-%m-%d").to_string()).collect(),
+        expiries: expiries.iter().map(|(d, _)| d.format("%Y-%m-%d").to_string()).collect(),
         lot_size: chain.lot_size,
         spot,
         spot_source,

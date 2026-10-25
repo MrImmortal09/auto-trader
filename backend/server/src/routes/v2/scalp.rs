@@ -96,7 +96,8 @@ struct ExpiriesAnswer {
 }
 
 /// `GET /api/v2/expiries?index=NIFTY` — every expiry this index's options
-/// are listed for from today, earliest first, with each one's lot size.
+/// are listed for from today, earliest first, with each one's lot size
+/// (read in one pass; no chain is built for it).
 pub async fn expiries_handler(State(state): State<AppState>, Query(q): Query<ChainQuery>) -> Response {
     let Some(index) = index_named(&q.index) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "index must be one of the six indices" }))).into_response();
@@ -105,15 +106,13 @@ pub async fn expiries_handler(State(state): State<AppState>, Query(q): Query<Cha
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "no option chain yet — the scrip master loads after the Kotak login" }))).into_response();
     }
     let today = shared_domain::today_ist();
-    let mut expiries = Vec::new();
-    for &date in state.execute.expiries(&state, index).await.iter() {
-        let Some(chain) = state.execute.chain_at(&state, index, date).await else { continue };
-        expiries.push(ExpiryOut {
-            date: date.format("%Y-%m-%d").to_string(),
-            days_to_expiry: (date - today).num_days(),
-            lot_size: chain.lot_size,
-        });
-    }
+    let expiries = state
+        .execute
+        .expiries(&state, index)
+        .await
+        .iter()
+        .map(|&(date, lot_size)| ExpiryOut { date: date.format("%Y-%m-%d").to_string(), days_to_expiry: (date - today).num_days(), lot_size })
+        .collect();
     Json(ExpiriesAnswer { index: index.to_string(), today: today.format("%Y-%m-%d").to_string(), expiries }).into_response()
 }
 

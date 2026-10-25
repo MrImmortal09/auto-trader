@@ -35,7 +35,8 @@ pub const MAX_LOTS_PER_TAP: i32 = 10;
 #[derive(Deserialize)]
 pub struct StreamQuery {
     index: Option<String>,
-    /// `YYYY-MM-DD`; missing or unlisted, the nearest expiry.
+    /// `YYYY-MM-DD`; missing, the nearest expiry. An unlisted one gives a
+    /// board error rather than another expiry's ladder.
     expiry: Option<String>,
     /// A strike to centre the subscribed window on; missing, ATM.
     centre: Option<f64>,
