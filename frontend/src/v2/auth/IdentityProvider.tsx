@@ -53,9 +53,11 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Ask the server who the token is now, and again every few minutes: a
-  // user the admin disabled is signed out on the next answer.
+  // user the admin disabled is signed out on the next answer. Asked of the
+  // phone token itself, so the owner holding the passkey still sees whose
+  // phone sign-in this browser keeps.
   useEffect(() => {
-    if (!userToken || hasWriteAccess) return;
+    if (!userToken) return;
     let cancelled = false;
     const check = async () => {
       try {
@@ -76,7 +78,7 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [serverBase, userToken, hasWriteAccess]);
+  }, [serverBase, userToken]);
 
   const openSignIn = useCallback((reason?: string) => setSignIn({ open: true, reason: reason ?? null }), []);
   const closeSignIn = useCallback(() => setSignIn({ open: false, reason: null }), []);
@@ -84,10 +86,12 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<Identity>(() => {
     const known = confirmed?.token === userToken ? confirmed : null;
-    const role: Role = hasWriteAccess ? 'owner' : known ? known.role : claimedRole(userToken);
+    const phone = known ? known.role : claimedRole(userToken);
+    const role: Role = hasWriteAccess ? 'owner' : phone;
     return {
       role,
       user: known?.user ?? null,
+      phoneRole: phone === 'admin' || phone === 'user' ? phone : null,
       canReadOwner: role === 'owner' || role === 'admin',
       // A sign-in that has happened closes the sheet, wherever it came from.
       signInOpen: signIn.open && !userToken,

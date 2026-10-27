@@ -3,7 +3,7 @@ import { Admin } from './admin/Admin';
 import { useIdentity } from './auth/identity';
 import { SignInSheet } from './auth/SignInSheet';
 import { Desk } from './desk/Desk';
-import { resumeTrading } from './lib/api';
+import { resumeTrading, streamToken } from './lib/api';
 import { plural } from './lib/format';
 import { useIsDesktop, useServerBase } from './lib/hooks';
 import type { Stopped } from './lib/types';
@@ -51,9 +51,9 @@ export default function App() {
   const screen: ScreenId = screens.includes(wanted) ? wanted : 'desk';
   const [killSwitchOpen, setKillSwitchOpen] = useState(false);
   const [resuming, setResuming] = useState(false);
-  const status = useStatus(serverBase);
+  const status = useStatus(serverBase, canReadOwner);
   const guard = useGuard();
-  useEngineErrors(serverBase, canReadOwner);
+  useEngineErrors(serverBase, streamToken(), canReadOwner);
 
   // The screen is mirrored in the hash (`/v2/#trade`): there are no deep paths.
   useEffect(() => {

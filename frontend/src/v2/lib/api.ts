@@ -47,9 +47,10 @@ async function errorOf(res: Response): Promise<string> {
 
 /**
  * Which sign-in a call speaks for: `owner` is the passkey token (v1's, with
- * its 401 handling), `user` the phone sign-in's token, and `auto` the
- * passkey when it's held, else the phone token — the right one for every
- * read, since the passkey may do everything a phone token may.
+ * its 401 handling) and the default for every write, `user` the phone
+ * sign-in's token, and `auto` the passkey when it's held, else the phone
+ * token — the right one for every read and for the allow-list's writes,
+ * since the passkey may do everything a phone token may.
  */
 export type Auth = 'auto' | 'owner' | 'user';
 
@@ -66,6 +67,17 @@ export function tokenFor(auth: Auth): { token: string | null; kind: 'owner' | 'u
 /** The token the live streams put in their URL — the same choice as `auto`. */
 export const streamToken = () => tokenFor('auto').token;
 
+/**
+ * A phone token goes out on its own. Anything else goes through v1's
+ * `apiFetch`: it sends the stored passkey even once it has expired, so the
+ * server's 401 on a write clears it and reopens the unlock dialog instead of
+ * the write going out with no token and failing silently. With nothing
+ * stored it sends no token at all.
+ */
+function fetchAs(kind: 'owner' | 'user' | 'none', token: string | null, base: string, path: string, init?: RequestInit) {
+  return kind === 'user' ? apiFetchWith(token, base, path, init) : apiFetch(base, path, init);
+}
+
 /** A phone token the server has refused: it's no longer good, so drop it
  * (unless a newer one was stored meanwhile) and tell the identity provider. */
 function userTokenRefused(token: string | null, isMutation: boolean) {
@@ -78,7 +90,7 @@ async function getJson<T>(serverBase: string, path: string, auth: Auth = 'auto')
   const { token, kind } = tokenFor(auth);
   let res: Response;
   try {
-    res = kind === 'owner' ? await apiFetch(serverBase, path) : await apiFetchWith(token, serverBase, path);
+    res = await fetchAs(kind, token, serverBase, path);
   } catch {
     throw new ApiError('Could not reach the server', 0);
   }
@@ -126,7 +138,7 @@ export interface Sent {
   body?: unknown;
 }
 
-async function send(base: string, path: string, method: string, body?: unknown, auth: Auth = 'auto'): Promise<Sent> {
+async function send(base: string, path: string, method: string, body?: unknown, auth: Auth = 'owner'): Promise<Sent> {
   const { token, kind } = tokenFor(auth);
   const init: RequestInit = {
     method,
@@ -134,7 +146,7 @@ async function send(base: string, path: string, method: string, body?: unknown, 
     body: body === undefined ? undefined : JSON.stringify(body),
   };
   try {
-    const res = kind === 'owner' ? await apiFetch(base, path, init) : await apiFetchWith(token, base, path, init);
+    const res = await fetchAs(kind, token, base, path, init);
     if (res.status === 401 && kind === 'user') userTokenRefused(token, true);
     if (!res.ok) return { ok: false, status: res.status, error: await errorOf(res) };
     return { ok: true, status: res.status, body: await res.json().catch(() => null) };
@@ -145,8 +157,9 @@ async function send(base: string, path: string, method: string, body?: unknown, 
 
 // ── Phone sign-in and the allow-list ─────────────────────────────────── //
 
-/** Who the caller is, by the token `auto` would send. */
-export const getMe = (base: string) => getJson<MeAnswer>(base, '/api/auth/me');
+/** Who the phone token is, as the server sees it — asked of that token even
+ * while the passkey is held. */
+export const getMe = (base: string) => getJson<MeAnswer>(base, '/api/auth/me', 'user');
 
 /** How a code request went: `retryAfter` is when "Send again" may be offered;
  * `lockedForSecs` comes with a 429. */
@@ -198,9 +211,11 @@ export async function verifyOtp(base: string, phone: string, code: string): Prom
 }
 
 export const listUsers = (base: string) => getJson<AdminUser[]>(base, '/api/admin/users');
-export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name });
-export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) => send(base, `/api/admin/users/${id}`, 'PATCH', patch);
-export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE');
+// The only writes the admin's phone token may make, so the only ones sent `auto`.
+export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name }, 'auto');
+export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) =>
+  send(base, `/api/admin/users/${id}`, 'PATCH', patch, 'auto');
+export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE', undefined, 'auto');
 
 const position = (id: string) => `/api/positions/${encodeURIComponent(id)}`;
 
@@ -243,7 +258,7 @@ export async function reconcilePreview(base: string): Promise<{ findings: Reconc
     // An owner read: the passkey when held, else the admin's phone token.
     const { token, kind } = tokenFor('auto');
     const path = '/api/positions/reconcile/preview';
-    const res = kind === 'owner' ? await apiFetch(base, path) : await apiFetchWith(token, base, path);
+    const res = await fetchAs(kind, token, base, path);
     const data = await res.json().catch(() => null);
     if (!res.ok) return { error: (data as { error?: string } | null)?.error ?? 'Failed to fetch live data from Kotak' };
     return { findings: Array.isArray(data) ? (data as ReconcileFinding[]) : [] };

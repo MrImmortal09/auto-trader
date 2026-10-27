@@ -121,9 +121,10 @@ function Details({ serverBase, t, marketOpen, compact }: { serverBase: string; t
 }
 
 export function System({ serverBase, desktop, health, marketOpen }: { serverBase: string; desktop: boolean; health: HealthSet | null; marketOpen: boolean }) {
-  const t = useTelemetryStream(serverBase, streamToken());
+  const token = streamToken();
+  const t = useTelemetryStream(serverBase, token);
   const sys = usePoll(() => getSystem(serverBase), 15_000, serverBase);
-  const log = useEngineLog(serverBase);
+  const log = useEngineLog(serverBase, token);
   const [view, setView] = useState<'overview' | 'log' | 'details'>('overview');
   const d = sys.data;
   const level = (k: keyof HealthSet): Level => health?.[k]?.level ?? 'off';

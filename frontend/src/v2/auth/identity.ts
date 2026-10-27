@@ -7,8 +7,11 @@ import type { Role, SessionUser } from '../lib/types';
  */
 export interface Identity {
   role: Role;
-  /** The phone sign-in, when there is one. */
+  /** The phone sign-in, once the server has confirmed it. */
   user: SessionUser | null;
+  /** The phone sign-in's role — the server's word, else the token's claim —
+   * or null without one. Set beside the passkey too: `role` is then `owner`. */
+  phoneRole: 'admin' | 'user' | null;
   /** Owner data (the engine's positions, logs, settings) may be read. */
   canReadOwner: boolean;
   signInOpen: boolean;
