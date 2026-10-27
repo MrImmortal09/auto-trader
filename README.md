@@ -392,6 +392,13 @@ sudo systemctl reload nginx
 
 If you have a domain, add HTTPS with Certbot afterward.
 
+**Client addresses behind the proxy.** The backend keys its sign-in rate limits (the passkey, and the phone OTP's send and verify limits) on the *last* `X-Forwarded-For` hop, which `$proxy_add_x_forwarded_for` appends from nginx's own view of the client; earlier hops and any `X-Real-IP` are whatever the client sent and are ignored. Keep that `proxy_set_header` line. If the site sits behind Cloudflare, `$remote_addr` is a Cloudflare edge address unless nginx restores the visitor's, so add the `real_ip` directives to the `http` block (Cloudflare publishes its ranges at https://www.cloudflare.com/ips/):
+
+```nginx
+set_real_ip_from 173.245.48.0/20;   # one line per Cloudflare range, v4 and v6
+real_ip_header CF-Connecting-IP;
+```
+
 ### 7. Connect the Vercel frontend to the VM
 
 After the Vercel site is live:

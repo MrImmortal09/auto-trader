@@ -90,13 +90,15 @@ export function apiFetch(serverBase: string, path: string, init?: RequestInit) {
   return fetch(apiUrl(serverBase, path), { ...init, headers }).then(res => {
     if (res.status === 401) {
       // 1. Passkey verification endpoint handles its own 401 (invalid passkey) — never clear session
-      // 2. Safe read methods (GET, HEAD, OPTIONS) should never revoke write access
-      // 3. Only if an active mutation that sent a token gets rejected by the server is the token invalid
+      // 2. A 401 to a request that carried the stored token means the token is
+      //    no longer good (expired, or the server's secret changed), whatever
+      //    the method: the owner's reads are gated too, so a background poll
+      //    is as telling as an order. Without a token there is nothing to drop.
       const method = (init?.method || 'GET').toUpperCase();
       const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
       const isPasskeyVerify = path.includes('/api/auth/verify-passkey');
 
-      if (!isPasskeyVerify && isMutation && token) {
+      if (!isPasskeyVerify && token) {
         handleUnauthorized(isMutation, token);
       }
     }

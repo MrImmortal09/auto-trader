@@ -1,9 +1,11 @@
 //! HTTP server — wires all crates together.
 //!
 //! # Modules
+//! - [`auth`]   — who is calling (passkey, phone admin, phone user, nobody) and what each may reach
 //! - [`db`]     — SQLite init, WAL, writer task, config loader
 //! - [`routes`] — Axum route handlers (portfolio, settings, auth)
 
+mod auth;
 mod balance;
 mod candles;
 mod db;
@@ -26,19 +28,7 @@ use sqlx::sqlite::SqlitePool;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing_subscriber::EnvFilter;
-use axum::{
-    extract::Request,
-    http::{StatusCode, header},
-    middleware::{self, Next},
-    response::IntoResponse,
-    Json,
-};
-
-
-pub struct RateLimitEntry {
-    pub attempts: u32,
-    pub window_start: std::time::Instant,
-}
+use axum::middleware;
 
 /// Returns the authentication secret if one is configured, or `None`.
 ///
@@ -51,63 +41,6 @@ pub(crate) fn resolve_auth_secret() -> Option<String> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| option_env!("AUTH_SECRET").map(String::from).filter(|s| !s.trim().is_empty()))
-}
-
-async fn auth_middleware(
-    req: Request,
-    next: Next,
-) -> Result<axum::response::Response, axum::response::Response> {
-    let path = req.uri().path();
-    let method = req.method();
-
-    // Allow public routes and safe read HTTP methods (read-only access):
-    // - Non-API routes (frontend static assets)
-    // - Explicit public endpoints
-    // - All safe read methods (GET, HEAD, OPTIONS)
-    if !path.starts_with("/api/")
-        || path == "/api/auth/verify-passkey"
-        || path == "/api/health"
-        || *method == axum::http::Method::GET
-        || *method == axum::http::Method::HEAD
-        || *method == axum::http::Method::OPTIONS
-    {
-        return Ok(next.run(req).await);
-    }
-
-    let auth_header = req.headers().get(header::AUTHORIZATION)
-        .and_then(|val| val.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
-
-    let token = match auth_header {
-        Some(t) => t,
-        None => {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Write access requires passkey authentication"})),
-            ).into_response());
-        }
-    };
-
-    let auth_secret = match resolve_auth_secret() {
-        Some(s) => s,
-        None => {
-            tracing::error!("AUTH_SECRET not configured");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "AUTH_SECRET not configured"})),
-            ).into_response());
-        }
-    };
-
-    match routes::verify_token(token, &auth_secret) {
-        Ok(_) => Ok(next.run(req).await),
-        Err(err_msg) => {
-            Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": err_msg})),
-            ).into_response())
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,8 +77,6 @@ pub(crate) struct AppState {
     pub ws_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Channel sender to forward dynamic messages to the Node bridge.
     pub ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
-    /// Rate limit map for passkey auth attempts
-    pub rate_limit_map: Arc<DashMap<String, RateLimitEntry>>,
     /// Serializes full Kotak login attempts — see `routes::KotakLoginDeps::login_lock`.
     pub kotak_login_lock: Arc<Mutex<()>>,
     /// `false` once the session watchdog finds the live Kotak session no longer
@@ -172,6 +103,13 @@ pub(crate) struct AppState {
     pub upstox: Option<upstox_client::UpstoxClient>,
     /// The v2 charts' bars — started by the first `/api/v2/candles` request.
     pub candles: Arc<candles::CandleService>,
+    /// Who may call what: the secret every token is signed with and the
+    /// phone sign-in's allow-list — see `auth`.
+    pub auth: auth::AuthState,
+    /// Sign-in attempt limits by phone and address — see `auth::otp`.
+    pub limits: Arc<auth::ratelimit::Limiter>,
+    /// How sign-in codes leave the server — see `auth::whatsapp`.
+    pub whatsapp: Arc<auth::whatsapp::Delivery>,
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +624,28 @@ async fn main() {
     let pool = db::init_db(&db_url).await;
     tracing::info!("SQLite ready at {db_url}");
 
+    // 2b. Who may sign in by phone: the allow-list, with the owner's own
+    // number (`ADMIN_PHONE`) always on it as the admin. See `auth`.
+    let admin_phone = auth::admin_phone();
+    match &admin_phone {
+        Some(phone) => db::seed_admin(&pool, phone).await,
+        None => tracing::warn!("ADMIN_PHONE is not set — no admin is seeded, so nobody can manage the allow-list by phone"),
+    }
+    let users = match db::load_users(&pool).await {
+        Ok(rows) => rows.into_iter().map(db::UserRow::into_record).collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::error!(error = %e, "could not load the users — nobody can sign in by phone until a restart");
+            Vec::new()
+        }
+    };
+    let auth_state = auth::AuthState {
+        secret: resolve_auth_secret().map(Arc::from),
+        users: Arc::new(auth::UserDirectory::from_records(users)),
+    };
+    tracing::info!(users = auth_state.users.len(), admin_seeded = admin_phone.is_some(), "Allow-list loaded");
+    let whatsapp = Arc::new(auth::whatsapp::Delivery::from_env());
+    tracing::info!(otp_delivery = whatsapp.describe(), "Phone sign-in");
+
     // 3. Load TradingConfig from DB
     let trading_cfg = Arc::new(RwLock::new(db::load_config_from_db(&pool).await));
     tracing::info!(mode = %trading_cfg.read().await.mode, "TradingConfig loaded");
@@ -980,7 +940,6 @@ async fn main() {
         scrip_loaded_at,
         ws_task,
         ws_tx,
-        rate_limit_map: Arc::new(DashMap::new()),
         kotak_login_lock,
         kotak_session_healthy,
         market,
@@ -990,6 +949,9 @@ async fn main() {
         execute: Arc::new(execute::ExecuteBoard::new()),
         upstox,
         candles: Arc::new(candles::CandleService::new()),
+        auth: auth_state,
+        limits: Arc::new(auth::ratelimit::Limiter::new()),
+        whatsapp,
     };
     pulse::spawn_sampler(state.clone());
     state.execute.spawn_error_watch(&state.log_tx);
@@ -997,6 +959,8 @@ async fn main() {
     // no login code. Nothing missed while down is replayed.
     tokio::spawn(routes::resume_saved_telegram(state.clone()));
 
+    // The middleware works from this alone; `state` itself goes to the handlers.
+    let auth_layer = state.auth.clone();
     let app = Router::new()
         .route("/api/webhook/telegram",            post(routes::webhook_handler))
         .route("/api/logs/stream",                  get(routes::sse_logs_handler))
@@ -1050,6 +1014,13 @@ async fn main() {
         .route("/api/auth/telegram/disconnect",     axum::routing::delete(routes::disconnect_telegram))
         .route("/api/auth/verify-passkey",          post(routes::verify_passkey_handler))
         .route("/api/auth/session",                 get(routes::session_status_handler))
+        .route("/api/auth/otp/request",             post(routes::otp_request_handler))
+        .route("/api/auth/otp/verify",              post(routes::otp_verify_handler))
+        .route("/api/auth/me",                      get(routes::me_handler))
+        .route("/api/admin/users",                  get(routes::list_users_handler)
+                                                   .post(routes::create_user_handler))
+        .route("/api/admin/users/:id",              axum::routing::patch(routes::patch_user_handler)
+                                                   .delete(routes::delete_user_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))
@@ -1065,7 +1036,9 @@ async fn main() {
         .route("/api/v2/candles",                   get(routes::v2::candles_handler))
         .route("/api/v2/candles/stream",            get(routes::v2::candles_stream_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
-        .layer(middleware::from_fn(auth_middleware))
+        // Every `/api/*` request learns who is calling and is refused when
+        // `auth::policy` asks for more — see `auth::middleware`.
+        .layer(middleware::from_fn_with_state(auth_layer, auth::middleware))
         // Outside auth, so rejected requests are counted too.
         .layer(middleware::from_fn(routes::telemetry::http_metrics))
         .with_state(state)

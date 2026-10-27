@@ -23,7 +23,8 @@ export function usePortfolioSnapshot(serverBase: string) {
           portfolioRes.json(),
           positionsRes.json(),
         ]);
-        setPortfolio(portfolioJson);
+        // A refusal (`{error}`) is not a portfolio: show nothing rather than crash.
+        setPortfolio(portfolioRes.ok && Array.isArray((portfolioJson as Portfolio | null)?.trades) ? (portfolioJson as Portfolio) : null);
         setPositions(Array.isArray(positionsJson) ? positionsJson : []);
       } catch (e) {
         console.error(e);

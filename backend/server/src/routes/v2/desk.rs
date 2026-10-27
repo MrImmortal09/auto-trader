@@ -7,13 +7,14 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use shared_domain::{MonitoredPosition, TradeState, TradeTag, TradingConfig};
 
+use crate::auth::Identity;
 use crate::desk::{self, Context, DeskPosition, FeedItem, FeedRow};
 use crate::history::{self, Call, GroupBy, Range};
 use crate::AppState;
@@ -289,22 +290,18 @@ struct StatusAnswer {
 
 /// `GET /api/v2/status?after=` — the status bar: mode, kill switch, market
 /// hours, the five health dots and the day's P&L, plus the fills after
-/// `after` for toasts (none without it).
-pub async fn status_handler(State(state): State<AppState>, Query(q): Query<StatusQuery>) -> Response {
-    let cfg = state.trading_cfg.read().await.clone();
-    let calls = match load_calls(&state, &cfg.mode).await {
-        Ok(calls) => calls,
-        Err(e) => return server_error("trades", e),
-    };
-    let positions = state.positions.read().await.clone();
+/// `after` for toasts (none without it). Public, but the owner's figures are
+/// the owner's and the admin's alone: everyone else gets the clock, the
+/// market phase and the health dots, with `PAPER`, no kill switch and no P&L.
+pub async fn status_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Query(q): Query<StatusQuery>,
+) -> Response {
     let now = shared_domain::now_ist();
     let today = now.date_naive();
     let day = today.format("%Y-%m-%d").to_string();
     let (market_open, market) = desk::market_phase(now, !telegram_ingester::parser::is_trading_holiday(today));
-
-    let (open, waiting) = desk_rows(&state, &positions, &cfg, &calls);
-    let day_pnl = desk::kpis(desk::booked_on(&calls, &day), &open, waiting.len(), 0).net;
-
     let latest = state.pulse.latest();
     let feed_age_secs = latest.as_ref().filter(|s| s.feed_connected).and_then(|s| s.feed_last_tick_age_secs);
     let health = latest.map(|s| {
@@ -324,6 +321,33 @@ pub async fn status_handler(State(state): State<AppState>, Query(q): Query<Statu
         )
     });
 
+    if !identity.can_read_owner_data() {
+        return Json(StatusAnswer {
+            now: now.format("%Y-%m-%d %H:%M:%S").to_string(),
+            mode: "PAPER".to_string(),
+            kill_switch: false,
+            stopped: None,
+            market_open,
+            market,
+            health,
+            feed_age_secs,
+            expiring: Vec::new(),
+            day_pnl: 0.0,
+            fills: Vec::new(),
+            last_fill_id: 0,
+        })
+        .into_response();
+    }
+
+    let cfg = state.trading_cfg.read().await.clone();
+    let calls = match load_calls(&state, &cfg.mode).await {
+        Ok(calls) => calls,
+        Err(e) => return server_error("trades", e),
+    };
+    let positions = state.positions.read().await.clone();
+
+    let (open, waiting) = desk_rows(&state, &positions, &cfg, &calls);
+    let day_pnl = desk::kpis(desk::booked_on(&calls, &day), &open, waiting.len(), 0).net;
     let stopped = if cfg.kill_switch_active {
         let engaged = sqlx::query_as::<_, (String, String)>(
             "SELECT message, timestamp FROM system_logs

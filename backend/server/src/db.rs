@@ -310,6 +310,36 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     ensure_column(&pool, "ALTER TABLE telegram_messages ADD COLUMN side TEXT").await;
     let _ = sqlx::query("DELETE FROM telegram_messages WHERE sent_at < ?").bind(&cutoff).execute(&pool).await;
 
+    // Who may sign in by phone (see `auth`): the allow-list the admin keeps,
+    // and the one-time codes sent to it, one row per send. New tables, so
+    // existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL UNIQUE,
+            name TEXT,
+            role TEXT NOT NULL DEFAULT 'user',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            last_login_at TEXT
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS otp_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            consumed INTEGER NOT NULL DEFAULT 0,
+            ip TEXT
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_otp_codes_phone_sent ON otp_codes (phone, sent_at)")
+        .execute(&pool).await.unwrap();
+    let _ = sqlx::query("DELETE FROM otp_codes WHERE expires_at < ?").bind(current_ist_timestamp_string()).execute(&pool).await;
+
     pool
 }
 
@@ -840,23 +870,75 @@ pub async fn prune_candles_owned(pool: SqlitePool, before: i64) {
     prune_candles(&pool, before).await;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use shared_domain::entry_gate::{Multipliers, TopupMode};
+// ---------------------------------------------------------------------------
+// Users (the phone sign-in's allow-list — see `auth`)
+// ---------------------------------------------------------------------------
 
+/// A row of `users`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UserRow {
+    pub id: i64,
+    pub phone: String,
+    pub name: Option<String>,
+    pub role: String,
+    pub enabled: i64,
+    pub created_at: String,
+    pub last_login_at: Option<String>,
+}
+
+impl UserRow {
+    pub fn into_record(self) -> crate::auth::UserRecord {
+        crate::auth::UserRecord {
+            id: self.id,
+            phone: self.phone,
+            name: self.name,
+            role: crate::auth::Role::parse(&self.role),
+            enabled: self.enabled != 0,
+        }
+    }
+}
+
+const USER_COLUMNS: &str = "id, phone, name, role, enabled, created_at, last_login_at";
+
+/// Make sure the owner's phone is on the allow-list as an enabled admin,
+/// whatever the row says now — run at every start.
+pub async fn seed_admin(pool: &SqlitePool, phone: &str) {
+    let done = sqlx::query(
+        "INSERT INTO users (phone, name, role, enabled, created_at) VALUES (?, 'Admin', 'admin', 1, ?)
+         ON CONFLICT(phone) DO UPDATE SET role = 'admin', enabled = 1",
+    )
+    .bind(phone)
+    .bind(current_ist_timestamp_string())
+    .execute(pool)
+    .await;
+    if let Err(e) = done {
+        tracing::error!(error = %e, "could not seed the admin user");
+    }
+}
+
+/// Every user, oldest first.
+pub async fn load_users(pool: &SqlitePool) -> sqlx::Result<Vec<UserRow>> {
+    sqlx::query_as::<_, UserRow>(&format!("SELECT {USER_COLUMNS} FROM users ORDER BY id ASC")).fetch_all(pool).await
+}
+
+pub async fn load_user(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<UserRow>> {
+    sqlx::query_as::<_, UserRow>(&format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?")).bind(id).fetch_optional(pool).await
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
     /// A throwaway SQLite file, removed (with its WAL files) when dropped.
-    struct TempDb(std::path::PathBuf);
+    pub(crate) struct TempDb(std::path::PathBuf);
 
     impl TempDb {
-        fn new(name: &str) -> Self {
+        pub(crate) fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!("auto-trader-{name}-{}.db", std::process::id()));
             let db = TempDb(path);
             db.remove();
             db
         }
 
-        fn url(&self) -> String {
+        pub(crate) fn url(&self) -> String {
             format!("sqlite://{}", self.0.display())
         }
 
@@ -872,6 +954,40 @@ mod tests {
             self.remove();
         }
     }
+}
+
+#[cfg(test)]
+mod user_tests {
+    use super::test_support::TempDb;
+    use super::*;
+
+    #[tokio::test]
+    async fn the_admin_is_seeded_once_and_always_put_back_as_an_enabled_admin() {
+        let db = TempDb::new("users");
+        let pool = init_db(&db.url()).await;
+        seed_admin(&pool, "7000000001").await;
+        seed_admin(&pool, "7000000001").await;
+        let users = load_users(&pool).await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!((users[0].phone.as_str(), users[0].role.as_str(), users[0].enabled), ("7000000001", "admin", 1));
+
+        // Demoted and disabled by hand, the next start repairs the row.
+        sqlx::query("UPDATE users SET role = 'user', enabled = 0, name = 'Om' WHERE phone = '7000000001'").execute(&pool).await.unwrap();
+        seed_admin(&pool, "7000000001").await;
+        let row = load_user(&pool, users[0].id).await.unwrap().unwrap();
+        assert_eq!((row.role.as_str(), row.enabled, row.name.as_deref()), ("admin", 1, Some("Om")));
+        let record = row.into_record();
+        assert_eq!(record.role, crate::auth::Role::Admin);
+        assert!(record.enabled);
+        assert!(load_user(&pool, 999).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::TempDb;
+    use super::*;
+    use shared_domain::entry_gate::{Multipliers, TopupMode};
 
     #[tokio::test]
     async fn a_fresh_database_starts_with_the_three_indicator_tiers() {

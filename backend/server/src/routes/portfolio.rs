@@ -107,14 +107,20 @@ pub async fn webhook_handler(
     }
 }
 
-/// `GET /api/logs/stream` — SSE stream of live engine events.
+/// `GET /api/logs/stream` — SSE stream of live engine events. The owner's
+/// and the admin's; an admin disabled meanwhile loses it at the next event.
 pub async fn sse_logs_handler(
     State(state): State<AppState>,
+    axum::Extension(identity): axum::Extension<crate::auth::Identity>,
 ) -> Sse<impl futures::stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.log_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| async move {
-        msg.ok().map(|data| Ok(Event::default().data(data)))
-    });
+    let auth = state.auth.clone();
+    let stream = BroadcastStream::new(rx)
+        .take_while(move |_| {
+            let still = crate::auth::still_signed_in(&auth, &identity);
+            async move { still }
+        })
+        .filter_map(|msg| async move { msg.ok().map(|data| Ok(Event::default().data(data))) });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 

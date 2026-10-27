@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { ExecuteFrame } from '../types';
 import { apiUrl } from '../lib/api';
-import { getToken } from '../lib/auth';
+import { getToken, onAuthChange } from '../lib/auth';
 
 /** No frame for this long (several missed 250 ms beats) and the stream is shown as stale. */
 export const STREAM_STALE_AFTER_MS = 2_000;
@@ -12,15 +12,23 @@ export const STREAM_STALE_AFTER_MS = 2_000;
  * null). Switching any of them reopens the stream; the last frame is kept
  * meanwhile so the page never blanks. `now` ticks so the caller can tell how
  * old the frame is.
+ *
+ * The server answers with the caller's own view (the engine's mode and
+ * positions for the owner, none for a visitor), so the stream is also
+ * reopened whenever the sign-in changes: the passkey unlocked, locked, or
+ * entered again after it expired. Until the new stream's first frame lands
+ * the old one counts as stale, so nothing is bought off a visitor's frame.
  */
 export function useExecuteStream(serverBase: string, index: string, expiry: string | null = null, centre: number | null = null) {
   const [frame, setFrame] = useState<ExecuteFrame | null>(null);
   const [connected, setConnected] = useState(false);
+  // Bumped on every sign-in change, so the effect below reopens the stream.
+  const [authEpoch, setAuthEpoch] = useState(0);
   // Local receipt time, so browser/VM clock skew can't make a live stream look
-  // stale — kept per index and expiry, so after a switch the stream counts as
-  // stale (and nothing is bought off the previous one's frame) until the new
-  // stream's first frame arrives.
-  const key = `${serverBase}|${index}|${expiry ?? ''}`;
+  // stale — kept per index, expiry and sign-in, so after a switch the stream
+  // counts as stale (and nothing is bought off the previous one's frame)
+  // until the new stream's first frame arrives.
+  const key = `${serverBase}|${index}|${expiry ?? ''}|${authEpoch}`;
   const [received, setReceived] = useState<{ key: string; at: number } | null>(null);
   const receivedAt = received?.key === key ? received.at : null;
   const [now, setNow] = useState(() => Date.now());
@@ -29,6 +37,8 @@ export function useExecuteStream(serverBase: string, index: string, expiry: stri
     const timer = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => onAuthChange(() => setAuthEpoch((n) => n + 1)), []);
 
   useEffect(() => {
     const token = getToken();
