@@ -11,10 +11,6 @@ export function formatPhone(phone: string): string {
   return phone.length === 10 ? `${phone.slice(0, 5)} ${phone.slice(5)}` : phone;
 }
 
-/** `••••• 43210`, for a line that names the number without showing it all. */
-export function maskedPhone(phone: string): string {
-  return phone.length === 10 ? `••••• ${phone.slice(5)}` : phone;
-}
 
 /** What to call a signed-in person: their name, else their number. */
 export function displayName(user: { name: string | null; phone: string } | null): string {

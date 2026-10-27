@@ -240,7 +240,10 @@ export const resumeTrading = (base: string) => send(base, '/api/kill-switch/rese
 
 export async function reconcilePreview(base: string): Promise<{ findings: ReconcileFinding[] } | { error: string }> {
   try {
-    const res = await apiFetch(base, '/api/positions/reconcile/preview');
+    // An owner read: the passkey when held, else the admin's phone token.
+    const { token, kind } = tokenFor('auto');
+    const path = '/api/positions/reconcile/preview';
+    const res = kind === 'owner' ? await apiFetch(base, path) : await apiFetchWith(token, base, path);
     const data = await res.json().catch(() => null);
     if (!res.ok) return { error: (data as { error?: string } | null)?.error ?? 'Failed to fetch live data from Kotak' };
     return { findings: Array.isArray(data) ? (data as ReconcileFinding[]) : [] };

@@ -141,7 +141,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [asked, setAsked] = useState<Record<string, true>>({});
   const guard = useGuard();
   const toast = useToast();
-  const { role, canReadOwner } = useIdentity();
+  const { canReadOwner } = useIdentity();
   // Whose desk a tap trades on: the owner's engine (the passkey) for the
   // owner and the admin; a user's own paper book otherwise, which a visitor
   // reaches by signing in first.
@@ -244,9 +244,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const spot: Record<string, number | null> = Object.fromEntries((frame?.indices ?? []).map((i) => [i.index, i.spot]));
   const change: Record<string, number | null> = Object.fromEntries((frame?.indices ?? []).map((i) => [i.index, i.change_pct]));
   const held = new Map(scalps.map((p) => [p.symbol, p]));
-  // A user's own paper book arrives with the next release: until then their
-  // taps stop here rather than at the owner's engine.
-  const blocked = (role === 'user' ? 'Paper trading for your account opens with the next update' : null) ?? buyBlockedReason(frame, stale);
+  // A user's own paper book arrives with the next release: until then a
+  // user's or a visitor's taps stop here, with no sign-in asked for that
+  // would lead nowhere yet, rather than at the owner's engine.
+  const blocked = (canReadOwner ? null : 'Paper trading for your account opens with the next update') ?? buyBlockedReason(frame, stale);
   const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[saved.index] ?? 1));
 
   // Escape drops a "+ Stop" that hasn't been placed yet.

@@ -9,8 +9,6 @@ export interface Identity {
   role: Role;
   /** The phone sign-in, when there is one. */
   user: SessionUser | null;
-  /** The passkey is held: owner-only actions go through without a prompt. */
-  hasPasskey: boolean;
   /** Owner data (the engine's positions, logs, settings) may be read. */
   canReadOwner: boolean;
   signInOpen: boolean;

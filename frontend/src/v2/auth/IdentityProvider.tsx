@@ -31,7 +31,13 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
   // The token, as stored: set by the sign-in sheet, cleared by sign-out, by
   // a refusal (`at_user_unauthorized`), or in another tab.
   useEffect(() => {
-    const read = () => setUserTokenState(validUserToken());
+    const read = () => {
+      const token = validUserToken();
+      setUserTokenState(token);
+      // A sign-in that completed elsewhere (another tab, say) closes the
+      // request here too, so a later sign-out doesn't bring the sheet back.
+      if (token) setSignIn({ open: false, reason: null });
+    };
     const off = onSessionChange(read);
     const onRefused = (e: Event) => {
       read();
@@ -82,7 +88,6 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
     return {
       role,
       user: known?.user ?? null,
-      hasPasskey: hasWriteAccess,
       canReadOwner: role === 'owner' || role === 'admin',
       // A sign-in that has happened closes the sheet, wherever it came from.
       signInOpen: signIn.open && !userToken,
