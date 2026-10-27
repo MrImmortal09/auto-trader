@@ -215,6 +215,35 @@ export interface StatusAnswer {
   last_fill_id: number;
 }
 
+/** Who a page's caller is, as the server sees it. */
+export type Role = 'anon' | 'user' | 'admin' | 'owner';
+
+/** A phone sign-in's user, as `/api/auth/otp/verify` and `/api/auth/me` return it. */
+export interface SessionUser {
+  id: number;
+  phone: string;
+  name: string | null;
+  role: 'admin' | 'user';
+}
+
+/** `GET /api/auth/me`. */
+export interface MeAnswer {
+  identity: 'owner' | 'admin' | 'user' | 'anonymous';
+  user: SessionUser | null;
+}
+
+/** `GET /api/admin/users`: one row of the allow-list. */
+export interface AdminUser {
+  id: number;
+  phone: string;
+  name: string | null;
+  role: 'admin' | 'user';
+  enabled: boolean;
+  /** IST `YYYY-MM-DD HH:MM:SS`. */
+  created_at: string;
+  last_login_at: string | null;
+}
+
 /** `GET /api/v2/flags`. */
 export interface Flags {
   index_options_only: boolean;

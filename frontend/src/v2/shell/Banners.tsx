@@ -28,9 +28,10 @@ function expiringLine(e: StatusAnswer['expiring']): string {
 /**
  * The banners under the status bar, besides Trading stopped: Kotak's session
  * gone in market hours, a stale price feed, and an expiry day with options
- * still held.
+ * still held. The Kotak one is the owner's and the admin's to act on; users
+ * and visitors get the stale-feed banner alone.
  */
-export function StatusBanners({ serverBase, status }: { serverBase: string; status: StatusAnswer | null }) {
+export function StatusBanners({ serverBase, status, canReadOwner }: { serverBase: string; status: StatusAnswer | null; canReadOwner: boolean }) {
   const guard = useGuard();
   const toast = useToast();
   const [connecting, setConnecting] = useState(false);
@@ -59,7 +60,7 @@ export function StatusBanners({ serverBase, status }: { serverBase: string; stat
   }
 
   const banners = [];
-  if (open && kotak?.level === 'down') {
+  if (canReadOwner && open && kotak?.level === 'down') {
     banners.push(
       <Banner
         key="kotak"

@@ -50,7 +50,12 @@ const BASES: { value: Basis; label: string }[] = [
  * with its VWAP and PCR, open interest by strike, and the day's checks. All
  * read-only, from Upstox through `/api/market/*`.
  */
-export function Market({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
+export function Market({ serverBase, desktop, canReadOwner }: {
+  serverBase: string;
+  desktop: boolean;
+  /** The engine's own thresholds are the owner's settings; everyone else scores on the defaults. */
+  canReadOwner: boolean;
+}) {
   const [saved, setSaved] = useState(loadSaved);
   // The strikes and basis looked at; until changed, the engine's own.
   const [view, setView] = useState<{ window: number; basis: Basis } | null>(null);
@@ -64,11 +69,11 @@ export function Market({ serverBase, desktop }: { serverBase: string; desktop: b
   }, [saved]);
 
   const index = saved.index;
-  const settings = usePoll(() => getSettings(serverBase), 60_000, serverBase);
+  const settings = usePoll(() => getSettings(serverBase), 60_000, serverBase, canReadOwner);
   const s = scoreSettings(settings.data);
   const window = view?.window ?? s.window;
   const basis = view?.basis ?? s.basis;
-  const ready = settings.data != null;
+  const ready = !canReadOwner || settings.data != null;
 
   const indicator = usePoll(() => getIndicator(serverBase), 15_000, serverBase);
   const live = usePoll(() => getMarketLive(serverBase), 30_000, serverBase);
