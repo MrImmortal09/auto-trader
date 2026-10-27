@@ -19,7 +19,11 @@ pub use auth_telegram::{
     resume_saved_telegram,
 };
 pub use health::{health_handler, version_handler};
-pub use auth_passkey::{verify_passkey_handler, session_status_handler, verify_token};
+pub use auth_passkey::{verify_passkey_handler, session_status_handler};
+pub mod auth_phone;
+pub use auth_phone::{otp_request_handler, otp_verify_handler, me_handler};
+pub mod admin;
+pub use admin::{list_users_handler, create_user_handler, patch_user_handler, delete_user_handler};
 pub mod market;
 pub use market::{market_indicator_handler, market_live_handler, market_option_chain_handler, market_trend_handler};
 pub mod kill_switch;

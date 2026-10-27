@@ -16,7 +16,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    Json,
+    Extension, Json,
 };
 use chrono::NaiveDate;
 use futures::stream::Stream;
@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::json;
 use shared_domain::{ManualAdd, MonitoredPosition, TradeSignal, TradeState, INDEX_NAMES};
 
+use crate::auth::Identity;
 use crate::execute::{self, STREAM_EVERY};
 use crate::routes::positions::persist_positions_snapshot;
 use crate::AppState;
@@ -45,9 +46,12 @@ pub struct StreamQuery {
 /// `GET /api/execute/stream?index=NIFTY&expiry=&centre=` — SSE, one frame
 /// every 250 ms: every index's spot, the chosen index's ladder for that
 /// expiry (nearest by default) around that strike (ATM by default), and the
-/// open positions.
+/// caller's open positions (the engine's for the owner and the admin, none
+/// for a visitor — see `execute::build_frame`). Public: a token, when there
+/// is one, arrives as `?token=` because an `EventSource` can't set headers.
 pub async fn execute_stream_handler(
     State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let wanted = q.index.unwrap_or_default().trim().to_uppercase();
@@ -57,11 +61,15 @@ pub async fn execute_stream_handler(
 
     let mut tick = tokio::time::interval(STREAM_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let stream = futures::stream::unfold((state, tick), move |(state, mut tick)| async move {
+    let stream = futures::stream::unfold((state, tick, identity), move |(state, mut tick, identity)| async move {
         tick.tick().await;
-        let frame = execute::build_frame(&state, index, expiry, centre).await;
+        // A user disabled by the admin loses the stream now, not on reconnect.
+        if !crate::auth::still_signed_in(&state.auth, &identity) {
+            return None;
+        }
+        let frame = execute::build_frame(&state, &identity, index, expiry, centre).await;
         let event = Event::default().data(serde_json::to_string(&frame).unwrap_or_default());
-        Some((Ok(event), (state, tick)))
+        Some((Ok(event), (state, tick, identity)))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
