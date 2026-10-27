@@ -41,7 +41,7 @@ const MAX_PUBLIC_LADDER_SCRIPS: usize = 30;
 /// Whose daily subscription budget a stream draws on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubPool {
-    /// The owner's passkey or the admin's phone.
+    /// The admin: the owner's desk.
     Owner,
     /// A signed-in user.
     Public,
@@ -54,7 +54,7 @@ pub enum SubPool {
 impl SubPool {
     pub fn of(identity: &Identity) -> Self {
         match identity {
-            Identity::Owner | Identity::Admin { .. } => SubPool::Owner,
+            Identity::Admin { .. } => SubPool::Owner,
             Identity::User { .. } => SubPool::Public,
             Identity::Anonymous => SubPool::None,
         }
@@ -732,8 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_and_the_admin_draw_on_one_budget_users_on_a_share_and_visitors_on_none() {
-        assert_eq!(SubPool::of(&Identity::Owner), SubPool::Owner);
+    fn the_admin_draws_on_the_owners_budget_users_on_a_share_and_visitors_on_none() {
         assert_eq!(SubPool::of(&Identity::Admin { user_id: 1 }), SubPool::Owner);
         assert_eq!(SubPool::of(&Identity::User { user_id: 2 }), SubPool::Public);
         assert_eq!(SubPool::of(&Identity::Anonymous), SubPool::None);

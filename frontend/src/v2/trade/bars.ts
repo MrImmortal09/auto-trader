@@ -2,7 +2,7 @@
 // history, then the stream's updates merged in.
 
 import type { KLineData } from 'klinecharts';
-import { apiFetch } from '../../lib/api';
+import { getCandles } from '../lib/api';
 import { TF_DAYS, type Bar, type Tf } from './model';
 
 export const toK = (b: Bar): KLineData => ({ timestamp: b.t, open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v ?? undefined });
@@ -15,13 +15,8 @@ function isoDay(t: number): string {
 export async function fetchDays(base: string, symbol: string, tf: Tf, days: number): Promise<Bar[]> {
   const to = Date.now();
   const from = to - (days - 1) * 86_400_000;
-  const res = await apiFetch(base, `/api/v2/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&from=${isoDay(from)}&to=${isoDay(to)}`);
-  if (!res.ok) {
-    const body = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(body?.error ?? `Bars unavailable (${res.status})`);
-  }
-  const body = (await res.json()) as { bars: Bar[] };
-  return body.bars;
+  // As whoever is signed in.
+  return (await getCandles(base, symbol, tf, isoDay(from), isoDay(to))).bars;
 }
 
 /** The days of bars a chart opens with at `tf`. */

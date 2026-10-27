@@ -1,6 +1,9 @@
 //! Phone sign-in: `POST /api/auth/otp/request`, `POST /api/auth/otp/verify`
 //! and `GET /api/auth/me`. Only an allow-listed, enabled phone gets a code —
 //! nothing is sent otherwise — and a right code is the whole "registration".
+//!
+//! The admin's code is also written to [`ADMIN_OTP_FILE`] on the server, so
+//! the owner can still get in when WhatsApp doesn't deliver.
 
 use std::net::SocketAddr;
 
@@ -14,10 +17,28 @@ use chrono::{DateTime, Duration, FixedOffset};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::{ip::client_ip, otp, token, Identity, UserRecord};
+use crate::auth::{ip::client_ip, otp, token, Identity, Role, UserRecord};
 use crate::AppState;
 
 const NOT_ENABLED: &str = "This number isn't enabled. Ask the admin to add it.";
+
+/// Where the admin's latest sign-in code is written, in the server's working
+/// directory (beside `trades.db`). Only the admin's code, never a user's;
+/// readable by the server's own user alone; removed once the admin signs in.
+pub const ADMIN_OTP_FILE: &str = "admin-otp.log";
+
+/// Write the admin's `code` to [`ADMIN_OTP_FILE`], replacing the last one.
+fn write_admin_code(phone: &str, code: &str, now: DateTime<FixedOffset>, expires_at: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(ADMIN_OTP_FILE)?;
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    writeln!(file, "{} IST  admin sign-in code {code} for {}  valid once, until {expires_at} IST", ist(now), masked(phone))
+}
 
 #[derive(Deserialize)]
 pub struct OtpRequest {
@@ -88,7 +109,9 @@ pub async fn otp_request_handler(
     let Some(secret) = state.auth.secret.as_deref() else {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "AUTH_SECRET not configured");
     };
-    if !state.whatsapp.configured() {
+    let admin = user.role == Role::Admin;
+    // The admin can still get a code without WhatsApp: it's also on the server.
+    if !state.whatsapp.configured() && !admin {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "Sign-in isn't configured on this server");
     }
 
@@ -103,13 +126,35 @@ pub async fn otp_request_handler(
         Ok(None) => return too_many(otp::SEND_WINDOW_SECS as u64),
         Err(e) => return server_error("store the code", e),
     };
-    if let Err(e) = state.whatsapp.send_otp(&phone, &code).await {
-        tracing::warn!(phone = %masked(&phone), error = %e, "OTP not delivered");
+    let on_server = admin
+        && match write_admin_code(&phone, &code, now, &expires_at) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, "could not write {ADMIN_OTP_FILE}");
+                false
+            }
+        };
+    let delivered = state.whatsapp.configured()
+        && match state.whatsapp.send_otp(&phone, &code).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(phone = %masked(&phone), error = %e, "OTP not delivered");
+                false
+            }
+        };
+    if !delivered && !on_server {
         let _ = otp::delete(&state.db_pool, row).await;
         return refuse(StatusCode::BAD_GATEWAY, "Could not send the OTP — try again in a minute");
     }
-    tracing::info!(phone = %masked(&phone), user_id = user.id, "OTP sent");
-    Json(json!({ "sent": true, "expires_in": otp::TTL_SECS, "retry_after": otp::RESEND_AFTER_SECS })).into_response()
+    if on_server {
+        tracing::info!(file = ADMIN_OTP_FILE, "Admin sign-in code also written on the server");
+    }
+    tracing::info!(phone = %masked(&phone), user_id = user.id, delivered, "OTP sent");
+    let mut answer = json!({ "sent": true, "delivered": delivered, "expires_in": otp::TTL_SECS, "retry_after": otp::RESEND_AFTER_SECS });
+    if !delivered {
+        answer["note"] = json!(format!("WhatsApp didn't deliver it. The code is in {ADMIN_OTP_FILE} on the server."));
+    }
+    Json(answer).into_response()
 }
 
 /// `POST /api/auth/otp/verify {phone, code}` — the token, or why not.
@@ -157,6 +202,10 @@ pub async fn otp_verify_handler(
             {
                 tracing::warn!(user_id = user.id, error = %e, "could not record the login time");
             }
+            if user.role == Role::Admin {
+                // Used: it opens nothing now, so it needn't sit on the disk.
+                let _ = std::fs::remove_file(ADMIN_OTP_FILE);
+            }
             let payload = token::TokenPayload::phone(user.id, user.role.as_str(), now.timestamp() as u64, user.role.token_ttl_secs());
             let signed = token::sign(&payload, secret);
             tracing::info!(phone = %masked(&phone), user_id = user.id, role = user.role.as_str(), "Phone sign-in");
@@ -165,8 +214,8 @@ pub async fn otp_verify_handler(
     }
 }
 
-/// `GET /api/auth/me` — who the caller is: `owner`, `admin`, `user` or
-/// `anonymous`, with the user record for a phone sign-in.
+/// `GET /api/auth/me` — who the caller is: `admin`, `user` or `anonymous`,
+/// with the user record for a phone sign-in.
 pub async fn me_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
     let user = identity.user_id().and_then(|id| state.auth.users.get(id)).map(|u| user_json(&u));
     Json(json!({ "identity": identity.kind(), "user": user })).into_response()

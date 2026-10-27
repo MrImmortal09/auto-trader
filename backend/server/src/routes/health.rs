@@ -47,10 +47,9 @@ struct HealthDto {
     current_process: Option<ProcessDto>,
     /// Whether `AUTH_SECRET` is set on the backend. Not a secret itself — just
     /// a diagnostic flag — so it's safe on this public, unauthenticated route.
-    /// When `false`, every `/api/*` route except this one and
-    /// `/api/auth/verify-passkey` returns 500 (see `auth_middleware`), so the
-    /// frontend can surface a clear "backend misconfigured" message instead
-    /// of a confusing wall of failed requests.
+    /// When `false`, every signed-in `/api/*` route returns 500 (see
+    /// `auth::middleware`), so the frontend can surface a clear "backend
+    /// misconfigured" message instead of a confusing wall of failed requests.
     auth_secret_configured: bool,
 }
 

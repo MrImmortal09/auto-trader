@@ -8,6 +8,9 @@ trades.db
 trades.db-*
 **/trades.db
 **/trades.db-*
+# The admin's latest sign-in code (routes::auth_phone::ADMIN_OTP_FILE).
+admin-otp.log
+**/admin-otp.log
 
 # Downloaded / installed server release binaries on the deploy host
 backend/server-v*

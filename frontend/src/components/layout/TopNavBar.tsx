@@ -82,8 +82,8 @@ export function TopNavBar({
         ) : (
           <button
             type="button"
-            onClick={() => openUnlockModal('Enter passkey to enable write operations and order execution')}
-            title="Click to unlock write access with passkey"
+            onClick={() => openUnlockModal('Sign in as the admin to place orders')}
+            title="Sign in as the admin to place orders"
             className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-400 hover:bg-amber-500/20 px-2.5 py-1 rounded-full text-xs font-semibold transition-colors"
           >
             <Eye size={13} className="text-amber-400 shrink-0" />

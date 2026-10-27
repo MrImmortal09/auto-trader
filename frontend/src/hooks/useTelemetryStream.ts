@@ -41,8 +41,7 @@ function mergePoints(prev: TelemetryPoint[], incoming: TelemetryPoint[]): Teleme
  * caller can show how old the latest sample is.
  */
 export function useTelemetryStream(serverBase: string, token?: string | null) {
-  // The stored passkey token unless `token` says otherwise (v2 passes the
-  // admin's phone token, which the System screen's data also needs).
+  // The stored sign-in's token unless `token` says otherwise.
   const sendToken = token === undefined ? getToken() : token;
   const [history, setHistory] = useState<TelemetryPoint[]>([]);
   const [latest, setLatest] = useState<TelemetrySample | null>(null);

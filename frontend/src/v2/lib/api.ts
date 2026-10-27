@@ -2,11 +2,11 @@
 // action goes to the same endpoint v1 uses, unchanged.
 
 import { apiFetch, apiFetchWith } from '../../lib/api';
-import { isTokenValid, getToken } from '../../lib/auth';
-import { clearUserToken, getUserToken, validUserToken } from '../../lib/session';
+import { validUserToken } from '../../lib/session';
 import type { ReconcileApplyItem, ReconcileFinding } from '../../types';
 import type { ChartLevel } from '../../types';
 import type { TradingConfig } from '../../types';
+import type { Bar, Tf } from '../trade/model';
 import type {
   AdminUser,
   ChainAnswer,
@@ -45,56 +45,17 @@ async function errorOf(res: Response): Promise<string> {
   return typeof body?.error === 'string' ? body.error : `Request failed (${res.status})`;
 }
 
-/**
- * Which sign-in a call speaks for: `owner` is the passkey token (v1's, with
- * its 401 handling) and the default for every write, `user` the phone
- * sign-in's token, and `auto` the passkey when it's held, else the phone
- * token — the right one for every read and for the allow-list's writes,
- * since the passkey may do everything a phone token may.
- */
-export type Auth = 'auto' | 'owner' | 'user';
+/** The token the live streams put in their URL: the sign-in's, while it hasn't expired. */
+export const streamToken = () => validUserToken();
 
-/** The token a call of `auth` sends: `null` means none is held. */
-export function tokenFor(auth: Auth): { token: string | null; kind: 'owner' | 'user' | 'none' } {
-  if (auth !== 'user' && isTokenValid()) return { token: getToken(), kind: 'owner' };
-  if (auth !== 'owner') {
-    const user = validUserToken();
-    if (user) return { token: user, kind: 'user' };
-  }
-  return { token: null, kind: 'none' };
-}
-
-/** The token the live streams put in their URL — the same choice as `auto`. */
-export const streamToken = () => tokenFor('auto').token;
-
-/**
- * A phone token goes out on its own. Anything else goes through v1's
- * `apiFetch`: it sends the stored passkey even once it has expired, so the
- * server's 401 on a write clears it and reopens the unlock dialog instead of
- * the write going out with no token and failing silently. With nothing
- * stored it sends no token at all.
- */
-function fetchAs(kind: 'owner' | 'user' | 'none', token: string | null, base: string, path: string, init?: RequestInit) {
-  return kind === 'user' ? apiFetchWith(token, base, path, init) : apiFetch(base, path, init);
-}
-
-/** A phone token the server has refused: it's no longer good, so drop it
- * (unless a newer one was stored meanwhile) and tell the identity provider. */
-function userTokenRefused(token: string | null, isMutation: boolean) {
-  if (!token || getUserToken() !== token) return;
-  clearUserToken();
-  window.dispatchEvent(new CustomEvent('at_user_unauthorized', { detail: { isMutation } }));
-}
-
-async function getJson<T>(serverBase: string, path: string, auth: Auth = 'auto'): Promise<T> {
-  const { token, kind } = tokenFor(auth);
+/** A read as whoever is signed in. A 401 drops the sign-in (v1's `apiFetch`). */
+async function getJson<T>(serverBase: string, path: string): Promise<T> {
   let res: Response;
   try {
-    res = await fetchAs(kind, token, serverBase, path);
+    res = await apiFetch(serverBase, path);
   } catch {
     throw new ApiError('Could not reach the server', 0);
   }
-  if (res.status === 401 && kind === 'user') userTokenRefused(token, false);
   if (!res.ok) throw new ApiError(await errorOf(res), res.status);
   return (await res.json()) as T;
 }
@@ -114,6 +75,9 @@ export const getMarks = (base: string) => getJson<MarksAnswer>(base, '/api/v2/ma
 export const getSystem = (base: string) => getJson<SystemAnswer>(base, '/api/v2/system');
 export const getModeCheck = (base: string) => getJson<ModeCheck>(base, '/api/v2/mode-check');
 export const getVersion = (base: string) => getJson<{ version: string }>(base, '/api/version');
+/** `symbol`'s bars at `tf` from one IST day to another (`YYYY-MM-DD`), both included. */
+export const getCandles = (base: string, symbol: string, tf: Tf, from: string, to: string) =>
+  getJson<{ bars: Bar[] }>(base, `/api/v2/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&from=${from}&to=${to}`);
 
 export const getIndicator = (base: string) => getJson<IndicatorAnswer>(base, '/api/market/indicator');
 export const getMarketLive = (base: string) => getJson<MarketLive>(base, '/api/market/live');
@@ -138,16 +102,14 @@ export interface Sent {
   body?: unknown;
 }
 
-async function send(base: string, path: string, method: string, body?: unknown, auth: Auth = 'owner'): Promise<Sent> {
-  const { token, kind } = tokenFor(auth);
+async function send(base: string, path: string, method: string, body?: unknown): Promise<Sent> {
   const init: RequestInit = {
     method,
     headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   };
   try {
-    const res = await fetchAs(kind, token, base, path, init);
-    if (res.status === 401 && kind === 'user') userTokenRefused(token, true);
+    const res = await apiFetch(base, path, init);
     if (!res.ok) return { ok: false, status: res.status, error: await errorOf(res) };
     return { ok: true, status: res.status, body: await res.json().catch(() => null) };
   } catch {
@@ -157,9 +119,8 @@ async function send(base: string, path: string, method: string, body?: unknown, 
 
 // ── Phone sign-in and the allow-list ─────────────────────────────────── //
 
-/** Who the phone token is, as the server sees it — asked of that token even
- * while the passkey is held. */
-export const getMe = (base: string) => getJson<MeAnswer>(base, '/api/auth/me', 'user');
+/** Who the sign-in is, as the server sees it. */
+export const getMe = (base: string) => getJson<MeAnswer>(base, '/api/auth/me');
 
 /** How a code request went: `retryAfter` is when "Send again" may be offered;
  * `lockedForSecs` comes with a 429. */
@@ -169,6 +130,8 @@ export interface OtpRequested {
   error?: string;
   retryAfter?: number;
   lockedForSecs?: number;
+  /** Why the code didn't come on WhatsApp, and where it is instead: the admin's only. */
+  note?: string;
 }
 
 export async function requestOtp(base: string, phone: string): Promise<OtpRequested> {
@@ -179,8 +142,8 @@ export async function requestOtp(base: string, phone: string): Promise<OtpReques
       body: JSON.stringify({ phone }),
     });
     if (res.ok) {
-      const data = (await res.json().catch(() => ({}))) as { retry_after?: number };
-      return { ok: true, status: res.status, retryAfter: typeof data.retry_after === 'number' ? data.retry_after : 30 };
+      const data = (await res.json().catch(() => ({}))) as { retry_after?: number; note?: string };
+      return { ok: true, status: res.status, retryAfter: typeof data.retry_after === 'number' ? data.retry_after : 30, note: data.note };
     }
     if (res.status === 429) {
       const secs = parseInt(res.headers.get('Retry-After') || '600', 10);
@@ -212,10 +175,10 @@ export async function verifyOtp(base: string, phone: string, code: string): Prom
 
 export const listUsers = (base: string) => getJson<AdminUser[]>(base, '/api/admin/users');
 // The only writes the admin's phone token may make, so the only ones sent `auto`.
-export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name }, 'auto');
+export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name });
 export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) =>
-  send(base, `/api/admin/users/${id}`, 'PATCH', patch, 'auto');
-export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE', undefined, 'auto');
+  send(base, `/api/admin/users/${id}`, 'PATCH', patch);
+export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE');
 
 const position = (id: string) => `/api/positions/${encodeURIComponent(id)}`;
 
@@ -255,10 +218,7 @@ export const resumeTrading = (base: string) => send(base, '/api/kill-switch/rese
 
 export async function reconcilePreview(base: string): Promise<{ findings: ReconcileFinding[] } | { error: string }> {
   try {
-    // An owner read: the passkey when held, else the admin's phone token.
-    const { token, kind } = tokenFor('auto');
-    const path = '/api/positions/reconcile/preview';
-    const res = await fetchAs(kind, token, base, path);
+    const res = await apiFetch(base, '/api/positions/reconcile/preview');
     const data = await res.json().catch(() => null);
     if (!res.ok) return { error: (data as { error?: string } | null)?.error ?? 'Failed to fetch live data from Kotak' };
     return { findings: Array.isArray(data) ? (data as ReconcileFinding[]) : [] };
@@ -269,29 +229,3 @@ export async function reconcilePreview(base: string): Promise<{ findings: Reconc
 
 export const reconcileApply = (base: string, items: ReconcileApplyItem[]) =>
   send(base, '/api/positions/reconcile/apply', 'POST', items);
-
-/** `POST /api/auth/verify-passkey`: the token, or why not. */
-export async function verifyPasskey(
-  base: string,
-  passkey: string,
-): Promise<{ token: string } | { error: string; lockedForSecs?: number }> {
-  try {
-    const res = await apiFetch(base, '/api/auth/verify-passkey', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ passkey }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { token: string };
-      return { token: data.token };
-    }
-    if (res.status === 429) {
-      const secs = parseInt(res.headers.get('Retry-After') || '900', 10);
-      return { error: 'Too many attempts.', lockedForSecs: secs };
-    }
-    if (res.status === 500) return { error: 'Server error — is AUTH_SECRET set on the backend?' };
-    return { error: 'That passkey is not right.' };
-  } catch {
-    return { error: 'Could not reach the server.' };
-  }
-}

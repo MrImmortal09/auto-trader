@@ -1,7 +1,7 @@
 //! HTTP server — wires all crates together.
 //!
 //! # Modules
-//! - [`auth`]   — who is calling (passkey, phone admin, phone user, nobody) and what each may reach
+//! - [`auth`]   — who is calling (the admin's phone, a user's phone, nobody) and what each may reach
 //! - [`db`]     — SQLite init, WAL, writer task, config loader
 //! - [`routes`] — Axum route handlers (portfolio, settings, auth)
 
@@ -604,13 +604,6 @@ async fn main() {
     // Register every metric up front — see `shared_domain::telemetry::init`.
     shared_domain::telemetry::init();
 
-    // Check PASSKEY status
-    if let Some(val) = std::env::var("PASSKEY").ok().or_else(|| option_env!("PASSKEY").map(String::from)) {
-        tracing::info!("PASSKEY is set (length: {})", val.len());
-    } else {
-        tracing::warn!("PASSKEY is NOT set (neither in runtime env nor compiled in)!");
-    }
-
     // Check AUTH_SECRET status — without it, auth_middleware 500s every
     // authenticated route (see main.rs auth_middleware), so a missing secret
     // needs to be loud here, not discovered later as a wall of failed requests.
@@ -625,12 +618,12 @@ async fn main() {
     tracing::info!("SQLite ready at {db_url}");
 
     // 2b. Who may sign in by phone: the allow-list, with the owner's own
-    // number (`ADMIN_PHONE`) always on it as the admin. See `auth`.
+    // number (`ADMIN_PHONE`) always on it as the one admin. See `auth`.
     let admin_phone = auth::admin_phone();
-    match &admin_phone {
-        Some(phone) => db::seed_admin(&pool, phone).await,
-        None => tracing::warn!("ADMIN_PHONE is not set — no admin is seeded, so nobody can manage the allow-list by phone"),
+    if admin_phone.is_none() {
+        tracing::warn!("ADMIN_PHONE is not set — nobody is admin, so nobody can trade, change settings or manage the allow-list");
     }
+    db::seed_admin(&pool, admin_phone.as_deref()).await;
     let users = match db::load_users(&pool).await {
         Ok(rows) => rows.into_iter().map(db::UserRow::into_record).collect::<Vec<_>>(),
         Err(e) => {
@@ -1012,7 +1005,6 @@ async fn main() {
         .route("/api/auth/telegram/chats",          get(routes::telegram_chats_handler))
         .route("/api/auth/telegram/start",          post(routes::telegram_start_handler))
         .route("/api/auth/telegram/disconnect",     axum::routing::delete(routes::disconnect_telegram))
-        .route("/api/auth/verify-passkey",          post(routes::verify_passkey_handler))
         .route("/api/auth/session",                 get(routes::session_status_handler))
         .route("/api/auth/otp/request",             post(routes::otp_request_handler))
         .route("/api/auth/otp/verify",              post(routes::otp_verify_handler))

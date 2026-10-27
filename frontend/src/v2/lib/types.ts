@@ -216,7 +216,7 @@ export interface StatusAnswer {
 }
 
 /** Who a page's caller is, as the server sees it. */
-export type Role = 'anon' | 'user' | 'admin' | 'owner';
+export type Role = 'anon' | 'user' | 'admin';
 
 /** A phone sign-in's user, as `/api/auth/otp/verify` and `/api/auth/me` return it. */
 export interface SessionUser {
@@ -228,7 +228,7 @@ export interface SessionUser {
 
 /** `GET /api/auth/me`. */
 export interface MeAnswer {
-  identity: 'owner' | 'admin' | 'user' | 'anonymous';
+  identity: 'admin' | 'user' | 'anonymous';
   user: SessionUser | null;
 }
 

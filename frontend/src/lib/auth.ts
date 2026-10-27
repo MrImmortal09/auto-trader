@@ -1,86 +1,33 @@
 // ---------------------------------------------------------------------------
-// JWT-like Token Management & Reactive Auth State
+// The sign-in, as v1 sees it: the phone sign-in's token (`session.ts`), the
+// one the main page (v2) keeps. There is no passkey any more: write access is
+// the admin's sign-in — `ADMIN_PHONE` on the server, and nobody else.
 // ---------------------------------------------------------------------------
+import { clearUserToken, decodeClaims, getUserToken, onSessionChange, setUserToken, validUserToken } from './session';
 
-const TOKEN_KEY = 'at_session_token';
-
-type AuthChangeListener = (hasWrite: boolean) => void;
-const listeners = new Set<AuthChangeListener>();
-
-export function getToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  return localStorage.getItem(TOKEN_KEY);
+// The retired passkey's token, wherever a browser still keeps it: it opens nothing now.
+try {
+  if (typeof window !== 'undefined') localStorage.removeItem('at_session_token');
+} catch {
+  // Blocked storage: nothing kept either.
 }
 
-export function setToken(token: string): void {
-  if (typeof window === 'undefined') return;
-  localStorage.setItem(TOKEN_KEY, token);
-  notifyAuthChange();
-}
+/** The stored token, even once expired: a request with it gets the 401 that clears it. */
+export const getToken = getUserToken;
+export const setToken = setUserToken;
+export const clearToken = clearUserToken;
 
-export function clearToken(): void {
-  if (typeof window === 'undefined') return;
-  localStorage.removeItem(TOKEN_KEY);
-  notifyAuthChange();
-}
-
-// Quick client-side check if the token exists and hasn't expired.
-// (The server still validates this cryptographically on every mutation request)
+/** A stored token that hasn't expired. The server still checks it on every request. */
 export function isTokenValid(): boolean {
-  const token = getToken();
-  if (!token) return false;
-
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return false;
-
-    // Decode the base64url payload with proper '=' padding
-    let payloadBase64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const pad = payloadBase64.length % 4;
-    if (pad) {
-      payloadBase64 += '='.repeat(4 - pad);
-    }
-    const payloadJson = atob(payloadBase64);
-    const payload = JSON.parse(payloadJson);
-
-    // exp is in seconds
-    const now = Math.floor(Date.now() / 1000);
-    return typeof payload.exp === 'number' && now < payload.exp;
-  } catch {
-    return false;
-  }
+  return validUserToken() != null;
 }
 
+/** Signed in as the admin, by the token's claim; the server has the last word. */
 export function hasWriteAccess(): boolean {
-  return isTokenValid();
+  return decodeClaims(validUserToken())?.role === 'admin';
 }
 
-export function onAuthChange(listener: AuthChangeListener): () => void {
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-  };
-}
-
-export function notifyAuthChange(): void {
-  const valid = hasWriteAccess();
-  for (const listener of listeners) {
-    try {
-      listener(valid);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('at_auth_change', { detail: { hasWrite: valid } }));
-  }
-}
-
-// Listen for cross-tab token changes
-if (typeof window !== 'undefined') {
-  window.addEventListener('storage', (e) => {
-    if (e.key === TOKEN_KEY) {
-      notifyAuthChange();
-    }
-  });
+/** Called with `hasWriteAccess()` whenever the sign-in changes, here or in another tab. */
+export function onAuthChange(listener: (hasWrite: boolean) => void): () => void {
+  return onSessionChange(() => listener(hasWriteAccess()));
 }

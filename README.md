@@ -164,11 +164,14 @@ See [`.env.example`](.env.example) for a ready-to-copy template (and
 one). These are the supported variables:
 
 ```dotenv
-# ── Auth (required) ───────────────────────────────────────
-# Gates the whole app — every /api/* route needs a bearer token obtained by
-# exchanging PASSKEY at POST /api/auth/verify-passkey, signed with AUTH_SECRET.
-PASSKEY=change-me
+# ── Sign-in (required) ────────────────────────────────────
+# Gates the whole app — every /api/* route but /api/health, /api/version and
+# the sign-in itself needs the bearer token a phone sign-in returns, signed
+# with AUTH_SECRET. See "Signing In".
 AUTH_SECRET=change-me-too
+ADMIN_PHONE=75xxxxxxxx                    # the owner's 10-digit number: the one admin
+WA_SERVER_URL=https://wa.example.com     # self-hosted WhatsApp server that sends the codes
+WA_API_KEY=change-me
 
 # ── SQLite ───────────────────────────────────────────────
 DATABASE_URL=sqlite://trades.db          # default
@@ -212,8 +215,10 @@ Kotak login form still works with only some fields filled in. A dedicated
 Example shell startup:
 
 ```bash
-export PASSKEY=change-me
 export AUTH_SECRET=change-me-too
+export ADMIN_PHONE=75xxxxxxxx
+export WA_SERVER_URL=https://wa.example.com
+export WA_API_KEY=change-me
 export DATABASE_URL=sqlite:///home/ubuntu/auto-trader/trades.db
 export TELEGRAM_API_ID=12345678
 export TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
@@ -304,8 +309,10 @@ Put your env vars in `~/auto-trader/backend/.env` (auto-loaded from the working 
 
 ```bash
 cat > ~/auto-trader/backend/.env <<'EOF'
-PASSKEY=change-me
 AUTH_SECRET=change-me-too
+ADMIN_PHONE=75xxxxxxxx
+WA_SERVER_URL=https://wa.example.com
+WA_API_KEY=change-me
 TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 TELEGRAM_CHAT_IDS=-1001234567890,-1009876543210
@@ -392,7 +399,7 @@ sudo systemctl reload nginx
 
 If you have a domain, add HTTPS with Certbot afterward.
 
-**Client addresses behind the proxy.** The backend keys its sign-in rate limits (the passkey, and the phone OTP's send and verify limits) on the *last* `X-Forwarded-For` hop, which `$proxy_add_x_forwarded_for` appends from nginx's own view of the client; earlier hops and any `X-Real-IP` are whatever the client sent and are ignored. Keep that `proxy_set_header` line. If the site sits behind Cloudflare, `$remote_addr` is a Cloudflare edge address unless nginx restores the visitor's, so add the `real_ip` directives to the `http` block (Cloudflare publishes its ranges at https://www.cloudflare.com/ips/):
+**Client addresses behind the proxy.** The backend keys its sign-in rate limits (the phone OTP's send and verify limits) on the *last* `X-Forwarded-For` hop, which `$proxy_add_x_forwarded_for` appends from nginx's own view of the client; earlier hops and any `X-Real-IP` are whatever the client sent and are ignored. Keep that `proxy_set_header` line. If the site sits behind Cloudflare, `$remote_addr` is a Cloudflare edge address unless nginx restores the visitor's, so add the `real_ip` directives to the `http` block (Cloudflare publishes its ranges at https://www.cloudflare.com/ips/):
 
 ```nginx
 set_real_ip_from 173.245.48.0/20;   # one line per Cloudflare range, v4 and v6
@@ -404,7 +411,7 @@ real_ip_header CF-Connecting-IP;
 After the Vercel site is live:
 
 1. Open the frontend in the browser.
-2. In the Kotak login panel, enter your backend address in `Server URL or IP:PORT`.
+2. On the sign-in page, click `Change` under the form and enter your backend address.
 3. Use either `http://PUBLIC_IP:8080` or your reverse-proxied domain such as `https://api.example.com`.
 4. Continue using the UI normally; all API calls, SSE logs, and downloads will use that stored backend URL.
 
@@ -434,7 +441,7 @@ For Kotak:
 
 Before considering the deployment ready, verify:
 
-- `curl http://127.0.0.1:8080/api/settings` returns JSON **from inside the VM** (over SSH)
+- `curl http://127.0.0.1:8080/api/health` returns JSON **from inside the VM** (over SSH)
 - `curl http://<public-ip>:8080/api/health` returns JSON **from your own machine, outside the VM** — this is the check that would have caught the iptables-ordering gotcha from step 1; a pass over SSH alone does not prove the outside world can reach it
 - `tmux attach -t trader` (or your session name) shows the server running and logging normally
 - the Vercel frontend can load settings and portfolio data
@@ -453,6 +460,42 @@ These files should remain on persistent disk on the VM, inside `backend/`:
 - `kotak-bridge/node_modules/`
 
 `update.sh` already keeps one previous binary as `backend/.server_prev` for rollback and prunes older ones — you don't need to manage binary versions by hand. If you ever move to a fresh VM, copy over `trades.db*`, `session.json`, and `.env` from `backend/` before starting the server there.
+
+---
+
+## Signing In
+
+The site (for example `https://at.axiosiiitl.dev`) opens on a sign-in page; nothing else loads, and the server answers nothing but `/api/health`, `/api/version` and the sign-in itself, until someone signs in. The redesign is at `/`; the old dashboard (v1) is at `/v1/`.
+
+- **One way in: a phone number and a WhatsApp code.** The server sends a 6-digit code through your WhatsApp server (`WA_SERVER_URL` / `WA_API_KEY`), valid for 10 minutes and for one sign-in. Only numbers on the allow-list (the Admin page) get a code. There is no passkey.
+- **The admin is `ADMIN_PHONE`, and nobody else.** That number is put on the allow-list as the admin at every start, and any other admin row is made a paper user. The admin's sign-in does everything: LIVE orders, Paper↔LIVE, the kill switch, Kotak and Telegram, settings, the allow-list, clearing the database and updating the server. It lasts 7 days.
+- **Everyone else is a paper trader**: charts, the Market page and (once it ships) their own paper portfolio — never the owner's positions, trades, logs or settings, and never a real order.
+- **v1 at `/v1/` opens with the admin's sign-in**, made on the main page in the same browser. Without it, v1 shows a link there.
+
+### When WhatsApp doesn't deliver the admin's code
+
+The server also **stores the admin's code** in a file, so you can still get in when WhatsApp is down:
+
+- **Where:** `admin-otp.log` in the server's working directory. On the VM that is **`~/auto-trader/backend/admin-otp.log`**, beside `trades.db`. Read it over SSH:
+
+  ```bash
+  cat ~/auto-trader/backend/admin-otp.log
+  # 2026-10-27 18:02:11 IST  admin sign-in code 123456 for 75••••xxxx  valid once, until 2026-10-27 18:12:11 IST
+  ```
+
+- **What:** only the admin's latest code, in plain text. Users' codes are never written there. Every code, the admin's included, is also kept in `trades.db` (table `otp_codes`), but only as a keyed hash, so it can't be read back from the database.
+- **Who can read it:** the file is created with mode `600`, so only the VM user that runs the server can read it. It is replaced by each new admin code and deleted when the admin signs in.
+- **When WhatsApp fails or isn't set up**, the admin's code still counts: the sign-in page says the code is on the server instead of refusing. A user's code is refused as before.
+
+### Where the server's log is
+
+The server writes its log to its terminal: on the VM, the `tmux` pane `0:0` it runs in (see [Deployment Guide § 5](#5-run-it-under-tmux-and-keep-it-updated-with-updatesh)).
+
+```bash
+tmux attach -t 0      # watch the live log; detach with Ctrl-b then d
+```
+
+`update.sh` keeps its own log at `/tmp/update.log`. The engine's events also reach the dashboard's log terminal and the `system_logs` table in `trades.db`. **The admin's code is not in any of these logs**: they only say `Admin sign-in code also written on the server`, so the code doesn't travel wherever the log is shipped (Grafana Alloy, for example). Only `admin-otp.log` holds it.
 
 ---
 

@@ -60,8 +60,8 @@ export function ServerData({ serverBase, settings, system, id, title, large = fa
       <Row title="Brokerage per order" caption="A flat charge per order in the P&L figures. What Kotak charges doesn't change.">
         <NumberInput label="Brokerage per order" value={cfg.brokerage_per_order} min={0} max={1000} grouped unit="₹" size={size} onCommit={(n) => void save(() => ({ brokerage_per_order: n }), `Brokerage ₹${n} an order`)} />
       </Row>
-      <Row title="Clear the database, or update the server" caption="In the current app, which asks before either.">
-        <a href="/settings" className="inline-flex h-7 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">
+      <Row title="Clear the database, or update the server" caption="In the old design, which asks before either.">
+        <a href="/v1/settings" className="inline-flex h-7 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">
           Open
         </a>
       </Row>

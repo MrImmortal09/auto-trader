@@ -15,15 +15,12 @@ function phoneName(user: SessionUser | null, phoneRole: 'admin' | 'user'): strin
 }
 
 /**
- * Desktop status bar: who is signed in by phone, with Sign out behind it —
- * or Sign in. The owner's passkey has its own lock button beside this; a
- * phone sign-in kept beside it still shows, so the owner can see and end it.
+ * Desktop status bar: who is signed in, with Sign out behind it — or Sign in.
  */
 export function AccountChip() {
-  const { role, user, phoneRole, openSignIn, signOut } = useIdentity();
+  const { user, phoneRole, openSignIn, signOut } = useIdentity();
   const [open, setOpen] = useState(false);
   if (!phoneRole) {
-    if (role === 'owner') return null;
     return (
       <Button size="sm" kind="profit" icon={<LogIn size={14} />} onClick={() => openSignIn()}>
         Sign in
@@ -44,7 +41,6 @@ export function AccountChip() {
             <Chip kind={phoneRole === 'admin' ? 'live' : 'neutral'} className="self-start">
               {roleLabel(phoneRole)}
             </Chip>
-            {role === 'owner' && <span className="type-caption text-fg-muted">Signing out keeps the passkey unlocked.</span>}
           </div>
           <Button
             size="md"
@@ -64,8 +60,7 @@ export function AccountChip() {
 
 /** Phone status bar's dropdown row: the same, as a row with one button. */
 export function AccountRow() {
-  const { role, user, phoneRole, openSignIn, signOut } = useIdentity();
-  if (!phoneRole && role === 'owner') return null;
+  const { user, phoneRole, openSignIn, signOut } = useIdentity();
   return (
     <div className="flex h-12 items-center gap-2.5 border-t border-line">
       <UserRound size={16} className="text-fg-muted" />

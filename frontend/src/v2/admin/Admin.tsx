@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import { Trash2, UserPlus } from 'lucide-react';
-import { useIdentity } from '../auth/identity';
 import { formatPhone, normalizePhone } from '../auth/phone';
 import { createUser, deleteUser, listUsers, patchUser } from '../lib/api';
 import { hhmm, shortDate } from '../lib/format';
@@ -23,12 +22,11 @@ function lastLogin(u: AdminUser): string {
 }
 
 /**
- * Admin: who may sign in by phone. The admin and the owner add numbers,
- * switch them off and remove them; only the owner's passkey can add another
- * admin, and the admin's own row stays. Mode and the credentials follow.
+ * Admin: who may sign in by phone. The admin adds numbers, switches them off
+ * and removes them, as paper traders; the admin's own row stays. Mode and the
+ * credentials follow.
  */
 export function Admin({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
-  const { role } = useIdentity();
   const users = usePoll(() => listUsers(serverBase), 15_000, serverBase);
   const guard = useGuard();
   const toast = useToast();
@@ -144,7 +142,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
       <div className={`flex flex-col gap-8 ${desktop ? 'max-w-[760px]' : ''}`}>
         <Section
           title="Users"
-          lead={`Who may sign in with a phone number. ${role === 'owner' ? 'Adding another admin is done with the passkey, through the API.' : 'Real-money actions still ask for the passkey.'} A disabled number is signed out at once.`}
+          lead="Who may sign in with a phone number, as a paper trader. The admin is the server's own number (ADMIN_PHONE) and nobody else. A disabled number is signed out at once."
         >
           {rows}
           {addForm}

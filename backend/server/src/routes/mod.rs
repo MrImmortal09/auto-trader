@@ -3,7 +3,7 @@ pub mod settings;
 pub mod auth_kotak;
 pub use auth_kotak::{KotakLoginDeps, try_env_auto_login, auto_login_enabled_by_env};
 pub mod auth_telegram;
-pub mod auth_passkey;
+pub mod auth_session;
 pub mod health;
 
 pub mod positions;
@@ -19,7 +19,7 @@ pub use auth_telegram::{
     resume_saved_telegram,
 };
 pub use health::{health_handler, version_handler};
-pub use auth_passkey::{verify_passkey_handler, session_status_handler};
+pub use auth_session::session_status_handler;
 pub mod auth_phone;
 pub use auth_phone::{otp_request_handler, otp_verify_handler, me_handler};
 pub mod admin;

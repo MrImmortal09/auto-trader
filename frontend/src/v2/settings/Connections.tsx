@@ -16,8 +16,8 @@ function longDate(day: string): string {
   return `${Number(day.slice(8, 10))} ${MONTHS[Number(day.slice(5, 7)) - 1]} ${day.slice(0, 4)}`;
 }
 
-/** The Kotak login form isn't in v2 yet: it stays in the current app. */
-const V1_SETTINGS = '/settings';
+/** The Kotak login form isn't in v2 yet: it stays in the old design, at /v1/. */
+const V1_SETTINGS = '/v1/settings';
 
 /**
  * Connections: the server, Kotak, Telegram and Upstox — each with its

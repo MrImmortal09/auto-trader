@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { dispose, init, type AxisCreateRangeCallback, type Chart, type KLineData, type OverlayEvent } from 'klinecharts';
 import { apiUrl } from '../../lib/api';
-import { getToken } from '../../lib/auth';
+import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
 import { CHART_STYLES, PIVOT_SERIES, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
@@ -205,7 +205,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
         .then((fut) => live && setFutureBars(fut))
         .catch(() => live && setFutureBars([]));
     }
-    const token = getToken();
+    const token = streamToken();
     const params = new URLSearchParams({ symbols: [symbol, future].filter(Boolean).join(','), tf });
     if (token) params.set('token', token);
     const es = new EventSource(`${apiUrl(serverBase, '/api/v2/candles/stream')}?${params}`);

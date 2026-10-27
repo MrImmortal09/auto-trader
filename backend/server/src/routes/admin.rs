@@ -1,7 +1,7 @@
-//! `/api/admin/users` — the allow-list. The admin (phone) and the owner
-//! (passkey) add, rename, disable and remove paper users. Admin rows are the
-//! owner's business alone: only the passkey may add, disable or remove one,
-//! and the owner's own row (`ADMIN_PHONE`) can't be disabled or removed at all.
+//! `/api/admin/users` — the allow-list. The admin adds, renames, disables
+//! and removes paper users. There is one admin, the owner's own number
+//! (`ADMIN_PHONE`, seeded at every start): nobody can be made an admin here,
+//! and the admin's row can't be disabled or removed.
 
 use axum::{
     extract::{Path, State},
@@ -63,7 +63,7 @@ pub struct NewUser {
     pub phone: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// `user` (the default) or `admin` (the owner's passkey only).
+    /// `user`, the default and the only role that may be added.
     #[serde(default)]
     pub role: Option<String>,
 }
@@ -83,12 +83,7 @@ pub async fn create_user_handler(
     };
     let role = match req.role.as_deref().map(str::trim) {
         None | Some("") | Some("user") => Role::User,
-        Some("admin") => {
-            if !identity.is_owner() {
-                return refuse(StatusCode::FORBIDDEN, "Only the owner's passkey can add an admin");
-            }
-            Role::Admin
-        }
+        Some("admin") => return refuse(StatusCode::FORBIDDEN, "There is one admin: the server's ADMIN_PHONE"),
         Some(other) => return refuse(StatusCode::BAD_REQUEST, format!("Unknown role {other:?}")),
     };
     if state.auth.users.by_phone(&phone).is_some() {
@@ -134,7 +129,6 @@ fn is_seeded_admin(record: &UserRecord) -> bool {
 /// `PATCH /api/admin/users/:id {name?, enabled?}`.
 pub async fn patch_user_handler(
     State(state): State<AppState>,
-    Extension(identity): Extension<Identity>,
     Path(id): Path<i64>,
     Json(patch): Json<UserPatch>,
 ) -> Response {
@@ -143,10 +137,6 @@ pub async fn patch_user_handler(
     };
     if patch.enabled == Some(false) && is_seeded_admin(&current) {
         return refuse(StatusCode::CONFLICT, "The admin account can't be disabled");
-    }
-    // Switching an admin off or back on is as good as removing or adding one.
-    if patch.enabled.is_some() && current.role == Role::Admin && !identity.is_owner() {
-        return refuse(StatusCode::FORBIDDEN, "Only the owner's passkey can enable or disable an admin");
     }
     let name = match patch.name {
         Some(n) => clean_name(Some(n)),
@@ -174,15 +164,12 @@ pub async fn patch_user_handler(
 }
 
 /// `DELETE /api/admin/users/:id` — remove a phone from the allow-list.
-pub async fn delete_user_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(id): Path<i64>) -> Response {
+pub async fn delete_user_handler(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let Some(current) = state.auth.users.get(id) else {
         return refuse(StatusCode::NOT_FOUND, "not found");
     };
     if is_seeded_admin(&current) {
         return refuse(StatusCode::CONFLICT, "The admin account can't be removed");
-    }
-    if current.role == Role::Admin && !identity.is_owner() {
-        return refuse(StatusCode::FORBIDDEN, "Only the owner's passkey can remove an admin");
     }
     let mut tx = match state.db_pool.begin().await {
         Ok(tx) => tx,

@@ -900,19 +900,30 @@ impl UserRow {
 
 const USER_COLUMNS: &str = "id, phone, name, role, enabled, created_at, last_login_at";
 
-/// Make sure the owner's phone is on the allow-list as an enabled admin,
-/// whatever the row says now — run at every start.
-pub async fn seed_admin(pool: &SqlitePool, phone: &str) {
-    let done = sqlx::query(
-        "INSERT INTO users (phone, name, role, enabled, created_at) VALUES (?, 'Admin', 'admin', 1, ?)
-         ON CONFLICT(phone) DO UPDATE SET role = 'admin', enabled = 1",
-    )
-    .bind(phone)
-    .bind(current_ist_timestamp_string())
-    .execute(pool)
-    .await;
-    if let Err(e) = done {
-        tracing::error!(error = %e, "could not seed the admin user");
+/// Make the owner's phone (`ADMIN_PHONE`) the one admin — run at every
+/// start. Its row is put back as an enabled admin whatever it says now, and
+/// any other admin row becomes a user: the admin has full power, live orders
+/// included, so nobody else may hold it. With no `ADMIN_PHONE`, nobody is admin.
+pub async fn seed_admin(pool: &SqlitePool, phone: Option<&str>) {
+    if let Some(phone) = phone {
+        let done = sqlx::query(
+            "INSERT INTO users (phone, name, role, enabled, created_at) VALUES (?, 'Admin', 'admin', 1, ?)
+             ON CONFLICT(phone) DO UPDATE SET role = 'admin', enabled = 1",
+        )
+        .bind(phone)
+        .bind(current_ist_timestamp_string())
+        .execute(pool)
+        .await;
+        if let Err(e) = done {
+            tracing::error!(error = %e, "could not seed the admin user");
+        }
+    }
+    match sqlx::query("UPDATE users SET role = 'user' WHERE role = 'admin' AND phone IS NOT ?").bind(phone).execute(pool).await {
+        Ok(done) if done.rows_affected() > 0 => {
+            tracing::warn!(demoted = done.rows_affected(), "Other admin rows made users: only ADMIN_PHONE is admin")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "could not demote the other admin rows"),
     }
 }
 
@@ -965,21 +976,40 @@ mod user_tests {
     async fn the_admin_is_seeded_once_and_always_put_back_as_an_enabled_admin() {
         let db = TempDb::new("users");
         let pool = init_db(&db.url()).await;
-        seed_admin(&pool, "7000000001").await;
-        seed_admin(&pool, "7000000001").await;
+        seed_admin(&pool, Some("7000000001")).await;
+        seed_admin(&pool, Some("7000000001")).await;
         let users = load_users(&pool).await.unwrap();
         assert_eq!(users.len(), 1);
         assert_eq!((users[0].phone.as_str(), users[0].role.as_str(), users[0].enabled), ("7000000001", "admin", 1));
 
         // Demoted and disabled by hand, the next start repairs the row.
         sqlx::query("UPDATE users SET role = 'user', enabled = 0, name = 'Om' WHERE phone = '7000000001'").execute(&pool).await.unwrap();
-        seed_admin(&pool, "7000000001").await;
+        seed_admin(&pool, Some("7000000001")).await;
         let row = load_user(&pool, users[0].id).await.unwrap().unwrap();
         assert_eq!((row.role.as_str(), row.enabled, row.name.as_deref()), ("admin", 1, Some("Om")));
         let record = row.into_record();
         assert_eq!(record.role, crate::auth::Role::Admin);
         assert!(record.enabled);
         assert!(load_user(&pool, 999).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn only_the_admin_phone_stays_an_admin() {
+        let db = TempDb::new("one-admin");
+        let pool = init_db(&db.url()).await;
+        sqlx::query("INSERT INTO users (phone, role, enabled, created_at) VALUES ('9876543210', 'admin', 1, 'x'), ('9876543211', 'user', 1, 'x')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_admin(&pool, Some("7000000001")).await;
+        let roles = |users: Vec<UserRow>| users.into_iter().map(|u| (u.phone, u.role)).collect::<Vec<_>>();
+        assert_eq!(
+            roles(load_users(&pool).await.unwrap()),
+            [("9876543210".into(), "user".into()), ("9876543211".into(), "user".into()), ("7000000001".into(), "admin".into())],
+        );
+        // Without ADMIN_PHONE nobody is admin.
+        seed_admin(&pool, None).await;
+        assert!(load_users(&pool).await.unwrap().iter().all(|u| u.role == "user"));
     }
 }
 

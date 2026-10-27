@@ -64,7 +64,7 @@ export function HostFacts({ serverBase }: { serverBase: string }) {
         }
       >
         {h && !h.auth_secret_configured && (
-          <p className="mb-2 rounded-8 bg-loss-subtle px-3 py-2 type-caption text-loss">AUTH_SECRET isn't set on the server: every action that needs the passkey fails until it is.</p>
+          <p className="mb-2 rounded-8 bg-loss-subtle px-3 py-2 type-caption text-loss">AUTH_SECRET isn't set on the server: nobody can sign in until it is.</p>
         )}
         {h ? (
           <>
