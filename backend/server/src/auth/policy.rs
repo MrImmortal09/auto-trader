@@ -202,8 +202,16 @@ mod tests {
         (GET, "/api/v2/candles", Access::SignedIn),
         (GET, "/api/v2/candles/stream", Access::SignedIn),
         (GET, "/api/v2/me/desk", Access::PhoneUser),
+        (GET, "/api/v2/me/history", Access::PhoneUser),
+        (GET, "/api/v2/me/marks", Access::PhoneUser),
+        (GET, "/api/v2/me/positions", Access::PhoneUser),
+        (GET, "/api/v2/me/activity", Access::PhoneUser),
         (POST, "/api/v2/me/buy", Access::PhoneUser),
         (PATCH, "/api/v2/me/positions/abc", Access::PhoneUser),
+        (POST, "/api/v2/me/positions/abc/sell", Access::PhoneUser),
+        (POST, "/api/v2/me/positions/abc/close", Access::PhoneUser),
+        (POST, "/api/v2/me/exit-all", Access::PhoneUser),
+        (POST, "/api/v2/me/reset", Access::PhoneUser),
     ];
 
     #[test]

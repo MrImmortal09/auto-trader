@@ -36,7 +36,7 @@ fn ltp_of(state: &AppState, p: &MonitoredPosition) -> Option<f64> {
     p.ws_scrip_key.as_ref().and_then(|k| state.prices.get(k).map(|v| *v)).filter(|v| *v > 0.0)
 }
 
-fn index_ltp(state: &AppState, index: &str) -> Option<f64> {
+pub(crate) fn index_ltp(state: &AppState, index: &str) -> Option<f64> {
     let (_, feed_name) = shared_domain::kotak_index_feed(index)?;
     state.prices.get(&shared_domain::index_price_key(feed_name)).map(|v| *v).filter(|v| *v > 0.0)
 }
@@ -79,13 +79,13 @@ fn desk_rows(
 }
 
 #[derive(Serialize)]
-struct Wallet {
+pub(crate) struct Wallet {
     /// `None` while the LIVE balance hasn't been read from Kotak yet.
-    balance: Option<f64>,
+    pub(crate) balance: Option<f64>,
     /// `PAPER`, `LIVE` or `LIVE_UNAVAILABLE`, as `/api/portfolio` says.
-    source: &'static str,
+    pub(crate) source: &'static str,
     /// IST time of the Kotak read behind a LIVE balance.
-    updated_at: Option<String>,
+    pub(crate) updated_at: Option<String>,
 }
 
 /// The wallet `/api/portfolio` shows: the paper wallet, or Kotak's cached
@@ -106,11 +106,11 @@ async fn wallet(state: &AppState, mode: &str) -> Wallet {
 }
 
 #[derive(Serialize)]
-struct ClosedCall {
+pub(crate) struct ClosedCall {
     #[serde(flatten)]
-    call: Call,
+    pub(crate) call: Call,
     /// When its Telegram message was sent, if the feed has it.
-    message_at: Option<String>,
+    pub(crate) message_at: Option<String>,
 }
 
 /// When each `(chat, message)` was sent, from the stored feed.
@@ -133,15 +133,15 @@ async fn message_times(state: &AppState, calls: &[Call]) -> HashMap<(i64, i64), 
 }
 
 #[derive(Serialize)]
-struct DeskAnswer {
-    mode: String,
-    kill_switch: bool,
-    wallet: Wallet,
-    kpis: desk::DeskKpis,
-    open: Vec<DeskPosition>,
-    waiting: Vec<DeskPosition>,
+pub(crate) struct DeskAnswer {
+    pub(crate) mode: String,
+    pub(crate) kill_switch: bool,
+    pub(crate) wallet: Wallet,
+    pub(crate) kpis: desk::DeskKpis,
+    pub(crate) open: Vec<DeskPosition>,
+    pub(crate) waiting: Vec<DeskPosition>,
     /// Calls closed today, newest first.
-    closed: Vec<ClosedCall>,
+    pub(crate) closed: Vec<ClosedCall>,
 }
 
 /// `GET /api/v2/desk` — Desk's Today: the figures (net, booked, open, calls
@@ -290,9 +290,10 @@ struct StatusAnswer {
 
 /// `GET /api/v2/status?after=` — the status bar: mode, kill switch, market
 /// hours, the five health dots and the day's P&L, plus the fills after
-/// `after` for toasts (none without it). Public, but the owner's figures are
-/// the owner's and the admin's alone: everyone else gets the clock, the
-/// market phase and the health dots, with `PAPER`, no kill switch and no P&L.
+/// `after` for toasts (none without it). The owner's figures are the
+/// admin's alone: a user gets the clock, the market phase and the health
+/// dots with `PAPER`, no kill switch, and their own paper P&L, fills and
+/// expiring positions.
 pub async fn status_handler(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
@@ -322,6 +323,14 @@ pub async fn status_handler(
     });
 
     if !identity.can_read_owner_data() {
+        // A user's own paper figures; nobody else's.
+        let (day_pnl, fills, last_fill_id, expiring) = match identity {
+            Identity::User { user_id } => match crate::routes::v2::me::status_figures(&state, user_id, q.after, MAX_FILLS).await {
+                Ok(figures) => figures,
+                Err(e) => return e,
+            },
+            _ => (0.0, Vec::new(), 0, Vec::new()),
+        };
         return Json(StatusAnswer {
             now: now.format("%Y-%m-%d %H:%M:%S").to_string(),
             mode: "PAPER".to_string(),
@@ -331,10 +340,10 @@ pub async fn status_handler(
             market,
             health,
             feed_age_secs,
-            expiring: Vec::new(),
-            day_pnl: 0.0,
-            fills: Vec::new(),
-            last_fill_id: 0,
+            expiring,
+            day_pnl,
+            fills,
+            last_fill_id,
         })
         .into_response();
     }

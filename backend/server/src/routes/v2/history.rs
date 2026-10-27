@@ -24,11 +24,24 @@ pub struct HistoryQuery {
 }
 
 #[derive(Serialize)]
-struct Answer {
-    mode: String,
-    range: String,
+pub(crate) struct Answer {
+    pub(crate) mode: String,
+    pub(crate) range: String,
     #[serde(flatten)]
-    report: Report,
+    pub(crate) report: Report,
+}
+
+/// `range` (default `7d`, lower-cased as answered) and `group` (default
+/// `channel`) from a query, or the 400 to answer.
+pub(crate) fn range_and_group(range: Option<&str>, group: Option<&str>) -> Result<(String, Range, GroupBy), Response> {
+    let name = range.unwrap_or("7d").trim().to_ascii_lowercase();
+    let Some(range) = Range::parse(&name) else {
+        return Err(bad_request("range must be today, 7d, 30d or all"));
+    };
+    let Some(group) = group.map_or(Some(GroupBy::Channel), GroupBy::parse) else {
+        return Err(bad_request("group must be channel, index or cepe"));
+    };
+    Ok((name, range, group))
 }
 
 /// `GET /api/v2/history?range=today|7d|30d|all&group=channel|index|cepe&mode=PAPER|LIVE`
@@ -37,12 +50,9 @@ struct Answer {
 /// default), index or CE/PE, and trading days. `mode` defaults to the current
 /// trading mode, as `/api/portfolio` does.
 pub async fn history_handler(State(state): State<AppState>, Query(q): Query<HistoryQuery>) -> Response {
-    let range_name = q.range.as_deref().unwrap_or("7d").trim().to_ascii_lowercase();
-    let Some(range) = Range::parse(&range_name) else {
-        return bad_request("range must be today, 7d, 30d or all");
-    };
-    let Some(group) = q.group.as_deref().map_or(Some(GroupBy::Channel), GroupBy::parse) else {
-        return bad_request("group must be channel, index or cepe");
+    let (range_name, range, group) = match range_and_group(q.range.as_deref(), q.group.as_deref()) {
+        Ok(parsed) => parsed,
+        Err(e) => return e,
     };
     let mode = match q.mode.as_deref().map(|m| m.trim().to_ascii_uppercase()) {
         Some(m) if m == "PAPER" || m == "LIVE" => m,

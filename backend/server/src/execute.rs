@@ -19,6 +19,7 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use trading_engine::{index_fo_segment, ChainStrike, OptionChain, ScripRecord};
 
 use crate::auth::Identity;
+use crate::paper::PaperPosition;
 use crate::AppState;
 
 /// Strikes subscribed and streamed each side of ATM. The screen shows ±5 of
@@ -613,12 +614,37 @@ fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
     }
 }
 
+/// A user's paper position, as the stream's row: always a manual scalp,
+/// filled at once, never busy.
+fn paper_row(state: &AppState, p: &PaperPosition) -> PositionRow {
+    let ltp = price(state, &p.ws_key);
+    PositionRow {
+        id: p.id.clone(),
+        manual: true,
+        index: p.index.clone(),
+        strike: Some(p.strike),
+        option_type: Some(p.option_type.clone()),
+        expiry: Some(p.expiry.format("%Y-%m-%d").to_string()),
+        symbol: p.trading_symbol.clone(),
+        lot_size: p.lot_size.max(1),
+        qty: p.qty,
+        avg: p.avg_price,
+        ltp,
+        pnl: ltp.map(|l| (l - p.avg_price) * f64::from(p.qty)),
+        placing: false,
+        adding: false,
+        exiting: false,
+        halted: false,
+        chart: p.chart,
+    }
+}
+
 /// One frame of the Execute screen for `index`: its `expiry`'s ladder (the
 /// nearest when `None`), the subscribed window around `centre` (ATM when
 /// `None`). The market data is the same for everyone; whose positions ride
 /// along, and whether the owner's mode, kill switch and Kotak state show,
-/// depends on `identity`: the owner and the admin see the engine's, a user
-/// their own paper trades, a visitor none.
+/// depends on `identity`: the admin sees the engine's, a user their own
+/// paper positions, a visitor none.
 pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>) -> ExecuteFrame {
     let owner_view = identity.can_read_owner_data();
     let (mode, kill_switch) = if owner_view {
@@ -646,9 +672,10 @@ pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, exp
 
     // What is actually held (or being bought by hand) — a signal still
     // waiting for its trigger is not a position yet. The engine's positions
-    // are the owner's: nobody else sees them.
-    let positions = if owner_view {
-        state
+    // are the owner's: nobody else sees them. A user sees their own paper
+    // positions instead.
+    let positions = match identity {
+        Identity::Admin { .. } => state
             .positions
             .read()
             .await
@@ -659,9 +686,9 @@ pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, exp
                 _ => true,
             })
             .map(|p| position_row(state, p))
-            .collect()
-    } else {
-        Vec::new()
+            .collect(),
+        Identity::User { user_id } => state.paper.open(*user_id).await.iter().map(|p| paper_row(state, p)).collect(),
+        Identity::Anonymous => Vec::new(),
     };
 
     let ts = shared_domain::now_ist().timestamp_millis();

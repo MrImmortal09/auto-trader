@@ -23,9 +23,9 @@ use crate::AppState;
 #[serde(deny_unknown_fields)]
 pub struct LevelsUpdate {
     #[serde(default, deserialize_with = "present")]
-    stop: Option<Option<ChartLevel>>,
+    pub(crate) stop: Option<Option<ChartLevel>>,
     #[serde(default, deserialize_with = "present")]
-    target: Option<Option<ChartLevel>>,
+    pub(crate) target: Option<Option<ChartLevel>>,
 }
 
 /// Tells a field that is there, even as `null`, from one left out.

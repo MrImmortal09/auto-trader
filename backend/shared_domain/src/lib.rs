@@ -860,33 +860,41 @@ impl ChartLevels {
     }
 }
 
+/// The exit reason once an option's `premium`, or its index's `index` value,
+/// has reached `chart`'s stop (checked first) or target. `option_type` is
+/// `CE` or `PE`; anything else never reaches a level. Shared by the engine's
+/// scalps and the users' paper positions.
+pub fn chart_level_reached(option_type: Option<&str>, chart: &ChartLevels, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
+    let call = match option_type {
+        Some(t) if t.eq_ignore_ascii_case("CE") => true,
+        Some(t) if t.eq_ignore_ascii_case("PE") => false,
+        _ => return None,
+    };
+    let reached = |level: &ChartLevel, is_stop: bool| {
+        let (value, falling) = match level.trigger {
+            // On its own premium a stop is reached falling and a target
+            // rising, for a call and a put alike.
+            LevelTrigger::Premium => (premium, is_stop),
+            // On the index a call loses as it falls, a put as it rises.
+            LevelTrigger::Index => (index, is_stop == call),
+        };
+        value.is_some_and(|v| v > 0.0 && if falling { v <= level.price } else { v >= level.price })
+    };
+    if chart.stop.as_ref().is_some_and(|l| reached(l, true)) {
+        return Some("CHART_STOP");
+    }
+    if chart.target.as_ref().is_some_and(|l| reached(l, false)) {
+        return Some("CHART_TARGET");
+    }
+    None
+}
+
 impl MonitoredPosition {
     /// The exit reason once the option's `premium`, or its index's `index`
     /// value, has reached this position's chart stop (checked first) or
-    /// target. Never for a position that isn't a CE or a PE.
+    /// target — see [`chart_level_reached`].
     pub fn chart_level_hit(&self, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
-        let call = match self.signal.option_type.as_deref() {
-            Some(t) if t.eq_ignore_ascii_case("CE") => true,
-            Some(t) if t.eq_ignore_ascii_case("PE") => false,
-            _ => return None,
-        };
-        let reached = |level: &ChartLevel, is_stop: bool| {
-            let (value, falling) = match level.trigger {
-                // On its own premium a stop is reached falling and a target
-                // rising, for a call and a put alike.
-                LevelTrigger::Premium => (premium, is_stop),
-                // On the index a call loses as it falls, a put as it rises.
-                LevelTrigger::Index => (index, is_stop == call),
-            };
-            value.is_some_and(|v| v > 0.0 && if falling { v <= level.price } else { v >= level.price })
-        };
-        if self.chart.stop.as_ref().is_some_and(|l| reached(l, true)) {
-            return Some("CHART_STOP");
-        }
-        if self.chart.target.as_ref().is_some_and(|l| reached(l, false)) {
-            return Some("CHART_TARGET");
-        }
-        None
+        chart_level_reached(self.signal.option_type.as_deref(), &self.chart, premium, index)
     }
     /// A buy on top of the holding is pending: a manual add not sent yet, a
     /// top-up order at the broker, or one whose send outcome is unknown.

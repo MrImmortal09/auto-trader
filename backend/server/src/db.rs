@@ -340,6 +340,52 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         .execute(&pool).await.unwrap();
     let _ = sqlx::query("DELETE FROM otp_codes WHERE expires_at < ?").bind(current_ist_timestamp_string()).execute(&pool).await;
 
+    // Each user's own paper portfolio (`paper`): a wallet, a ledger of fills
+    // like `paper_trades`, and the open positions as one JSON snapshot per
+    // user like `open_positions`. Nothing here is the owner's: the live
+    // engine never reads these tables. A reset bumps `epoch`; older legs stay
+    // in the ledger but drop out of every view.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_wallets (
+            user_id INTEGER PRIMARY KEY,
+            balance REAL NOT NULL,
+            epoch INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            epoch INTEGER NOT NULL DEFAULT 0,
+            position_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            trading_symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            qty INTEGER NOT NULL,
+            executed_price REAL NOT NULL,
+            timestamp TEXT NOT NULL,
+            gross_value REAL NOT NULL, brokerage REAL NOT NULL,
+            stt_charge REAL NOT NULL, sebi_fee REAL NOT NULL,
+            stamp_duty REAL NOT NULL, transaction_charge REAL NOT NULL,
+            gst REAL NOT NULL, net_value REAL NOT NULL,
+            exit_reason TEXT,
+            option_type TEXT,
+            strike REAL,
+            expiry TEXT,
+            label TEXT
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_trades_user ON user_trades (user_id, epoch, id)")
+        .execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_positions (
+            user_id INTEGER PRIMARY KEY,
+            json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+
     pool
 }
 
