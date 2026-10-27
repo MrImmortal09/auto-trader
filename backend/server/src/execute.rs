@@ -18,18 +18,56 @@ use shared_domain::{telemetry, ChartLevels, MonitoredPosition, TradeState, INDEX
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use trading_engine::{index_fo_segment, ChainStrike, OptionChain, ScripRecord};
 
+use crate::auth::Identity;
 use crate::AppState;
 
 /// Strikes subscribed and streamed each side of ATM. The screen shows ±5 of
 /// them; the spare two each side let it hold its rows still while the user's
 /// finger is on the ladder, and give a re-centred ladder prices at once.
 const SUBSCRIBE_HALF: usize = 7;
-/// Ladder scrips subscribed per day at most. Subscriptions are never
-/// withdrawn, and the feed's own cap (200 on the retired HSM feed; unknown
-/// on the native one) must keep room for positions' contracts, whose stops
-/// depend on their ticks. Past the budget a row shows no price, and the buy
-/// route refuses a contract with no recent price: it fails toward not trading.
+/// Ladder scrips subscribed per day at most, everyone's together. Subscriptions
+/// are never withdrawn, and the feed's own cap (200 on the retired HSM feed;
+/// unknown on the native one) must keep room for positions' contracts, whose
+/// stops depend on their ticks. Past the budget a row shows no price, and the
+/// buy route refuses a contract with no recent price: it fails toward not
+/// trading.
 const MAX_LADDER_SCRIPS: usize = 120;
+/// How much of that total signed-in users' streams may take, together. The
+/// owner's and the admin's streams may use the whole total, so paper users
+/// cost the owner at most this many strikes a day and the feed never carries
+/// more than before. One window is 15 strikes × CE/PE = 30 keys.
+const MAX_PUBLIC_LADDER_SCRIPS: usize = 30;
+
+/// Whose daily subscription budget a stream draws on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubPool {
+    /// The owner's passkey or the admin's phone.
+    Owner,
+    /// A signed-in user.
+    Public,
+    /// A visitor: subscribes nothing, and sees prices only for contracts
+    /// someone signed in is already streaming — one unsigned request could
+    /// otherwise use up the users' whole share for the day.
+    None,
+}
+
+impl SubPool {
+    pub fn of(identity: &Identity) -> Self {
+        match identity {
+            Identity::Owner | Identity::Admin { .. } => SubPool::Owner,
+            Identity::User { .. } => SubPool::Public,
+            Identity::Anonymous => SubPool::None,
+        }
+    }
+
+    fn budget(self) -> usize {
+        match self {
+            SubPool::Owner => MAX_LADDER_SCRIPS,
+            SubPool::Public => MAX_PUBLIC_LADDER_SCRIPS,
+            SubPool::None => 0,
+        }
+    }
+}
 /// How often the stream pushes a frame.
 pub const STREAM_EVERY: Duration = Duration::from_millis(250);
 /// A feed quieter than this is stale: no manual buy is accepted on it.
@@ -71,7 +109,11 @@ struct Subscriptions {
     /// The IST day they were sent on: the feed drops ladder subscriptions at
     /// each day's close, so a new day starts from none.
     day: Option<NaiveDate>,
-    scrips: HashSet<String>,
+    /// Every ladder scrip sent today, whichever pool paid for it.
+    sent: HashSet<String>,
+    /// How much of each pool's budget is spent.
+    owner_used: usize,
+    public_used: usize,
     indices_sent: bool,
 }
 
@@ -204,9 +246,13 @@ impl ExecuteBoard {
         Some((index.to_string(), chain, record))
     }
 
-    /// Make sure the feed streams every index's spot value and `keys`.
-    /// Subscriptions are never withdrawn: open positions share the feed.
-    async fn ensure_subscribed(&self, state: &AppState, keys: &[String]) {
+    /// Make sure the feed streams every index's spot value and `keys`, paid
+    /// for out of `pool`'s budget. Subscriptions are never withdrawn: open
+    /// positions share the feed.
+    async fn ensure_subscribed(&self, state: &AppState, keys: &[String], pool: SubPool) {
+        if pool == SubPool::None {
+            return;
+        }
         let Some(tx) = state.ws_tx.lock().await.clone() else { return };
         let today = shared_domain::today_ist();
         let mut subs = self.subs.lock().await;
@@ -222,15 +268,21 @@ impl ExecuteBoard {
             let msg = serde_json::json!({ "action": "subscribe_indices", "indices": indices.join(",") });
             subs.indices_sent = tx.send(msg.to_string()).is_ok();
         }
-        let wanted: Vec<&String> = keys.iter().filter(|k| !subs.scrips.contains(*k)).collect();
+        let wanted: Vec<&String> = keys.iter().filter(|k| !subs.sent.contains(*k)).collect();
         if wanted.is_empty() {
             return;
         }
-        let room = MAX_LADDER_SCRIPS.saturating_sub(subs.scrips.len());
+        let used = match pool {
+            SubPool::Owner => subs.owner_used,
+            SubPool::Public | SubPool::None => subs.public_used,
+        };
+        // The pool's own share, inside what is left of the day's total.
+        let room = pool.budget().saturating_sub(used).min(MAX_LADDER_SCRIPS.saturating_sub(subs.sent.len()));
         if wanted.len() > room {
             tracing::warn!(
-                "Ladder subscription budget reached: {} of {MAX_LADDER_SCRIPS} scrips subscribed today, {} more asked for; the rest show no price until tomorrow",
-                subs.scrips.len(),
+                "Ladder subscription budget reached ({pool:?}): {used} of {} scrips (total {} of {MAX_LADDER_SCRIPS}) subscribed today, {} more asked for; the rest show no price until tomorrow",
+                pool.budget(),
+                subs.sent.len(),
                 wanted.len()
             );
         }
@@ -242,7 +294,11 @@ impl ExecuteBoard {
         // position's own subscription), so they never pile up across days.
         let msg = serde_json::json!({ "action": "subscribe", "scrips": fresh.join("&"), "ladder": true });
         if tx.send(msg.to_string()).is_ok() {
-            subs.scrips.extend(fresh);
+            match pool {
+                SubPool::Owner => subs.owner_used += fresh.len(),
+                SubPool::Public | SubPool::None => subs.public_used += fresh.len(),
+            }
+            subs.sent.extend(fresh);
         }
     }
 }
@@ -441,9 +497,9 @@ fn window(len: usize, atm: usize, half: usize) -> std::ops::Range<usize> {
 }
 
 /// The board for `index`: its `expiry`'s chain (the nearest when `None`; an
-/// unlisted one is an error), with the window subscribed and streamed
-/// around `centre` (ATM when `None`).
-async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>) -> Result<Board, String> {
+/// unlisted one is an error), with the window subscribed (out of `pool`'s
+/// budget) and streamed around `centre` (ATM when `None`).
+async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>, pool: SubPool) -> Result<Board, String> {
     if state.scrip_store.read().await.is_none() {
         return Err("Scrip Master not loaded yet — connect Kotak first".to_string());
     }
@@ -485,7 +541,7 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
         .flatten()
         .map(ScripRecord::ws_key)
         .collect();
-    state.execute.ensure_subscribed(state, &keys).await;
+    state.execute.ensure_subscribed(state, &keys, pool).await;
 
     let quote = |r: &Option<ScripRecord>| {
         r.as_ref().map(|r| {
@@ -559,11 +615,19 @@ fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
 
 /// One frame of the Execute screen for `index`: its `expiry`'s ladder (the
 /// nearest when `None`), the subscribed window around `centre` (ATM when
-/// `None`).
-pub async fn build_frame(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>) -> ExecuteFrame {
-    let (mode, kill_switch) = {
+/// `None`). The market data is the same for everyone; whose positions ride
+/// along, and whether the owner's mode, kill switch and Kotak state show,
+/// depends on `identity`: the owner and the admin see the engine's, a user
+/// their own paper trades, a visitor none.
+pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>) -> ExecuteFrame {
+    let owner_view = identity.can_read_owner_data();
+    let (mode, kill_switch) = if owner_view {
         let cfg = state.trading_cfg.read().await;
         (cfg.mode.clone(), cfg.kill_switch_active)
+    } else {
+        // Users trade on paper whatever the owner does, and the owner's kill
+        // switch is not theirs.
+        ("PAPER".to_string(), false)
     };
 
     let mut indices = Vec::with_capacity(INDEX_NAMES.len());
@@ -575,25 +639,30 @@ pub async fn build_frame(state: &AppState, index: &str, expiry: Option<NaiveDate
         indices.push(IndexHeadline { index: name, spot, change_pct });
     }
 
-    let (board, board_error) = match build_board(state, index, expiry, centre).await {
+    let (board, board_error) = match build_board(state, index, expiry, centre, SubPool::of(identity)).await {
         Ok(b) => (Some(b), None),
         Err(e) => (None, Some(e)),
     };
 
     // What is actually held (or being bought by hand) — a signal still
-    // waiting for its trigger is not a position yet.
-    let positions = state
-        .positions
-        .read()
-        .await
-        .iter()
-        .filter(|p| match p.state {
-            TradeState::Closed => false,
-            TradeState::WaitingForEntry => p.manual,
-            _ => true,
-        })
-        .map(|p| position_row(state, p))
-        .collect();
+    // waiting for its trigger is not a position yet. The engine's positions
+    // are the owner's: nobody else sees them.
+    let positions = if owner_view {
+        state
+            .positions
+            .read()
+            .await
+            .iter()
+            .filter(|p| match p.state {
+                TradeState::Closed => false,
+                TradeState::WaitingForEntry => p.manual,
+                _ => true,
+            })
+            .map(|p| position_row(state, p))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let ts = shared_domain::now_ist().timestamp_millis();
     ExecuteFrame {
@@ -602,12 +671,12 @@ pub async fn build_frame(state: &AppState, index: &str, expiry: Option<NaiveDate
         kill_switch,
         market_open: manual_buy_window_open(),
         feed: feed_status(),
-        kotak_ready: kotak_ready(state),
+        kotak_ready: owner_view && kotak_ready(state),
         indices,
         board,
         board_error,
         positions,
-        errors: state.execute.recent_errors(ts),
+        errors: if owner_view { state.execute.recent_errors(ts) } else { Vec::new() },
     }
 }
 
@@ -660,6 +729,18 @@ mod tests {
             lot_size: 65,
             tick_size: 0.05,
         }
+    }
+
+    #[test]
+    fn the_owner_and_the_admin_draw_on_one_budget_users_on_a_share_and_visitors_on_none() {
+        assert_eq!(SubPool::of(&Identity::Owner), SubPool::Owner);
+        assert_eq!(SubPool::of(&Identity::Admin { user_id: 1 }), SubPool::Owner);
+        assert_eq!(SubPool::of(&Identity::User { user_id: 2 }), SubPool::Public);
+        assert_eq!(SubPool::of(&Identity::Anonymous), SubPool::None);
+        assert_eq!(SubPool::None.budget(), 0);
+        // The public share sits inside the one total: the feed never carries more than before.
+        assert!(SubPool::Public.budget() < SubPool::Owner.budget());
+        assert_eq!(SubPool::Owner.budget(), MAX_LADDER_SCRIPS);
     }
 
     #[test]

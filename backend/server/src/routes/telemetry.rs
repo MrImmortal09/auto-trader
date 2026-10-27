@@ -50,14 +50,23 @@ pub async fn telemetry_snapshot_handler(State(state): State<AppState>) -> Json<T
     })
 }
 
-/// `GET /api/telemetry/stream` — SSE, one [`Sample`] per sampler tick.
+/// `GET /api/telemetry/stream` — SSE, one [`Sample`] per sampler tick. The
+/// owner's and the admin's; an admin disabled meanwhile loses it at the
+/// next sample.
 pub async fn telemetry_stream_handler(
     State(state): State<AppState>,
+    axum::Extension(identity): axum::Extension<crate::auth::Identity>,
 ) -> Sse<impl futures::stream::Stream<Item = Result<Event, Infallible>>> {
-    let stream = WatchStream::from_changes(state.pulse.subscribe()).filter_map(|sample| async move {
-        let sample = sample?;
-        serde_json::to_string(&*sample).ok().map(|json| Ok(Event::default().data(json)))
-    });
+    let auth = state.auth.clone();
+    let stream = WatchStream::from_changes(state.pulse.subscribe())
+        .take_while(move |_| {
+            let still = crate::auth::still_signed_in(&auth, &identity);
+            async move { still }
+        })
+        .filter_map(|sample| async move {
+            let sample = sample?;
+            serde_json::to_string(&*sample).ok().map(|json| Ok(Event::default().data(json)))
+        });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 

@@ -41,13 +41,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const handleUnauthorizedEvent = (e: Event) => {
       const customEvent = e as CustomEvent<{ isMutation?: boolean }>;
-      // Only revoke write access and open the modal if an active mutation request (order, update, etc.) failed due to unauthorized.
-      // Never disrupt the user or revoke write access during passive background polling or read requests!
-      if (customEvent.detail?.isMutation) {
-        setHasWriteAccess(false);
-        setIsUnlockModalOpen(true);
-        setUnlockReason('Session expired or unauthorized. Enter passkey to restore write access.');
-      }
+      // The stored token was refused (see lib/api's apiFetch): it is gone,
+      // write access with it, and the passkey is asked for again. The
+      // owner's reads are gated like the writes, so a refused poll counts.
+      setHasWriteAccess(false);
+      setIsUnlockModalOpen(true);
+      setUnlockReason(
+        customEvent.detail?.isMutation
+          ? 'Session expired or unauthorized. Enter passkey to restore write access.'
+          : 'Session expired. Enter the passkey to continue.',
+      );
     };
 
     if (typeof window !== 'undefined') {
