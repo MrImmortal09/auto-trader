@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Save, Settings, Sliders, Wallet, Layers3, Info, AlertTriangle, KeyRound, Lock, Gauge } from 'lucide-react';
+import { Save, Settings, Sliders, Wallet, Layers3, Info, AlertTriangle, KeyRound, LogOut, Gauge } from 'lucide-react';
 import type { CallVerdict, IndicatorIndex, IndicatorPreview, TopupMode, TradingConfig } from '../types';
 import { apiFetch } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
@@ -1045,10 +1045,10 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
               type="button"
               onClick={lock}
               className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 bg-error/10 hover:bg-error/20 text-error text-sm rounded-lg transition-colors font-body-bold shadow-sm"
-              title="Lock session and switch to Read-Only mode"
+              title="Sign out — here and on the main page"
             >
-              <Lock size={14} />
-              Lock Session
+              <LogOut size={14} />
+              Sign Out
             </button>
           ) : (
             <button

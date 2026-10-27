@@ -64,6 +64,16 @@ fn too_many(retry_after_secs: u64) -> Response {
         .into_response()
 }
 
+/// The phone's codes have taken the day's guesses (`otp::MAX_GUESSES_PER_DAY`).
+fn too_many_today() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("Retry-After", otp::GUESS_WINDOW_SECS.to_string())],
+        Json(json!({ "error": "Too many wrong codes for this number today. Try again tomorrow." })),
+    )
+        .into_response()
+}
+
 fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
     tracing::error!("phone sign-in: {what}: {e}");
     refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("could not {what}"))
@@ -116,6 +126,12 @@ pub async fn otp_request_handler(
     }
 
     let now = shared_domain::now_ist();
+    // A code that could take no guess isn't worth a WhatsApp message.
+    match otp::guesses_since(&state.db_pool, &phone, &otp::guess_window_start(&ist(now))).await {
+        Ok(n) if n >= otp::MAX_GUESSES_PER_DAY => return too_many_today(),
+        Ok(_) => {}
+        Err(e) => return server_error("check the code limits", e),
+    }
     let since = ist(now - Duration::seconds(otp::SEND_WINDOW_SECS));
     let code = otp::generate_code();
     let hash = otp::hash_code(secret, &phone, &code);
@@ -192,6 +208,7 @@ pub async fn otp_verify_handler(
         ),
         Ok(otp::Verify::NoCode) => refuse(StatusCode::UNAUTHORIZED, "That code has expired — ask for a new one"),
         Ok(otp::Verify::TooManyAttempts) => refuse(StatusCode::UNAUTHORIZED, "Too many wrong codes — ask for a new one"),
+        Ok(otp::Verify::TooManyToday) => too_many_today(),
         Ok(otp::Verify::Ok) => {
             state.limits.clear(&verify_key);
             if let Err(e) = sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")

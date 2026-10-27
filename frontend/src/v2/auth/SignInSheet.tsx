@@ -142,7 +142,7 @@ export function SignInForm({ reason, onClose }: { reason: string | null; onClose
             />
           </span>
         </label>
-        {locked ? <p className="type-caption text-loss tnum">Too many attempts. Try again in {mmss(lockedFor)}.</p> : error && <p className="type-caption text-loss">{error}</p>}
+        {locked ? <p className="type-caption text-loss tnum">{lockedFor > 3600 ? error : `Too many attempts. Try again in ${mmss(lockedFor)}.`}</p> : error && <p className="type-caption text-loss">{error}</p>}
         <div className="flex items-center gap-2">
           <span className="flex-1" />
           {cancel}
@@ -192,7 +192,7 @@ export function SignInForm({ reason, onClose }: { reason: string | null; onClose
           }}
           className={`${INPUT} text-center num-large tracking-[0.6em]`}
         />
-        {locked ? <p className="type-caption text-loss tnum">Too many attempts. Try again in {mmss(lockedFor)}.</p> : error && <p className="type-caption text-loss">{error}</p>}
+        {locked ? <p className="type-caption text-loss tnum">{lockedFor > 3600 ? error : `Too many attempts. Try again in ${mmss(lockedFor)}.`}</p> : error && <p className="type-caption text-loss">{error}</p>}
         <div className="flex items-center gap-2">
           <Button size="sm" kind="quiet" disabled={busy || locked || resendIn > 0} onClick={() => phone && void sendCode(phone)}>
             {resendIn > 0 ? `Send again in ${resendIn}s` : 'Send again'}
