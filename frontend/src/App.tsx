@@ -26,6 +26,9 @@ import { MarketDataScreen } from './screens/MarketDataScreen';
 import { SystemPulseScreen } from './screens/SystemPulseScreen';
 import { ExecuteScreen } from './screens/ExecuteScreen';
 
+// The redesign is the site's front page; this app lives under /v1/.
+const BASE = '/v1';
+
 export default function App() {
   const [logHeight, setLogHeight] = useState(220);
   const [serverBase, setServerBase] = useState(() => getStoredServerBase());
@@ -35,7 +38,7 @@ export default function App() {
 
   const [activeScreen, setActiveScreen] = useState<ScreenId>(() => {
     if (typeof window !== 'undefined') {
-      const p = window.location.pathname;
+      const p = window.location.pathname.replace(/^\/v1(?=\/|$)/, '');
       if (p.startsWith('/reports') || p.startsWith('/portfolio')) return 'portfolio';
       if (p.startsWith('/system') || p.startsWith('/health')) return 'system';
       if (p.startsWith('/settings')) return 'settings';
@@ -98,7 +101,7 @@ export default function App() {
         system: '/system',
         settings: '/settings',
       };
-      window.history.pushState(null, '', paths[screen]);
+      window.history.pushState(null, '', BASE + paths[screen]);
     }
   }
 

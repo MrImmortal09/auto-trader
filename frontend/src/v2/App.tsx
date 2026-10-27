@@ -12,7 +12,6 @@ import { KillSwitchDialog } from './shell/KillSwitchDialog';
 import { NavRail, TabBar } from './shell/Nav';
 import { SCREENS, screenFromHash, TAB_SCREENS, visibleScreens, type ScreenId } from './shell/screens';
 import { DesktopStatusBar, PhoneStatusBar } from './shell/StatusBar';
-import { UnlockDialog } from './shell/UnlockDialog';
 import { useGuard } from './shell/useGuard';
 import { useEngineErrors, useStatus } from './shell/useStatus';
 import { Banner } from './ui/Banner';
@@ -37,8 +36,8 @@ function stoppedLine(s: Stopped): string {
 
 /**
  * The v2 shell: status bar, banners, navigation and the current screen.
- * Anyone may look; what shows depends on who is signed in (`useIdentity`):
- * the owner and the admin get the whole desk, a user or a visitor the
+ * Only for someone signed in (`SignInGate`); what shows depends on who
+ * (`useIdentity`): the owner and the admin get the whole desk, a user the
  * public screens and their own sign-in.
  */
 export default function App() {
@@ -55,7 +54,7 @@ export default function App() {
   const guard = useGuard();
   useEngineErrors(serverBase, streamToken(), canReadOwner);
 
-  // The screen is mirrored in the hash (`/v2/#trade`): there are no deep paths.
+  // The screen is mirrored in the hash (`/#trade`): there are no deep paths.
   useEffect(() => {
     const onHash = () => setWanted(screenFromHash());
     window.addEventListener('hashchange', onHash);
@@ -154,7 +153,6 @@ export default function App() {
         <KillSwitchDialog serverBase={serverBase} mode={s?.mode} onClose={() => setKillSwitchOpen(false)} onDone={() => void status.refresh()} />
       )}
       <SignInSheet />
-      <UnlockDialog serverBase={serverBase} />
     </div>
   );
 }

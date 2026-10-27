@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Save, Settings, Sliders, Wallet, Layers3, Info, AlertTriangle, KeyRound, Lock, Gauge } from 'lucide-react';
+import { Save, Settings, Sliders, Wallet, Layers3, Info, AlertTriangle, KeyRound, LogOut, Gauge } from 'lucide-react';
 import type { CallVerdict, IndicatorIndex, IndicatorPreview, TopupMode, TradingConfig } from '../types';
 import { apiFetch } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
@@ -727,12 +727,12 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
           <div className="flex items-center gap-2">
             <AlertTriangle size={16} className="shrink-0 text-amber-400" />
             <span>
-              <strong>Read-Only Mode:</strong> You are viewing live settings. Enter your passkey to modify configuration or save changes.
+              <strong>Read-Only Mode:</strong> You are viewing live settings. Sign in as the admin to modify configuration or save changes.
             </span>
           </div>
           <button
             type="button"
-            onClick={() => openUnlockModal('Enter passkey to edit trading settings')}
+            onClick={() => openUnlockModal('Sign in as the admin to edit trading settings')}
             className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded-lg text-xs font-bold transition-colors"
           >
             <KeyRound size={13} />
@@ -1045,17 +1045,17 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
               type="button"
               onClick={lock}
               className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 bg-error/10 hover:bg-error/20 text-error text-sm rounded-lg transition-colors font-body-bold shadow-sm"
-              title="Lock session and switch to Read-Only mode"
+              title="Sign out — here and on the main page"
             >
-              <Lock size={14} />
-              Lock Session
+              <LogOut size={14} />
+              Sign Out
             </button>
           ) : (
             <button
               type="button"
-              onClick={() => openUnlockModal('Enter passkey to unlock write access')}
+              onClick={() => openUnlockModal('Sign in as the admin for write access')}
               className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 text-sm rounded-lg transition-colors font-body-bold shadow-sm"
-              title="Enter passkey to unlock write access"
+              title="Sign in as the admin for write access"
             >
               <KeyRound size={14} />
               Unlock

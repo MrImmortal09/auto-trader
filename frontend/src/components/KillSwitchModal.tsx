@@ -39,7 +39,7 @@ export function KillSwitchModal({
       });
       if (!res.ok) {
         if (res.status === 401) {
-          throw new Error('Session unauthorized or expired. Please refresh the page and enter your passkey.');
+          throw new Error('Session unauthorized or expired. Sign in again as the admin on the main page.');
         }
         const errData = await res.json().catch(() => null);
         throw new Error(errData?.error || `Request failed with status ${res.status}`);
@@ -74,7 +74,7 @@ export function KillSwitchModal({
       });
       if (!res.ok) {
         if (res.status === 401) {
-          throw new Error('Session unauthorized or expired. Please enter your passkey.');
+          throw new Error('Session unauthorized or expired. Sign in again as the admin on the main page.');
         }
         const errData = await res.json().catch(() => null);
         throw new Error(errData?.error || `Request failed with status ${res.status}`);

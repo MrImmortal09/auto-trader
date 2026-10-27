@@ -1,6 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, CircleAlert, Lock, LockOpen } from 'lucide-react';
-import { useAuth } from '../../context/AuthContext';
+import { ChevronDown, CircleAlert } from 'lucide-react';
 import { AccountChip, AccountRow } from '../auth/AccountChip';
 import { signedMoney, toneOf } from '../lib/format';
 import { useIstClock } from '../lib/hooks';
@@ -25,7 +24,7 @@ const DOTS: { key: keyof HealthSet; name: string }[] = [
 
 /** The dots `role` gets: everything for the owner's view, the feed alone otherwise. */
 function dotsFor(role: Role) {
-  return role === 'owner' || role === 'admin' ? DOTS : DOTS.filter((d) => d.key === 'feed');
+  return role === 'admin' ? DOTS : DOTS.filter((d) => d.key === 'feed');
 }
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -41,19 +40,6 @@ function dotOf(status: StatusAnswer | null, unreachable: boolean, key: keyof Hea
   return status?.health?.[key] ?? { level: 'off', label: 'Waiting for the first reading' };
 }
 
-function WriteAccess() {
-  const { hasWriteAccess, openUnlockModal, lock } = useAuth();
-  return hasWriteAccess ? (
-    <Button size="sm" kind="ghost" className="border border-line" icon={<LockOpen size={14} />} onClick={lock} title="Lock: switch to read-only">
-      Write access
-    </Button>
-  ) : (
-    <Button size="sm" kind="ghost" className="border border-line" icon={<Lock size={14} />} onClick={() => openUnlockModal()} title="Enter the passkey to place orders">
-      Read only
-    </Button>
-  );
-}
-
 export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
   status: StatusAnswer | null;
   unreachable: boolean;
@@ -61,7 +47,7 @@ export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
   onKillSwitch: () => void;
 }) {
   const clock = useIstClock();
-  const ownerView = role === 'owner' || role === 'admin';
+  const ownerView = role === 'admin';
   return (
     <header className="flex h-10 shrink-0 items-center gap-4 border-b border-line bg-inset px-4">
       <div className="flex min-w-0 flex-1 items-center gap-3">
@@ -89,7 +75,6 @@ export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
           </>
         )}
         <AccountChip />
-        {ownerView && <WriteAccess />}
         {ownerView &&
           (status?.kill_switch ? (
             <span className="inline-flex h-7 items-center gap-1.5 rounded-6 border border-loss px-2.5 type-button text-loss">
@@ -120,8 +105,7 @@ export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
   onKillSwitch: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const { hasWriteAccess, openUnlockModal, lock } = useAuth();
-  const ownerView = role === 'owner' || role === 'admin';
+  const ownerView = role === 'admin';
   const dots = dotsFor(role).map((d) => ({ ...d, ...dotOf(status, unreachable, d.key) }));
   const worst: Level = dots.some((d) => d.level === 'down') ? 'down' : dots.every((d) => d.level === 'off') ? 'off' : 'ok';
   return (
@@ -169,15 +153,6 @@ export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
           <div className="mt-1">
             <AccountRow />
           </div>
-          {ownerView && (
-            <div className="flex h-12 items-center gap-2.5 border-t border-line">
-              {hasWriteAccess ? <LockOpen size={16} className="text-fg-muted" /> : <Lock size={16} className="text-fg-muted" />}
-              <span className="type-body-strong text-fg">{hasWriteAccess ? 'Write access' : 'Read only'}</span>
-              <Button size="sm" className="ml-auto" onClick={() => (hasWriteAccess ? lock() : openUnlockModal())}>
-                {hasWriteAccess ? 'Lock' : 'Unlock'}
-              </Button>
-            </div>
-          )}
         </div>
       )}
     </header>

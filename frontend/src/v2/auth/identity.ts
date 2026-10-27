@@ -2,23 +2,24 @@ import { createContext, useContext } from 'react';
 import type { Role, SessionUser } from '../lib/types';
 
 /**
- * Who is using the page: the owner (the passkey, v1's), the admin or a user
- * (a phone sign-in), or nobody. Provided by `IdentityProvider`.
+ * Who is using the page: the admin (the owner's own number) or a user — a
+ * phone sign-in — or nobody. Provided by `IdentityProvider`.
  */
 export interface Identity {
   role: Role;
   /** The phone sign-in, once the server has confirmed it. */
   user: SessionUser | null;
-  /** The phone sign-in's role — the server's word, else the token's claim —
-   * or null without one. Set beside the passkey too: `role` is then `owner`. */
+  /** The sign-in's role — the server's word, else the token's claim — or
+   * null without one: `role` without `anon`. */
   phoneRole: 'admin' | 'user' | null;
-  /** Owner data (the engine's positions, logs, settings) may be read. */
+  /** The admin: the owner's data (the engine's positions, logs, settings)
+   * may be read, and every order and setting changed. */
   canReadOwner: boolean;
   signInOpen: boolean;
   signInReason: string | null;
   openSignIn: (reason?: string) => void;
   closeSignIn: () => void;
-  /** Drop the phone sign-in. The passkey, if held, stays. */
+  /** Drop the sign-in. */
   signOut: () => void;
 }
 

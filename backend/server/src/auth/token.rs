@@ -1,7 +1,8 @@
-//! The bearer token — one format for the owner's passkey login and the phone
-//! sign-in: `base64url(header).base64url(payload).base64url(HMAC-SHA256)`,
-//! signed with `AUTH_SECRET`. The passkey's token says `sub: "trader"`; a
-//! phone token says `sub: "u:<user id>"` with `role: "admin"` or `"user"`.
+//! The bearer token of a phone sign-in:
+//! `base64url(header).base64url(payload).base64url(HMAC-SHA256)`, signed with
+//! `AUTH_SECRET`, saying `sub: "u:<user id>"` with `role: "admin"` or `"user"`.
+//! The retired passkey's tokens (`sub: "trader"`) name no user, so they are
+//! refused like any unknown token.
 //! Who the token *is* right now (an admin may have been disabled since) is the
 //! middleware's business — see `auth::identify`.
 
@@ -12,12 +13,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// `sub` of the owner's passkey token.
-pub const OWNER_SUB: &str = "trader";
-/// `role` of the owner's passkey token.
-pub const OWNER_ROLE: &str = "write";
 /// How long each kind of token lives.
-pub const OWNER_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 pub const ADMIN_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 pub const USER_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
@@ -37,18 +33,9 @@ pub struct TokenPayload {
 }
 
 impl TokenPayload {
-    /// The owner's passkey token, as it has always been minted.
-    pub fn owner(now: u64) -> Self {
-        TokenPayload { sub: OWNER_SUB.to_string(), iat: now, exp: now + OWNER_TTL_SECS, role: Some(OWNER_ROLE.to_string()) }
-    }
-
     /// A phone sign-in's token for `user_id` with `role` (`admin` or `user`).
     pub fn phone(user_id: i64, role: &str, now: u64, ttl_secs: u64) -> Self {
         TokenPayload { sub: format!("u:{user_id}"), iat: now, exp: now + ttl_secs, role: Some(role.to_string()) }
-    }
-
-    pub fn is_owner(&self) -> bool {
-        self.sub == OWNER_SUB
     }
 
     /// The user id a phone token names (`u:<id>`), if it is one.
@@ -109,20 +96,16 @@ mod tests {
     const SECRET: &str = "test-secret";
 
     #[test]
-    fn an_owner_token_round_trips_and_is_the_owner() {
-        let token = sign(&TokenPayload::owner(1_000), SECRET);
-        let payload = verify_at(&token, SECRET, 1_500).unwrap();
-        assert!(payload.is_owner());
+    fn a_retired_passkey_token_names_no_user() {
+        let passkey = TokenPayload { sub: "trader".into(), iat: 1_000, exp: 9_999, role: Some("write".into()) };
+        let payload = verify_at(&sign(&passkey, SECRET), SECRET, 1_500).unwrap();
         assert_eq!(payload.user_id(), None);
-        assert_eq!(payload.role.as_deref(), Some("write"));
-        assert_eq!(payload.exp, 1_000 + OWNER_TTL_SECS);
     }
 
     #[test]
     fn a_phone_token_names_its_user_and_role() {
         let token = sign(&TokenPayload::phone(42, "user", 1_000, USER_TTL_SECS), SECRET);
         let payload = verify_at(&token, SECRET, 1_500).unwrap();
-        assert!(!payload.is_owner());
         assert_eq!(payload.user_id(), Some(42));
         assert_eq!(payload.role.as_deref(), Some("user"));
         assert_eq!(payload.exp, 1_000 + USER_TTL_SECS);

@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
-// The phone sign-in's token (a user's or the admin's), beside the passkey
-// token in `auth.ts`. Both are the same JWT-like format; this one names a
-// user (`sub: "u:<id>"`) and a role. v1 never reads it.
+// The phone sign-in's token (a user's or the admin's) — the only sign-in.
+// JWT-like, naming a user (`sub: "u:<id>"`) and a role. v1 reads it through
+// `auth.ts`.
 // ---------------------------------------------------------------------------
 
 const USER_TOKEN_KEY = 'at_user_token';

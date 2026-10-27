@@ -15,11 +15,10 @@ const RANGES: { value: RangeId; label: string }[] = [
 ];
 
 /** Desk: Today, or the range switch's 7D, 30D and All — the owner's book,
- * for the owner and the admin. A visitor is asked to sign in; a user's own
- * paper desk comes with the next release. */
+ * for the admin. A user's own paper desk comes with the next release. */
 export function Desk({ serverBase, desktop, stopped, role }: { serverBase: string; desktop: boolean; stopped: Stopped | null; role: Role }) {
   const [range, setRange] = useState<RangeId>('today');
-  if (role !== 'owner' && role !== 'admin') return <DeskGuest role={role} />;
+  if (role !== 'admin') return <DeskGuest role={role} />;
   const rangeSwitch = <Segment label="Range" options={RANGES} value={range} onChange={setRange} size={desktop ? 'sm' : 'lg'} stretch={!desktop} />;
   return range === 'today' ? (
     <DeskToday serverBase={serverBase} desktop={desktop} rangeSwitch={rangeSwitch} stopped={stopped} />

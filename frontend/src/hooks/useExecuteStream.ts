@@ -12,13 +12,12 @@ export const STREAM_STALE_AFTER_MS = 2_000;
  * null). Switching any of them reopens the stream; the last frame is kept
  * meanwhile so the page never blanks. `now` ticks so the caller can tell how
  * old the frame is. The token goes in the URL (an `EventSource` can't set
- * headers): the stored passkey token unless `token` says otherwise — v2
- * passes a phone sign-in's token, or null for a visitor.
+ * headers): the stored sign-in's unless `token` says otherwise.
  *
  * The server answers with the caller's own view (the engine's mode and
  * positions for the owner, none for a visitor), so the stream is also
- * reopened whenever the sign-in changes: the passkey unlocked, locked, or
- * entered again after it expired, or a different `token` passed. Until the
+ * reopened whenever the sign-in changes: signed in, signed out, or signed
+ * in again after it expired, or a different `token` passed. Until the
  * new stream's first frame lands the old one counts as stale, so nothing is
  * bought off a visitor's frame.
  */

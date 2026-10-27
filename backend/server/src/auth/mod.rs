@@ -1,11 +1,10 @@
 //! Who is calling, and what they may reach.
 //!
-//! Three ways in: the owner's **passkey** (the token `routes::auth_passkey`
-//! mints — full power, as always), and a **phone** sign-in by WhatsApp OTP
-//! that is either the **admin** (the owner's own number: sees everything,
-//! but real-money writes still need the passkey) or a **user** (their own
-//! paper portfolio and nothing of the owner's). Nobody signed in is
-//! **anonymous** and may read market data.
+//! One way in: a **phone** sign-in by WhatsApp OTP, as either the **admin**
+//! (the owner's own number, `ADMIN_PHONE`, and nobody else: full power — live
+//! orders, settings, the broker) or a **user** (their own paper portfolio and
+//! nothing of the owner's). There is no passkey any more. Nobody signed in is
+//! **anonymous** and may only check the server's health and sign in.
 //!
 //! `middleware` works out the [`Identity`] of every `/api/*` request, puts
 //! it into the request's extensions, and refuses the request if
@@ -32,14 +31,14 @@ use serde_json::json;
 
 pub use policy::Access;
 
-/// The owner's phone (`ADMIN_PHONE`): seeded as an enabled `admin` on every
-/// start and never disabled or removed. `None` when it isn't set or isn't a
-/// mobile number, in which case nobody is seeded.
+/// The owner's phone (`ADMIN_PHONE`): seeded as the one enabled `admin` on
+/// every start and never disabled or removed. `None` when it isn't set or
+/// isn't a mobile number, in which case nobody is admin.
 pub fn admin_phone() -> Option<String> {
     let raw = std::env::var("ADMIN_PHONE").ok().filter(|v| !v.trim().is_empty())?;
     let phone = otp::normalize_phone(&raw);
     if phone.is_none() {
-        tracing::warn!("ADMIN_PHONE is not a 10-digit Indian mobile — no admin seeded");
+        tracing::warn!("ADMIN_PHONE is not a 10-digit Indian mobile — nobody is admin");
     }
     phone
 }
@@ -48,22 +47,16 @@ pub fn admin_phone() -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Identity {
     Anonymous,
-    /// The passkey token.
-    Owner,
-    /// The admin's phone token.
+    /// The admin's phone token: the owner.
     Admin { user_id: i64 },
     /// A user's phone token.
     User { user_id: i64 },
 }
 
 impl Identity {
-    pub fn is_owner(&self) -> bool {
-        matches!(self, Identity::Owner)
-    }
-
     /// May see the owner's positions, trades, logs, settings and connections.
     pub fn can_read_owner_data(&self) -> bool {
-        matches!(self, Identity::Owner | Identity::Admin { .. })
+        matches!(self, Identity::Admin { .. })
     }
 
     /// The phone sign-in's user id, for the admin and users.
@@ -74,11 +67,10 @@ impl Identity {
         }
     }
 
-    /// `owner`, `admin`, `user` or `anonymous`.
+    /// `admin`, `user` or `anonymous`.
     pub fn kind(&self) -> &'static str {
         match self {
             Identity::Anonymous => "anonymous",
-            Identity::Owner => "owner",
             Identity::Admin { .. } => "admin",
             Identity::User { .. } => "user",
         }
@@ -173,7 +165,7 @@ pub struct AuthState {
 /// them at once, not only on the next request.
 pub fn still_signed_in(auth: &AuthState, identity: &Identity) -> bool {
     match identity {
-        Identity::Anonymous | Identity::Owner => true,
+        Identity::Anonymous => true,
         Identity::Admin { user_id } => auth.users.get(*user_id).is_some_and(|u| u.enabled && u.role == Role::Admin),
         Identity::User { user_id } => auth.users.get(*user_id).is_some_and(|u| u.enabled && u.role == Role::User),
     }
@@ -183,9 +175,6 @@ pub fn still_signed_in(auth: &AuthState, identity: &Identity) -> bool {
 pub fn identify(auth: &AuthState, token: &str) -> Result<Identity, &'static str> {
     let secret = auth.secret.as_deref().ok_or("AUTH_SECRET not configured")?;
     let payload = token::verify_token(token, secret)?;
-    if payload.is_owner() {
-        return Ok(Identity::Owner);
-    }
     let user_id = payload.user_id().ok_or("Unknown token subject")?;
     Ok(match auth.users.get(user_id) {
         Some(u) if u.enabled => match u.role {
@@ -280,8 +269,10 @@ mod tests {
         token::sign(&token::TokenPayload::phone(user_id, role, now, 3600), SECRET)
     }
 
-    fn owner_token() -> String {
-        token::sign(&token::TokenPayload::owner(shared_domain::now_ist().timestamp() as u64), SECRET)
+    /// What the retired passkey minted.
+    fn passkey_token() -> String {
+        let now = shared_domain::now_ist().timestamp() as u64;
+        token::sign(&token::TokenPayload { sub: "trader".into(), iat: now, exp: now + 3600, role: Some("write".into()) }, SECRET)
     }
 
     async fn who(Extension(identity): Extension<Identity>) -> String {
@@ -315,7 +306,7 @@ mod tests {
     #[test]
     fn identify_reads_the_directory_not_the_token() {
         let auth = auth();
-        assert_eq!(identify(&auth, &owner_token()), Ok(Identity::Owner));
+        assert_eq!(identify(&auth, &passkey_token()), Err("Unknown token subject"));
         assert_eq!(identify(&auth, &phone_token(1, "admin")), Ok(Identity::Admin { user_id: 1 }));
         assert_eq!(identify(&auth, &phone_token(2, "user")), Ok(Identity::User { user_id: 2 }));
         // A token claiming admin for a user row is a user; a disabled or unknown row is nobody.
@@ -324,13 +315,12 @@ mod tests {
         assert_eq!(identify(&auth, &phone_token(99, "user")), Ok(Identity::Anonymous));
         assert_eq!(identify(&auth, "garbage"), Err("Malformed token"));
         let no_secret = AuthState { secret: None, users: auth.users.clone() };
-        assert_eq!(identify(&no_secret, &owner_token()), Err("AUTH_SECRET not configured"));
+        assert_eq!(identify(&no_secret, &phone_token(1, "admin")), Err("AUTH_SECRET not configured"));
     }
 
     #[test]
     fn a_stream_ends_when_its_user_is_disabled_or_demoted() {
         let auth = auth();
-        assert!(still_signed_in(&auth, &Identity::Owner));
         assert!(still_signed_in(&auth, &Identity::Anonymous));
         assert!(still_signed_in(&auth, &Identity::Admin { user_id: 1 }));
         assert!(still_signed_in(&auth, &Identity::User { user_id: 2 }));
@@ -344,36 +334,42 @@ mod tests {
     #[tokio::test]
     async fn the_middleware_lets_each_identity_through_its_own_doors() {
         let app = app(auth());
-        let (owner, admin, user) = (owner_token(), phone_token(1, "admin"), phone_token(2, "user"));
+        let (admin, user) = (phone_token(1, "admin"), phone_token(2, "user"));
 
         // Public: everyone, and the handler learns who it is.
         assert_eq!(call(&app, "GET", "/api/health", None).await, (StatusCode::OK, "anonymous".into()));
+        // Market data: anyone signed in, nobody else.
         assert_eq!(call(&app, "GET", "/api/v2/chain", Some(&user)).await, (StatusCode::OK, "user".into()));
         assert_eq!(call(&app, "GET", "/api/execute/stream", Some(&admin)).await, (StatusCode::OK, "admin".into()));
+        assert_eq!(call(&app, "GET", "/api/v2/chain", None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, "GET", "/api/execute/stream", None).await.0, StatusCode::UNAUTHORIZED);
         // Static files are outside the policy.
         assert_eq!(call(&app, "GET", "/static.js", None).await.0, StatusCode::OK);
 
-        // The owner's data.
-        assert_eq!(call(&app, "GET", "/api/positions", Some(&owner)).await, (StatusCode::OK, "owner".into()));
+        // The owner's data: the admin only.
         assert_eq!(call(&app, "GET", "/api/positions", Some(&admin)).await, (StatusCode::OK, "admin".into()));
         assert_eq!(call(&app, "GET", "/api/positions", Some(&user)).await.0, StatusCode::FORBIDDEN);
         assert_eq!(call(&app, "GET", "/api/positions", None).await.0, StatusCode::UNAUTHORIZED);
 
-        // Real money: the passkey only.
-        assert_eq!(call(&app, "POST", "/api/execute/buy", Some(&owner)).await.0, StatusCode::OK);
-        assert_eq!(call(&app, "POST", "/api/execute/buy", Some(&admin)).await.0, StatusCode::FORBIDDEN);
+        // Real money: the admin only.
+        assert_eq!(call(&app, "POST", "/api/execute/buy", Some(&admin)).await, (StatusCode::OK, "admin".into()));
         assert_eq!(call(&app, "POST", "/api/execute/buy", Some(&user)).await.0, StatusCode::FORBIDDEN);
         let (status, body) = call(&app, "POST", "/api/execute/buy", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(body.contains("Write access requires passkey authentication"));
+        assert!(body.contains("Sign in as the admin"));
+
+        // The retired passkey's token opens nothing.
+        let (status, body) = call(&app, "POST", "/api/execute/buy", Some(&passkey_token())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("Unknown token subject"));
+        assert_eq!(call(&app, "GET", "/api/positions", Some(&passkey_token())).await.0, StatusCode::UNAUTHORIZED);
 
         // A paper portfolio: users only.
         assert_eq!(call(&app, "POST", "/api/v2/me/buy", Some(&user)).await.0, StatusCode::OK);
         assert_eq!(call(&app, "POST", "/api/v2/me/buy", Some(&admin)).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(call(&app, "POST", "/api/v2/me/buy", Some(&owner)).await.0, StatusCode::FORBIDDEN);
         assert_eq!(call(&app, "POST", "/api/v2/me/buy", None).await.0, StatusCode::UNAUTHORIZED);
 
-        // The allow-list: owner or admin.
+        // The allow-list: the admin.
         assert_eq!(call(&app, "POST", "/api/admin/users", Some(&admin)).await.0, StatusCode::OK);
         assert_eq!(call(&app, "POST", "/api/admin/users", Some(&user)).await.0, StatusCode::FORBIDDEN);
 

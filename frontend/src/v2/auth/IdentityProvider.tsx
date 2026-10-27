@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { useAuth } from '../../context/AuthContext';
 import { clearUserToken, decodeClaims, onSessionChange, validUserToken } from '../../lib/session';
 import { getMe } from '../lib/api';
 import { useServerBase } from '../lib/hooks';
@@ -22,14 +21,13 @@ function claimedRole(token: string | null): Role {
  */
 export function IdentityProvider({ children }: { children: ReactNode }) {
   const serverBase = useServerBase();
-  const { hasWriteAccess } = useAuth();
   const [userToken, setUserTokenState] = useState<string | null>(validUserToken);
   // What the server last said about a token; ignored once the token changes.
   const [confirmed, setConfirmed] = useState<{ token: string; role: Role; user: SessionUser | null } | null>(null);
   const [signIn, setSignIn] = useState<{ open: boolean; reason: string | null }>({ open: false, reason: null });
 
   // The token, as stored: set by the sign-in sheet, cleared by sign-out, by
-  // a refusal (`at_user_unauthorized`), or in another tab.
+  // a refusal (`at_unauthorized`, from `apiFetch`), or in another tab.
   useEffect(() => {
     const read = () => {
       const token = validUserToken();
@@ -45,17 +43,15 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
         setSignIn({ open: true, reason: 'Your sign-in has expired. Sign in again to continue.' });
       }
     };
-    window.addEventListener('at_user_unauthorized', onRefused);
+    window.addEventListener('at_unauthorized', onRefused);
     return () => {
       off();
-      window.removeEventListener('at_user_unauthorized', onRefused);
+      window.removeEventListener('at_unauthorized', onRefused);
     };
   }, []);
 
   // Ask the server who the token is now, and again every few minutes: a
-  // user the admin disabled is signed out on the next answer. Asked of the
-  // phone token itself, so the owner holding the passkey still sees whose
-  // phone sign-in this browser keeps.
+  // user the admin disabled is signed out on the next answer.
   useEffect(() => {
     if (!userToken) return;
     let cancelled = false;
@@ -86,13 +82,12 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<Identity>(() => {
     const known = confirmed?.token === userToken ? confirmed : null;
-    const phone = known ? known.role : claimedRole(userToken);
-    const role: Role = hasWriteAccess ? 'owner' : phone;
+    const role: Role = known ? known.role : claimedRole(userToken);
     return {
       role,
       user: known?.user ?? null,
-      phoneRole: phone === 'admin' || phone === 'user' ? phone : null,
-      canReadOwner: role === 'owner' || role === 'admin',
+      phoneRole: role === 'anon' ? null : role,
+      canReadOwner: role === 'admin',
       // A sign-in that has happened closes the sheet, wherever it came from.
       signInOpen: signIn.open && !userToken,
       signInReason: signIn.reason,
@@ -100,7 +95,7 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
       closeSignIn,
       signOut,
     };
-  }, [hasWriteAccess, confirmed, userToken, signIn, openSignIn, closeSignIn, signOut]);
+  }, [confirmed, userToken, signIn, openSignIn, closeSignIn, signOut]);
 
   return <IdentityContext.Provider value={value}>{children}</IdentityContext.Provider>;
 }

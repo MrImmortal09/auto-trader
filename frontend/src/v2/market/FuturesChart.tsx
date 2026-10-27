@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { dispose, init, type AxisCreateRangeCallback, type Chart, type KLineData } from 'klinecharts';
 import { ChevronDown, Layers as LayersIcon } from 'lucide-react';
 import { apiUrl } from '../../lib/api';
-import { getToken } from '../../lib/auth';
+import { streamToken } from '../lib/api';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { MarketIndex } from '../lib/types';
 import { fetchBars, toK, upsert } from '../trade/bars';
@@ -133,7 +133,7 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
     if (!c) return;
     c.setSymbol({ ticker: symbol, pricePrecision: 2, volumePrecision: 0 });
     c.setPeriod({ type: 'minute', span: TF_MS[tf] / 60_000 });
-    const token = getToken();
+    const token = streamToken();
     const params = new URLSearchParams({ symbols: symbol, tf });
     if (token) params.set('token', token);
     const es = new EventSource(`${apiUrl(serverBase, '/api/v2/candles/stream')}?${params}`);

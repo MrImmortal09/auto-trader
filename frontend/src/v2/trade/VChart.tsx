@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Vela, type SerializedDrawing, type TimelineMark } from '@luxalgo/vela';
 import { apiUrl } from '../../lib/api';
-import { getToken } from '../../lib/auth';
+import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, upsert } from './bars';
 import { C, FONT, type MarkerData } from './chartSetup';
 import type { ChartLine, ChartProps } from './KChart';
@@ -246,7 +246,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
         .then((fut) => live && setFutureAt({ key, value: fut }))
         .catch(() => live && setFutureAt({ key, value: [] }));
     }
-    const token = getToken();
+    const token = streamToken();
     const params = new URLSearchParams({ symbols: [symbol, future].filter(Boolean).join(','), tf });
     if (token) params.set('token', token);
     const es = new EventSource(`${apiUrl(serverBase, '/api/v2/candles/stream')}?${params}`);

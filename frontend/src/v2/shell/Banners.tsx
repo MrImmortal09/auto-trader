@@ -47,9 +47,9 @@ export function StatusBanners({ serverBase, status, canReadOwner }: { serverBase
     setConnecting(true);
     try {
       const k = await getKotak(serverBase).catch(() => null);
-      // Without saved credentials it's the login form, in the current app.
+      // Without saved credentials it's the login form, in the old design.
       if (!k?.has_env_credentials) {
-        window.location.href = '/settings';
+        window.location.href = '/v1/settings';
         return;
       }
       const sent = await guard('Logging in to Kotak needs write access.', () => kotakAutoLogin(serverBase), "Couldn't log in to Kotak");

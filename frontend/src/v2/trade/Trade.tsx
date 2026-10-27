@@ -142,10 +142,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const guard = useGuard();
   const toast = useToast();
   const { canReadOwner } = useIdentity();
-  // Whose desk a tap trades on: the owner's engine (the passkey) for the
-  // owner and the admin; a user's own paper book otherwise, which a visitor
-  // reaches by signing in first.
-  const scope = canReadOwner ? 'owner' : 'user';
+  // Whose desk a tap trades on: the owner's engine for the admin, a user's
+  // own paper book otherwise.
+  const scope = canReadOwner ? 'admin' : 'user';
 
   const save = useCallback((next: (s: Saved) => Saved) => {
     setSaved((prev) => {
