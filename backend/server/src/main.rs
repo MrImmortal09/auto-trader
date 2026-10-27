@@ -32,15 +32,64 @@ use axum::middleware;
 
 /// Returns the authentication secret if one is configured, or `None`.
 ///
-/// Looks first in the runtime environment via [`std::env::var`] (`AUTH_SECRET`),
-/// then falls back to compile-time [`option_env!`] (`AUTH_SECRET`). Empty
-/// strings are treated as unset so a misconfigured empty env var doesn't
-/// silently disable authentication.
+/// Read from the runtime environment (`AUTH_SECRET`, usually from `.env`)
+/// only — never baked into the binary, whose releases anyone can download.
+/// Empty strings are treated as unset so a misconfigured empty env var
+/// doesn't silently disable authentication.
 pub(crate) fn resolve_auth_secret() -> Option<String> {
-    std::env::var("AUTH_SECRET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| option_env!("AUTH_SECRET").map(String::from).filter(|s| !s.trim().is_empty()))
+    std::env::var("AUTH_SECRET").ok().filter(|s| !s.trim().is_empty())
+}
+
+/// `server admin-token`: print a fresh 7-day admin token and exit — the way
+/// in when the admin's sign-in codes can't be used: WhatsApp is down, or
+/// someone is burning them with wrong guesses (they share the per-phone
+/// limits with the owner). It needs the server's own `.env` and database, so
+/// it is exactly as safe as a shell on the VM. It only reads the database:
+/// the running server needn't stop.
+async fn print_admin_token() -> i32 {
+    let (Some(secret), Some(phone)) = (resolve_auth_secret(), auth::admin_phone()) else {
+        eprintln!("admin-token needs AUTH_SECRET and ADMIN_PHONE — run it from the server's directory, beside its .env");
+        return 1;
+    };
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://trades.db".into());
+    let opts = match <sqlx::sqlite::SqliteConnectOptions as std::str::FromStr>::from_str(&db_url) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid DATABASE_URL {db_url}: {e}");
+            return 1;
+        }
+    };
+    let pool = match SqlitePool::connect_with(opts).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("Can't open {db_url}: {e}");
+            return 1;
+        }
+    };
+    let id = sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE phone = ? AND role = 'admin' AND enabled = 1")
+        .bind(&phone)
+        .fetch_optional(&pool)
+        .await;
+    match id {
+        Ok(Some(id)) => {
+            let now = shared_domain::now_ist().timestamp() as u64;
+            let payload = auth::token::TokenPayload::phone(id, "admin", now, auth::token::ADMIN_TTL_SECS);
+            println!("{}", auth::token::sign(&payload, &secret));
+            eprintln!(
+                "Admin token, valid 7 days. On the site, in the browser console: \
+                 localStorage.setItem('at_user_token', '<token>') — then reload."
+            );
+            0
+        }
+        Ok(None) => {
+            eprintln!("No enabled admin for ADMIN_PHONE in {db_url} — start the server once with ADMIN_PHONE set");
+            1
+        }
+        Err(e) => {
+            eprintln!("Can't read the users from {db_url}: {e}");
+            1
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +637,10 @@ async fn main() {
     // Silently a no-op when there's no `.env` file — the process environment
     // (systemd EnvironmentFile=, shell exports, etc.) still works as before.
     let _ = dotenvy::dotenv();
+
+    if std::env::args().nth(1).as_deref() == Some("admin-token") {
+        std::process::exit(print_admin_token().await);
+    }
 
     // 1. Tracing — timestamps in IST (UTC+5:30) so server logs are readable
     let ist_timer = tracing_subscriber::fmt::time::OffsetTime::new(

@@ -338,7 +338,7 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     ).execute(&pool).await.unwrap();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_otp_codes_phone_sent ON otp_codes (phone, sent_at)")
         .execute(&pool).await.unwrap();
-    let _ = sqlx::query("DELETE FROM otp_codes WHERE expires_at < ?").bind(current_ist_timestamp_string()).execute(&pool).await;
+    let _ = crate::auth::otp::prune_before_window(&pool, &current_ist_timestamp_string()).await;
 
     pool
 }

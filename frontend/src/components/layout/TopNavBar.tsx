@@ -1,4 +1,4 @@
-import { Bell, User, AlertOctagon, ShieldCheck, Lock, Eye, KeyRound, Zap } from 'lucide-react';
+import { Bell, User, AlertOctagon, ShieldCheck, LogOut, Eye, KeyRound, Zap } from 'lucide-react';
 import type { ScreenId } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 
@@ -73,10 +73,10 @@ export function TopNavBar({
             <button
               type="button"
               onClick={lock}
-              title="Lock session (switch to Read-Only mode)"
+              title="Sign out — here and on the main page"
               className="ml-1 text-emerald-400/70 hover:text-emerald-300 p-0.5 rounded transition-colors"
             >
-              <Lock size={12} />
+              <LogOut size={12} />
             </button>
           </div>
         ) : (

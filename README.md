@@ -167,7 +167,8 @@ one). These are the supported variables:
 # ── Sign-in (required) ────────────────────────────────────
 # Gates the whole app — every /api/* route but /api/health, /api/version and
 # the sign-in itself needs the bearer token a phone sign-in returns, signed
-# with AUTH_SECRET. See "Signing In".
+# with AUTH_SECRET. See "Signing In". Read at run time only, never built into
+# the binary (release binaries are public).
 AUTH_SECRET=change-me-too
 ADMIN_PHONE=75xxxxxxxx                    # the owner's 10-digit number: the one admin
 WA_SERVER_URL=https://wa.example.com     # self-hosted WhatsApp server that sends the codes
@@ -468,6 +469,7 @@ These files should remain on persistent disk on the VM, inside `backend/`:
 The site (for example `https://at.axiosiiitl.dev`) opens on a sign-in page; nothing else loads, and the server answers nothing but `/api/health`, `/api/version` and the sign-in itself, until someone signs in. The redesign is at `/`; the old dashboard (v1) is at `/v1/`.
 
 - **One way in: a phone number and a WhatsApp code.** The server sends a 6-digit code through your WhatsApp server (`WA_SERVER_URL` / `WA_API_KEY`), valid for 10 minutes and for one sign-in. Only numbers on the allow-list (the Admin page) get a code. There is no passkey.
+- **Limits, per number:** 3 codes every 10 minutes, 5 guesses a code, and 30 guesses a day across all its codes; past that the number gets no code until the day is up. Per address: 10 sends and 20 guesses every 10 minutes. Anyone who knows the admin's number can use those up — the way back in is [`admin-token`](#locked-out-sign-in-with-admin-token).
 - **The admin is `ADMIN_PHONE`, and nobody else.** That number is put on the allow-list as the admin at every start, and any other admin row is made a paper user. The admin's sign-in does everything: LIVE orders, Paper↔LIVE, the kill switch, Kotak and Telegram, settings, the allow-list, clearing the database and updating the server. It lasts 7 days.
 - **Everyone else is a paper trader**: charts, the Market page and (once it ships) their own paper portfolio — never the owner's positions, trades, logs or settings, and never a real order.
 - **v1 at `/v1/` opens with the admin's sign-in**, made on the main page in the same browser. Without it, v1 shows a link there.
@@ -486,6 +488,18 @@ The server also **stores the admin's code** in a file, so you can still get in w
 - **What:** only the admin's latest code, in plain text. Users' codes are never written there. Every code, the admin's included, is also kept in `trades.db` (table `otp_codes`), but only as a keyed hash, so it can't be read back from the database.
 - **Who can read it:** the file is created with mode `600`, so only the VM user that runs the server can read it. It is replaced by each new admin code and deleted when the admin signs in.
 - **When WhatsApp fails or isn't set up**, the admin's code still counts: the sign-in page says the code is on the server instead of refusing. A user's code is refused as before.
+
+### Locked out: sign in with `admin-token`
+
+The admin's code shares its limits with anyone who types the admin's number, so a stranger can burn every code (and the day's 30 guesses) before you get to use one. The server binary can then mint an admin sign-in itself, from a shell on the VM:
+
+```bash
+cd ~/auto-trader/backend
+./server-<version>-x86_64-unknown-linux-gnu admin-token
+# eyJhbGciOiJIUzI1NiIs…   ← the token (stdout); the line after it says what to do
+```
+
+It reads `AUTH_SECRET` and `ADMIN_PHONE` from `.env` and the admin's row from `trades.db` in that directory (read only — the running server keeps running), prints a 7-day admin token and exits. On the site, open the browser console and run `localStorage.setItem('at_user_token', '<token>')`, then reload. Anyone who can run this already has the VM, so it opens nothing new.
 
 ### Where the server's log is
 

@@ -147,7 +147,7 @@ export async function requestOtp(base: string, phone: string): Promise<OtpReques
     }
     if (res.status === 429) {
       const secs = parseInt(res.headers.get('Retry-After') || '600', 10);
-      return { ok: false, status: 429, error: 'Too many attempts.', lockedForSecs: Number.isFinite(secs) ? secs : 600 };
+      return { ok: false, status: 429, error: await errorOf(res), lockedForSecs: Number.isFinite(secs) ? secs : 600 };
     }
     return { ok: false, status: res.status, error: await errorOf(res) };
   } catch {
@@ -165,7 +165,7 @@ export async function verifyOtp(base: string, phone: string, code: string): Prom
     if (res.ok) return (await res.json()) as { token: string; user: SessionUser };
     if (res.status === 429) {
       const secs = parseInt(res.headers.get('Retry-After') || '600', 10);
-      return { error: 'Too many attempts.', status: 429, lockedForSecs: Number.isFinite(secs) ? secs : 600 };
+      return { error: await errorOf(res), status: 429, lockedForSecs: Number.isFinite(secs) ? secs : 600 };
     }
     return { error: await errorOf(res), status: res.status };
   } catch {
@@ -174,7 +174,7 @@ export async function verifyOtp(base: string, phone: string, code: string): Prom
 }
 
 export const listUsers = (base: string) => getJson<AdminUser[]>(base, '/api/admin/users');
-// The only writes the admin's phone token may make, so the only ones sent `auto`.
+// The Admin page's allow-list.
 export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name });
 export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) =>
   send(base, `/api/admin/users/${id}`, 'PATCH', patch);

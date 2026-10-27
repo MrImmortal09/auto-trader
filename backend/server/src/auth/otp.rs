@@ -21,6 +21,13 @@ pub const MAX_SENDS_PER_PHONE: i64 = 3;
 pub const SEND_WINDOW_SECS: i64 = 10 * 60;
 /// Guesses a code takes before it is thrown away (a right one counts too).
 pub const MAX_WRONG_ATTEMPTS: i64 = 5;
+/// Guesses one phone's codes may take in `GUESS_WINDOW_SECS`, every code
+/// together: without it, 3 codes × 5 guesses every 10 minutes is about
+/// 2,000 guesses a day at one number. Past it the phone gets no new code and
+/// no guess until the oldest of them is a day old; the admin can still get
+/// in with `server admin-token` on the VM.
+pub const MAX_GUESSES_PER_DAY: i64 = 30;
+pub const GUESS_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// Per address, inside `IP_WINDOW`.
 pub const MAX_SENDS_PER_IP: u32 = 10;
 pub const MAX_VERIFIES_PER_IP: u32 = 20;
@@ -97,10 +104,29 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// Drop codes that expired before `now`.
-pub async fn prune_expired(pool: &SqlitePool, now: &str) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM otp_codes WHERE expires_at < ?").bind(now).execute(pool).await?;
+/// The IST timestamp `GUESS_WINDOW_SECS` before `now`; everything (`""`)
+/// if `now` can't be read, so the cap errs toward refusing.
+pub fn guess_window_start(now: &str) -> String {
+    chrono::NaiveDateTime::parse_from_str(now, "%Y-%m-%d %H:%M:%S")
+        .map(|t| (t - chrono::Duration::seconds(GUESS_WINDOW_SECS)).format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+/// Drop codes sent more than a day before `now`: older than any guess the
+/// daily cap counts. Newer ones stay, expired or not, so a restart can't
+/// reset the cap.
+pub async fn prune_before_window(pool: &SqlitePool, now: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM otp_codes WHERE sent_at < ?").bind(guess_window_start(now)).execute(pool).await?;
     Ok(())
+}
+
+/// Guesses at `phone`'s codes sent at or after `since`.
+pub async fn guesses_since(pool: &SqlitePool, phone: &str, since: &str) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT COALESCE(SUM(attempts), 0) FROM otp_codes WHERE phone = ? AND sent_at >= ?")
+        .bind(phone)
+        .bind(since)
+        .fetch_one(pool)
+        .await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +138,8 @@ pub enum Verify {
     NoCode,
     /// The fifth wrong guess: the code is gone, ask for a new one.
     TooManyAttempts,
+    /// The phone's codes took `MAX_GUESSES_PER_DAY` guesses in the last day.
+    TooManyToday,
 }
 
 #[derive(sqlx::FromRow)]
@@ -122,8 +150,8 @@ struct Pending {
 
 /// Check `code` against the newest live code for `phone`. The guess is
 /// counted in one guarded statement *before* it is compared, so parallel
-/// guesses each take one of the five tries; a right code claims the row
-/// with the same guard, so it is accepted once.
+/// guesses each take one of the five tries, and none past the day's cap; a
+/// right code claims the row with the same guard, so it is accepted once.
 pub async fn verify(pool: &SqlitePool, secret: &str, phone: &str, code: &str, now: &str) -> sqlx::Result<Verify> {
     let pending = sqlx::query_as::<_, Pending>(
         "SELECT id, code_hash FROM otp_codes
@@ -136,15 +164,27 @@ pub async fn verify(pool: &SqlitePool, secret: &str, phone: &str, code: &str, no
     .await?;
     let Some(pending) = pending else { return Ok(Verify::NoCode) };
 
+    let since = guess_window_start(now);
     let attempts: Option<i64> = sqlx::query_scalar(
         "UPDATE otp_codes SET attempts = attempts + 1
-         WHERE id = ? AND consumed = 0 AND attempts < ? RETURNING attempts",
+         WHERE id = ? AND consumed = 0 AND attempts < ?
+           AND (SELECT COALESCE(SUM(attempts), 0) FROM otp_codes WHERE phone = ? AND sent_at >= ?) < ?
+         RETURNING attempts",
     )
     .bind(pending.id)
     .bind(MAX_WRONG_ATTEMPTS)
+    .bind(phone)
+    .bind(&since)
+    .bind(MAX_GUESSES_PER_DAY)
     .fetch_optional(pool)
     .await?;
-    let Some(attempts) = attempts else { return Ok(Verify::TooManyAttempts) };
+    let Some(attempts) = attempts else {
+        return Ok(if guesses_since(pool, phone, &since).await? >= MAX_GUESSES_PER_DAY {
+            Verify::TooManyToday
+        } else {
+            Verify::TooManyAttempts
+        });
+    };
 
     if code_matches(secret, phone, code, &pending.code_hash) {
         let mut tx = pool.begin().await?;
@@ -166,6 +206,41 @@ pub async fn verify(pool: &SqlitePool, secret: &str, phone: &str, code: &str, no
         return Ok(Verify::TooManyAttempts);
     }
     Ok(Verify::Wrong { attempts_left: MAX_WRONG_ATTEMPTS - attempts })
+}
+
+#[cfg(test)]
+mod daily_cap_tests {
+    use super::*;
+    use crate::db::{self, test_support::TempDb};
+
+    const PHONE: &str = "7000000001";
+
+    #[tokio::test]
+    async fn a_phone_takes_thirty_guesses_a_day_across_all_its_codes() {
+        let tmp = TempDb::new("otp-daily");
+        let pool = db::init_db(&tmp.url()).await;
+        let hash = hash_code("s", PHONE, "123456");
+        // Six codes over the morning, each burned with five wrong guesses: thirty in all.
+        for i in 0..6 {
+            let at = format!("2026-10-26 {:02}:00:00", 8 + i);
+            let until = format!("2026-10-26 {:02}:10:00", 8 + i);
+            insert_if_under_limit(&pool, PHONE, &hash, &at, &until, "ip", &at, MAX_SENDS_PER_PHONE).await.unwrap().unwrap();
+            let guess_at = format!("2026-10-26 {:02}:05:00", 8 + i);
+            for _ in 0..MAX_WRONG_ATTEMPTS {
+                assert_ne!(verify(&pool, "s", PHONE, "000000", &guess_at).await.unwrap(), Verify::Ok);
+            }
+        }
+        assert_eq!(guesses_since(&pool, PHONE, "2026-10-26 00:00:00").await.unwrap(), MAX_GUESSES_PER_DAY);
+        // A seventh code takes no guess, even the right one.
+        insert_if_under_limit(&pool, PHONE, &hash, "2026-10-26 15:00:00", "2026-10-26 15:10:00", "ip", "2026-10-26 15:00:00", 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verify(&pool, "s", PHONE, "123456", "2026-10-26 15:01:00").await.unwrap(), Verify::TooManyToday);
+        // The day runs back 24 hours from each guess.
+        assert_eq!(guess_window_start("2026-10-27 08:00:01"), "2026-10-26 08:00:01");
+        assert_eq!(guess_window_start("garbage"), "");
+    }
 }
 
 #[cfg(test)]
@@ -242,7 +317,7 @@ mod tests {
         let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM otp_codes WHERE phone = ? AND consumed = 0").bind(PHONE).fetch_one(&pool).await.unwrap();
         assert_eq!(live, 0);
 
-        prune_expired(&pool, "2026-10-27 00:00:00").await.unwrap();
+        prune_before_window(&pool, "2026-10-27 12:00:00").await.unwrap();
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM otp_codes").fetch_one(&pool).await.unwrap();
         assert_eq!(rows, 0);
     }
