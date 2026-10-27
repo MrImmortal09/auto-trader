@@ -327,7 +327,8 @@ mod tests {
         let tmp = TempDb::new("otp-race");
         let pool = db::init_db(&tmp.url()).await;
         send(&pool, "123456", "2026-10-26 10:00:00", "2026-10-26 10:10:00").await.unwrap();
-        // Twenty wrong guesses at once: at most five are counted as tries, the rest are refused.
+        // Twenty wrong guesses at once: at most five are counted as tries, the rest are refused —
+        // as too many, or as no code when a guess looks only after the fifth has thrown it away.
         let guesses = (0..20).map(|_| {
             let pool = pool.clone();
             async move { verify(&pool, "s", PHONE, "000000", "2026-10-26 10:05:00").await.unwrap() }
@@ -335,7 +336,7 @@ mod tests {
         let answers = futures::future::join_all(guesses).await;
         let wrong = answers.iter().filter(|a| matches!(a, Verify::Wrong { .. })).count();
         assert!(wrong <= 4, "{answers:?}");
-        assert!(answers.iter().all(|a| matches!(a, Verify::Wrong { .. } | Verify::TooManyAttempts)), "{answers:?}");
+        assert!(answers.iter().all(|a| matches!(a, Verify::Wrong { .. } | Verify::TooManyAttempts | Verify::NoCode)), "{answers:?}");
         // Afterwards even the right code is refused.
         assert_eq!(verify(&pool, "s", PHONE, "123456", "2026-10-26 10:05:00").await.unwrap(), Verify::NoCode);
     }
