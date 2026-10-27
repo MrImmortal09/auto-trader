@@ -13,6 +13,7 @@ mod desk;
 mod execute;
 mod history;
 mod market_data;
+mod paper;
 mod pulse;
 mod routes;
 mod system;
@@ -159,6 +160,9 @@ pub(crate) struct AppState {
     pub limits: Arc<auth::ratelimit::Limiter>,
     /// How sign-in codes leave the server — see `auth::whatsapp`.
     pub whatsapp: Arc<auth::whatsapp::Delivery>,
+    /// Signed-in users' own paper portfolios — see `paper`. Nothing in it
+    /// reaches the owner's engine or the broker.
+    pub paper: Arc<paper::PaperDesk>,
 }
 
 // ---------------------------------------------------------------------------
@@ -969,6 +973,13 @@ async fn main() {
         Arc::clone(&balance),
     ));
 
+    // 9d. Users' paper portfolios, as they were left.
+    let paper_desk = Arc::new(
+        paper::PaperDesk::load(pool.clone(), Arc::clone(&prices))
+            .await
+            .expect("cannot read the users' paper positions"),
+    );
+
     // 10. Router
     let state = AppState {
         signal_tx,
@@ -998,8 +1009,13 @@ async fn main() {
         auth: auth_state,
         limits: Arc::new(auth::ratelimit::Limiter::new()),
         whatsapp,
+        paper: paper_desk,
     };
     pulse::spawn_sampler(state.clone());
+    // Users' paper positions: chart levels and the expiry square-off, and
+    // their contracts kept on the feed.
+    tokio::spawn(paper::engine::run(Arc::clone(&state.paper)));
+    paper::feed::spawn_keeper(Arc::clone(&state.paper), Arc::clone(&state.ws_tx));
     state.execute.spawn_error_watch(&state.log_tx);
     // Reconnect Telegram from the last Start, so a restart or an update needs
     // no login code. Nothing missed while down is replayed.
@@ -1080,6 +1096,17 @@ async fn main() {
         .route("/api/v2/mode-check",                get(routes::v2::mode_check_handler))
         .route("/api/v2/candles",                   get(routes::v2::candles_handler))
         .route("/api/v2/candles/stream",            get(routes::v2::candles_stream_handler))
+        .route("/api/v2/me/desk",                   get(routes::v2::me::desk_handler))
+        .route("/api/v2/me/history",                get(routes::v2::me::history_handler))
+        .route("/api/v2/me/marks",                  get(routes::v2::me::marks_handler))
+        .route("/api/v2/me/positions",              get(routes::v2::me::positions_handler))
+        .route("/api/v2/me/activity",               get(routes::v2::me::activity_handler))
+        .route("/api/v2/me/buy",                    post(routes::v2::me::buy_handler))
+        .route("/api/v2/me/positions/:id",          axum::routing::patch(routes::v2::me::patch_levels_handler))
+        .route("/api/v2/me/positions/:id/sell",     post(routes::v2::me::sell_handler))
+        .route("/api/v2/me/positions/:id/close",    post(routes::v2::me::close_handler))
+        .route("/api/v2/me/exit-all",               post(routes::v2::me::exit_all_handler))
+        .route("/api/v2/me/reset",                  post(routes::v2::me::reset_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
         // Every `/api/*` request learns who is calling and is refused when
         // `auth::policy` asks for more — see `auth::middleware`.

@@ -171,12 +171,24 @@ pub async fn delete_user_handler(State(state): State<AppState>, Path(id): Path<i
     if is_seeded_admin(&current) {
         return refuse(StatusCode::CONFLICT, "The admin account can't be removed");
     }
+    // Held until the rows are gone, so they can't open a position meanwhile.
+    let Some(flat) = state.paper.hold_flat(id).await else {
+        return refuse(
+            StatusCode::CONFLICT,
+            "This user holds open paper positions — disable them instead, or remove them once they are flat",
+        );
+    };
     let mut tx = match state.db_pool.begin().await {
         Ok(tx) => tx,
         Err(e) => return server_error("remove the user", e),
     };
+    // A user's paper portfolio goes with them: a later user given the same id
+    // must start from nothing.
     let done = async {
         sqlx::query("DELETE FROM otp_codes WHERE phone = ?").bind(&current.phone).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM user_trades WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM user_positions WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM user_wallets WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&mut *tx).await?;
         Ok::<(), sqlx::Error>(())
     }
@@ -188,6 +200,8 @@ pub async fn delete_user_handler(State(state): State<AppState>, Path(id): Path<i
     if let Err(e) = tx.commit().await {
         return server_error("remove the user", e);
     }
+    drop(flat);
+    state.paper.forget(id);
     state.auth.users.remove(id);
     tracing::info!(user_id = id, "User removed from the allow-list");
     Json(json!({ "deleted": true, "id": id })).into_response()

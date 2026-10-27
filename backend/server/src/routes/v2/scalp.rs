@@ -230,6 +230,34 @@ struct MarksAnswer {
     telegram: Vec<TelegramLine>,
 }
 
+/// `day`'s legs, as chart markers.
+fn fill_marks(legs: Vec<history::Leg>, day: &str) -> Vec<FillMark> {
+    legs.into_iter()
+        .filter(|l| l.timestamp.starts_with(day))
+        .map(|l| FillMark {
+            scalp: l.signal_id.as_deref().is_some_and(|s| s.starts_with("manual-")),
+            id: l.id,
+            t: l.timestamp,
+            action: l.action.to_ascii_uppercase(),
+            qty: l.qty,
+            price: l.executed_price,
+            index: l.ticker,
+            strike: l.strike,
+            side: l.option_type,
+            reason: l.exit_reason,
+        })
+        .collect()
+}
+
+/// `GET /api/v2/me/marks`'s answer, from a user's own paper `legs`: their
+/// fills today, in `/api/v2/marks`' shape, and no Telegram calls or
+/// positions — those are the owner's.
+pub(crate) fn paper_marks(legs: Vec<history::Leg>) -> Response {
+    let day = shared_domain::today_ist().format("%Y-%m-%d").to_string();
+    let fills = fill_marks(legs, &day);
+    Json(MarksAnswer { day, fills, calls: Vec::new(), telegram: Vec::new() }).into_response()
+}
+
 /// `GET /api/v2/marks` — today's buys and sells (the current mode's), the
 /// Telegram calls that named an index option and when they arrived, and the
 /// open Telegram positions — for the Scalp charts' markers and read-only lines.
@@ -243,22 +271,7 @@ pub async fn marks_handler(State(state): State<AppState>) -> Response {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "could not read trades" }))).into_response();
         }
     };
-    let fills = legs
-        .into_iter()
-        .filter(|l| l.timestamp.starts_with(&day))
-        .map(|l| FillMark {
-            scalp: l.signal_id.as_deref().is_some_and(|s| s.starts_with("manual-")),
-            id: l.id,
-            t: l.timestamp,
-            action: l.action.to_ascii_uppercase(),
-            qty: l.qty,
-            price: l.executed_price,
-            index: l.ticker,
-            strike: l.strike,
-            side: l.option_type,
-            reason: l.exit_reason,
-        })
-        .collect();
+    let fills = fill_marks(legs, &day);
     let calls = sqlx::query_as::<_, CallMark>(
         "SELECT id, sent_at, chat_title, instrument, strike, side, text FROM telegram_messages
          WHERE sent_at >= ? AND sent_at <= ? AND kind = 'signal' AND instrument IS NOT NULL

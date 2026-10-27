@@ -14,6 +14,7 @@ use serde::Serialize;
 use shared_domain::{ChartLevels, MonitoredPosition, TradeState};
 
 use crate::history::{Call, LegRow, UNKNOWN_CHANNEL};
+use crate::paper::PaperPosition;
 
 /// The colour a chip takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -294,6 +295,46 @@ impl DeskPosition {
     }
 }
 
+impl DeskPosition {
+    /// A user's open paper position, as the same row: a scalp, no stop or
+    /// targets but its chart levels.
+    pub fn of_paper(p: &PaperPosition, ltp: Option<f64>, index_ltp: Option<f64>) -> DeskPosition {
+        let ltp = ltp.filter(|v| *v > 0.0);
+        let pnl = ltp.map(|ltp| (ltp - p.avg_price) * f64::from(p.qty));
+        let pnl_pct = ltp.filter(|_| p.avg_price > 0.0).map(|ltp| (ltp - p.avg_price) / p.avg_price * 100.0);
+        DeskPosition {
+            id: p.id.clone(),
+            contract: p.label(),
+            index: p.index.clone(),
+            strike: Some(p.strike),
+            side: Some(p.option_type.clone()),
+            source: Source { kind: "scalp", title: "Scalp".to_string() },
+            state: "active",
+            qty: p.qty,
+            lot_size: p.lot_size.max(1),
+            lots: p.lots(),
+            lots_set: false,
+            avg: p.avg_price,
+            since: hh_mm(&p.opened_at),
+            ltp,
+            pnl,
+            pnl_pct,
+            entry: p.avg_price,
+            entry_max: None,
+            entry_condition: "MARKET".to_string(),
+            zone: None,
+            valid_till: None,
+            stop: 0.0,
+            signal_stop: 0.0,
+            targets: Vec::new(),
+            next_target: None,
+            chart: p.chart,
+            index_ltp: index_ltp.filter(|v| *v > 0.0),
+            busy: None,
+        }
+    }
+}
+
 /// The Desk's figures for today.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeskKpis {
@@ -537,6 +578,19 @@ pub fn expiring_today(positions: &[MonitoredPosition], today: NaiveDate) -> Vec<
             *by_index.entry(p.signal.instrument_name.trim().to_uppercase()).or_default() += 1;
         }
     }
+    expiring(by_index, today)
+}
+
+/// [`expiring_today`] for a user's paper positions.
+pub fn paper_expiring_today(positions: &[PaperPosition], today: NaiveDate) -> Vec<Expiring> {
+    let mut by_index: BTreeMap<String, usize> = BTreeMap::new();
+    for p in positions.iter().filter(|p| p.expiry == today && p.qty > 0) {
+        *by_index.entry(p.index.trim().to_uppercase()).or_default() += 1;
+    }
+    expiring(by_index, today)
+}
+
+fn expiring(by_index: BTreeMap<String, usize>, today: NaiveDate) -> Vec<Expiring> {
     by_index
         .into_iter()
         .map(|(index, positions)| Expiring {

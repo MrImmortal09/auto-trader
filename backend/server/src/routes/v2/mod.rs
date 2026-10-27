@@ -6,6 +6,7 @@ pub mod candles;
 pub mod desk;
 pub mod flags;
 pub mod history;
+pub mod me;
 pub mod positions;
 pub mod scalp;
 pub mod system;

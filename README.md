@@ -741,6 +741,12 @@ The **Daily Reports** page provides an aggregated view of trading performance by
 | `GET` | `/api/v2/chain?index=&expiry=` | One expiry's strikes (the nearest by default), each side with its trading symbol and delta (Upstox's for the expiry it polls, else an assumed ±0.50) |
 | `GET` | `/api/v2/candles?symbol=&tf=&from=&to=` | Chart bars, oldest first. `symbol`: an index (`NIFTY`), its nearest future (`NIFTY:FUT`) or an option (`NIFTY:2026-10-27:22750:CE`); `tf`: `1m`, `5m` (default) or `15m`; `from`/`to`: IST days (default: the last five). Past days come from Upstox; today's are built from live ticks and replaced minute by minute with Upstox's official candles, which carry the volume |
 | `GET` | `/api/v2/candles/stream?symbols=&tf=` | SSE: every 250 ms, the bars that changed — the forming bar, and a closed bar again when Upstox's official minutes correct it. Up to 6 comma-separated symbols |
+| `GET` | `/api/v2/me/desk` | A user's own paper Desk, in `/api/v2/desk`'s shape: wallet (₹10,00,000 to start), today's figures, open positions and the calls closed today. `/api/v2/me/*` is for a user's phone sign-in only (the admin gets 403) |
+| `GET` | `/api/v2/me/history?range=&group=` · `/me/marks` · `/me/positions` · `/me/activity` | The user's closed calls (`/api/v2/history`'s shape), today's fills for the charts, open positions, and the last 100 things that happened to them (in memory) |
+| `POST` | `/api/v2/me/buy` | `{trading_symbol, lots}`: a paper buy, filled at once at the live price — the same checks as `/api/execute/buy` but the kill switch, plus 10 open contracts per user, 40 across all users, and no buy of a contract being squared off. Charges are Kotak's with ₹20 brokerage a leg; the wallet never goes below zero |
+| `POST` | `/api/v2/me/positions/:id/sell` · `/close` · `/api/v2/me/exit-all` | `{lots}` / all of one / all of them, at the live price (from the last 10 s), 09:15–15:30 IST. Never more than is held |
+| `PATCH` | `/api/v2/me/positions/:id` | Chart `stop` and `target`, as `/api/v2/positions/:id` (not gated by `chart_stops`). Checked every 500 ms; a crossed level sells everything at a fresh price. An expiring position is sold from 15:29:30 IST |
+| `POST` | `/api/v2/me/reset` | Start over with ₹10,00,000 and an empty history (only when nothing is open) |
 
 ---
 
