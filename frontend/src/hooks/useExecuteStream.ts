@@ -11,9 +11,11 @@ export const STREAM_STALE_AFTER_MS = 2_000;
  * ladder of `expiry` (the nearest when null) around `centre` (ATM when
  * null). Switching any of them reopens the stream; the last frame is kept
  * meanwhile so the page never blanks. `now` ticks so the caller can tell how
- * old the frame is.
+ * old the frame is. The token goes in the URL (an `EventSource` can't set
+ * headers): the stored passkey token unless `token` says otherwise — v2
+ * passes a phone sign-in's token, or null for a visitor.
  */
-export function useExecuteStream(serverBase: string, index: string, expiry: string | null = null, centre: number | null = null) {
+export function useExecuteStream(serverBase: string, index: string, expiry: string | null = null, centre: number | null = null, token?: string | null) {
   const [frame, setFrame] = useState<ExecuteFrame | null>(null);
   const [connected, setConnected] = useState(false);
   // Local receipt time, so browser/VM clock skew can't make a live stream look
@@ -30,12 +32,12 @@ export function useExecuteStream(serverBase: string, index: string, expiry: stri
     return () => clearInterval(timer);
   }, []);
 
+  const sendToken = token === undefined ? getToken() : token;
   useEffect(() => {
-    const token = getToken();
     const params = new URLSearchParams({ index });
     if (expiry) params.set('expiry', expiry);
     if (centre != null) params.set('centre', String(centre));
-    if (token) params.set('token', token);
+    if (sendToken) params.set('token', sendToken);
     const es = new EventSource(`${apiUrl(serverBase, '/api/execute/stream')}?${params}`);
     es.onopen = () => setConnected(true);
     es.onmessage = (e: MessageEvent<string>) => {
@@ -52,7 +54,7 @@ export function useExecuteStream(serverBase: string, index: string, expiry: stri
     // EventSource reconnects on its own; this only flips the badge meanwhile.
     es.onerror = () => setConnected(false);
     return () => es.close();
-  }, [serverBase, index, expiry, centre, key]);
+  }, [serverBase, index, expiry, centre, key, sendToken]);
 
   const ageMs = receivedAt == null ? null : Math.max(0, now - receivedAt);
   const stale = !connected || ageMs == null || ageMs > STREAM_STALE_AFTER_MS;

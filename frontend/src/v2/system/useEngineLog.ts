@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { apiFetch, apiUrl } from '../../lib/api';
-import { getToken } from '../../lib/auth';
+import { apiFetchWith, apiUrl } from '../../lib/api';
+import { streamToken } from '../lib/api';
 import { nowIstTime, todayIst } from '../lib/format';
 import { logLine, type LogLine } from './logLines';
 
@@ -32,7 +32,7 @@ export function useEngineLog(serverBase: string): { lines: LogLine[]; connected:
         return { base: serverBase, lines: next.slice(0, MAX_LINES), connected: prev.base === serverBase ? prev.connected : null };
       });
 
-    apiFetch(serverBase, '/api/logs/history')
+    apiFetchWith(streamToken(), serverBase, '/api/logs/history')
       .then((r) => (r.ok ? r.json() : []))
       .then((rows: unknown) => {
         if (cancelled || !Array.isArray(rows)) return;
@@ -44,7 +44,7 @@ export function useEngineLog(serverBase: string): { lines: LogLine[]; connected:
       })
       .catch(() => {});
 
-    const token = getToken();
+    const token = streamToken();
     const es = new EventSource(apiUrl(serverBase, '/api/logs/stream') + (token ? `?token=${encodeURIComponent(token)}` : ''));
     es.onopen = () => setState((prev) => ({ ...prev, base: serverBase, connected: true }));
     es.onmessage = (e: MessageEvent<string>) => {

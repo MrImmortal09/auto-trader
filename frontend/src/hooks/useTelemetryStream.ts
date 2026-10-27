@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { TelemetryPoint, TelemetrySample, TelemetrySnapshot } from '../types';
-import { apiFetch, apiUrl } from '../lib/api';
+import { apiFetch, apiFetchWith, apiUrl } from '../lib/api';
 import { getToken } from '../lib/auth';
 
 /** Matches the backend ring: 15 minutes at one sample per 2s. */
@@ -40,7 +40,10 @@ function mergePoints(prev: TelemetryPoint[], incoming: TelemetryPoint[]): Teleme
  * appends each 2s sample from the SSE stream. `now` ticks every second so the
  * caller can show how old the latest sample is.
  */
-export function useTelemetryStream(serverBase: string) {
+export function useTelemetryStream(serverBase: string, token?: string | null) {
+  // The stored passkey token unless `token` says otherwise (v2 passes the
+  // admin's phone token, which the System screen's data also needs).
+  const sendToken = token === undefined ? getToken() : token;
   const [history, setHistory] = useState<TelemetryPoint[]>([]);
   const [latest, setLatest] = useState<TelemetrySample | null>(null);
   const [connected, setConnected] = useState(false);
@@ -65,7 +68,7 @@ export function useTelemetryStream(serverBase: string) {
       setReceivedAt(Date.now());
     };
 
-    apiFetch(serverBase, '/api/telemetry/snapshot')
+    (token === undefined ? apiFetch(serverBase, '/api/telemetry/snapshot') : apiFetchWith(sendToken, serverBase, '/api/telemetry/snapshot'))
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((snap: TelemetrySnapshot) => {
         if (cancelled) return;
@@ -77,9 +80,8 @@ export function useTelemetryStream(serverBase: string) {
         if (!cancelled) setError(`Could not load stats history: ${String(e)}`);
       });
 
-    const token = getToken();
     const es = new EventSource(
-      apiUrl(serverBase, '/api/telemetry/stream') + (token ? `?token=${encodeURIComponent(token)}` : ''),
+      apiUrl(serverBase, '/api/telemetry/stream') + (sendToken ? `?token=${encodeURIComponent(sendToken)}` : ''),
     );
     es.onopen = () => setConnected(true);
     es.onmessage = (e: MessageEvent<string>) => {
@@ -100,7 +102,7 @@ export function useTelemetryStream(serverBase: string) {
       cancelled = true;
       es.close();
     };
-  }, [serverBase]);
+  }, [serverBase, token, sendToken]);
 
   const ageMs = receivedAt == null ? null : Math.max(0, now - receivedAt);
   const stale = ageMs == null || ageMs > STALE_AFTER_MS;

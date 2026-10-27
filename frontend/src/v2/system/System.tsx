@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react';
 import { ChevronLeft, ChevronRight, Download } from 'lucide-react';
 import { useTelemetryStream } from '../../hooks/useTelemetryStream';
-import { getSystem } from '../lib/api';
+import { getSystem, streamToken } from '../lib/api';
 import { hhmm, plural } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { HealthSet, Level, SystemAnswer } from '../lib/types';
@@ -121,7 +121,7 @@ function Details({ serverBase, t, marketOpen, compact }: { serverBase: string; t
 }
 
 export function System({ serverBase, desktop, health, marketOpen }: { serverBase: string; desktop: boolean; health: HealthSet | null; marketOpen: boolean }) {
-  const t = useTelemetryStream(serverBase);
+  const t = useTelemetryStream(serverBase, streamToken());
   const sys = usePoll(() => getSystem(serverBase), 15_000, serverBase);
   const log = useEngineLog(serverBase);
   const [view, setView] = useState<'overview' | 'log' | 'details'>('overview');

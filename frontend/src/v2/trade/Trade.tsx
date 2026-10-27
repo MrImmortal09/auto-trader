@@ -3,7 +3,8 @@ import { ChartCandlestick, ChevronDown, Columns2, Columns3, Square } from 'lucid
 import type { ChartLevel, ExecutePosition } from '../../types';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
-import { executeBuy, executeExitAll, exitPosition, getChain, getExpiries, getFlags, getMarks, sellQty, setChartLevels, type Sent } from '../lib/api';
+import { useIdentity } from '../auth/identity';
+import { executeBuy, executeExitAll, exitPosition, getChain, getExpiries, getFlags, getMarks, sellQty, setChartLevels, streamToken, type Sent } from '../lib/api';
 import { price, signedPct, toneOf, todayIst } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { ChainAnswer, ExpiriesAnswer } from '../lib/types';
@@ -140,6 +141,11 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [asked, setAsked] = useState<Record<string, true>>({});
   const guard = useGuard();
   const toast = useToast();
+  const { role, canReadOwner } = useIdentity();
+  // Whose desk a tap trades on: the owner's engine (the passkey) for the
+  // owner and the admin; a user's own paper book otherwise, which a visitor
+  // reaches by signing in first.
+  const scope = canReadOwner ? 'owner' : 'user';
 
   const save = useCallback((next: (s: Saved) => Saved) => {
     setSaved((prev) => {
@@ -167,9 +173,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const ladderExpiry = chosenExpiry && (!listedExpiries || listedExpiries.some((e) => e.date === chosenExpiry)) ? chosenExpiry : null;
   const ladderKey = `${saved.index}:${ladderExpiry ?? ''}`;
   const centre = centreAt?.key === ladderKey ? centreAt.strike : null;
-  const { frame, stale, now } = useExecuteStream(serverBase, saved.index, ladderExpiry, centre);
+  const { frame, stale, now } = useExecuteStream(serverBase, saved.index, ladderExpiry, centre, streamToken());
   const flags = usePoll(() => getFlags(serverBase), 15_000, serverBase);
-  const marks = usePoll(() => getMarks(serverBase), 5_000, serverBase);
+  // The fills and calls on the charts are the owner's.
+  const marks = usePoll(() => getMarks(serverBase), 5_000, serverBase, canReadOwner);
   const chartStopsOn = flags.data?.chart_stops ?? false;
 
   const scalps = useMemo(() => (frame?.positions ?? []).filter((p) => p.manual).map((p) => withPending(p, pending, now)), [frame, pending, now]);
@@ -237,7 +244,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const spot: Record<string, number | null> = Object.fromEntries((frame?.indices ?? []).map((i) => [i.index, i.spot]));
   const change: Record<string, number | null> = Object.fromEntries((frame?.indices ?? []).map((i) => [i.index, i.change_pct]));
   const held = new Map(scalps.map((p) => [p.symbol, p]));
-  const blocked = buyBlockedReason(frame, stale);
+  // A user's own paper book arrives with the next release: until then their
+  // taps stop here rather than at the owner's engine.
+  const blocked = (role === 'user' ? 'Paper trading for your account opens with the next update' : null) ?? buyBlockedReason(frame, stale);
   const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[saved.index] ?? 1));
 
   // Escape drops a "+ Stop" that hasn't been placed yet.
@@ -263,7 +272,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   async function buy(sym: string, label: string) {
     const qty = lots * (board?.lot_size ?? 0);
-    const sent = await busy(sym, () => guard('Placing orders needs write access.', () => executeBuy(serverBase, sym, lots), `${label} not bought`));
+    const sent = await busy(sym, () => guard('Sign in to place paper orders.', () => executeBuy(serverBase, sym, lots), `${label} not bought`, scope));
     if (sent?.ok) {
       const added = (sent.body as { action?: string } | null)?.action === 'added';
       toast({ tone: 'neutral', title: `${added ? 'Adding' : 'Buying'} ${qty} ${label}`, body: 'Market order sent — the fill shows here when it is done.' });
@@ -275,15 +284,15 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     exitAllBusy,
     onLessLot: (p) => {
       const label = contractLabel(p.index, p.strike, p.option_type);
-      void busy(p.id, () => guard('Selling needs write access.', () => sellQty(serverBase, p.id, p.lot_size), `${label} not sold`));
+      void busy(p.id, () => guard('Selling needs write access.', () => sellQty(serverBase, p.id, p.lot_size), `${label} not sold`, scope));
     },
     onExit: (p) => {
       const label = contractLabel(p.index, p.strike, p.option_type);
-      void busy(p.id, () => guard('Exiting needs write access.', () => exitPosition(serverBase, p.id), `${label} not exited`));
+      void busy(p.id, () => guard('Exiting needs write access.', () => exitPosition(serverBase, p.id), `${label} not exited`, scope));
     },
     onExitAll: () => {
       setExitAllBusy(true);
-      void guard('Exiting needs write access.', () => executeExitAll(serverBase), 'Exit all not sent').finally(() => setExitAllBusy(false));
+      void guard('Exiting needs write access.', () => executeExitAll(serverBase), 'Exit all not sent', scope).finally(() => setExitAllBusy(false));
     },
   };
 
@@ -294,6 +303,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       'Moving a stop or target needs write access.',
       () => setChartLevels(serverBase, p.id, { [kind]: lvl }),
       `${kind === 'stop' ? 'Stop' : 'Target'} not ${lvl ? 'set' : 'removed'}`,
+      scope,
     );
     if (!sent?.ok) {
       // Back to what the engine has.

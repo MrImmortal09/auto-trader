@@ -104,6 +104,17 @@ export function apiFetch(serverBase: string, path: string, init?: RequestInit) {
   });
 }
 
+/**
+ * `fetch` with `token` as the bearer — the phone sign-in's token, say — and
+ * nothing else: no stored token is read, cleared or reported on a 401. The
+ * caller decides what a refusal means for the token it sent.
+ */
+export function apiFetchWith(token: string | null, serverBase: string, path: string, init?: RequestInit) {
+  const headers = new Headers(init?.headers);
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  return fetch(apiUrl(serverBase, path), { ...init, headers });
+}
+
 export function handleUnauthorized(isMutation: boolean = false, rejectedToken?: string) {
   // If a specific token was rejected, only clear if it matches the current stored token
   // (prevents an older in-flight request from wiping a freshly saved token)

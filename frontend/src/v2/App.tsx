@@ -1,4 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
+import { Admin } from './admin/Admin';
+import { useIdentity } from './auth/identity';
+import { SignInSheet } from './auth/SignInSheet';
 import { Desk } from './desk/Desk';
 import { resumeTrading } from './lib/api';
 import { plural } from './lib/format';
@@ -7,13 +10,14 @@ import type { Stopped } from './lib/types';
 import { StatusBanners } from './shell/Banners';
 import { KillSwitchDialog } from './shell/KillSwitchDialog';
 import { NavRail, TabBar } from './shell/Nav';
-import { screenFromHash, type ScreenId } from './shell/screens';
+import { SCREENS, screenFromHash, TAB_SCREENS, visibleScreens, type ScreenId } from './shell/screens';
 import { DesktopStatusBar, PhoneStatusBar } from './shell/StatusBar';
 import { UnlockDialog } from './shell/UnlockDialog';
 import { useGuard } from './shell/useGuard';
 import { useEngineErrors, useStatus } from './shell/useStatus';
 import { Banner } from './ui/Banner';
 import { Settings } from './settings/Settings';
+import { UserSettings } from './settings/UserSettings';
 import { System } from './system/System';
 import { Segment } from './ui/Segment';
 
@@ -31,26 +35,35 @@ function stoppedLine(s: Stopped): string {
   return `${head} New calls are ignored until you resume.`;
 }
 
-/** The v2 shell: status bar, banners, navigation and the current screen. */
+/**
+ * The v2 shell: status bar, banners, navigation and the current screen.
+ * Anyone may look; what shows depends on who is signed in (`useIdentity`):
+ * the owner and the admin get the whole desk, a user or a visitor the
+ * public screens and their own sign-in.
+ */
 export default function App() {
   const serverBase = useServerBase();
   const desktop = useIsDesktop();
-  const [screen, setScreen] = useState<ScreenId>(screenFromHash);
+  const { role, canReadOwner } = useIdentity();
+  const screens = visibleScreens(role);
+  const [wanted, setWanted] = useState<ScreenId>(screenFromHash);
+  // A screen this person may not open (an old hash, or a sign-out) falls back to Desk.
+  const screen: ScreenId = screens.includes(wanted) ? wanted : 'desk';
   const [killSwitchOpen, setKillSwitchOpen] = useState(false);
   const [resuming, setResuming] = useState(false);
   const status = useStatus(serverBase);
   const guard = useGuard();
-  useEngineErrors(serverBase);
+  useEngineErrors(serverBase, canReadOwner);
 
   // The screen is mirrored in the hash (`/v2/#trade`): there are no deep paths.
   useEffect(() => {
-    const onHash = () => setScreen(screenFromHash());
+    const onHash = () => setWanted(screenFromHash());
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
 
   function go(next: ScreenId) {
-    setScreen(next);
+    setWanted(next);
     if (window.location.hash !== `#${next}`) window.location.hash = next;
   }
 
@@ -63,25 +76,29 @@ export default function App() {
 
   const s = status.data;
   const unreachable = !!status.error;
-  const stopped = s?.kill_switch ? s.stopped ?? { at: null, positions_exited: 0, entries_cancelled: 0 } : null;
+  const stopped = canReadOwner && s?.kill_switch ? s.stopped ?? { at: null, positions_exited: 0, entries_cancelled: 0 } : null;
+  // Phone: the screens behind More, with a switch between them when there are several.
+  const more = screens.filter((id) => !TAB_SCREENS.includes(id));
 
   const content =
     screen === 'desk' ? (
-      <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} />
+      <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} role={role} />
     ) : screen === 'trade' ? (
       <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>
         <Trade serverBase={serverBase} desktop={desktop} />
       </Suspense>
     ) : screen === 'market' ? (
       <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>
-        <Market serverBase={serverBase} desktop={desktop} />
+        <Market serverBase={serverBase} desktop={desktop} canReadOwner={canReadOwner} />
       </Suspense>
     ) : (
       (() => {
         const page =
           screen === 'system' ? (
             <System serverBase={serverBase} desktop={desktop} health={s?.health ?? null} marketOpen={s?.market_open ?? false} />
-          ) : (
+          ) : screen === 'admin' ? (
+            <Admin serverBase={serverBase} desktop={desktop} />
+          ) : canReadOwner ? (
             <Settings
               serverBase={serverBase}
               desktop={desktop}
@@ -89,9 +106,10 @@ export default function App() {
               onKillSwitch={() => setKillSwitchOpen(true)}
               onModeChanged={() => void status.refresh()}
             />
+          ) : (
+            <UserSettings serverBase={serverBase} desktop={desktop} />
           );
-        if (desktop) return page;
-        // Phone: More holds Settings and System behind a two-way switch.
+        if (desktop || more.length < 2) return page;
         return (
           <div className="flex min-h-full flex-col">
             <div className="px-4 pt-4">
@@ -101,10 +119,7 @@ export default function App() {
                 stretch
                 value={screen}
                 onChange={go}
-                options={[
-                  { value: 'settings', label: 'Settings' },
-                  { value: 'system', label: 'System' },
-                ]}
+                options={SCREENS.filter((sc) => more.includes(sc.id)).map((sc) => ({ value: sc.id, label: sc.label }))}
               />
             </div>
             <div className="flex-1">{page}</div>
@@ -116,9 +131,9 @@ export default function App() {
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-canvas text-fg">
       {desktop ? (
-        <DesktopStatusBar status={s} unreachable={unreachable} onKillSwitch={() => setKillSwitchOpen(true)} />
+        <DesktopStatusBar status={s} unreachable={unreachable} role={role} onKillSwitch={() => setKillSwitchOpen(true)} />
       ) : (
-        <PhoneStatusBar status={s} unreachable={unreachable} onKillSwitch={() => setKillSwitchOpen(true)} />
+        <PhoneStatusBar status={s} unreachable={unreachable} role={role} onKillSwitch={() => setKillSwitchOpen(true)} />
       )}
       {stopped && (
         <Banner
@@ -128,17 +143,17 @@ export default function App() {
           action={{ label: resuming ? 'Resuming…' : 'Resume trading', onClick: () => void resume(), disabled: resuming }}
         />
       )}
-      <StatusBanners serverBase={serverBase} status={s} />
+      <StatusBanners serverBase={serverBase} status={s} canReadOwner={canReadOwner} />
       <div className="flex min-h-0 flex-1">
-        {desktop && <NavRail screen={screen} onSelect={go} />}
+        {desktop && <NavRail screens={screens} screen={screen} onSelect={go} />}
         <main className="min-w-0 flex-1 overflow-y-auto">{content}</main>
       </div>
-      {!desktop && <TabBar screen={screen} onSelect={go} />}
+      {!desktop && <TabBar screens={screens} screen={screen} onSelect={go} />}
 
-
-      {killSwitchOpen && (
+      {killSwitchOpen && canReadOwner && (
         <KillSwitchDialog serverBase={serverBase} mode={s?.mode} onClose={() => setKillSwitchOpen(false)} onDone={() => void status.refresh()} />
       )}
+      <SignInSheet />
       <UnlockDialog serverBase={serverBase} />
     </div>
   );

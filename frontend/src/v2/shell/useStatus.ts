@@ -1,7 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { apiUrl } from '../../lib/api';
-import { getToken } from '../../lib/auth';
-import { getStatus } from '../lib/api';
+import { getStatus, streamToken } from '../lib/api';
 import { fillToast } from '../lib/labels';
 import { usePoll } from '../lib/usePoll';
 import type { StatusAnswer } from '../lib/types';
@@ -35,13 +34,15 @@ export function useStatus(serverBase: string) {
   return polled;
 }
 
-/** A toast for each engine error on the live log. */
-export function useEngineErrors(serverBase: string) {
+/** A toast for each engine error on the live log — the owner's and the
+ * admin's; the log is theirs, so `enabled` is false for anyone else. */
+export function useEngineErrors(serverBase: string, enabled = true) {
   const toast = useToast();
   useEffect(() => {
+    if (!enabled) return;
     let es: EventSource;
     try {
-      const token = getToken();
+      const token = streamToken();
       es = new EventSource(apiUrl(serverBase, '/api/logs/stream') + (token ? `?token=${encodeURIComponent(token)}` : ''));
     } catch {
       return;
@@ -62,5 +63,5 @@ export function useEngineErrors(serverBase: string) {
       toast({ tone: 'loss', title: instrument ? `Error · ${instrument}` : 'Engine error', body: message, key: `error-${message}` });
     };
     return () => es.close();
-  }, [serverBase, toast]);
+  }, [serverBase, toast, enabled]);
 }
