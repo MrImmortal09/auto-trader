@@ -49,6 +49,8 @@ pub struct StreamQuery {
 /// caller's open positions (the engine's for the owner and the admin, none
 /// for a visitor — see `execute::build_frame`). Public: a token, when there
 /// is one, arrives as `?token=` because an `EventSource` can't set headers.
+/// The view is fixed when the stream opens, so the frontend reopens it
+/// whenever the sign-in changes (`useExecuteStream`).
 pub async fn execute_stream_handler(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,

@@ -141,13 +141,12 @@ pub async fn patch_user_handler(
     let Some(current) = state.auth.users.get(id) else {
         return refuse(StatusCode::NOT_FOUND, "not found");
     };
-    if patch.enabled == Some(false) {
-        if is_seeded_admin(&current) {
-            return refuse(StatusCode::CONFLICT, "The admin account can't be disabled");
-        }
-        if current.role == Role::Admin && !identity.is_owner() {
-            return refuse(StatusCode::FORBIDDEN, "Only the owner's passkey can disable an admin");
-        }
+    if patch.enabled == Some(false) && is_seeded_admin(&current) {
+        return refuse(StatusCode::CONFLICT, "The admin account can't be disabled");
+    }
+    // Switching an admin off or back on is as good as removing or adding one.
+    if patch.enabled.is_some() && current.role == Role::Admin && !identity.is_owner() {
+        return refuse(StatusCode::FORBIDDEN, "Only the owner's passkey can enable or disable an admin");
     }
     let name = match patch.name {
         Some(n) => clean_name(Some(n)),

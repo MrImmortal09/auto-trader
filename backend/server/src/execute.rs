@@ -32,10 +32,10 @@ const SUBSCRIBE_HALF: usize = 7;
 /// buy route refuses a contract with no recent price: it fails toward not
 /// trading.
 const MAX_LADDER_SCRIPS: usize = 120;
-/// How much of that total everyone else's streams — signed-in users and
-/// visitors together — may take. The owner's and the admin's streams may use
-/// the whole total, so browsing costs the owner at most this many strikes a
-/// day and the feed never carries more than before.
+/// How much of that total signed-in users' streams may take, together. The
+/// owner's and the admin's streams may use the whole total, so paper users
+/// cost the owner at most this many strikes a day and the feed never carries
+/// more than before. One window is 15 strikes × CE/PE = 30 keys.
 const MAX_PUBLIC_LADDER_SCRIPS: usize = 30;
 
 /// Whose daily subscription budget a stream draws on.
@@ -43,19 +43,28 @@ const MAX_PUBLIC_LADDER_SCRIPS: usize = 30;
 pub enum SubPool {
     /// The owner's passkey or the admin's phone.
     Owner,
-    /// A user or a visitor.
+    /// A signed-in user.
     Public,
+    /// A visitor: subscribes nothing, and sees prices only for contracts
+    /// someone signed in is already streaming — one unsigned request could
+    /// otherwise use up the users' whole share for the day.
+    None,
 }
 
 impl SubPool {
     pub fn of(identity: &Identity) -> Self {
-        if identity.can_read_owner_data() { SubPool::Owner } else { SubPool::Public }
+        match identity {
+            Identity::Owner | Identity::Admin { .. } => SubPool::Owner,
+            Identity::User { .. } => SubPool::Public,
+            Identity::Anonymous => SubPool::None,
+        }
     }
 
     fn budget(self) -> usize {
         match self {
             SubPool::Owner => MAX_LADDER_SCRIPS,
             SubPool::Public => MAX_PUBLIC_LADDER_SCRIPS,
+            SubPool::None => 0,
         }
     }
 }
@@ -241,6 +250,9 @@ impl ExecuteBoard {
     /// for out of `pool`'s budget. Subscriptions are never withdrawn: open
     /// positions share the feed.
     async fn ensure_subscribed(&self, state: &AppState, keys: &[String], pool: SubPool) {
+        if pool == SubPool::None {
+            return;
+        }
         let Some(tx) = state.ws_tx.lock().await.clone() else { return };
         let today = shared_domain::today_ist();
         let mut subs = self.subs.lock().await;
@@ -262,7 +274,7 @@ impl ExecuteBoard {
         }
         let used = match pool {
             SubPool::Owner => subs.owner_used,
-            SubPool::Public => subs.public_used,
+            SubPool::Public | SubPool::None => subs.public_used,
         };
         // The pool's own share, inside what is left of the day's total.
         let room = pool.budget().saturating_sub(used).min(MAX_LADDER_SCRIPS.saturating_sub(subs.sent.len()));
@@ -284,7 +296,7 @@ impl ExecuteBoard {
         if tx.send(msg.to_string()).is_ok() {
             match pool {
                 SubPool::Owner => subs.owner_used += fresh.len(),
-                SubPool::Public => subs.public_used += fresh.len(),
+                SubPool::Public | SubPool::None => subs.public_used += fresh.len(),
             }
             subs.sent.extend(fresh);
         }
@@ -720,11 +732,12 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_and_the_admin_draw_on_one_budget_and_everyone_else_on_another() {
+    fn the_owner_and_the_admin_draw_on_one_budget_users_on_a_share_and_visitors_on_none() {
         assert_eq!(SubPool::of(&Identity::Owner), SubPool::Owner);
         assert_eq!(SubPool::of(&Identity::Admin { user_id: 1 }), SubPool::Owner);
         assert_eq!(SubPool::of(&Identity::User { user_id: 2 }), SubPool::Public);
-        assert_eq!(SubPool::of(&Identity::Anonymous), SubPool::Public);
+        assert_eq!(SubPool::of(&Identity::Anonymous), SubPool::None);
+        assert_eq!(SubPool::None.budget(), 0);
         // The public share sits inside the one total: the feed never carries more than before.
         assert!(SubPool::Public.budget() < SubPool::Owner.budget());
         assert_eq!(SubPool::Owner.budget(), MAX_LADDER_SCRIPS);
