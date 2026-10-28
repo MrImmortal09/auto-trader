@@ -23,6 +23,7 @@ import type {
   MarketIndex,
   MarketLive,
   MarksAnswer,
+  PaperActivity,
   MeAnswer,
   ModeCheck,
   OptionChainAnswer,
@@ -220,6 +221,8 @@ export const getMyHistory = (base: string, range: RangeId, group: GroupId) =>
   getJson<HistoryAnswer>(base, `/api/v2/me/history?range=${range}&group=${group}`);
 /** The user's fills today, for the charts: no Telegram calls or positions. */
 export const getMyMarks = (base: string) => getJson<MarksAnswer>(base, '/api/v2/me/marks');
+/** The user's last 100 fills, levels and resets, newest first. */
+export const getMyActivity = (base: string) => getJson<PaperActivity[]>(base, '/api/v2/me/activity');
 export const paperBuy = (base: string, tradingSymbol: string, lots: number) =>
   send(base, '/api/v2/me/buy', 'POST', { trading_symbol: tradingSymbol, lots });
 export const paperSellLots = (base: string, id: string, lots: number) => send(base, `${mine(id)}/sell`, 'POST', { lots });

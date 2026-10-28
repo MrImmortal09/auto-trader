@@ -12,6 +12,8 @@ import {
   getExpiries,
   getFlags,
   getMarks,
+  getMyActivity,
+  getMyDesk,
   getMyMarks,
   paperBuy,
   paperClose,
@@ -38,7 +40,7 @@ import type { Placing } from './KChart';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, type LevelActions, type LevelKind, type Layers } from './lines';
 import { approxMoney, CHART_LIBS, istClock, levelCrossed, levelPnl, optionOf, sameSym, symbolLabel, toTick, type ChartLib, type ChartSym, type Tf } from './model';
-import { PositionSheet, ScalpBar, ScalpPositionsPanel, type PositionHandlers } from './Positions';
+import { PositionSheet, ScalpBar, ScalpPositionsPanel, type PaperAccount, type PositionHandlers } from './Positions';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 
@@ -199,6 +201,12 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const marks = usePoll(() => (paper ? getMyMarks(serverBase) : getMarks(serverBase)), 5_000, `${serverBase}|${paper ? 'paper' : 'owner'}`);
   // `chart_stops` gates the owner's engine; a paper position always takes levels.
   const chartStopsOn = paper || (flags.data?.chart_stops ?? false);
+  // A user's wallet, today's P&L and recent activity, beside the positions.
+  const myDesk = usePoll(() => getMyDesk(serverBase), 5_000, serverBase, paper);
+  const myActivity = usePoll(() => getMyActivity(serverBase), 5_000, serverBase, paper);
+  const account: PaperAccount | undefined = paper
+    ? { balance: myDesk.data?.wallet.balance ?? null, today: myDesk.data?.kpis.net ?? null, activity: myActivity.data }
+    : undefined;
 
   const scalps = useMemo(() => (frame?.positions ?? []).filter((p) => p.manual).map((p) => withPending(p, pending, now)), [frame, pending, now]);
   const board = frame?.board && frame.board.index === saved.index ? frame.board : null;
@@ -537,6 +545,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         setPlacingAt({ slot: 0, id: p.id, kind, trigger: 'index' });
       }}
       onClose={() => setSheet(false)}
+      paper={account}
     />
   );
 
@@ -561,7 +570,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           <div className="flex h-[260px] shrink-0 px-2">{charts[0]}</div>
         )}
         <div className="flex min-h-0 flex-1 flex-col pt-3">{ladder}</div>
-        <ScalpBar scalps={scalps} h={handlers} onOpen={() => setSheet(true)} />
+        <ScalpBar scalps={scalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />
         {sheetEl}
       </div>
     );
@@ -598,7 +607,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
         </aside>
       </div>
-      <ScalpPositionsPanel scalps={scalps} h={handlers} canSet={chartStopsOn} onAdd={placeFromPanel} onRemove={(p, kind) => void sendLevel(p, kind, null)} />
+      <ScalpPositionsPanel scalps={scalps} h={handlers} canSet={chartStopsOn} onAdd={placeFromPanel} onRemove={(p, kind) => void sendLevel(p, kind, null)} paper={account} />
       {!chartStopsOn && scalps.length > 0 && (
         <p className="shrink-0 type-caption text-fg-muted">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
       )}

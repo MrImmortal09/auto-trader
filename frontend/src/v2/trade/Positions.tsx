@@ -1,13 +1,15 @@
+import { useState } from 'react';
 import type { ChartLevel, ExecutePosition } from '../../types';
 import { contractLabel, expiryLabel } from '../../lib/execute';
-import { price, signedMoney, signedPct, toneOf } from '../lib/format';
-import type { DeskPosition } from '../lib/types';
+import { hhmmss, money, price, shortDate, signedMoney, signedPct, todayIst, toneOf } from '../lib/format';
+import type { DeskPosition, PaperActivity } from '../lib/types';
 import { PositionRail } from '../desk/PositionRail';
 import { railFor } from '../desk/rail';
 import { Button } from '../ui/Button';
 import { SourceChip } from '../ui/Chip';
 import { HoldButton } from '../ui/HoldButton';
 import { Modal } from '../ui/Modal';
+import { Segment } from '../ui/Segment';
 import type { LevelKind } from './lines';
 import { approxMoney, levelPnl } from './model';
 
@@ -29,6 +31,53 @@ function levelWords(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel): strin
   return `${p.index} ${falls ? '≤' : '≥'} ${price(lvl.price)}`;
 }
 
+/** A user's own paper portfolio, as the Trade screen shows it beside the
+ * positions: the wallet, today's P&L and the recent activity. */
+export interface PaperAccount {
+  balance: number | null;
+  /** Booked plus open, today. */
+  today: number | null;
+  /** Newest first; null until loaded. */
+  activity: PaperActivity[] | null;
+}
+
+type Tab = 'positions' | 'activity';
+
+const ACTIVITY_TEXT: Record<PaperActivity['kind'], string> = { buy: 'text-fg', sell: 'text-fg', levels: 'text-fg-muted', reset: 'text-fg-muted' };
+
+/** "10:42:05", or "27 Oct 10:42:05" on another day. */
+function when(ts: string): string {
+  return ts.startsWith(todayIst()) ? hhmmss(ts) : `${shortDate(ts.slice(0, 10))} ${hhmmss(ts)}`;
+}
+
+/** The user's last fills, levels and resets, newest first. */
+function ActivityList({ items }: { items: PaperActivity[] | null }) {
+  if (items == null) return <p className="py-2 type-body text-fg-muted">Loading…</p>;
+  if (items.length === 0) {
+    return <p className="py-2 type-body text-fg-muted">Nothing yet. Buys, sells, stops and targets show here until the server next restarts.</p>;
+  }
+  return (
+    <div className="flex flex-col">
+      {items.map((a, i) => (
+        <div key={`${a.t}-${i}`} className="flex items-baseline gap-3 border-t border-line py-1.5">
+          <span className="min-w-[64px] shrink-0 whitespace-nowrap type-caption text-fg-muted tnum">{when(a.t)}</span>
+          <span className={`min-w-0 type-body ${ACTIVITY_TEXT[a.kind]}`}>{a.message}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** "Wallet ₹9,88,000.00 · today +₹1,500.00". */
+function WalletLine({ paper }: { paper: PaperAccount }) {
+  return (
+    <span className="type-caption text-fg-muted tnum">
+      Wallet {paper.balance == null ? '—' : money(paper.balance)} · today{' '}
+      <span className={TONE_TEXT[toneOf(paper.today)]}>{paper.today == null ? '—' : signedMoney(paper.today)}</span>
+    </span>
+  );
+}
+
 export interface PositionHandlers {
   /** Positions with a sell in flight from here. */
   sending: Record<string, boolean>;
@@ -40,7 +89,7 @@ export interface PositionHandlers {
 
 /** Desktop: the open manual trades, each with its stop and target (added or
  * removed from here, dragged on the charts), −1 lot and Exit; Exit all held. */
-export function ScalpPositionsPanel({ scalps, h, canSet, onAdd, onRemove }: {
+export function ScalpPositionsPanel({ scalps, h, canSet, onAdd, onRemove, paper }: {
   scalps: ExecutePosition[];
   h: PositionHandlers;
   /** Levels can be set (`chart_stops` on); removing works either way. */
@@ -48,23 +97,51 @@ export function ScalpPositionsPanel({ scalps, h, canSet, onAdd, onRemove }: {
   /** "+ Stop": put the level on a chart with the next click. */
   onAdd: (p: ExecutePosition, kind: LevelKind) => void;
   onRemove: (p: ExecutePosition, kind: LevelKind) => void;
+  /** A user's paper wallet and activity; the admin's desk has none. */
+  paper?: PaperAccount;
 }) {
+  const [tab, setTab] = useState<Tab>('positions');
   const open = scalps.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
+  const showActivity = !!paper && tab === 'activity';
   return (
     <section className="shrink-0 rounded-12 border border-line bg-panel px-4 py-3">
       <header className="flex items-center gap-3 pb-1">
-        <h2 className="flex items-baseline gap-2 type-title text-fg">
-          Positions <span className="type-caption text-fg-muted tnum">{scalps.length}</span>
-        </h2>
+        {paper ? (
+          <Segment
+            label="Show"
+            size="sm"
+            value={tab}
+            onChange={setTab}
+            options={[
+              { value: 'positions', label: `Positions ${scalps.length}` },
+              { value: 'activity', label: 'Activity' },
+            ]}
+          />
+        ) : (
+          <h2 className="flex items-baseline gap-2 type-title text-fg">
+            Positions <span className="type-caption text-fg-muted tnum">{scalps.length}</span>
+          </h2>
+        )}
         <span className="flex-1" />
+        {paper && (
+          <>
+            <WalletLine paper={paper} />
+            <span aria-hidden className="h-5 w-px bg-line" />
+          </>
+        )}
         <span className="type-label text-fg-muted">Open</span>
         <span className={`num-medium ${TONE_TEXT[toneOf(open)]}`}>{signedMoney(open)}</span>
         <HoldButton size="sm" disabled={scalps.length === 0 || h.exitAllBusy} onFire={h.onExitAll}>
           {h.exitAllBusy ? 'Exiting…' : 'Hold to exit all'}
         </HoldButton>
       </header>
-      {scalps.length === 0 && <p className="py-2 type-body text-fg-muted">No open trade. Tap Buy on the ladder to open one.</p>}
-      {scalps.map((p) => {
+      {showActivity && (
+        <div className="max-h-[220px] overflow-y-auto">
+          <ActivityList items={paper.activity} />
+        </div>
+      )}
+      {!showActivity && scalps.length === 0 && <p className="py-2 type-body text-fg-muted">No open trade. Tap Buy on the ladder to open one.</p>}
+      {!showActivity && scalps.map((p) => {
         const note = busyNote(p, !!h.sending[p.id]);
         const locked = note != null || p.qty <= 0;
         const meta = [p.expiry ? expiryLabel(p.expiry) : null, `${p.qty} qty`, `avg ${price(p.avg)}`].filter(Boolean).join(' · ');
@@ -115,14 +192,17 @@ export function ScalpPositionsPanel({ scalps, h, canSet, onAdd, onRemove }: {
   );
 }
 
-/** Phone: the bar under the ladder — open P&L, and Exit all held. */
-export function ScalpBar({ scalps, h, onOpen }: { scalps: ExecutePosition[]; h: PositionHandlers; onOpen: () => void }) {
+/** Phone: the bar under the ladder — open P&L (and a user's wallet), and
+ * Exit all held. A tap opens the sheet; a user's opens even with nothing
+ * held, for the activity. */
+export function ScalpBar({ scalps, h, onOpen, paper }: { scalps: ExecutePosition[]; h: PositionHandlers; onOpen: () => void; paper?: PaperAccount }) {
   const open = scalps.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
   return (
     <div className="flex shrink-0 items-center gap-3 border-t border-line bg-inset px-4 py-2">
-      <button type="button" onClick={onOpen} disabled={scalps.length === 0} className="min-w-0 flex-1 text-left disabled:opacity-60">
+      <button type="button" onClick={onOpen} disabled={scalps.length === 0 && !paper} className="min-w-0 flex-1 text-left disabled:opacity-60">
         <div className="type-caption text-fg-muted">Open · {scalps.length === 1 ? '1 trade' : `${scalps.length} trades`}</div>
         <div className={`num-medium ${TONE_TEXT[toneOf(open)]}`}>{signedMoney(open)}</div>
+        {paper && <WalletLine paper={paper} />}
       </button>
       <HoldButton size="lg" disabled={scalps.length === 0 || h.exitAllBusy} onFire={h.onExitAll}>
         {h.exitAllBusy ? 'Exiting…' : 'Hold to exit all'}
@@ -166,7 +246,7 @@ function railOf(p: ExecutePosition, indexNow: number | null, levelsOn: boolean) 
 }
 
 /** Figma "Scalp · position sheet": each scalp, its stop and target, −1 lot and Exit. */
-export function PositionSheet({ scalps, h, indexNow, deltaOf, since, canSet, onRemove, onAdd, onClose }: {
+export function PositionSheet({ scalps, h, indexNow, deltaOf, since, canSet, onRemove, onAdd, onClose, paper }: {
   scalps: ExecutePosition[];
   h: PositionHandlers;
   indexNow: (index: string) => number | null;
@@ -178,12 +258,33 @@ export function PositionSheet({ scalps, h, indexNow, deltaOf, since, canSet, onR
   /** Put a level on the chart: the sheet closes so the chart can be tapped. */
   onAdd: (p: ExecutePosition, kind: LevelKind) => void;
   onClose: () => void;
+  /** A user's paper wallet and activity; the admin's desk has none. */
+  paper?: PaperAccount;
 }) {
+  const [tab, setTab] = useState<Tab>('positions');
+  const showActivity = !!paper && tab === 'activity';
   return (
     <Modal open onClose={onClose} label="Positions">
       <div className="flex flex-col gap-5 overflow-y-auto px-4 pt-3 pb-4">
-        {scalps.length === 0 && <p className="type-body text-fg-muted">No open trade.</p>}
-        {scalps.map((p) => {
+        {paper && (
+          <div className="flex flex-col gap-2">
+            <Segment
+              label="Show"
+              size="lg"
+              stretch
+              value={tab}
+              onChange={setTab}
+              options={[
+                { value: 'positions', label: `Positions ${scalps.length}` },
+                { value: 'activity', label: 'Activity' },
+              ]}
+            />
+            <WalletLine paper={paper} />
+          </div>
+        )}
+        {showActivity && <ActivityList items={paper.activity} />}
+        {!showActivity && scalps.length === 0 && <p className="type-body text-fg-muted">No open trade.</p>}
+        {!showActivity && scalps.map((p) => {
           const note = busyNote(p, !!h.sending[p.id]);
           const locked = note != null || p.qty <= 0;
           const delta = deltaOf(p);

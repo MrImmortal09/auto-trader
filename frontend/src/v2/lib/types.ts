@@ -308,6 +308,16 @@ export interface AdminPosition {
   opened_at: string;
 }
 
+/** One line of a user's paper activity (`GET /api/v2/me/activity`): a fill,
+ * a chart level set, or a reset — kept in the server's memory, newest first. */
+export interface PaperActivity {
+  /** IST `YYYY-MM-DD HH:MM:SS`. */
+  t: string;
+  kind: 'buy' | 'sell' | 'levels' | 'reset';
+  position_id: string | null;
+  message: string;
+}
+
 /** `GET /api/v2/flags`. */
 export interface Flags {
   index_options_only: boolean;
