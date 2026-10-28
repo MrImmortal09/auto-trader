@@ -127,8 +127,10 @@ export const istDay = dayOf;
 
 /**
  * VWAP by bar start, restarting each IST day: the volume-weighted typical
- * price of every bar with Upstox's official volume (a forming bar has none
- * yet, so the line runs to the last closed bar).
+ * price of the day's bars with Upstox's official volume. A bar without any
+ * yet — the forming bar, until its official minute lands — carries the day's
+ * VWAP so far, so the line and its readout reach the latest bar. Before the
+ * day's first volume there is none.
  */
 export function vwapOf(bars: Bar[]): Map<number, number> {
   const out = new Map<number, number>();
@@ -141,12 +143,25 @@ export function vwapOf(bars: Bar[]): Map<number, number> {
       pv = 0;
       vol = 0;
     }
-    if (b.v == null || b.v <= 0) continue;
-    pv += ((b.h + b.l + b.c) / 3) * b.v;
-    vol += b.v;
-    out.set(b.t, pv / vol);
+    if (b.v != null && b.v > 0) {
+      pv += ((b.h + b.l + b.c) / 3) * b.v;
+      vol += b.v;
+    }
+    if (vol > 0) out.set(b.t, pv / vol);
   }
   return out;
+}
+
+/** A VWAP series cut into its IST days, oldest first: each day's line is
+ * its own, never joined to the day before. */
+export function vwapDays(series: Map<number, number>): { day: number; points: { time: number; price: number }[] }[] {
+  const days = new Map<number, { time: number; price: number }[]>();
+  for (const [time, price] of [...series].sort((a, z) => a[0] - z[0])) {
+    const day = dayOf(time);
+    if (!days.has(day)) days.set(day, []);
+    days.get(day)!.push({ time, price });
+  }
+  return [...days].map(([day, points]) => ({ day, points }));
 }
 
 /**

@@ -5,7 +5,7 @@ import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, upsert } from './bars';
 import { C, FONT, type MarkerData } from './chartSetup';
 import type { ChartLine, ChartProps } from './KChart';
-import { barAt, futureName, symbolName, TF_MS, vwapOf, vwapOnIndex, type Bar } from './model';
+import { barAt, futureName, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar } from './model';
 import { pivotLines, pivotsByDay } from './pivots';
 import { CandleProvider, PROVIDER, velaSymbol, type Feed } from './velaProvider';
 
@@ -75,7 +75,8 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
   const handlers = useRef(new Map<string, ChartLine>());
   const applied = useRef(new Map<string, { price: number; text: string; time: number }>());
   const appliedPivots = useRef(new Map<string, { price: number; text: string; time: number }>());
-  const appliedVwap = useRef('');
+  // Each VWAP day's line as last drawn, by drawing id.
+  const appliedVwap = useRef(new Map<string, string>());
   // A level moves only under a pointer: Vela reports its own nudges and our
   // updates as edits too, and no key may ever move a stop.
   const pointerDown = useRef(false);
@@ -86,7 +87,8 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
   const [pivotLevels, setPivotLevels] = useState<Keyed<{ name: string; value: number }[]> | null>(null);
   // A drag: the line's own edits settle before the level is sent, and the screen's price waits.
   const settling = useRef(new Map<string, number>());
-  const extras = useRef<{ vwap: string | null; pivots: Map<string, string> }>({ vwap: null, pivots: new Map() });
+  // Our locked drawings: a VWAP line per IST day, and the pivot levels by name.
+  const extras = useRef<{ vwap: Map<number, string>; pivots: Map<string, string> }>({ vwap: new Map(), pivots: new Map() });
   // Bumped when one of our drawings is erased, so the next sync puts it back.
   const [lost, setLost] = useState(0);
   const placingNow = useRef(placing);
@@ -192,7 +194,8 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
         }
         handlers.current.delete(id);
         applied.current.delete(id);
-        if (extras.current.vwap === id) extras.current.vwap = null;
+        for (const [day, vid] of extras.current.vwap) if (vid === id) extras.current.vwap.delete(day);
+        appliedVwap.current.delete(id);
         for (const [name, vid] of extras.current.pivots) if (vid === id) extras.current.pivots.delete(name);
         if (ours) setLost((n) => n + 1);
       }),
@@ -220,9 +223,9 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       handlerMap.clear();
       appliedMap.clear();
       pivotMap.clear();
-      appliedVwap.current = '';
+      appliedVwap.current = new Map();
       pointerEdits.clear();
-      extras.current = { vwap: null, pivots: new Map() };
+      extras.current = { vwap: new Map(), pivots: new Map() };
     };
   }, [bus, chartId]);
 
@@ -342,31 +345,35 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     c.marks.set(marks);
   }, [markers, loaded]);
 
-  // VWAP: a locked polyline through each bar's value — the option's own, or
-  // the future's moved onto the index.
+  // VWAP: a locked polyline per IST day through each bar's value — the
+  // option's own, or the future's moved onto the index. One line per day, so
+  // yesterday's close is never joined to today's open.
   useEffect(() => {
     const c = chart.current;
     if (!c || !loaded || !bars) return;
     const ex = extras.current;
-    if (!vwap) {
-      if (ex.vwap) c.drawings.remove(ex.vwap);
-      ex.vwap = null;
-      return;
+    const days = vwap ? vwapDays(sym.kind === 'index' ? vwapOnIndex(futureBars, bars) : vwapOf(bars)).filter((d) => d.points.length >= 2) : [];
+    const wanted = new Set(days.map((d) => d.day));
+    for (const [day, vid] of ex.vwap) {
+      if (wanted.has(day)) continue;
+      c.drawings.remove(vid);
+      ex.vwap.delete(day);
+      appliedVwap.current.delete(vid);
     }
-    const series = sym.kind === 'index' ? vwapOnIndex(futureBars, bars) : vwapOf(bars);
-    const anchors = [...series].sort((a, b) => a[0] - b[0]).map(([time, price]) => ({ time, price }));
-    if (anchors.length < 2) return;
-    const present = ex.vwap && c.drawings.all().some((d) => d.id === ex.vwap);
-    // Every update costs Vela an undo copy of all drawings: only a changed line is redrawn.
-    const signature = anchors.map((a) => `${a.time}:${a.price.toFixed(2)}`).join(',');
-    if (present && ex.vwap) {
-      if (signature !== appliedVwap.current) c.drawings.update(ex.vwap, { anchors });
-      appliedVwap.current = signature;
-    } else {
-      appliedVwap.current = signature;
+    const present = new Set(c.drawings.all().map((d) => d.id));
+    for (const { day, points: anchors } of days) {
+      // Every update costs Vela an undo copy of all drawings: only a changed line is redrawn.
+      const signature = anchors.map((a) => `${a.time}:${a.price.toFixed(2)}`).join(',');
+      const vid = ex.vwap.get(day);
+      if (vid && present.has(vid)) {
+        if (signature !== appliedVwap.current.get(vid)) c.drawings.update(vid, { anchors });
+        appliedVwap.current.set(vid, signature);
+        continue;
+      }
       const d = c.drawings.add('polyline', { anchors, style: { lineColor: C.indicator, lineWidth: 1, lineStyle: 'solid' } });
-      if (!d) return;
-      ex.vwap = d.id;
+      if (!d) continue;
+      ex.vwap.set(day, d.id);
+      appliedVwap.current.set(d.id, signature);
       c.drawings.lock(d.id, true);
     }
   }, [vwap, bars, futureBars, loaded, sym.kind]);
