@@ -132,7 +132,7 @@ export function ScalpBar({ scalps, h, onOpen }: { scalps: ExecutePosition[]; h: 
 }
 
 /** The rail a scalp shows, by the Desk's rules. */
-function railOf(p: ExecutePosition, indexNow: number | null) {
+function railOf(p: ExecutePosition, indexNow: number | null, levelsOn: boolean) {
   return railFor({
     id: p.id,
     contract: contractLabel(p.index, p.strike, p.option_type),
@@ -162,7 +162,7 @@ function railOf(p: ExecutePosition, indexNow: number | null) {
     chart: p.chart ?? { stop: null, target: null },
     index_ltp: indexNow,
     busy: null,
-  } satisfies DeskPosition);
+  } satisfies DeskPosition, levelsOn);
 }
 
 /** Figma "Scalp · position sheet": each scalp, its stop and target, −1 lot and Exit. */
@@ -237,7 +237,7 @@ export function PositionSheet({ scalps, h, indexNow, deltaOf, since, canSet, onR
                   {pct != null && <div className={`type-caption tnum ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</div>}
                 </div>
               </header>
-              <PositionRail spec={railOf(p, indexNow(p.index))} />
+              <PositionRail spec={railOf(p, indexNow(p.index), canSet)} />
               <div>
                 {row('stop')}
                 {row('target')}

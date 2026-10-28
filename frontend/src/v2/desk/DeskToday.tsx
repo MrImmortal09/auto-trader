@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { cancelPosition, exitPosition, getDesk, getFeed, getMyDesk, paperClose, paperSellLots, sellQty, setLots, type Sent } from '../lib/api';
+import { cancelPosition, exitPosition, getDesk, getFeed, getFlags, getMyDesk, paperClose, paperSellLots, sellQty, setLots, type Sent } from '../lib/api';
 import { money, plural, signedMoney, toneOf } from '../lib/format';
 import { useIsWide } from '../lib/hooks';
 import { usePoll } from '../lib/usePoll';
@@ -54,6 +54,9 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped, paper = f
   const wide = useIsWide() && !paper;
   const desk = usePoll(() => (paper ? getMyDesk(serverBase) : getDesk(serverBase)), 2000, `${serverBase}|${paper ? 'paper' : 'owner'}`);
   const feed = usePoll(() => getFeed(serverBase), 4000, serverBase, !paper);
+  // Whether a scalp's stop and target can be set: the owner's switch; paper always.
+  const flags = usePoll(() => getFlags(serverBase), 30_000, serverBase, !paper);
+  const levelsOn = paper || (flags.data?.chart_stops ?? true);
   const scope = paper ? 'user' : 'admin';
   const guard = useGuard();
   const toast = useToast();
@@ -139,7 +142,7 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped, paper = f
         ) : (
           <div className={list}>
             {d.open.map((p) => (
-              <OpenRow key={p.id} p={p} desktop={desktop} sending={!!sending[p.id]} onLessLot={() => void lessLot(p)} onExit={() => void exit(p)} />
+              <OpenRow key={p.id} p={p} desktop={desktop} sending={!!sending[p.id]} levelsOn={levelsOn} onLessLot={() => void lessLot(p)} onExit={() => void exit(p)} />
             ))}
           </div>
         )}

@@ -1110,6 +1110,8 @@ async fn main() {
         .route("/api/v2/me/exit-all",               post(routes::v2::me::exit_all_handler))
         .route("/api/v2/me/reset",                  post(routes::v2::me::reset_handler))
         .fallback_service(ServeDir::new("../frontend/dist"))
+        // Every SSE stream unbuffered at Nginx — see `routes::sse`.
+        .layer(middleware::map_response(routes::sse::no_buffering))
         // Every `/api/*` request learns who is calling and is refused when
         // `auth::policy` asks for more — see `auth::middleware`.
         .layer(middleware::from_fn_with_state(auth_layer, auth::middleware))
