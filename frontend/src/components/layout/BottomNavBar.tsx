@@ -1,5 +1,4 @@
 import {
-  Activity,
   BarChart2,
   Gauge,
   LayoutDashboard,
@@ -59,13 +58,6 @@ export function BottomNavBar({
       >
         <TrendingUp size={20} className={activeScreen === 'portfolio' ? 'scale-110 transition-transform' : ''} />
         <span className="text-[10px] mt-1 font-medium">Portfolio</span>
-      </div>
-      <div
-        onClick={() => onSelectScreen('system')}
-        className={itemClass(activeScreen === 'system')}
-      >
-        <Activity size={20} className={activeScreen === 'system' ? 'scale-110 transition-transform' : ''} />
-        <span className="text-[10px] mt-1 font-medium">System</span>
       </div>
       <div
         onClick={() => onSelectScreen('settings')}

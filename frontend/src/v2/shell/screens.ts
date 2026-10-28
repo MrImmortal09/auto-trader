@@ -21,10 +21,23 @@ export function visibleScreens(role: Role): ScreenId[] {
   return role === 'admin' ? ['desk', 'trade', 'market', 'system', 'settings', 'admin'] : ['desk', 'trade', 'market', 'settings'];
 }
 
-/** The screen named in `location.hash` (`/#trade`), or Desk. `#scalp`,
- * the Trade screen's old name, still opens it. */
-export function screenFromHash(): ScreenId {
-  const id = window.location.hash.replace(/^#/, '').split('/')[0];
+/** Screens with no button anywhere: they open from their address alone
+ * (`/v2/system`), for whoever may open them. */
+const LINK_ONLY: ScreenId[] = ['system'];
+
+/** The screens the navigation shows `role`. */
+export function navScreens(role: Role): ScreenId[] {
+  return visibleScreens(role).filter((id) => !LINK_ONLY.includes(id));
+}
+
+/** v2 lives under `/v2/`, one path per screen: `/v2/trade`. */
+export const screenPath = (id: ScreenId) => `/v2/${id}`;
+
+/** The screen the address names — `/v2/trade`, or an old `/#trade` link —
+ * or Desk. `scalp`, the Trade screen's old name, still opens it. */
+export function screenFromLocation(): ScreenId {
+  const fromPath = window.location.pathname.match(/^\/v2\/([^/]+)/)?.[1];
+  const id = fromPath ?? window.location.hash.replace(/^#/, '').split('/')[0];
   if (id === 'scalp') return 'trade';
   return SCREENS.some((s) => s.id === id) ? (id as ScreenId) : 'desk';
 }
