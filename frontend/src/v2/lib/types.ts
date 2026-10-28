@@ -242,6 +242,70 @@ export interface AdminUser {
   /** IST `YYYY-MM-DD HH:MM:SS`. */
   created_at: string;
   last_login_at: string | null;
+  /** A user's paper figures; null for the admin. */
+  paper: AdminPaper | null;
+}
+
+/** A user's paper portfolio at a glance, on the Admin page. */
+export interface AdminPaper {
+  balance: number;
+  /** Times they started over. */
+  resets: number;
+  open: number;
+  /** The open positions' P&L at the live price. */
+  open_pnl: number;
+  /** Today's booked plus open P&L, since the last reset. */
+  day_pnl: number;
+  /** Fills since the last reset. */
+  trades: number;
+  /** IST `YYYY-MM-DD HH:MM:SS` of the newest fill, any reset. */
+  last_trade_at: string | null;
+}
+
+/** One paper fill (`GET /api/admin/trades`). */
+export interface AdminTrade {
+  id: number;
+  user_id: number;
+  /** IST `YYYY-MM-DD HH:MM:SS`. */
+  t: string;
+  action: 'BUY' | 'SELL';
+  contract: string;
+  qty: number;
+  price: number;
+  charges: number;
+  /** What the wallet paid (a buy) or got (a sell), charges included. */
+  net: number;
+  /** A sell's P&L, charges included on both sides. */
+  pnl: number | null;
+  reason: string | null;
+  /** From before the user's last reset: gone from their own views. */
+  before_reset: boolean;
+}
+
+export interface AdminTradesAnswer {
+  /** Newest first. */
+  trades: AdminTrade[];
+  /** Fills in the range beyond those listed. */
+  more: number;
+  count: number;
+  /** The P&L of every sell in the range. */
+  realized: number;
+}
+
+/** One open paper position (`GET /api/admin/positions`). */
+export interface AdminPosition {
+  user_id: number;
+  id: string;
+  contract: string;
+  /** `YYYY-MM-DD`. */
+  expiry: string;
+  qty: number;
+  lots: number;
+  avg: number;
+  ltp: number | null;
+  pnl: number | null;
+  /** IST `YYYY-MM-DD HH:MM:SS` of the first buy. */
+  opened_at: string;
 }
 
 /** `GET /api/v2/flags`. */

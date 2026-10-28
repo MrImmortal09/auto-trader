@@ -14,6 +14,7 @@ use serde_json::json;
 
 use crate::auth::{admin_phone, otp, Identity, Role, UserRecord};
 use crate::db::{self, UserRow};
+use crate::routes::admin_paper::{self, PaperSummary};
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -25,6 +26,9 @@ pub struct UserOut {
     pub enabled: bool,
     pub created_at: String,
     pub last_login_at: Option<String>,
+    /// A user's paper wallet, positions and P&L — in the list only, and
+    /// never for the admin, who trades on the owner's desk.
+    pub paper: Option<PaperSummary>,
 }
 
 impl From<UserRow> for UserOut {
@@ -37,6 +41,7 @@ impl From<UserRow> for UserOut {
             enabled: r.enabled != 0,
             created_at: r.created_at,
             last_login_at: r.last_login_at,
+            paper: None,
         }
     }
 }
@@ -50,12 +55,22 @@ fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
     refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("could not {what}"))
 }
 
-/// `GET /api/admin/users` — everyone on the allow-list, oldest first.
+/// `GET /api/admin/users` — everyone on the allow-list, oldest first, each
+/// user with their paper figures.
 pub async fn list_users_handler(State(state): State<AppState>) -> Response {
-    match db::load_users(&state.db_pool).await {
-        Ok(rows) => Json(rows.into_iter().map(UserOut::from).collect::<Vec<_>>()).into_response(),
-        Err(e) => server_error("read the users", e),
+    let mut users: Vec<UserOut> = match db::load_users(&state.db_pool).await {
+        Ok(rows) => rows.into_iter().map(UserOut::from).collect(),
+        Err(e) => return server_error("read the users", e),
+    };
+    let traders: Vec<i64> = users.iter().filter(|u| u.role == Role::User.as_str()).map(|u| u.id).collect();
+    let mut paper = match admin_paper::summaries(&state, &traders).await {
+        Ok(paper) => paper,
+        Err(e) => return server_error("read the paper portfolios", e),
+    };
+    for u in &mut users {
+        u.paper = paper.remove(&u.id);
     }
+    Json(users).into_response()
 }
 
 #[derive(Deserialize)]
@@ -107,7 +122,7 @@ pub async fn create_user_handler(
     tracing::info!(user_id = id, role = role.as_str(), by = identity.kind(), "User added to the allow-list");
     (
         StatusCode::CREATED,
-        Json(UserOut { id, phone, name, role: role.as_str(), enabled: true, created_at: now, last_login_at: None }),
+        Json(UserOut { id, phone, name, role: role.as_str(), enabled: true, created_at: now, last_login_at: None, paper: None }),
     )
         .into_response()
 }
