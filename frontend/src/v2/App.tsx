@@ -156,7 +156,8 @@ export default function App() {
       <StatusBanners serverBase={serverBase} status={s} canReadOwner={canReadOwner} />
       <div className="flex min-h-0 flex-1">
         {desktop && <NavRail screens={nav} screen={screen} onSelect={go} />}
-        <main className="min-w-0 flex-1 overflow-y-auto">{content}</main>
+        {/* Trade fits the window and never scrolls: its ladder and panel scroll inside. */}
+        <main className={`min-w-0 flex-1 ${screen === 'trade' ? 'overflow-hidden' : 'overflow-y-auto'}`}>{content}</main>
       </div>
       {!desktop && <TabBar screens={nav} screen={screen} onSelect={go} />}
 
