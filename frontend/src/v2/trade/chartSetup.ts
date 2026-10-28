@@ -260,23 +260,35 @@ registerOverlay<MarkerData>({
   },
 });
 
+const IST_OFFSET = 330 * 60_000;
+const dayNumber = (t: number) => Math.floor((t + IST_OFFSET) / 86_400_000);
+
 // ── VWAP ────────────────────────────────────────────────────────────────── //
 
 /** Each chart's VWAP by bar start (Unix ms), keyed by the chart's id. The
  * indicator reads it here: KLineChart can't carry a Map in `extendData`. */
 export const VWAP_SERIES = new Map<string, Map<number, number>>();
 
-registerIndicator<{ vwap?: number }, number, { key: string }>({
+registerIndicator<{ vwap?: number; day?: number }, number, { key: string }>({
   name: 'v2Vwap',
   shortName: 'VWAP',
   series: 'price',
   precision: 2,
   // Bumped to make the chart recalculate when new bars change the series.
   calcParams: [0],
-  figures: [{ key: 'vwap', title: '', type: 'line' }],
+  figures: [
+    {
+      key: 'vwap',
+      title: '',
+      type: 'line',
+      // Each day's VWAP starts afresh: the step from one day's last bar to the
+      // next day's first is left undrawn.
+      styles: ({ data }) => (data.current?.day != null && data.next?.day != null && data.current.day !== data.next.day ? { color: 'rgba(0, 0, 0, 0)' } : null),
+    },
+  ],
   calc: (dataList, indicator) => {
     const series = VWAP_SERIES.get(indicator.extendData?.key ?? '');
-    return dataList.map((d) => ({ vwap: series?.get(d.timestamp) }));
+    return dataList.map((d) => ({ vwap: series?.get(d.timestamp), day: dayNumber(d.timestamp) }));
   },
 });
 
@@ -287,8 +299,6 @@ export const PIVOT_SERIES = new Map<string, Map<number, PivotLevels>>();
 
 /** TradingView's pivot orange, for every level and its name. */
 const PIVOT_ORANGE = '#fb8c00';
-const IST_OFFSET = 330 * 60_000;
-const dayNumber = (t: number) => Math.floor((t + IST_OFFSET) / 86_400_000);
 
 // Standard pivots, drawn straight onto the candle pane the way TradingView
 // draws them: solid orange levels across each day, named at the day's start.
