@@ -32,14 +32,15 @@ function chartText(kind: 'Stop' | 'Target', l: ChartLevel, index: string, side: 
   return `${kind} ${index} ${falls ? '≤' : '≥'} ${level(l.price)}`;
 }
 
-/** The rail for a Desk position. */
-export function railFor(p: DeskPosition): RailSpec {
+/** The rail for a Desk position. `levelsOn`: a scalp's stop and target can
+ * be set from the charts (the owner's `chart_stops` switch; always for paper). */
+export function railFor(p: DeskPosition, levelsOn = true): RailSpec {
   const none = (empty: string): RailSpec => ({ marks: [], marker: null, fill: null, zone: null, dashed: true, empty });
 
   if (p.source.kind === 'scalp') {
     if (p.state === 'waiting') return none('Buying at market');
     const { stop, target } = p.chart;
-    if (!stop && !target) return none('No stop or target yet · add them from the chart');
+    if (!stop && !target) return none(levelsOn ? 'No stop or target yet · add them from the chart' : 'No stop or target · chart stops are off (Settings → Beta)');
     if (stop && target && stop.trigger !== target.trigger) {
       return none(`${chartText('Stop', stop, p.index, p.side)} · ${chartText('Target', target, p.index, p.side)}`);
     }

@@ -30,11 +30,13 @@ function openMeta(p: DeskPosition): string {
 
 // ── Figma "Position row / Desktop" and "Position card / Phone" ────────── //
 
-export function OpenRow({ p, desktop, sending, onLessLot, onExit }: {
+export function OpenRow({ p, desktop, sending, levelsOn, onLessLot, onExit }: {
   p: DeskPosition;
   desktop: boolean;
   /** An action on it is in flight. */
   sending: boolean;
+  /** A scalp's stop and target can be set from the charts. */
+  levelsOn: boolean;
   onLessLot: () => void;
   onExit: () => void;
 }) {
@@ -84,7 +86,7 @@ export function OpenRow({ p, desktop, sending, onLessLot, onExit }: {
       <div className="flex items-center gap-6 border-b border-line py-3.5">
         <div className="w-[260px] shrink-0">{head}</div>
         <div className="min-w-[200px] max-w-[440px] flex-1">
-          <PositionRail spec={railFor(p)} />
+          <PositionRail spec={railFor(p, levelsOn)} />
         </div>
         <div className="ml-auto w-[130px]">{pnl}</div>
         <div className="flex shrink-0 gap-2">
@@ -100,7 +102,7 @@ export function OpenRow({ p, desktop, sending, onLessLot, onExit }: {
         {head}
         {pnl}
       </div>
-      <PositionRail spec={railFor(p)} />
+      <PositionRail spec={railFor(p, levelsOn)} />
       <div className="grid grid-cols-2 gap-2">
         {lessLot}
         {exit}

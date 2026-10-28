@@ -2,12 +2,14 @@ use axum::{
     extract::{Path, State, Query},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use shared_domain::current_ist_timestamp_string;
 use trading_engine::{Exchange, FeeCalculator};
 
+use crate::auth::Identity;
+use crate::routes::auth_kotak::send_log;
 use crate::AppState;
 use shared_domain::{DbWriteMessage, MonitoredPosition, TradeState, TradeTag};
 
@@ -118,6 +120,7 @@ pub async fn scrip_download_handler(
 
 pub async fn delete_position_handler(
     State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // In LIVE, forgetting a position that still holds stock or tracks a broker
@@ -144,16 +147,34 @@ pub async fn delete_position_handler(
     }
 
     let mut positions = state.positions.write().await;
-    let len_before = positions.len();
-    positions.retain(|p| p.id != id);
-    if positions.len() < len_before {
-        let snapshot = positions.clone();
-        drop(positions);
-        persist_positions_snapshot(&state, &snapshot).await;
-        (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response()
-    }
+    let Some(at) = positions.iter().position(|p| p.id == id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response();
+    };
+    let removed = positions.remove(at);
+    let snapshot = positions.clone();
+    drop(positions);
+    persist_positions_snapshot(&state, &snapshot).await;
+    // A call that just vanishes from the desk can't be explained afterwards:
+    // say which went, from what state, and who removed it.
+    let contract = crate::desk::contract_label(&removed.signal.instrument_name, removed.signal.strike, removed.signal.option_type.as_deref());
+    let what = match removed.state {
+        TradeState::WaitingForEntry => "Waiting call cancelled",
+        TradeState::Closed => "Closed position cleared",
+        _ => "Position removed",
+    };
+    send_log(&state.db_tx, &state.log_tx, "INFO", serde_json::json!({
+        "event": "POSITION_DELETED",
+        "level": "INFO",
+        "message": format!("{what} from the dashboard: {contract}"),
+        "instrument": removed.signal.instrument_name,
+        "position_id": removed.id,
+        "state": format!("{:?}", removed.state),
+        "executed_qty": removed.executed_qty,
+        "manual": removed.manual,
+        "by": identity.kind(),
+    }))
+    .await;
+    (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
 }
 
 pub async fn patch_position_handler(
