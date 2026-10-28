@@ -10,7 +10,7 @@ import type { CrosshairBus } from './bus';
 import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type Placing } from './KChart';
 import type { Layers } from './lines';
-import { CHART_LIBS, sameSym, symbolLabel, type Bar, type ChartLib, type ChartSym, type Tf } from './model';
+import { CANDLE_STYLES, CHART_LIBS, sameSym, symbolLabel, type Bar, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 const TFS: Tf[] = ['1m', '5m', '15m'];
@@ -19,7 +19,7 @@ const TFS: Tf[] = ['1m', '5m', '15m'];
 const VChart = lazy(() => import('./VChart'));
 
 /** One chart: its header (instrument, timeframe, Layers) and the chart. */
-export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide }: {
+export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, style, onStyle, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide }: {
   chartId: string;
   serverBase: string;
   sym: ChartSym;
@@ -28,6 +28,8 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   onTf: (tf: Tf) => void;
   layers: Layers;
   onLayers: (l: Layers) => void;
+  style: CandleStyle;
+  onStyle: (s: CandleStyle) => void;
   /** Each index's value and its change today. */
   spot: Record<string, number | null>;
   change: Record<string, number | null>;
@@ -202,8 +204,12 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               note="Standard, from the day before: P, R1–R5, S1–S5"
               onChange={(v) => onLayers({ ...layers, pivots: v })}
             />
+            <div className="flex items-center justify-between gap-3 px-2 pt-3 pb-1">
+              <span className="type-label text-fg">Candle style</span>
+              <Segment label="Candle style" size="sm" value={style} onChange={onStyle} options={CANDLE_STYLES} />
+            </div>
             {onLib && (
-              <div className="flex items-center justify-between gap-3 px-2 pt-3 pb-1">
+              <div className="flex items-center justify-between gap-3 px-2 pt-1 pb-1">
                 <span className="type-label text-fg">Chart library</span>
                 <Segment label="Chart library" size="sm" value={lib} onChange={onLib} options={CHART_LIBS} />
               </div>
@@ -228,6 +234,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               markers={markers}
               vwap={layers.vwap}
               pivots={layers.pivots}
+              style={style}
               placing={placing}
               onPlacingDone={onPlacingDone}
               bus={bus}
@@ -244,6 +251,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             markers={markers}
             vwap={layers.vwap}
             pivots={layers.pivots}
+            style={style}
             placing={placing}
             onPlacingDone={onPlacingDone}
             bus={bus}
