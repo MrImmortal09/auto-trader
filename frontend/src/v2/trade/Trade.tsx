@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChartCandlestick, ChevronDown, ChevronUp, Columns2, Columns3, Square } from 'lucide-react';
+import { ChartCandlestick, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Columns2, Columns3, Square } from 'lucide-react';
 import type { ChartLevel, ExecutePosition } from '../../types';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
@@ -74,13 +74,15 @@ interface Saved {
   panelHeight: number;
   /** Desktop: the index bar folded away, for room. */
   barHidden: boolean;
+  /** Desktop: the options ladder folded away, the charts taking its width. */
+  ladderHidden: boolean;
 }
 
 const STORE_KEY = 'v2.trade';
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false };
 
 /** The saved layout, with any option that has since expired back on its
  * index, and any chosen expiry that has passed back to the nearest. */
@@ -106,6 +108,7 @@ function loadSaved(): Saved {
     panelOpen: saved.panelOpen !== false,
     panelHeight: clampPanelHeight(typeof saved.panelHeight === 'number' ? saved.panelHeight : DEFAULT_PANEL_HEIGHT),
     barHidden: saved.barHidden === true,
+    ladderHidden: saved.ladderHidden === true,
   };
 }
 
@@ -654,15 +657,36 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         </div>
       )}
       <div ref={chartsRef} className="flex min-h-[200px] flex-1 gap-3">
-        <div className="flex min-w-0 flex-1 gap-3">{charts}</div>
-        <aside className="flex w-[380px] shrink-0 flex-col rounded-12 border border-line bg-panel py-3">
-          <div className="flex items-center gap-2 px-3 pb-3">
-            <h2 className="type-title text-fg">{saved.index} options</h2>
-            <span className="ml-auto">{expiryPicker('sm')}</span>
-          </div>
-          {ladder}
-          {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
-        </aside>
+        <div className="flex min-w-0 flex-1 gap-1.5">{charts}</div>
+        {saved.ladderHidden ? (
+          <button
+            type="button"
+            onClick={() => save((s) => ({ ...s, ladderHidden: false }))}
+            aria-label={`Show the ${saved.index} options`}
+            title={`Show the ${saved.index} options`}
+            className="-mx-1 flex w-5 shrink-0 items-center justify-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+          >
+            <ChevronLeft size={14} />
+          </button>
+        ) : (
+          <aside className="flex w-[380px] shrink-0 flex-col rounded-12 border border-line bg-panel py-3">
+            <div className="flex items-center gap-2 px-3 pb-3">
+              <h2 className="type-title text-fg">{saved.index} options</h2>
+              <span className="ml-auto">{expiryPicker('sm')}</span>
+              <button
+                type="button"
+                onClick={() => save((s) => ({ ...s, ladderHidden: true }))}
+                aria-label={`Hide the ${saved.index} options`}
+                title={`Hide the ${saved.index} options`}
+                className="grid size-7 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </div>
+            {ladder}
+            {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
+          </aside>
+        )}
       </div>
       <TradingPanel
         serverBase={serverBase}
