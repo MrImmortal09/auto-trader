@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { cancelPosition, exitPosition, getDesk, getFeed, sellQty, setLots, type Sent } from '../lib/api';
+import { cancelPosition, exitPosition, getDesk, getFeed, getMyDesk, paperClose, paperSellLots, sellQty, setLots, type Sent } from '../lib/api';
 import { money, plural, signedMoney, toneOf } from '../lib/format';
 import { useIsWide } from '../lib/hooks';
 import { usePoll } from '../lib/usePoll';
@@ -41,17 +41,20 @@ function walletLabel(d: DeskAnswer): string {
 }
 
 /** Desk · Today: the figures, open and waiting positions, the calls closed
- * today, and the live Telegram feed. */
-export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
+ * today, and the live Telegram feed. With `paper`, a user's own portfolio:
+ * no waiting calls, Telegram feed or Kotak sync, and sells fill at once. */
+export function DeskToday({ serverBase, desktop, rangeSwitch, stopped, paper = false }: {
   serverBase: string;
   desktop: boolean;
   rangeSwitch: ReactNode;
   /** What the kill switch did, while it's on. */
   stopped: Stopped | null;
+  paper?: boolean;
 }) {
-  const wide = useIsWide();
-  const desk = usePoll(() => getDesk(serverBase), 2000, serverBase);
-  const feed = usePoll(() => getFeed(serverBase), 4000, serverBase);
+  const wide = useIsWide() && !paper;
+  const desk = usePoll(() => (paper ? getMyDesk(serverBase) : getDesk(serverBase)), 2000, `${serverBase}|${paper ? 'paper' : 'owner'}`);
+  const feed = usePoll(() => getFeed(serverBase), 4000, serverBase, !paper);
+  const scope = paper ? 'user' : 'admin';
   const guard = useGuard();
   const toast = useToast();
   // Rows with an action in flight: their buttons wait for the answer and the
@@ -64,7 +67,7 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
   async function act(id: string, reason: string, failTitle: string, run: () => Promise<Sent>): Promise<Sent | null> {
     setSending((s) => ({ ...s, [id]: true }));
     try {
-      const sent = await guard(reason, run, failTitle);
+      const sent = await guard(reason, run, failTitle, scope);
       await desk.refresh();
       return sent;
     } finally {
@@ -72,13 +75,16 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
     }
   }
 
+  // A paper sell fills at once; its toast, with the P&L, comes from the status bar.
   async function lessLot(p: DeskPosition) {
-    const sent = await act(p.id, 'Selling needs write access.', `Couldn't sell ${p.contract}`, () => sellQty(serverBase, p.id, p.lot_size));
+    const sell = () => (paper ? paperSellLots(serverBase, p.id, 1) : sellQty(serverBase, p.id, p.lot_size));
+    const sent = await act(p.id, 'Selling needs write access.', `Couldn't sell ${p.contract}`, sell);
     if (sent?.ok && sent.status === 202) toast({ tone: 'neutral', title: `Selling 1 lot of ${p.contract}`, body: 'Sent to Kotak at market — the fill shows here when it is done.' });
   }
 
   async function exit(p: DeskPosition) {
-    const sent = await act(p.id, 'Exiting needs write access.', `Couldn't exit ${p.contract}`, () => exitPosition(serverBase, p.id));
+    const close = () => (paper ? paperClose(serverBase, p.id) : exitPosition(serverBase, p.id));
+    const sent = await act(p.id, 'Exiting needs write access.', `Couldn't exit ${p.contract}`, close);
     if (sent?.ok && sent.status === 202) toast({ tone: 'neutral', title: `Exiting ${p.contract}`, body: 'Sent to Kotak at market — the fill shows here when it is done.' });
   }
 
@@ -102,7 +108,7 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
         <Stat label="Net today" value={signedMoney(k.net)} size="hero" tone={toneOf(k.net)} />
         <Stat label="Booked" value={signedMoney(k.booked)} tone={toneOf(k.booked)} />
         <Stat label="Open" value={signedMoney(k.open)} tone={toneOf(k.open)} />
-        <Stat label="Calls today" value={k.calls} />
+        <Stat label={paper ? 'Trades today' : 'Calls today'} value={k.calls} />
         <Stat
           label={walletLabel(d)}
           value={d.wallet.balance == null ? '—' : money(d.wallet.balance)}
@@ -115,7 +121,7 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
         <div className="grid grid-cols-3 gap-3">
           <Stat label="Booked" value={signedMoney(k.booked)} size="medium" tone={toneOf(k.booked)} />
           <Stat label="Open" value={signedMoney(k.open)} size="medium" tone={toneOf(k.open)} />
-          <Stat label="Calls today" value={k.calls} size="medium" />
+          <Stat label={paper ? 'Trades today' : 'Calls today'} value={k.calls} size="medium" />
         </div>
       </div>
     )
@@ -138,7 +144,7 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
           </div>
         )}
       </Section>
-      <Section title="Waiting" count={d.waiting.length}>
+      {!paper && <Section title="Waiting" count={d.waiting.length}>
         {d.waiting.length === 0 ? (
           <Empty>
             {stopped?.entries_cancelled
@@ -160,7 +166,7 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
             ))}
           </div>
         )}
-      </Section>
+      </Section>}
       <Section title="Closed today" count={d.closed.length}>
         {d.closed.length === 0 ? (
           <Empty>Nothing closed yet today.</Empty>
@@ -200,12 +206,12 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
           <div className="flex items-center gap-4">
             {rangeSwitch}
             <span className="flex-1" />
-            <SyncWithKotak serverBase={serverBase} onSynced={() => void desk.refresh()} />
+            {!paper && <SyncWithKotak serverBase={serverBase} onSynced={() => void desk.refresh()} />}
           </div>
           {kpis}
           {loading}
-          {!wide && paneSwitch}
-          {wide || pane === 'positions' ? positions : feedPane}
+          {!wide && !paper && paneSwitch}
+          {wide || paper || pane === 'positions' ? positions : feedPane}
         </div>
         {wide && <aside className="w-[320px] shrink-0 border-l border-line px-4 py-5">{feedPane}</aside>}
       </div>
@@ -216,8 +222,8 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped }: {
       {rangeSwitch}
       {kpis}
       {loading}
-      {paneSwitch}
-      {pane === 'positions' ? positions : feedPane}
+      {!paper && paneSwitch}
+      {paper || pane === 'positions' ? positions : feedPane}
     </div>
   );
 }
