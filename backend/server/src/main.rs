@@ -501,10 +501,13 @@ async fn run_daily_kotak_recycle(
 // Kotak session watchdog — mid-day reconnection
 // ---------------------------------------------------------------------------
 
-/// Runs forever. Every 20 s during market hours it checks that the live Kotak
-/// session still works and, if it doesn't, clears it and logs back in from env
-/// credentials — the mid-session counterpart to the fixed 09:05 / 09:15
-/// triggers, which cannot help with a session that dies at (say) 12:30.
+/// Runs forever. Every 20 s during market hours (every 5 minutes outside them)
+/// it checks that the live Kotak session still works and, if it doesn't,
+/// clears it — and, during market hours, logs back in from env credentials:
+/// the mid-session counterpart to the fixed 09:05 / 09:15 triggers, which
+/// cannot help with a session that dies at (say) 12:30. Outside market hours
+/// a dead session is only cleared, so nothing keeps calling Kotak with it
+/// overnight.
 ///
 /// Deliberately conservative so it never fights the other login paths or
 /// thrashes a flaky network:
@@ -522,6 +525,9 @@ async fn run_kotak_session_watchdog(
 ) {
     use std::time::{Duration, Instant};
     const PROBE_EVERY: Duration = Duration::from_secs(20);
+    /// Outside market hours a session is probed every 5 minutes: enough to
+    /// notice it die at midnight, without ~180 calls an hour to Kotak.
+    const OFF_HOURS_PROBE_EVERY: Duration = Duration::from_secs(300);
     const MIN_RELOGIN_GAP: Duration = Duration::from_secs(300);
     const MAX_TRANSIENT_FAILS: u32 = 3;
 
@@ -529,6 +535,7 @@ async fn run_kotak_session_watchdog(
     tokio::time::sleep(Duration::from_secs(60)).await;
 
     let mut last_relogin: Option<Instant> = None;
+    let mut last_probe: Option<Instant> = None;
     let mut transient_fails: u32 = 0;
     let mut absent_streak: u32 = 0;
 
@@ -554,6 +561,10 @@ async fn run_kotak_session_watchdog(
                 }
                 Some(c) => {
                     absent_streak = 0;
+                    if !shared_domain::is_market_open() && last_probe.is_some_and(|t| t.elapsed() < OFF_HOURS_PROBE_EVERY) {
+                        continue;
+                    }
+                    last_probe = Some(Instant::now());
                     match c.get_order_book().await {
                         Ok(_) => {
                             healthy.store(true, Ordering::Relaxed);
@@ -586,8 +597,17 @@ async fn run_kotak_session_watchdog(
         }
 
         // Outside market hours the daily clear / trigger tasks own the session
-        // lifecycle — don't rebuild one they may be about to tear down.
+        // lifecycle — don't rebuild one they may be about to tear down. Don't
+        // keep a dead one either: a session from an evening restart is refused
+        // from midnight, and this probe and the balance refresh would call
+        // Kotak with it every few seconds until the 09:00 clear (~2,000 refused
+        // calls a night). Drop it as the 15:40 clear does; the 09:05 login
+        // (or the 09:10 / 09:15 ones) opens the day's.
         if !shared_domain::is_market_open() {
+            clear_kotak_session(
+                &handles.kotak, &handles.ws_task, &handles.ws_tx,
+                &handles.pool, &handles.log_tx, "session dead outside market hours",
+            ).await;
             continue;
         }
         if !routes::auto_login_enabled_by_env() {
