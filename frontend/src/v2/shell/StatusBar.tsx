@@ -67,7 +67,7 @@ export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
         })}
       </div>
       <div className="flex flex-1 items-center justify-end gap-3">
-        {ownerView && (
+        {role !== 'anon' && (
           <>
             <span className="type-label text-fg-muted">Day</span>
             <span className={`num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]}`}>{status ? signedMoney(status.day_pnl) : '—'}</span>
@@ -123,7 +123,7 @@ export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
           <ChevronDown size={14} className={`shrink-0 text-fg-muted transition-transform ${open ? 'rotate-180' : ''}`} />
         </button>
         <span className="flex-1" />
-        {ownerView && <span className={`num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]}`}>{status ? signedMoney(status.day_pnl) : '—'}</span>}
+        {role !== 'anon' && <span className={`num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]}`}>{status ? signedMoney(status.day_pnl) : '—'}</span>}
         {ownerView &&
           (status?.kill_switch ? (
             <span role="img" aria-label="Trading stopped" className="grid size-9 place-items-center rounded-8 border border-loss bg-loss-subtle text-loss">

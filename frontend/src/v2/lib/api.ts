@@ -183,6 +183,44 @@ export const deleteUser = (base: string, id: number) => send(base, `/api/admin/u
 /** Run update.sh on the server: the latest release, a restart and a health check. */
 export const updateServer = (base: string) => send(base, '/api/update_server', 'POST');
 
+// ── A user's own paper portfolio (`/api/v2/me/*`) ─────────────────────── //
+// Fills are booked at once at the live price: an answer is the fill.
+
+/** A paper fill, as the server answers a buy or a sell. */
+export interface PaperFill {
+  /** The trade row: the status bar's fills go by it. */
+  trade_id: number;
+  position_id: string;
+  action: 'BUY' | 'SELL';
+  contract: string;
+  qty: number;
+  price: number;
+  /** What the wallet paid or got, charges included. */
+  net_value: number;
+  /** Units still held after it. */
+  held: number;
+  balance: number;
+}
+
+const mine = (id: string) => `/api/v2/me/positions/${encodeURIComponent(id)}`;
+
+/** The user's Desk Today, in `/api/v2/desk`'s shape. */
+export const getMyDesk = (base: string) => getJson<DeskAnswer>(base, '/api/v2/me/desk');
+export const getMyHistory = (base: string, range: RangeId, group: GroupId) =>
+  getJson<HistoryAnswer>(base, `/api/v2/me/history?range=${range}&group=${group}`);
+/** The user's fills today, for the charts: no Telegram calls or positions. */
+export const getMyMarks = (base: string) => getJson<MarksAnswer>(base, '/api/v2/me/marks');
+export const paperBuy = (base: string, tradingSymbol: string, lots: number) =>
+  send(base, '/api/v2/me/buy', 'POST', { trading_symbol: tradingSymbol, lots });
+export const paperSellLots = (base: string, id: string, lots: number) => send(base, `${mine(id)}/sell`, 'POST', { lots });
+export const paperClose = (base: string, id: string) => send(base, `${mine(id)}/close`, 'POST');
+/** Sells everything: `{sold, not_sold}`, the second saying why each wasn't. */
+export const paperExitAll = (base: string) => send(base, '/api/v2/me/exit-all', 'POST');
+export const setPaperLevels = (base: string, id: string, levels: { stop?: ChartLevel | null; target?: ChartLevel | null }) =>
+  send(base, mine(id), 'PATCH', levels);
+/** Back to ₹10,00,000 and no history; refused while anything is open. */
+export const resetPortfolio = (base: string) => send(base, '/api/v2/me/reset', 'POST');
+
 const position = (id: string) => `/api/positions/${encodeURIComponent(id)}`;
 
 /** Sell `qty` of an open position at market — v1's partial sell. */

@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { ChevronRight, X } from 'lucide-react';
-import { getHistory } from '../lib/api';
+import { getHistory, getMyHistory } from '../lib/api';
 import { dateRange, dayLabel, indexName, pct, plural, signedMoney, toneOf } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { Call, GroupId, GroupRow, HistoryAnswer, RangeId } from '../lib/types';
@@ -119,16 +119,21 @@ function SourceTable({ groups, group, rangeName, onPick, desktop }: {
 }
 
 /** Desk over 7D, 30D or All: the range's KPIs, P&L curve, P&L by source and
- * its trading days. */
-export function DeskRange({ serverBase, range, desktop, rangeSwitch }: {
+ * its trading days — the owner's, or with `paper` the user's own. */
+export function DeskRange({ serverBase, range, desktop, rangeSwitch, paper = false }: {
   serverBase: string;
   range: Exclude<RangeId, 'today'>;
   desktop: boolean;
   rangeSwitch: ReactNode;
+  paper?: boolean;
 }) {
   const [group, setGroup] = useState<GroupId>('channel');
   const [pick, setPick] = useState<Drill | null>(null);
-  const history = usePoll(() => getHistory(serverBase, range, group), 30_000, `${serverBase}|${range}|${group}`);
+  const history = usePoll(
+    () => (paper ? getMyHistory(serverBase, range, group) : getHistory(serverBase, range, group)),
+    30_000,
+    `${serverBase}|${range}|${group}|${paper ? 'paper' : 'owner'}`,
+  );
   const h = history.data;
   const k = h?.kpis;
   const rangeName = RANGE_NAME[range];
