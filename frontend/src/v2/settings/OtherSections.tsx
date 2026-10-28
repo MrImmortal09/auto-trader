@@ -7,6 +7,7 @@ import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
 import { Row, Section } from './parts';
 import { uptimeText } from './summary';
+import { UpdateServer } from './UpdateServer';
 import type { SettingsState } from './useSettings';
 
 /** Trade: how its orders go, which is fixed. */
@@ -22,10 +23,11 @@ export function TradeNotes({ flags, id, title }: { flags: Flags | null; id?: str
 }
 
 /** Server and data: what's running, the paper wallet and the P&L charges. */
-export function ServerData({ serverBase, settings, system, id, title, large = false }: {
+export function ServerData({ serverBase, settings, system, onRestarted, id, title, large = false }: {
   serverBase: string;
   settings: SettingsState;
   system: SystemAnswer | null;
+  onRestarted: () => void;
   id?: string;
   title?: string;
   large?: boolean;
@@ -60,7 +62,10 @@ export function ServerData({ serverBase, settings, system, id, title, large = fa
       <Row title="Brokerage per order" caption="A flat charge per order in the P&L figures. What Kotak charges doesn't change.">
         <NumberInput label="Brokerage per order" value={cfg.brokerage_per_order} min={0} max={1000} grouped unit="₹" size={size} onCommit={(n) => void save(() => ({ brokerage_per_order: n }), `Brokerage ₹${n} an order`)} />
       </Row>
-      <Row title="Clear the database, or update the server" caption="In the old design, which asks before either.">
+      <Row title="Update the server" caption="The latest release from GitHub. It restarts in about a minute, and goes back to this one if the new one fails.">
+        <UpdateServer serverBase={serverBase} size={size} onRestarted={onRestarted} />
+      </Row>
+      <Row title="Clear the database" caption="In the old design, which asks first.">
         <a href="/v1/settings" className="inline-flex h-7 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">
           Open
         </a>
