@@ -1,4 +1,4 @@
-import { useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from 'react';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import type { ExecutePosition } from '../../../types';
 import { contractLabel, expiryLabel } from '../../../lib/execute';
@@ -13,7 +13,7 @@ import type { LevelKind } from '../lines';
 import type { PaperAccount, PositionHandlers } from '../Positions';
 import { busyNote, levelWords } from '../words';
 import { activityEvents, type EngineError } from './activity';
-import { clampPanelHeight } from './height';
+import { MIN_CHART_HEIGHT, MIN_PANEL_HEIGHT } from './height';
 import { ActivityList, HistoryList, PaperActivityList } from './lists';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -21,6 +21,22 @@ const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg'
 const PAPER_START = 1_000_000;
 
 type TabId = 'positions' | 'waiting' | 'orders' | 'history' | 'activity';
+
+/** The tallest the panel can be now: its own height, plus all of the charts'
+ * but `MIN_CHART_HEIGHT`, less whatever already reaches past the screen's
+ * bottom padding. */
+function roomFor(panel: HTMLElement | null, charts: HTMLElement | null, height: number): number {
+  const own = panel?.getBoundingClientRect().height ?? height;
+  const above = charts?.getBoundingClientRect().height ?? MIN_CHART_HEIGHT;
+  const screen = panel?.parentElement;
+  let spill = 0;
+  if (screen) {
+    const end = screen.getBoundingClientRect().bottom - (parseFloat(getComputedStyle(screen).paddingBottom) || 0);
+    const last = screen.lastElementChild?.getBoundingClientRect().bottom ?? end;
+    spill = Math.max(0, last - end);
+  }
+  return Math.max(MIN_PANEL_HEIGHT, Math.floor(own + above - MIN_CHART_HEIGHT - spill));
+}
 
 /** A panel tab: its label and count, underlined while open. */
 function PanelTab({ id, label, count, active, onSelect }: { id: TabId; label: string; count: number | null; active: boolean; onSelect: (id: TabId) => void }) {
@@ -151,9 +167,10 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
  * tabs — Positions (every open trade with its stop and target, −1 lot and
  * Close), Waiting (first buys still being placed) and Orders (what rests at
  * Kotak) for the owner's desk, History (today's closed trades) and Activity.
- * Exit all is held. Its top edge drags to resize it; the chevron folds it.
+ * Exit all is held. Its top edge drags to resize it — up into the charts,
+ * never past the bottom of the window — and the chevron folds it.
  */
-export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, paper }: {
+export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, chartsRef, layout, paper }: {
   serverBase: string;
   mode: string;
   desk: DeskAnswer | null;
@@ -173,13 +190,19 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   /** Height while open, in px. */
   height: number;
   onHeight: (h: number) => void;
+  /** The charts above, which give the panel its room. */
+  chartsRef: RefObject<HTMLElement | null>;
+  /** Changes whenever the screen above changes shape (the index bar shown
+   * or hidden), so the panel fits itself again. */
+  layout: string;
   /** A user's paper portfolio: no Waiting or Orders, their own activity. */
   paper?: PaperAccount;
 }) {
   const [tab, setTab] = useState<TabId>('positions');
   // The height under a drag, kept here until the pointer lifts.
   const [dragged, setDragged] = useState<number | null>(null);
-  const drag = useRef<{ y: number; h: number } | null>(null);
+  const drag = useRef<{ y: number; h: number; max: number } | null>(null);
+  const sectionRef = useRef<HTMLElement>(null);
   const active = scalps.filter((p) => !p.placing);
   const waiting = scalps.filter((p) => p.placing);
   const openPnl = active.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
@@ -199,13 +222,31 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
       return rows;
     });
 
+  // A height the window can no longer hold (it got smaller, the index bar
+  // came back, a banner appeared) comes down to fit: the screen never scrolls.
+  useEffect(() => {
+    const charts = chartsRef.current;
+    const screen = sectionRef.current?.parentElement;
+    if (!open || !charts || !screen) return;
+    const fit = () => {
+      if (drag.current) return;
+      const max = roomFor(sectionRef.current, charts, height);
+      if (height > max) onHeight(max);
+    };
+    fit();
+    const watch = new ResizeObserver(fit);
+    watch.observe(charts);
+    watch.observe(screen);
+    return () => watch.disconnect();
+  }, [open, height, onHeight, chartsRef, layout]);
+
   const onDragStart = (e: ReactPointerEvent<HTMLDivElement>) => {
-    drag.current = { y: e.clientY, h: height };
+    drag.current = { y: e.clientY, h: height, max: roomFor(sectionRef.current, chartsRef.current, height) };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
   const onDragMove = (e: ReactPointerEvent<HTMLDivElement>) => {
     const d = drag.current;
-    if (d) setDragged(clampPanelHeight(d.h + (d.y - e.clientY)));
+    if (d) setDragged(Math.round(Math.min(d.max, Math.max(MIN_PANEL_HEIGHT, d.h + (d.y - e.clientY)))));
   };
   const onDragEnd = () => {
     if (drag.current && dragged != null) onHeight(dragged);
@@ -365,7 +406,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   }
 
   return (
-    <section style={{ height: dragged ?? height }} className="relative flex shrink-0 overflow-hidden rounded-12 border border-line bg-panel">
+    <section ref={sectionRef} style={{ height: dragged ?? height }} className="relative flex shrink-0 overflow-hidden rounded-12 border border-line bg-panel">
       {/* The top edge: drag to make the panel taller or shorter. */}
       <div
         role="separator"
@@ -375,9 +416,10 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
         onPointerMove={onDragMove}
         onPointerUp={onDragEnd}
         onPointerCancel={onDragEnd}
-        className="group absolute inset-x-0 top-0 z-10 flex h-2 cursor-row-resize justify-center"
+        title="Drag to resize"
+        className="group absolute inset-x-0 top-0 z-10 flex h-3 cursor-row-resize touch-none justify-center"
       >
-        <span className="mt-0.5 h-1 w-10 rounded-full bg-line group-hover:bg-line-strong" />
+        <span className="mt-1 h-1 w-12 rounded-full bg-line-strong group-hover:bg-fg-muted" />
       </div>
       <aside className="w-[260px] shrink-0 overflow-y-auto border-r border-line">
         <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical />

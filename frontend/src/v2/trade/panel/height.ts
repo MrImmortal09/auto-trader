@@ -1,8 +1,13 @@
-// The trading panel's height while open: what a drag may set, and what a
-// saved height is clamped to on a smaller window.
+// The trading panel's height while open. The Trade screen doesn't scroll:
+// the panel grows up into the charts, which keep at least
+// `MIN_CHART_HEIGHT`, and never past the bottom of the window.
 
 export const DEFAULT_PANEL_HEIGHT = 320;
-const MIN_HEIGHT = 180;
-const maxHeight = () => Math.max(MIN_HEIGHT, Math.round(window.innerHeight * 0.6));
+export const MIN_PANEL_HEIGHT = 180;
+/** The least height the charts keep when the panel grows. */
+export const MIN_CHART_HEIGHT = 200;
 
-export const clampPanelHeight = (h: number) => Math.min(maxHeight(), Math.max(MIN_HEIGHT, Math.round(h)));
+/** A saved height, before the screen is laid out: within the panel's least
+ * and what a window this tall could hold. The panel measures itself to fit
+ * once it is on screen. */
+export const clampPanelHeight = (h: number) => Math.max(MIN_PANEL_HEIGHT, Math.min(Math.round(h), window.innerHeight - 300));

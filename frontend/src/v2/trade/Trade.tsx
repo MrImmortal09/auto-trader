@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChartCandlestick, ChevronDown, Columns2, Columns3, Square } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChartCandlestick, ChevronDown, ChevronUp, Columns2, Columns3, Square } from 'lucide-react';
 import type { ChartLevel, ExecutePosition } from '../../types';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
@@ -72,13 +72,15 @@ interface Saved {
   panelOpen: boolean;
   /** Desktop: the trading panel's height while open, in px. */
   panelHeight: number;
+  /** Desktop: the index bar folded away, for room. */
+  barHidden: boolean;
 }
 
 const STORE_KEY = 'v2.trade';
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false };
 
 /** The saved layout, with any option that has since expired back on its
  * index, and any chosen expiry that has passed back to the nearest. */
@@ -103,6 +105,7 @@ function loadSaved(): Saved {
     chartLib: saved.chartLib === 'vela' ? 'vela' : 'kline',
     panelOpen: saved.panelOpen !== false,
     panelHeight: clampPanelHeight(typeof saved.panelHeight === 'number' ? saved.panelHeight : DEFAULT_PANEL_HEIGHT),
+    barHidden: saved.barHidden === true,
   };
 }
 
@@ -189,6 +192,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       return s;
     });
   }, []);
+  // Desktop: the charts row, which the trading panel grows up into.
+  const chartsRef = useRef<HTMLDivElement>(null);
+  const setPanelHeight = useCallback((panelHeight: number) => save((s) => ({ ...s, panelHeight })), [save]);
 
   // Each index on screen: its listed expiries, before the stream opens.
   const shownSlots = desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1);
@@ -613,20 +619,41 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   ];
   return (
     <div className="flex h-full min-h-0 flex-col gap-3 p-4">
-      <div className="flex shrink-0 items-center gap-3">
-        <IndexTabs indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
-        <span className="flex-1" />
-        <Segment label="Chart library" size="sm" value={saved.chartLib} onChange={setLib} options={CHART_LIBS} />
-        <span className="type-label text-fg-muted">Charts</span>
-        <div role="tablist" aria-label="Charts" className="flex gap-1 rounded-8 bg-inset p-1">
-          {layouts.map(({ n, icon: Icon, label }) => (
-            <button key={n} type="button" role="tab" aria-selected={saved.layout === n} aria-label={label} onClick={() => save((s) => ({ ...s, layout: n }))} className={`grid size-7 place-items-center rounded-6 ${saved.layout === n ? 'bg-raised text-fg' : 'text-fg-muted hover:text-fg'}`}>
-              <Icon size={16} />
-            </button>
-          ))}
+      {saved.barHidden ? (
+        <button
+          type="button"
+          onClick={() => save((s) => ({ ...s, barHidden: false }))}
+          aria-label="Show the index bar"
+          title="Show the index bar"
+          className="-mt-2 -mb-1 flex h-4 shrink-0 items-center justify-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+        >
+          <ChevronDown size={14} />
+        </button>
+      ) : (
+        <div className="flex shrink-0 items-center gap-3">
+          <IndexTabs indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
+          <span className="flex-1" />
+          <Segment label="Chart library" size="sm" value={saved.chartLib} onChange={setLib} options={CHART_LIBS} />
+          <span className="type-label text-fg-muted">Charts</span>
+          <div role="tablist" aria-label="Charts" className="flex gap-1 rounded-8 bg-inset p-1">
+            {layouts.map(({ n, icon: Icon, label }) => (
+              <button key={n} type="button" role="tab" aria-selected={saved.layout === n} aria-label={label} onClick={() => save((s) => ({ ...s, layout: n }))} className={`grid size-7 place-items-center rounded-6 ${saved.layout === n ? 'bg-raised text-fg' : 'text-fg-muted hover:text-fg'}`}>
+                <Icon size={16} />
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() => save((s) => ({ ...s, barHidden: true }))}
+            aria-label="Hide the index bar"
+            title="Hide the index bar"
+            className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+          >
+            <ChevronUp size={16} />
+          </button>
         </div>
-      </div>
-      <div className="flex min-h-[420px] flex-1 gap-3">
+      )}
+      <div ref={chartsRef} className="flex min-h-[200px] flex-1 gap-3">
         <div className="flex min-w-0 flex-1 gap-3">{charts}</div>
         <aside className="flex w-[380px] shrink-0 flex-col rounded-12 border border-line bg-panel py-3">
           <div className="flex items-center gap-2 px-3 pb-3">
@@ -652,7 +679,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         open={saved.panelOpen}
         onToggle={() => save((s) => ({ ...s, panelOpen: !s.panelOpen }))}
         height={saved.panelHeight}
-        onHeight={(panelHeight) => save((s) => ({ ...s, panelHeight }))}
+        onHeight={setPanelHeight}
+        chartsRef={chartsRef}
+        layout={saved.barHidden ? 'bar hidden' : 'bar shown'}
         paper={account}
       />
       {!chartStopsOn && scalps.length > 0 && (
