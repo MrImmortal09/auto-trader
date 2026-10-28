@@ -16,9 +16,12 @@ import {
   vwapOf,
   vwapOnIndex,
   type Bar,
+  type CandleStyle,
   type ChartSym,
   type Tf,
 } from './model';
+
+const KLINE_CANDLE: Record<CandleStyle, 'candle_solid' | 'ohlc' | 'area'> = { candles: 'candle_solid', bars: 'ohlc', area: 'area' };
 
 /** A horizontal order line: at a price, or at the bar close at a time (where
  * the index was when a scalp was bought). */
@@ -78,6 +81,7 @@ export interface ChartProps {
   vwap: boolean;
   /** Standard pivot points, daily. */
   pivots: boolean;
+  style: CandleStyle;
   placing: Placing | null;
   onPlacingDone: () => void;
   bus: CrosshairBus;
@@ -90,7 +94,7 @@ export interface ChartProps {
  * bars come from the candle service and follow its stream; an index chart's
  * VWAP is its future's, moved onto the index by the basis.
  */
-export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, placing, onPlacingDone, bus, onState }: ChartProps) {
+export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, style, placing, onPlacingDone, bus, onState }: ChartProps) {
   const host = useRef<HTMLDivElement>(null);
   const chart = useRef<Chart | null>(null);
   const pushBar = useRef<((k: KLineData) => void) | null>(null);
@@ -240,6 +244,10 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   useEffect(() => {
     onState?.({ loading: !loaded && !error, error, last: bars?.[bars.length - 1] ?? null });
   }, [loaded, error, bars, onState]);
+
+  useEffect(() => {
+    chart.current?.setStyles({ candle: { type: KLINE_CANDLE[style] } });
+  }, [style]);
 
   // VWAP: the option's own, or the future's moved onto the index.
   useEffect(() => {

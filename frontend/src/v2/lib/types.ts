@@ -331,6 +331,23 @@ export interface ChainSide {
   delta: { value: number; assumed: boolean };
 }
 
+/** `GET /api/positions`: the engine's own rows, the few fields the Trade panel's Orders tab reads. */
+export interface RawPosition {
+  id: string;
+  manual?: boolean;
+  state: string;
+  executed_qty: number;
+  signal: { instrument_name: string; strike: number | null; option_type: string | null };
+  /** LIVE: the entry buy at Kotak, while it fills. */
+  entry_order_id?: string | null;
+  /** LIVE: an exit sell at Kotak, while it fills. */
+  pending_exit_order_id?: string | null;
+  /** LIVE: a resting SL-M order at Kotak (one adopted at startup; the engine places none). */
+  sl_order_id?: string | null;
+  sl_order_qty?: number;
+  sl_order_trigger?: number;
+}
+
 /** `GET /api/v2/expiries?index=`: every expiry the index's options are listed for, earliest first. */
 export interface ExpiriesAnswer {
   index: string;

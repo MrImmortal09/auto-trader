@@ -5,7 +5,7 @@ import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, upsert } from './bars';
 import { C, FONT, type MarkerData } from './chartSetup';
 import type { ChartLine, ChartProps } from './KChart';
-import { barAt, futureName, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar } from './model';
+import { barAt, futureName, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle } from './model';
 import { pivotLines, pivotsByDay } from './pivots';
 import { CandleProvider, PROVIDER, velaSymbol, type Feed } from './velaProvider';
 
@@ -44,6 +44,8 @@ interface Keyed<T> {
   value: T;
 }
 
+const VELA_STYLE: Record<CandleStyle, string> = { candles: 'candles', bars: 'bars', area: 'area' };
+
 /**
  * One Vela chart: `sym` at `tf`, the same order lines, markers, VWAP and
  * pivots as the KLineChart page, drawn with Vela's own tools — a level is a
@@ -51,7 +53,7 @@ interface Keyed<T> {
  * timeline lane, and "+ Stop" places on the next click. Bars come from the
  * candle service through a Vela data provider and follow the same stream.
  */
-export default function VChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, placing, onPlacingDone, bus, onState }: ChartProps) {
+export default function VChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, style, placing, onPlacingDone, bus, onState }: ChartProps) {
   const host = useRef<HTMLDivElement>(null);
   const chart = useRef<Vela | null>(null);
   const provider = useRef<CandleProvider | null>(null);
@@ -283,6 +285,10 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     placingNow.current = placing;
     doneNow.current = onPlacingDone;
   });
+
+  useEffect(() => {
+    chart.current?.renderer.set('priceStyle', VELA_STYLE[style]);
+  }, [style]);
 
   // Order lines: one horizontal-line drawing each, dragged with Vela's own handle.
   useEffect(() => {
