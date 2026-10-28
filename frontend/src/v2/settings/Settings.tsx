@@ -95,7 +95,7 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
       case 'trade':
         return <TradeNotes id={sid} title={title} flags={flags.data} />;
       case 'server':
-        return <ServerData id={sid} title={title} serverBase={serverBase} settings={settings} system={system.data} large={large} />;
+        return <ServerData id={sid} title={title} serverBase={serverBase} settings={settings} system={system.data} onRestarted={() => void system.refresh()} large={large} />;
       case 'beta':
         return <Beta id={sid} title={title} serverBase={serverBase} flags={flags.data} onSaved={() => void flags.refresh()} />;
     }

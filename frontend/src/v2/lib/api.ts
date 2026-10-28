@@ -180,6 +180,9 @@ export const patchUser = (base: string, id: number, patch: { name?: string; enab
   send(base, `/api/admin/users/${id}`, 'PATCH', patch);
 export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE');
 
+/** Run update.sh on the server: the latest release, a restart and a health check. */
+export const updateServer = (base: string) => send(base, '/api/update_server', 'POST');
+
 const position = (id: string) => `/api/positions/${encodeURIComponent(id)}`;
 
 /** Sell `qty` of an open position at market — v1's partial sell. */
