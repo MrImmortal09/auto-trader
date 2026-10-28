@@ -466,7 +466,7 @@ These files should remain on persistent disk on the VM, inside `backend/`:
 
 ## Signing In
 
-The site (for example `https://at.axiosiiitl.dev`) opens on a sign-in page; nothing else loads, and the server answers nothing but `/api/health`, `/api/version` and the sign-in itself, until someone signs in. The redesign is at `/`; the old dashboard (v1) is at `/v1/`.
+The site (for example `https://at.axiosiiitl.dev`) opens on a sign-in page; nothing else loads, and the server answers nothing but `/api/health`, `/api/version` and the sign-in itself, until someone signs in. The redesign (v2) is at `/v2/`, one address per screen (`/v2/desk`, `/v2/trade`, `/v2/market`, `/v2/settings`, `/v2/admin`), and `/` opens it; the old dashboard (v1) is at `/v1/` (`/v1/execute`, `/v1/positions`, …). The System screens have no button: open `/v2/system` or `/v1/system` (signed in as the admin).
 
 - **One way in: a phone number and a WhatsApp code.** The server sends a 6-digit code through your WhatsApp server (`WA_SERVER_URL` / `WA_API_KEY`), valid for 10 minutes and for one sign-in. Only numbers on the allow-list (the Admin page) get a code. There is no passkey.
 - **Limits, per number:** 3 codes every 10 minutes, 5 guesses a code, and 30 guesses a day across all its codes; past that the number gets no code until the day is up. Per address: 10 sends and 20 guesses every 10 minutes. Anyone who knows the admin's number can use those up — the way back in is [`admin-token`](#locked-out-sign-in-with-admin-token).

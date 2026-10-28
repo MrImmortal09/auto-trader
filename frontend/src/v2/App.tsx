@@ -10,7 +10,7 @@ import type { Stopped } from './lib/types';
 import { StatusBanners } from './shell/Banners';
 import { KillSwitchDialog } from './shell/KillSwitchDialog';
 import { NavRail, TabBar } from './shell/Nav';
-import { SCREENS, screenFromHash, TAB_SCREENS, visibleScreens, type ScreenId } from './shell/screens';
+import { navScreens, SCREENS, screenFromLocation, screenPath, TAB_SCREENS, visibleScreens, type ScreenId } from './shell/screens';
 import { DesktopStatusBar, PhoneStatusBar } from './shell/StatusBar';
 import { useGuard } from './shell/useGuard';
 import { useEngineErrors, useStatus } from './shell/useStatus';
@@ -45,8 +45,9 @@ export default function App() {
   const desktop = useIsDesktop();
   const { role, canReadOwner } = useIdentity();
   const screens = visibleScreens(role);
-  const [wanted, setWanted] = useState<ScreenId>(screenFromHash);
-  // A screen this person may not open (an old hash, or a sign-out) falls back to Desk.
+  const nav = navScreens(role);
+  const [wanted, setWanted] = useState<ScreenId>(screenFromLocation);
+  // A screen this person may not open (an old link, or a sign-out) falls back to Desk.
   const screen: ScreenId = screens.includes(wanted) ? wanted : 'desk';
   const [killSwitchOpen, setKillSwitchOpen] = useState(false);
   const [resuming, setResuming] = useState(false);
@@ -54,16 +55,25 @@ export default function App() {
   const guard = useGuard();
   useEngineErrors(serverBase, streamToken(), canReadOwner);
 
-  // The screen is mirrored in the hash (`/#trade`): there are no deep paths.
+  // The screen is the address (`/v2/trade`): Back and Forward move between screens.
   useEffect(() => {
-    const onHash = () => setWanted(screenFromHash());
-    window.addEventListener('hashchange', onHash);
-    return () => window.removeEventListener('hashchange', onHash);
+    const onPop = () => setWanted(screenFromLocation());
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
   }, []);
+
+  // `/`, an old `/#trade` link or a screen this person can't open: show the
+  // address of the screen actually open.
+  useEffect(() => {
+    const path = screenPath(screen);
+    if (window.location.pathname !== path || window.location.hash) {
+      window.history.replaceState(null, '', path + window.location.search);
+    }
+  }, [screen]);
 
   function go(next: ScreenId) {
     setWanted(next);
-    if (window.location.hash !== `#${next}`) window.location.hash = next;
+    if (window.location.pathname !== screenPath(next)) window.history.pushState(null, '', screenPath(next));
   }
 
   async function resume() {
@@ -77,7 +87,7 @@ export default function App() {
   const unreachable = !!status.error;
   const stopped = canReadOwner && s?.kill_switch ? s.stopped ?? { at: null, positions_exited: 0, entries_cancelled: 0 } : null;
   // Phone: the screens behind More, with a switch between them when there are several.
-  const more = screens.filter((id) => !TAB_SCREENS.includes(id));
+  const more = nav.filter((id) => !TAB_SCREENS.includes(id));
 
   const content =
     screen === 'desk' ? (
@@ -108,7 +118,8 @@ export default function App() {
           ) : (
             <UserSettings serverBase={serverBase} desktop={desktop} />
           );
-        if (desktop || more.length < 2) return page;
+        // A link-only screen (System) opens on its own, outside More's switch.
+        if (desktop || more.length < 2 || !more.includes(screen)) return page;
         return (
           <div className="flex min-h-full flex-col">
             <div className="px-4 pt-4">
@@ -144,10 +155,10 @@ export default function App() {
       )}
       <StatusBanners serverBase={serverBase} status={s} canReadOwner={canReadOwner} />
       <div className="flex min-h-0 flex-1">
-        {desktop && <NavRail screens={screens} screen={screen} onSelect={go} />}
+        {desktop && <NavRail screens={nav} screen={screen} onSelect={go} />}
         <main className="min-w-0 flex-1 overflow-y-auto">{content}</main>
       </div>
-      {!desktop && <TabBar screens={screens} screen={screen} onSelect={go} />}
+      {!desktop && <TabBar screens={nav} screen={screen} onSelect={go} />}
 
       {killSwitchOpen && canReadOwner && (
         <KillSwitchDialog serverBase={serverBase} mode={s?.mode} onClose={() => setKillSwitchOpen(false)} onDone={() => void status.refresh()} />

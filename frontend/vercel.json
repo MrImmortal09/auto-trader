@@ -1,16 +1,6 @@
 {
   "redirects": [
     {
-      "source": "/v2",
-      "destination": "/",
-      "permanent": false
-    },
-    {
-      "source": "/v2/:path*",
-      "destination": "/",
-      "permanent": false
-    },
-    {
       "source": "/:screen(execute|positions|analytics|market|portfolio|reports|system|health|settings)",
       "destination": "/v1/:screen",
       "permanent": false
@@ -24,6 +14,14 @@
     {
       "source": "/v1/(.*)",
       "destination": "/v1/index.html"
+    },
+    {
+      "source": "/v2",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/v2/(.*)",
+      "destination": "/index.html"
     },
     {
       "source": "/(.*)",

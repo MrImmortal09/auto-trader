@@ -91,7 +91,7 @@ Note: there is a second, unused `shared_domain/Cargo.toml` at the repo root (out
 
 ### Frontend (`frontend/`, Vite + React 19 + Tailwind v4)
 
-`src/App.tsx` is the shell; `src/components/` holds the dashboard panels (settings bar, portfolio, log terminal, login panels for Kotak/Telegram, reports); `src/screens/` holds full routed views (trade analytics, portfolio performance); `src/lib/api.ts` wraps backend calls and `src/lib/auth.ts` reads the phone sign-in's token (`src/lib/session.ts`, `localStorage`), which v1 (now at `/v1/`) and v2 (at `/`) share; v1 opens only for the admin's. The backend URL itself is stored client-side (`localStorage` + cookie) rather than baked in at build time, since the frontend (Vercel) and backend (VM) are typically deployed separately — see README's split-deployment guide.
+`src/App.tsx` is the shell; `src/components/` holds the dashboard panels (settings bar, portfolio, log terminal, login panels for Kotak/Telegram, reports); `src/screens/` holds full routed views (trade analytics, portfolio performance); `src/lib/api.ts` wraps backend calls and `src/lib/auth.ts` reads the phone sign-in's token (`src/lib/session.ts`, `localStorage`), which v1 (at `/v1/<screen>`) and v2 (at `/v2/<screen>`, `/` opens it; `src/v2/shell/screens.ts`) share; v1 opens only for the admin's. The System screens are link-only (`/v2/system`, `/v1/system`): no button in either app's navigation. The backend URL itself is stored client-side (`localStorage` + cookie) rather than baked in at build time, since the frontend (Vercel) and backend (VM) are typically deployed separately — see README's split-deployment guide.
 
 ### Deployment
 
