@@ -8,6 +8,8 @@ import type { ChartLevel } from '../../types';
 import type { TradingConfig } from '../../types';
 import type { Bar, Tf } from '../trade/model';
 import type {
+  AdminPosition,
+  AdminTradesAnswer,
   AdminUser,
   ChainAnswer,
   ExpiriesAnswer,
@@ -174,6 +176,14 @@ export async function verifyOtp(base: string, phone: string, code: string): Prom
 }
 
 export const listUsers = (base: string) => getJson<AdminUser[]>(base, '/api/admin/users');
+/** Every user's paper fills (or `user`'s), on or after `from` (`YYYY-MM-DD`; all without it). */
+export function getAdminTrades(base: string, user: number | null, from: string | null) {
+  const q = new URLSearchParams();
+  if (user != null) q.set('user', String(user));
+  if (from) q.set('from', from);
+  return getJson<AdminTradesAnswer>(base, `/api/admin/trades${q.size ? `?${q}` : ''}`);
+}
+export const getAdminPositions = (base: string) => getJson<AdminPosition[]>(base, '/api/admin/positions');
 // The Admin page's allow-list.
 export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name });
 export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) =>

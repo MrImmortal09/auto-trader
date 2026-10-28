@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Trash2, UserPlus } from 'lucide-react';
 import { formatPhone, normalizePhone } from '../auth/phone';
 import { createUser, deleteUser, listUsers, patchUser } from '../lib/api';
-import { hhmm, shortDate } from '../lib/format';
+import { hhmm, plural, shortDate } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { AdminUser } from '../lib/types';
 import { Row, Section } from '../settings/parts';
@@ -12,6 +12,7 @@ import { Chip } from '../ui/Chip';
 import { Modal } from '../ui/Modal';
 import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
+import { PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
 
 const INPUT = 'rounded-6 border border-line bg-inset px-2.5 text-fg outline-none placeholder:text-fg-muted focus:border-line-strong disabled:opacity-50';
 
@@ -22,9 +23,9 @@ function lastLogin(u: AdminUser): string {
 }
 
 /**
- * Admin: who may sign in by phone. The admin adds numbers, switches them off
- * and removes them, as paper traders; the admin's own row stays. Mode and the
- * credentials follow.
+ * Admin: who may sign in by phone — the admin adds numbers, switches them off
+ * and removes them, as paper traders; the admin's own row stays — and what
+ * every user holds and has traded on paper, read-only.
  */
 export function Admin({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
   const users = usePoll(() => listUsers(serverBase), 15_000, serverBase);
@@ -97,11 +98,25 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
                 {!u.enabled && <Chip kind="loss">Disabled</Chip>}
               </span>
             }
-            caption={`+91 ${formatPhone(u.phone)} · ${lastLogin(u)} · added ${shortDate(u.created_at.slice(0, 10))}`}
+            caption={
+              <>
+                <div>{`+91 ${formatPhone(u.phone)} · ${lastLogin(u)} · added ${shortDate(u.created_at.slice(0, 10))}`}</div>
+                {u.paper && <PaperLine p={u.paper} />}
+              </>
+            }
           >
             <Toggle checked={u.enabled} disabled={isAdmin || !!busy[u.id]} label={`${u.enabled ? 'Disable' : 'Enable'} ${formatPhone(u.phone)}`} onChange={(on) => void setEnabled(u, on)} />
             {!isAdmin && (
-              <Button size={size} kind="quiet" icon={<Trash2 size={14} />} aria-label={`Remove ${formatPhone(u.phone)}`} disabled={!!busy[u.id]} onClick={() => setRemoving(u)} />
+              <Button
+                size={size}
+                kind="quiet"
+                icon={<Trash2 size={14} />}
+                aria-label={`Remove ${formatPhone(u.phone)}`}
+                // The server refuses while they hold anything: disable them instead.
+                title={u.paper?.open ? `Holds ${plural(u.paper.open, 'open paper position')}: disable them instead, or remove them once flat` : undefined}
+                disabled={!!busy[u.id] || (u.paper?.open ?? 0) > 0}
+                onClick={() => setRemoving(u)}
+              />
             )}
           </Row>
         );
@@ -147,12 +162,16 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
           {rows}
           {addForm}
         </Section>
+        <PaperPositions serverBase={serverBase} users={list} />
+        <PaperTrades serverBase={serverBase} users={list} desktop={desktop} />
       </div>
       {removing && (
         <Modal open onClose={() => setRemoving(null)} label="Remove user" width="lg:max-w-[400px]">
           <div className="flex flex-col gap-4 p-6">
             <h2 className="type-title text-fg">Remove {removing.name?.trim() || formatPhone(removing.phone)}?</h2>
-            <p className="type-body text-fg-muted">+91 {formatPhone(removing.phone)} is taken off the allow-list and signed out at once. Add the number again to let them back in.</p>
+            <p className="type-body text-fg-muted">
+              +91 {formatPhone(removing.phone)} is taken off the allow-list and signed out at once, and their paper portfolio and its trades are deleted. Add the number again to let them back in, starting fresh.
+            </p>
             <div className="flex justify-end gap-2">
               <Button size="md" onClick={() => setRemoving(null)}>
                 Cancel
