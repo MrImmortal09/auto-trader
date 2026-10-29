@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react';
 import { ChevronRight, X } from 'lucide-react';
 import { getHistory, getMyHistory } from '../lib/api';
+import { downloadCsv } from '../lib/csv';
 import { dateRange, dayLabel, indexName, pct, plural, signedMoney, toneOf } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { Call, GroupId, GroupRow, HistoryAnswer, RangeId } from '../lib/types';
@@ -30,22 +31,11 @@ function matches(c: Call, pick: Drill, group: GroupId): boolean {
   return (c.side ?? 'Other') === pick.label;
 }
 
-function csvCell(v: string | number | null): string {
-  const s = v == null ? '' : String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
 /** The range's calls as a CSV download. */
 function exportCsv(h: HistoryAnswer) {
   const head = ['Closed', 'Opened', 'Channel', 'Index', 'Strike', 'Side', 'Bought qty', 'Sold qty', 'Net P&L', 'Charges', 'How it ended'];
   const rows = h.calls.map((c) => [c.closed_at, c.opened_at, c.channel, c.index, c.strike, c.side, c.bought_qty, c.sold_qty, c.pnl == null ? null : c.pnl.toFixed(2), c.charges.toFixed(2), c.outcome?.label ?? c.exit_reason]);
-  const csv = [head, ...rows].map((r) => r.map(csvCell).join(',')).join('\n');
-  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `auto-trader-${h.mode.toLowerCase()}-${h.range}-${h.to}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
+  downloadCsv(`auto-trader-${h.mode.toLowerCase()}-${h.range}-${h.to}.csv`, [head, ...rows]);
 }
 
 /** A panel; `bare` drops its fill and padding (phone's By source list). */

@@ -34,6 +34,7 @@ import type {
   SystemAnswer,
   TelegramState,
   TrendAnswer,
+  UserReport,
 } from './types';
 
 export class ApiError extends Error {
@@ -187,6 +188,12 @@ export function getAdminTrades(base: string, user: number | null, from: string |
   return getJson<AdminTradesAnswer>(base, `/api/admin/trades${q.size ? `?${q}` : ''}`);
 }
 export const getAdminPositions = (base: string) => getJson<AdminPosition[]>(base, '/api/admin/positions');
+/** One user's paper P&L over the IST days `from`..`to` (from their first fill without `from`). */
+export function getUserReport(base: string, user: number, from: string | null, to: string) {
+  const q = new URLSearchParams({ to });
+  if (from) q.set('from', from);
+  return getJson<UserReport>(base, `/api/admin/users/${user}/report?${q}`);
+}
 // The Admin page's allow-list.
 export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name });
 export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) =>
