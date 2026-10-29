@@ -1084,6 +1084,7 @@ async fn main() {
                                                    .delete(routes::delete_user_handler))
         .route("/api/admin/trades",                 get(routes::admin_paper::trades_handler))
         .route("/api/admin/positions",              get(routes::admin_paper::positions_handler))
+        .route("/api/admin/users/:id/report",       get(routes::admin_report::report_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))

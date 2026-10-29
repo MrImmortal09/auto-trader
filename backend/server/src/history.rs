@@ -146,20 +146,29 @@ pub async fn load_legs(pool: &sqlx::SqlitePool, mode: &str) -> Result<Vec<Leg>, 
     .await
 }
 
+/// `user_trades` read as legs: each position's own call, under "Scalps".
+const USER_LEG_COLUMNS: &str = "id, ticker, action, qty, executed_price, timestamp, net_value,
+    brokerage + stt_charge + sebi_fee + stamp_duty + transaction_charge + gst AS charges,
+    'manual-' || position_id AS signal_id, label AS raw_message, exit_reason,
+    NULL AS chat_id, NULL AS chat_title, option_type, strike";
+
 /// A user's paper fills since their last reset (`epoch`), oldest first, read
 /// as the owner's scalps are: one call per position, under "Scalps".
 pub async fn load_user_legs(pool: &sqlx::SqlitePool, user_id: i64, epoch: i64) -> Result<Vec<Leg>, sqlx::Error> {
-    sqlx::query_as::<_, Leg>(
-        "SELECT id, ticker, action, qty, executed_price, timestamp, net_value,
-                brokerage + stt_charge + sebi_fee + stamp_duty + transaction_charge + gst AS charges,
-                'manual-' || position_id AS signal_id, label AS raw_message, exit_reason,
-                NULL AS chat_id, NULL AS chat_title, option_type, strike
-         FROM user_trades WHERE user_id = ? AND epoch = ? ORDER BY id ASC",
-    )
-    .bind(user_id)
-    .bind(epoch)
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, Leg>(&format!("SELECT {USER_LEG_COLUMNS} FROM user_trades WHERE user_id = ? AND epoch = ? ORDER BY id ASC"))
+        .bind(user_id)
+        .bind(epoch)
+        .fetch_all(pool)
+        .await
+}
+
+/// Every paper fill of a user, before and after their resets, oldest first —
+/// for the admin. Position ids are UUIDs, so no two epochs share a call.
+pub async fn load_user_legs_all(pool: &sqlx::SqlitePool, user_id: i64) -> Result<Vec<Leg>, sqlx::Error> {
+    sqlx::query_as::<_, Leg>(&format!("SELECT {USER_LEG_COLUMNS} FROM user_trades WHERE user_id = ? ORDER BY id ASC"))
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
 }
 
 /// Group trade rows into calls, in the order each call first appears.

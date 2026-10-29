@@ -308,6 +308,153 @@ export interface AdminPosition {
   opened_at: string;
 }
 
+/** One trade on a day of a user's report: a paper position, from its first
+ * buy to its last sell. */
+export interface ReportTrade {
+  /** The paper position's id. */
+  id: string;
+  contract: string;
+  /** IST `YYYY-MM-DD HH:MM:SS` of the first buy. */
+  opened_at: string;
+  /** The last sell, once everything bought was sold; null while held. */
+  closed_at: string | null;
+  held_secs: number | null;
+  bought_qty: number;
+  sold_qty: number;
+  /** Average fill prices, before charges. */
+  avg_buy: number | null;
+  avg_sell: number | null;
+  /** The whole trade's P&L after charges, once closed. */
+  pnl: number | null;
+  /** What its sells on this day booked: gross − charges = net. */
+  day_gross: number;
+  day_charges: number;
+  day_net: number;
+  outcome: Outcome | null;
+  before_reset: boolean;
+  /** Every fill of it, oldest first — other days' too. */
+  legs: LegRow[];
+}
+
+/** One IST day of a user's report. */
+export interface ReportDay {
+  date: string;
+  /** Booked by the day's sells. */
+  gross: number;
+  charges: number;
+  net: number;
+  turnover: number;
+  buys: number;
+  sells: number;
+  /** Trades fully sold that day. */
+  closed: number;
+  wins: number;
+  losses: number;
+  /** IST timestamps of the day's first and last fill. */
+  first_at: string;
+  last_at: string;
+  expiries: string[];
+  /** Every trade with a fill that day, in the order they opened. */
+  trades: ReportTrade[];
+  /** The day's trades left out of `trades`, past the report's limit. */
+  unlisted: number;
+}
+
+/** One contract's fills over the range. */
+export interface ReportContract {
+  contract: string;
+  trades: number;
+  buy_qty: number;
+  buy_value: number;
+  sell_qty: number;
+  sell_value: number;
+  avg_buy: number | null;
+  avg_sell: number | null;
+  gross: number;
+  charges: number;
+  net: number;
+}
+
+/** The trades closed in the range, by the IST hour they opened in. */
+export interface ReportHour {
+  hour: number;
+  closed: number;
+  wins: number;
+  net: number;
+}
+
+/** One fill in a user's tradebook. */
+export interface ReportFill {
+  id: number;
+  /** IST `YYYY-MM-DD HH:MM:SS`. */
+  t: string;
+  action: 'BUY' | 'SELL';
+  contract: string;
+  qty: number;
+  price: number;
+  /** Quantity × price. */
+  value: number;
+  /** The fill's own charges. */
+  charges: number;
+  net: number;
+  /** A sell's P&L, charges included on both sides. */
+  pnl: number | null;
+  reason: string | null;
+  position_id: string;
+  before_reset: boolean;
+}
+
+export interface ReportSummary {
+  /** Booked by every sell in the range: gross − charges = net. */
+  gross: number;
+  charges: number;
+  net: number;
+  /** Charges on every fill in the range, bought or sold. */
+  charges_paid: number;
+  turnover: number;
+  buys: number;
+  sells: number;
+  /** Trades fully sold in the range. */
+  closed: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+  profit_factor: number | null;
+  avg_per_trade: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  best: number | null;
+  worst: number | null;
+  avg_held_secs: number | null;
+  max_drawdown: number;
+  days_traded: number;
+  green_days: number;
+  red_days: number;
+}
+
+/** `GET /api/admin/users/:id/report`: one user's paper P&L over a range. */
+export interface UserReport {
+  user: AdminUser;
+  /** IST day of their first fill, before any reset. */
+  first_day: string | null;
+  /** What they hold now, at the live price. */
+  open: AdminPosition[];
+  /** The range's first day; null from the first fill on. */
+  from: string | null;
+  to: string;
+  summary: ReportSummary;
+  /** The booked P&L after each sell, oldest first. */
+  curve: CurvePoint[];
+  /** Newest first. */
+  days: ReportDay[];
+  /** Best first. */
+  contracts: ReportContract[];
+  hours: ReportHour[];
+  /** Newest first. */
+  fills: ReportFill[];
+  more_fills: number;
+}
+
 /** One line of a user's paper activity (`GET /api/v2/me/activity`): a fill,
  * a chart level set, or a reset — kept in the server's memory, newest first. */
 export interface PaperActivity {

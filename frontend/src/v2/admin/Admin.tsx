@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Trash2, UserPlus } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { ChartLine, Trash2, UserPlus } from 'lucide-react';
 import { formatPhone, normalizePhone } from '../auth/phone';
 import { createUser, deleteUser, listUsers, patchUser } from '../lib/api';
 import { hhmm, plural, shortDate } from '../lib/format';
@@ -13,6 +13,7 @@ import { Modal } from '../ui/Modal';
 import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
 import { PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
+import { UserReport } from './UserReport';
 
 const INPUT = 'rounded-6 border border-line bg-inset px-2.5 text-fg outline-none placeholder:text-fg-muted focus:border-line-strong disabled:opacity-50';
 
@@ -22,13 +23,21 @@ function lastLogin(u: AdminUser): string {
   return `Last signed in ${shortDate(u.last_login_at.slice(0, 10))} ${hhmm(u.last_login_at)}`;
 }
 
+/** The user whose P&L report the address opens: `/v2/admin?user=7`. */
+function reportFromUrl(): number | null {
+  const id = Number(new URLSearchParams(window.location.search).get('user'));
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 /**
  * Admin: who may sign in by phone — the admin adds numbers, switches them off
  * and removes them, as paper traders; the admin's own row stays — and what
- * every user holds and has traded on paper, read-only.
+ * every user holds and has traded on paper, read-only — and, for the user
+ * picked, their P&L report.
  */
 export function Admin({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
-  const users = usePoll(() => listUsers(serverBase), 15_000, serverBase);
+  const [viewing, setViewing] = useState<number | null>(reportFromUrl);
+  const users = usePoll(() => listUsers(serverBase), 15_000, serverBase, viewing == null);
   const guard = useGuard();
   const toast = useToast();
   const [phone, setPhone] = useState('');
@@ -38,6 +47,23 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [removing, setRemoving] = useState<AdminUser | null>(null);
   const large = !desktop;
   const size = large ? 'lg' : 'md';
+
+  // The report is in the address (`?user=7`): Back returns to the list.
+  useEffect(() => {
+    const onPop = () => setViewing(reportFromUrl());
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  function openReport(id: number) {
+    window.history.pushState(null, '', `${window.location.pathname}?user=${id}`);
+    setViewing(id);
+  }
+
+  function closeReport() {
+    window.history.pushState(null, '', window.location.pathname);
+    setViewing(null);
+  }
 
   async function act(id: number, run: () => Promise<unknown>) {
     setBusy((b) => ({ ...b, [id]: true }));
@@ -81,6 +107,8 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
     });
   }
 
+  if (viewing != null) return <UserReport serverBase={serverBase} userId={viewing} desktop={desktop} onBack={closeReport} />;
+
   const list = users.data ?? [];
   const rows =
     users.data == null ? (
@@ -88,12 +116,19 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
     ) : (
       list.map((u) => {
         const isAdmin = u.role === 'admin';
+        const who = u.name?.trim() || formatPhone(u.phone);
         return (
           <Row
             key={u.id}
             title={
               <span className="flex items-center gap-2">
-                <span className="truncate">{u.name?.trim() || formatPhone(u.phone)}</span>
+                {isAdmin ? (
+                  <span className="truncate">{who}</span>
+                ) : (
+                  <button type="button" onClick={() => openReport(u.id)} title={`Open ${who}'s P&L report`} className="truncate text-left hover:underline">
+                    {who}
+                  </button>
+                )}
                 {isAdmin && <Chip kind="live">Admin</Chip>}
                 {!u.enabled && <Chip kind="loss">Disabled</Chip>}
               </span>
@@ -105,6 +140,11 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
               </>
             }
           >
+            {!isAdmin && (
+              <Button size={size} kind="ghost" icon={<ChartLine size={14} />} aria-label={`P&L report of ${who}`} onClick={() => openReport(u.id)}>
+                {large ? null : 'P&L'}
+              </Button>
+            )}
             <Toggle checked={u.enabled} disabled={isAdmin || !!busy[u.id]} label={`${u.enabled ? 'Disable' : 'Enable'} ${formatPhone(u.phone)}`} onChange={(on) => void setEnabled(u, on)} />
             {!isAdmin && (
               <Button
@@ -157,7 +197,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
       <div className={`flex flex-col gap-8 ${desktop ? 'max-w-[760px]' : ''}`}>
         <Section
           title="Users"
-          lead="Who may sign in with a phone number, as a paper trader. The admin is the server's own number (ADMIN_PHONE) and nobody else. A disabled number is signed out at once."
+          lead="Who may sign in with a phone number, as a paper trader. The admin is the server's own number (ADMIN_PHONE) and nobody else. A disabled number is signed out at once. Open a user for their P&L report: every trade, day by day."
         >
           {rows}
           {addForm}
