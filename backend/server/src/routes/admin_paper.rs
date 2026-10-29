@@ -258,31 +258,30 @@ pub struct PositionOut {
     pub chart: ChartLevels,
 }
 
+impl PositionOut {
+    /// `user_id`'s position `p`, at the live price.
+    pub fn of(state: &AppState, user_id: i64, p: PaperPosition) -> PositionOut {
+        let ltp = state.paper.price(&p.ws_key);
+        PositionOut {
+            user_id,
+            contract: p.label(),
+            expiry: p.expiry.format("%Y-%m-%d").to_string(),
+            qty: p.qty,
+            lots: p.lots(),
+            avg: p.avg_price,
+            pnl: ltp.map(|l| (l - p.avg_price) * f64::from(p.qty)),
+            ltp,
+            opened_at: p.opened_at.clone(),
+            chart: p.chart,
+            id: p.id,
+        }
+    }
+}
+
 /// `GET /api/admin/positions` — every user's open paper positions at the
 /// live price, by user, oldest first.
 pub async fn positions_handler(State(state): State<AppState>) -> Response {
-    let mut rows: Vec<PositionOut> = state
-        .paper
-        .all_open()
-        .await
-        .into_iter()
-        .map(|(user_id, p)| {
-            let ltp = state.paper.price(&p.ws_key);
-            PositionOut {
-                user_id,
-                contract: p.label(),
-                expiry: p.expiry.format("%Y-%m-%d").to_string(),
-                qty: p.qty,
-                lots: p.lots(),
-                avg: p.avg_price,
-                pnl: ltp.map(|l| (l - p.avg_price) * f64::from(p.qty)),
-                ltp,
-                opened_at: p.opened_at.clone(),
-                chart: p.chart,
-                id: p.id,
-            }
-        })
-        .collect();
+    let mut rows: Vec<PositionOut> = state.paper.all_open().await.into_iter().map(|(user_id, p)| PositionOut::of(&state, user_id, p)).collect();
     rows.sort_by(|a, b| (a.user_id, &a.opened_at).cmp(&(b.user_id, &b.opened_at)));
     Json(rows).into_response()
 }

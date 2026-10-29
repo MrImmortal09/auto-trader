@@ -187,6 +187,7 @@ mod tests {
         (DELETE, "/api/admin/users/3", Access::Admin),
         (GET, "/api/admin/trades", Access::Admin),
         (GET, "/api/admin/positions", Access::Admin),
+        (GET, "/api/admin/users/3/report", Access::Admin),
         (GET, "/api/admin/credentials", Access::Admin),
         (PUT, "/api/admin/credentials", Access::Admin),
         (GET, "/api/v2/flags", Access::SignedIn),
