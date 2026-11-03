@@ -16,8 +16,26 @@ const PIVOT = '#fb8c00';
 /** A drag reports every move; the level is sent once the line has rested this long. */
 const MOVE_SETTLE_MS = 300;
 const MARK_COLOR: Record<MarkerData['kind'], string> = { B: C.profit, E: C.muted, T: C.profit, S: C.loss, call: C.indicator };
+/** Vela's price pane: where every order line belongs. */
+const PRICE_PANE = 'price';
 
 type Text = NonNullable<SerializedDrawing['text']>;
+
+/** Our own changes to the chart's drawings: the edits they echo are not the user's. */
+function quietly<T>(applying: { current: boolean }, change: () => T): T {
+  applying.current = true;
+  try {
+    return change();
+  } finally {
+    applying.current = false;
+  }
+}
+
+/** A drawing as it stands: anything that moves, restyles, unlocks, hides or
+ * re-panes it after the sync put it there shows up as a different look. */
+function lookOf(d: SerializedDrawing | undefined): string {
+  return d ? JSON.stringify([d.anchors, d.style, d.text ?? null, d.locked, d.visible, d.paneId, d.showOn ?? null]) : '';
+}
 
 /** A level's words. Vela centres a horizontal line's label on its anchor,
  * which is kept a fifth of the way into the view, clear of both axes. The
@@ -52,6 +70,8 @@ const VELA_STYLE: Record<CandleStyle, string> = { candles: 'candles', bars: 'bar
  * horizontal-line drawing dragged with Vela's handles, markers sit on its
  * timeline lane, and "+ Stop" places on the next click. Bars come from the
  * candle service through a Vela data provider and follow the same stream.
+ * Only a drag of a level's own line moves the level; whatever else Vela lets
+ * the user do to a line is put back.
  */
 export default function VChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, style, placing, onPlacingDone, bus, onState }: ChartProps) {
   const host = useRef<HTMLDivElement>(null);
@@ -75,15 +95,20 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
   // Our lines' drawings: line id → Vela's drawing id; handlers and what was applied, by Vela id.
   const owned = useRef(new Map<string, string>());
   const handlers = useRef(new Map<string, ChartLine>());
-  const applied = useRef(new Map<string, { price: number; text: string; time: number }>());
+  const applied = useRef(new Map<string, { price: number; text: string; time: number; style: string; look: string }>());
   const appliedPivots = useRef(new Map<string, { price: number; text: string; time: number }>());
   // Each VWAP day's line as last drawn, by drawing id.
   const appliedVwap = useRef(new Map<string, string>());
-  // A level moves only under a pointer: Vela reports its own nudges and our
-  // updates as edits too, and no key may ever move a stop.
-  const pointerDown = useRef(false);
-  const pointerUpAt = useRef(0);
-  const byPointer = useRef(new Set<string>());
+  // A level moves only by a drag of its own line on the chart, and Vela commits
+  // a drag inside the pointer's release on its canvas. Every other edit of a
+  // line (its settings panel, unlocking it, dragging a selection of several,
+  // keys, undo) is put back, and no key may ever move a stop.
+  const pressed = useRef(new Set<number>());
+  // The drawings edited while a pointer pressed on the canvas is released there.
+  const release = useRef<Set<string> | null>(null);
+  // The release each line's latest edit came in, if it came in one.
+  const releaseOf = useRef(new Map<string, Set<string>>());
+  const applying = useRef(false);
   // Bumped (once a frame) as the view pans or zooms, so anchors follow it.
   const [view, setView] = useState(0);
   const [pivotLevels, setPivotLevels] = useState<Keyed<{ name: string; value: number }[]> | null>(null);
@@ -91,8 +116,9 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
   const settling = useRef(new Map<string, number>());
   // Our locked drawings: a VWAP line per IST day, and the pivot levels by name.
   const extras = useRef<{ vwap: Map<number, string>; pivots: Map<string, string> }>({ vwap: new Map(), pivots: new Map() });
-  // Bumped when one of our drawings is erased, so the next sync puts it back.
-  const [lost, setLost] = useState(0);
+  // Bumped when one of our lines is erased or edited off what the sync put
+  // there, so the next sync puts it back.
+  const [drift, setDrift] = useState(0);
   const placingNow = useRef(placing);
   const doneNow = useRef(onPlacingDone);
   const first = useRef(true);
@@ -136,16 +162,34 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     // Pointer only: Vela's arrow keys would nudge a selected stop or target,
     // and a nudge is sent like a drag. This drops its key listener and tabindex.
     c.renderer.set('keyboard', false);
-    const onDown = () => {
-      pointerDown.current = true;
+    // The canvas is the one element of the chart that takes the pointer; its
+    // popups, panels and menus are not canvases.
+    const onCanvas = (t: EventTarget | null) => t instanceof HTMLCanvasElement && el.contains(t);
+    const onDown = (e: PointerEvent) => {
+      if (onCanvas(e.target)) pressed.current.add(e.pointerId);
     };
-    const onUp = () => {
-      pointerDown.current = false;
-      pointerUpAt.current = performance.now();
+    const onRelease = (e: PointerEvent) => {
+      if (!pressed.current.delete(e.pointerId) || !onCanvas(e.target)) return;
+      const edits = new Set<string>();
+      release.current = edits;
+      // Over once the release is handled (below), or at the latest on the next task.
+      window.setTimeout(() => {
+        if (release.current === edits) release.current = null;
+      }, 0);
     };
-    el.addEventListener('pointerdown', onDown, true);
-    window.addEventListener('pointerup', onUp, true);
-    window.addEventListener('pointercancel', onUp, true);
+    const onReleased = () => {
+      release.current = null;
+    };
+    const onBlur = () => {
+      pressed.current.clear();
+      release.current = null;
+    };
+    window.addEventListener('pointerdown', onDown, true);
+    window.addEventListener('pointerup', onRelease, true);
+    window.addEventListener('pointercancel', onRelease, true);
+    window.addEventListener('pointerup', onReleased);
+    window.addEventListener('pointercancel', onReleased);
+    window.addEventListener('blur', onBlur);
     c.marks.defineGroup({ id: 'fills', label: 'Trades' }).defineGroup({ id: 'calls', label: 'Telegram calls' });
     chart.current = c;
     const settle = settling.current;
@@ -153,8 +197,31 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     const handlerMap = handlers.current;
     const appliedMap = applied.current;
     const pivotMap = appliedPivots.current;
-    const pointerEdits = byPointer.current;
+    const releases = releaseOf.current;
+    const down = pressed.current;
     let frame = 0;
+    // A line's edits have rested. One line dragged on its own, and still
+    // draggable, sends where it was dropped; anything else is put back.
+    const settleEdit = (id: string) => {
+      // A drag under way decides on its release.
+      if (pressed.current.size > 0) {
+        settle.set(id, window.setTimeout(() => settleEdit(id), MOVE_SETTLE_MS));
+        return;
+      }
+      settle.delete(id);
+      const edits = releases.get(id);
+      releases.delete(id);
+      const line = handlers.current.get(id);
+      const price = c.drawings.all().find((d) => d.id === id)?.anchors[0]?.price;
+      const was = applied.current.get(id)?.price;
+      const dragged = edits?.size === 1 && line?.data.draggable === true;
+      if (dragged && line.onMove && price != null && was != null && Math.abs(price - was) >= 1e-9) {
+        applied.current.delete(id);
+        line.onMove(price);
+        return;
+      }
+      setDrift((n) => n + 1);
+    };
     const offs = [
       c.on('load:end', ({ bars: n }) => setPainted({ key: want.current.key, value: n > 0 })),
       c.on('viewport:changed', () => {
@@ -164,27 +231,24 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
           setView((n) => n + 1);
         });
       }),
-      // A level dragged: once its edits rest, where it was dropped goes to the engine.
+      // A line edited: decided once its edits rest (see `settleEdit`).
       c.on('drawing:edited', ({ id }) => {
-        const line = handlers.current.get(id);
-        if (!line?.onMove) return;
-        // Only an edit made while a pointer is down (or just released) is a drag.
-        if (pointerDown.current || performance.now() - pointerUpAt.current < 250) byPointer.current.add(id);
+        if (applying.current) return;
+        release.current?.add(id);
+        if (!handlers.current.has(id)) return;
+        if (release.current) releases.set(id, release.current);
+        else releases.delete(id);
         const prev = settle.get(id);
         if (prev != null) window.clearTimeout(prev);
-        settle.set(
-          id,
-          window.setTimeout(() => {
-            settle.delete(id);
-            const dragged = byPointer.current.delete(id);
-            const price = c.drawings.all().find((d) => d.id === id)?.anchors[0]?.price;
-            const was = applied.current.get(id)?.price;
-            // Our own updates echo as edits: only a price a pointer moved is a drag.
-            if (!dragged || price == null || (was != null && Math.abs(price - was) < 1e-9)) return;
-            applied.current.delete(id);
-            handlers.current.get(id)?.onMove?.(price);
-          }, MOVE_SETTLE_MS),
-        );
+        settle.set(id, window.setTimeout(() => settleEdit(id), MOVE_SETTLE_MS));
+      }),
+      // A copy of one of our lines (Duplicate, a Ctrl-drag) would pass for a
+      // real stop or target: removed at once.
+      c.on('drawing:created', ({ id }) => {
+        if (applying.current) return;
+        const text = c.drawings.all().find((d) => d.id === id)?.text?.value;
+        if (!text || ![...applied.current.values()].some((a) => a.text === text)) return;
+        window.setTimeout(() => quietly(applying, () => c.drawings.remove(id)), 0);
       }),
       // Erased by the user: never a removed level — it comes back on the next sync.
       c.on('drawing:removed', ({ id }) => {
@@ -196,10 +260,14 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
         }
         handlers.current.delete(id);
         applied.current.delete(id);
+        releases.delete(id);
+        const pending = settle.get(id);
+        if (pending != null) window.clearTimeout(pending);
+        settle.delete(id);
         for (const [day, vid] of extras.current.vwap) if (vid === id) extras.current.vwap.delete(day);
         appliedVwap.current.delete(id);
         for (const [name, vid] of extras.current.pivots) if (vid === id) extras.current.pivots.delete(name);
-        if (ours) setLost((n) => n + 1);
+        if (ours) setDrift((n) => n + 1);
       }),
       // "+ Stop": the next click on the price pane places it.
       c.renderer.onClick((e) => {
@@ -212,9 +280,12 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     ];
     return () => {
       offs.forEach((off) => off());
-      el.removeEventListener('pointerdown', onDown, true);
-      window.removeEventListener('pointerup', onUp, true);
-      window.removeEventListener('pointercancel', onUp, true);
+      window.removeEventListener('pointerdown', onDown, true);
+      window.removeEventListener('pointerup', onRelease, true);
+      window.removeEventListener('pointercancel', onRelease, true);
+      window.removeEventListener('pointerup', onReleased);
+      window.removeEventListener('pointercancel', onReleased);
+      window.removeEventListener('blur', onBlur);
       if (frame) cancelAnimationFrame(frame);
       for (const t of settle.values()) window.clearTimeout(t);
       settle.clear();
@@ -226,7 +297,9 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       appliedMap.clear();
       pivotMap.clear();
       appliedVwap.current = new Map();
-      pointerEdits.clear();
+      releases.clear();
+      down.clear();
+      release.current = null;
       extras.current = { vwap: new Map(), pivots: new Map() };
     };
   }, [bus, chartId]);
@@ -290,52 +363,80 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     chart.current?.renderer.set('priceStyle', VELA_STYLE[style]);
   }, [style]);
 
-  // Order lines: one horizontal-line drawing each, dragged with Vela's own handle.
+  // Order lines: one horizontal-line drawing each, dragged with Vela's own
+  // handle. Each is checked against the drawing as it stands, not against what
+  // was last sent, so an edit that was put back, a line unlocked, hidden,
+  // restyled or moved to another pane is set right; and a line is only touched
+  // when something changed, as every change costs Vela an undo copy.
   useEffect(() => {
     const c = chart.current;
     if (!c || !loaded || !bars) return;
     const at = anchorTime(c, bars[0].t);
     const tfMs = TF_MS[tf];
     const wanted = new Set<string>();
-    const present = new Set(c.drawings.all().map((d) => d.id));
-    for (const line of lines) {
-      const price = typeof line.price === 'number' ? line.price : barAt(bars, line.price.at, tfMs)?.c;
-      if (price == null || !Number.isFinite(price)) continue;
-      wanted.add(line.id);
-      const text = line.data
-        .parts(price)
-        .filter((part) => WORD_PARTS.has(part.key))
-        .map((part) => part.text)
-        .join(' · ');
-      const style = { lineColor: line.data.color, lineWidth: 1, lineStyle: line.data.dashed ? ('dashed' as const) : ('solid' as const) };
-      let vid = owned.current.get(line.id);
-      if (vid && !present.has(vid)) vid = undefined;
-      if (!vid) {
-        const d = c.drawings.add('hline', { anchors: [{ time: at, price }], style, text: lineText(text, line.data.color) });
-        if (!d) continue;
-        vid = d.id;
-        owned.current.set(line.id, vid);
-        c.drawings.lock(vid, !line.data.draggable);
-        applied.current.set(vid, { price, text, time: at });
-      } else if (!settling.current.has(vid)) {
-        const prev = applied.current.get(vid);
-        const patch: Partial<SerializedDrawing> = {};
-        if (prev?.price !== price || prev?.time !== at) patch.anchors = [{ time: at, price }];
-        if (prev?.text !== text) patch.text = lineText(text, line.data.color);
-        if (Object.keys(patch).length > 0) c.drawings.update(vid, patch);
-        c.drawings.lock(vid, !line.data.draggable);
-        applied.current.set(vid, { price, text, time: at });
+    const now = new Map(c.drawings.all().map((d) => [d.id, d]));
+    const touched = new Map<string, { price: number; text: string; time: number; style: string }>();
+    quietly(applying, () => {
+      for (const line of lines) {
+        const price = typeof line.price === 'number' ? line.price : barAt(bars, line.price.at, tfMs)?.c;
+        if (price == null || !Number.isFinite(price)) continue;
+        wanted.add(line.id);
+        const text = line.data
+          .parts(price)
+          .filter((part) => WORD_PARTS.has(part.key))
+          .map((part) => part.text)
+          .join(' · ');
+        const style = { lineColor: line.data.color, lineWidth: 1, lineStyle: line.data.dashed ? ('dashed' as const) : ('solid' as const) };
+        const styleKey = `${style.lineColor}|${style.lineStyle}`;
+        const locked = !line.data.draggable;
+        let vid = owned.current.get(line.id);
+        const d = vid ? now.get(vid) : undefined;
+        if (vid && !d) vid = undefined;
+        // On another pane, or shown on some timeframes only: drawn afresh.
+        if (vid && d && (d.paneId !== PRICE_PANE || (d.showOn?.length ?? 0) > 0)) {
+          c.drawings.remove(vid);
+          handlers.current.delete(vid);
+          applied.current.delete(vid);
+          vid = undefined;
+        }
+        if (!vid || !d) {
+          const added = c.drawings.add('hline', { anchors: [{ time: at, price }], style, text: lineText(text, line.data.color) });
+          if (!added) continue;
+          vid = added.id;
+          owned.current.set(line.id, vid);
+          if (locked) c.drawings.lock(vid, true);
+          // Adding makes its look the default for new horizontal lines: a line
+          // the user draws must never pass for a stop.
+          c.drawings.resetToolDefaults('hline');
+          touched.set(vid, { price, text, time: at, style: styleKey });
+        } else if (!settling.current.has(vid)) {
+          const prev = applied.current.get(vid);
+          const drifted = !prev || lookOf(d) !== prev.look;
+          const patch: Partial<SerializedDrawing> = {};
+          if (drifted || prev.price !== price || prev.time !== at) patch.anchors = [{ time: at, price }];
+          if (drifted || prev.text !== text) patch.text = lineText(text, line.data.color);
+          if (drifted || prev.style !== styleKey) patch.style = style;
+          if (Object.keys(patch).length > 0) c.drawings.update(vid, patch);
+          if (d.locked !== locked) c.drawings.lock(vid, locked);
+          if (!d.visible) c.drawings.show(vid, true);
+          if (Object.keys(patch).length > 0 || d.locked !== locked || !d.visible) touched.set(vid, { price, text, time: at, style: styleKey });
+        }
+        handlers.current.set(vid, line);
       }
-      handlers.current.set(vid, line);
+      for (const [lineId, vid] of [...owned.current]) {
+        if (wanted.has(lineId)) continue;
+        c.drawings.remove(vid);
+        owned.current.delete(lineId);
+        handlers.current.delete(vid);
+        applied.current.delete(vid);
+      }
+    });
+    // What the sync left, to tell the next time whether anything else moved it.
+    if (touched.size > 0) {
+      const after = new Map(c.drawings.all().map((d) => [d.id, d]));
+      for (const [vid, set] of touched) applied.current.set(vid, { ...set, look: lookOf(after.get(vid)) });
     }
-    for (const [lineId, vid] of [...owned.current]) {
-      if (wanted.has(lineId)) continue;
-      c.drawings.remove(vid);
-      owned.current.delete(lineId);
-      handlers.current.delete(vid);
-      applied.current.delete(vid);
-    }
-  }, [lines, bars, loaded, tf, lost, view]);
+  }, [lines, bars, loaded, tf, drift, view]);
 
   // Markers on Vela's timeline lane: B/E/T/S tokens, a pin for a Telegram call.
   useEffect(() => {
@@ -360,28 +461,30 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     const ex = extras.current;
     const days = vwap ? vwapDays(sym.kind === 'index' ? vwapOnIndex(futureBars, bars) : vwapOf(bars)).filter((d) => d.points.length >= 2) : [];
     const wanted = new Set(days.map((d) => d.day));
-    for (const [day, vid] of ex.vwap) {
-      if (wanted.has(day)) continue;
-      c.drawings.remove(vid);
-      ex.vwap.delete(day);
-      appliedVwap.current.delete(vid);
-    }
-    const present = new Set(c.drawings.all().map((d) => d.id));
-    for (const { day, points: anchors } of days) {
-      // Every update costs Vela an undo copy of all drawings: only a changed line is redrawn.
-      const signature = anchors.map((a) => `${a.time}:${a.price.toFixed(2)}`).join(',');
-      const vid = ex.vwap.get(day);
-      if (vid && present.has(vid)) {
-        if (signature !== appliedVwap.current.get(vid)) c.drawings.update(vid, { anchors });
-        appliedVwap.current.set(vid, signature);
-        continue;
+    quietly(applying, () => {
+      for (const [day, vid] of ex.vwap) {
+        if (wanted.has(day)) continue;
+        c.drawings.remove(vid);
+        ex.vwap.delete(day);
+        appliedVwap.current.delete(vid);
       }
-      const d = c.drawings.add('polyline', { anchors, style: { lineColor: C.indicator, lineWidth: 1, lineStyle: 'solid' } });
-      if (!d) continue;
-      ex.vwap.set(day, d.id);
-      appliedVwap.current.set(d.id, signature);
-      c.drawings.lock(d.id, true);
-    }
+      const present = new Set(c.drawings.all().map((d) => d.id));
+      for (const { day, points: anchors } of days) {
+        // Every update costs Vela an undo copy of all drawings: only a changed line is redrawn.
+        const signature = anchors.map((a) => `${a.time}:${a.price.toFixed(2)}`).join(',');
+        const vid = ex.vwap.get(day);
+        if (vid && present.has(vid)) {
+          if (signature !== appliedVwap.current.get(vid)) c.drawings.update(vid, { anchors });
+          appliedVwap.current.set(vid, signature);
+          continue;
+        }
+        const d = c.drawings.add('polyline', { anchors, style: { lineColor: C.indicator, lineWidth: 1, lineStyle: 'solid' } });
+        if (!d) continue;
+        ex.vwap.set(day, d.id);
+        appliedVwap.current.set(d.id, signature);
+        c.drawings.lock(d.id, true);
+      }
+    });
   }, [vwap, bars, futureBars, loaded, sym.kind]);
 
   // Standard pivots for today, from a week of 15-minute bars; read again every
@@ -416,32 +519,36 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     const at = anchorTime(c, bars[0].t);
     const present = new Set(c.drawings.all().map((d) => d.id));
     const wanted = new Set<string>();
-    for (const { name, value } of levels) {
-      wanted.add(name);
-      const text = `${name} (${value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`;
-      const vid = ex.pivots.get(name);
-      if (vid && present.has(vid)) {
-        // Only what changed: every update costs Vela an undo copy of all drawings.
-        const prev = appliedPivots.current.get(vid);
-        const patch: Partial<SerializedDrawing> = {};
-        if (prev?.price !== value || prev?.time !== at) patch.anchors = [{ time: at, price: value }];
-        if (prev?.text !== text) patch.text = pivotText(text);
-        if (Object.keys(patch).length > 0) c.drawings.update(vid, patch);
-        appliedPivots.current.set(vid, { price: value, text, time: at });
-      } else {
-        const d = c.drawings.add('hline', { anchors: [{ time: at, price: value }], style: { lineColor: PIVOT, lineWidth: 1, lineStyle: 'solid' }, text: pivotText(text) });
-        if (!d) continue;
-        ex.pivots.set(name, d.id);
-        appliedPivots.current.set(d.id, { price: value, text, time: at });
-        c.drawings.lock(d.id, true);
+    quietly(applying, () => {
+      for (const { name, value } of levels) {
+        wanted.add(name);
+        const text = `${name} (${value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`;
+        const vid = ex.pivots.get(name);
+        if (vid && present.has(vid)) {
+          // Only what changed: every update costs Vela an undo copy of all drawings.
+          const prev = appliedPivots.current.get(vid);
+          const patch: Partial<SerializedDrawing> = {};
+          if (prev?.price !== value || prev?.time !== at) patch.anchors = [{ time: at, price: value }];
+          if (prev?.text !== text) patch.text = pivotText(text);
+          if (Object.keys(patch).length > 0) c.drawings.update(vid, patch);
+          appliedPivots.current.set(vid, { price: value, text, time: at });
+        } else {
+          const d = c.drawings.add('hline', { anchors: [{ time: at, price: value }], style: { lineColor: PIVOT, lineWidth: 1, lineStyle: 'solid' }, text: pivotText(text) });
+          if (!d) continue;
+          ex.pivots.set(name, d.id);
+          appliedPivots.current.set(d.id, { price: value, text, time: at });
+          c.drawings.lock(d.id, true);
+          // A pivot is a horizontal line too: a line the user draws must not take its look.
+          c.drawings.resetToolDefaults('hline');
+        }
       }
-    }
-    for (const [name, vid] of [...ex.pivots]) {
-      if (wanted.has(name)) continue;
-      c.drawings.remove(vid);
-      ex.pivots.delete(name);
-      appliedPivots.current.delete(vid);
-    }
+      for (const [name, vid] of [...ex.pivots]) {
+        if (wanted.has(name)) continue;
+        c.drawings.remove(vid);
+        ex.pivots.delete(name);
+        appliedPivots.current.delete(vid);
+      }
+    });
   }, [pivots, pivotLevels, key, bars, loaded, view]);
 
   return <div ref={host} className="absolute inset-0" />;
