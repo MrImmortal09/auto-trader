@@ -136,3 +136,15 @@
     scrollbar-color: var(--color-line) transparent;
   }
 }
+
+/* Vela's style menu: Heikin Ashi draws made-up candles under real-price stop
+   lines (VChart also switches straight back from it). */
+[data-vei-id="heikinashi"] {
+  display: none !important;
+}
+
+/* Vela 0.9.0 drops a menu's z-index once the pointer moves over it, and the
+   menu falls behind the chart, out of reach: keep the one it opened with. */
+.vela-workspace [data-part="positioner"][style*="--z-index"] {
+  z-index: var(--z-index) !important;
+}

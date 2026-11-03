@@ -18,9 +18,12 @@ export interface Layers {
   vwap: boolean;
   /** Standard pivot points, daily. */
   pivots: boolean;
+  /** RSI (14) and CCI (20), each in a pane under the candles. */
+  rsi: boolean;
+  cci: boolean;
 }
 
-export const DEFAULT_LAYERS: Layers = { myTrades: true, telegramTrades: false, telegramCalls: false, vwap: true, pivots: true };
+export const DEFAULT_LAYERS: Layers = { myTrades: true, telegramTrades: false, telegramCalls: false, vwap: true, pivots: true, rsi: false, cci: false };
 
 /** What the screen can do to a scalp's levels from a chart. */
 export interface LevelActions {

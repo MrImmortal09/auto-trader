@@ -1,7 +1,8 @@
 // KLineChart setup for the v2 Trade charts: the theme from the design tokens,
-// the order-line and marker overlays, VWAP and pivots. Registered once, globally.
+// the order-line and marker overlays, VWAP and pivots, RSI and CCI. Registered
+// once, globally.
 
-import { registerIndicator, registerOverlay, utils, type DeepPartial, type OverlayFigure, type Styles } from 'klinecharts';
+import { registerIndicator, registerOverlay, utils, type Chart, type DeepPartial, type OverlayFigure, type Styles } from 'klinecharts';
 import { pivotLines, type PivotLevels } from './pivots';
 
 /** The design tokens as plain values: the chart draws on a canvas. */
@@ -361,3 +362,58 @@ registerIndicator<Record<string, never>, number, { key: string }>({
     return true;
   },
 });
+
+// ── RSI and CCI ─────────────────────────────────────────────────────────── //
+
+/** An oscillator in a pane of its own under the candles. */
+export type Oscillator = 'rsi' | 'cci';
+
+const OSCILLATORS: Record<Oscillator, { name: string; pane: string; length: number; figure: string; levels: number[]; min: number; max: number }> = {
+  // 0 to 100, read against 70 and 30.
+  rsi: { name: 'RSI', pane: 'rsi_pane', length: 14, figure: 'rsi1', levels: [70, 30], min: 0, max: 100 },
+  // Unbounded: at least ±100 is kept in view.
+  cci: { name: 'CCI', pane: 'cci_pane', length: 20, figure: 'cci', levels: [100, -100], min: -100, max: 100 },
+};
+
+/** KLineChart's own RSI or CCI on `chart`, in its pane, with dashed lines at
+ * the levels it is read against; `on: false` takes the pane away. */
+export function showOscillator(chart: Chart, which: Oscillator, on: boolean, compact: boolean) {
+  const o = OSCILLATORS[which];
+  const shown = chart.getIndicators({ name: o.name, paneId: o.pane }).length > 0;
+  if (!on) {
+    if (shown) chart.removeIndicator({ name: o.name, paneId: o.pane });
+    return;
+  }
+  if (shown) return;
+  chart.createIndicator({
+    name: o.name,
+    paneId: o.pane,
+    calcParams: [o.length],
+    // The legend row reads like VWAP's: the name and the value.
+    figures: [{ key: o.figure, title: '', type: 'line' }],
+    minValue: o.min,
+    maxValue: o.max,
+    // The levels, under the line KLineChart draws.
+    draw: ({ ctx, bounding, yAxis }) => {
+      ctx.save();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = C.muted;
+      ctx.fillStyle = C.muted;
+      ctx.font = `10px ${FONT}`;
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'bottom';
+      ctx.setLineDash([4, 4]);
+      for (const level of o.levels) {
+        const y = Math.round(yAxis.convertToPixel(level)) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(bounding.width, y);
+        ctx.stroke();
+        ctx.fillText(level < 0 ? `−${-level}` : String(level), bounding.width - 8, y - 2);
+      }
+      ctx.restore();
+      return false;
+    },
+  });
+  chart.setPaneOptions({ id: o.pane, height: compact ? 72 : 100, minHeight: 56 });
+}
