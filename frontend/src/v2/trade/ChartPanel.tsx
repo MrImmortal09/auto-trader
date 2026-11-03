@@ -7,6 +7,8 @@ import { CheckboxRow } from '../ui/CheckboxRow';
 import { Popover } from '../ui/Popover';
 import { Segment } from '../ui/Segment';
 import type { CrosshairBus } from './bus';
+import { DrawBanner, DrawMenu } from './DrawMenu';
+import { useDrawing, type DrawApi } from './drawings';
 import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type Placing } from './KChart';
 import type { Layers } from './lines';
@@ -54,8 +56,11 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   /** Phone: folds the chart away, for more of the ladder. */
   onHide?: () => void;
 }) {
-  const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | null>(null);
+  const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | null>(null);
   const [chartState, setChartState] = useState<{ loading: boolean; error: string | null; last: Bar | null }>({ loading: true, error: null, last: null });
+  // KLineChart's drawing tools, while it draws this chart.
+  const drawApi = useRef<DrawApi | null>(null);
+  const { drawing, pick: pickTool, cancel: cancelDrawing } = useDrawing(useCallback(() => drawApi.current, []));
   // The expiry the picker lists strikes for: what was picked on this
   // chart's current instrument, else the charted option's, else the nearest.
   const [picked, setPicked] = useState<{ on: string; expiry: string | null } | null>(null);
@@ -182,6 +187,17 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             ))}
           </div>
         )}
+        {lib !== 'vela' && (
+          <DrawMenu
+            open={menu === 'draw'}
+            onToggle={() => setMenu(menu === 'draw' ? null : 'draw')}
+            onClose={close}
+            onPick={pickTool}
+            onClear={() => drawApi.current?.clear()}
+            disabled={placing != null}
+            compact={compact}
+          />
+        )}
         <div className="relative">
           <button type="button" aria-label="Layers" aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <LayersIcon size={16} />
@@ -204,6 +220,8 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               note="Standard, from the day before: P, R1–R5, S1–S5"
               onChange={(v) => onLayers({ ...layers, pivots: v })}
             />
+            <CheckboxRow checked={layers.rsi} title="RSI" note="14 bars, lines at 70 and 30" onChange={(v) => onLayers({ ...layers, rsi: v })} />
+            <CheckboxRow checked={layers.cci} title="CCI" note="20 bars, lines at +100 and −100" onChange={(v) => onLayers({ ...layers, cci: v })} />
             <div className="flex items-center justify-between gap-3 px-2 pt-3 pb-1">
               <span className="type-label text-fg">Candle style</span>
               <Segment label="Candle style" size="sm" value={style} onChange={onStyle} options={CANDLE_STYLES} />
@@ -234,11 +252,17 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               markers={markers}
               vwap={layers.vwap}
               pivots={layers.pivots}
+              rsi={layers.rsi}
+              cci={layers.cci}
               style={style}
               placing={placing}
               onPlacingDone={onPlacingDone}
               bus={bus}
               onState={onState}
+              onStyle={onStyle}
+              onStudies={(s) => {
+                if (s.rsi !== layers.rsi || s.cci !== layers.cci) onLayers({ ...layers, ...s });
+              }}
             />
           </Suspense>
         ) : (
@@ -251,13 +275,18 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             markers={markers}
             vwap={layers.vwap}
             pivots={layers.pivots}
+            rsi={layers.rsi}
+            cci={layers.cci}
             style={style}
             placing={placing}
             onPlacingDone={onPlacingDone}
             bus={bus}
             onState={onState}
+            compact={compact}
+            drawRef={drawApi}
           />
         )}
+        {drawing && !placing && lib !== 'vela' && <DrawBanner tool={drawing} onCancel={cancelDrawing} />}
         {placing && (
           <div className="pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center">
             <div className="pointer-events-auto flex items-center gap-3 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-lg">

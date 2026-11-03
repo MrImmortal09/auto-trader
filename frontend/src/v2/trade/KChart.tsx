@@ -1,10 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import { dispose, init, type AxisCreateRangeCallback, type Chart, type KLineData, type OverlayEvent } from 'klinecharts';
 import { apiUrl } from '../../lib/api';
 import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
-import { CHART_STYLES, PIVOT_SERIES, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
+import { CHART_STYLES, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
+import { DRAW_PREFIX, KlineDrawings, type DrawApi } from './drawings';
 import { pivotsByDay } from './pivots';
 import {
   barAt,
@@ -81,6 +82,9 @@ export interface ChartProps {
   vwap: boolean;
   /** Standard pivot points, daily. */
   pivots: boolean;
+  /** RSI (14) and CCI (20), each in a pane under the candles. */
+  rsi: boolean;
+  cci: boolean;
   style: CandleStyle;
   placing: Placing | null;
   onPlacingDone: () => void;
@@ -92,11 +96,18 @@ export interface ChartProps {
 /**
  * One KLineChart: `sym` at `tf`, with its order lines, markers and VWAP. The
  * bars come from the candle service and follow its stream; an index chart's
- * VWAP is its future's, moved onto the index by the basis.
+ * VWAP is its future's, moved onto the index by the basis. The user's own
+ * drawings are kept per instrument (see `drawings.ts`).
  */
-export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, style, placing, onPlacingDone, bus, onState }: ChartProps) {
+export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, rsi, cci, style, placing, onPlacingDone, bus, onState, compact = false, drawRef }: ChartProps & {
+  /** Phone: shorter RSI and CCI panes. */
+  compact?: boolean;
+  /** Set to this chart's drawing tools while it is up, for the Draw menu. */
+  drawRef?: RefObject<DrawApi | null>;
+}) {
   const host = useRef<HTMLDivElement>(null);
   const chart = useRef<Chart | null>(null);
+  const drawings = useRef<KlineDrawings | null>(null);
   const pushBar = useRef<((k: KLineData) => void) | null>(null);
   const [bars, setBars] = useState<Bar[] | null>(null);
   const [futureBars, setFutureBars] = useState<Bar[]>([]);
@@ -146,6 +157,8 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     });
     if (!c) return;
     chart.current = c;
+    const drawn = new KlineDrawings(c);
+    drawings.current = drawn;
     const placed = applied.current;
     c.overrideYAxis({ paneId: 'candle_pane', createRange: rangeWithLines(linePrices) });
     c.setDataLoader({
@@ -188,11 +201,26 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       c.unsubscribeAction('onCrosshairChange', onCross);
       VWAP_SERIES.delete(chartId);
       PIVOT_SERIES.delete(chartId);
+      // A drawing under way ends with the chart.
+      drawn.cancel();
+      drawings.current = null;
       dispose(el);
       chart.current = null;
       placed.clear();
     };
   }, [bus, chartId]);
+
+  useEffect(() => {
+    if (!drawRef) return;
+    drawRef.current = {
+      start: (tool, done) => (drawings.current ? drawings.current.start(tool, done) : done()),
+      cancel: () => drawings.current?.cancel(),
+      clear: () => drawings.current?.clear(),
+    };
+    return () => {
+      drawRef.current = null;
+    };
+  }, [drawRef]);
 
   // This symbol and timeframe: the chart loads the history (see the loader),
   // the stream keeps the forming bar and the future's bars live.
@@ -201,6 +229,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     if (!c) return;
     let live = true;
     applied.current.clear();
+    drawings.current?.hide();
     c.removeOverlay();
     c.setSymbol({ ticker: symbol, pricePrecision: 2, volumePrecision: 0 });
     c.setPeriod({ type: 'minute', span: TF_MS[tf] / 60_000 });
@@ -248,6 +277,19 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   useEffect(() => {
     chart.current?.setStyles({ candle: { type: KLINE_CANDLE[style] } });
   }, [style]);
+
+  // The instrument's saved drawings, once its bars are in: a switch clears the chart.
+  useEffect(() => {
+    if (loaded) drawings.current?.show(symbol);
+  }, [loaded, symbol, tf]);
+
+  // RSI and CCI: KLineChart's own, each in its pane.
+  useEffect(() => {
+    if (chart.current) showOscillator(chart.current, 'rsi', rsi, compact);
+  }, [rsi, compact]);
+  useEffect(() => {
+    if (chart.current) showOscillator(chart.current, 'cci', cci, compact);
+  }, [cci, compact]);
 
   // VWAP: the option's own, or the future's moved onto the index.
   useEffect(() => {
@@ -372,7 +414,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     }
 
     for (const o of c.getOverlays()) {
-      if (o.id === 'placing') continue;
+      if (o.id === 'placing' || o.id.startsWith(DRAW_PREFIX)) continue;
       if (!wanted.has(o.id)) {
         c.removeOverlay({ id: o.id });
         applied.current.delete(o.id);
@@ -389,11 +431,13 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   });
 
   // "+ Stop": a line that follows the pointer until the next click or tap. A
-  // spot not taken leaves it following, to tap again.
+  // spot not taken leaves it following, to tap again. It comes before a
+  // drawing under way, which is given up.
   const placingKey = placing?.key ?? null;
   useEffect(() => {
     const c = chart.current;
     if (!c || !placingKey || !loaded) return;
+    drawings.current?.cancel();
     const start = () =>
       c.createOverlay({
         id: 'placing',
