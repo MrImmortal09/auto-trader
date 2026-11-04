@@ -7,6 +7,7 @@ import { useCallback, useRef, useState } from 'react';
 import type { Chart, DeepPartial, OverlayCreate, OverlayEvent, OverlayStyle } from 'klinecharts';
 import { readStored, writeStored } from '../../lib/execute';
 import { todayIst } from '../lib/format';
+import { alpha } from '../lib/palette';
 import { C, FONT } from './chartSetup';
 
 export type DrawTool = 'segment' | 'horizontalStraightLine' | 'rayLine' | 'verticalStraightLine' | 'fibonacciLine';
@@ -71,11 +72,15 @@ interface Saved {
 
 const TOOLS = new Set<string>(DRAW_TOOLS.map((t) => t.tool));
 
-// The indicators' light blue: never a stop's red or a target's green.
+// The user's own marks, in the accent: never a stop's red, a target's green or
+// the VWAP's indicator blue. The handles are accent dots in a faint accent
+// halo, and a label (Fibonacci's levels) is white on accent, like the chart's
+// other tags.
+const HALO = alpha(C.accent, 0.35);
 const STYLES: DeepPartial<OverlayStyle> = {
-  line: { color: C.indicator, size: 1 },
-  point: { color: C.indicator, borderColor: 'rgba(121, 167, 242, 0.35)', activeColor: C.indicator, activeBorderColor: 'rgba(121, 167, 242, 0.35)' },
-  text: { color: C.onAccent, backgroundColor: C.indicator, borderColor: C.indicator, family: FONT, size: 11 },
+  line: { color: C.accent, size: 1 },
+  point: { color: C.accent, borderColor: HALO, activeColor: C.accent, activeBorderColor: HALO },
+  text: { color: C.onAccent, backgroundColor: C.accent, borderColor: C.accent, family: FONT, size: 11 },
 };
 
 function isSaved(d: unknown): d is Saved {

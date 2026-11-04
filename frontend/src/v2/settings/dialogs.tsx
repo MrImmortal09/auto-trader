@@ -37,7 +37,7 @@ export function ServerDialog({ current, onClose }: { current: string; onClose: (
             placeholder="https://…"
             autoComplete="off"
             spellCheck={false}
-            className={`h-11 rounded-6 border bg-inset px-3 type-body text-fg outline-none focus:border-line-strong ${valid ? 'border-line' : 'border-loss'}`}
+            className={`h-11 rounded-6 border bg-inset px-3 type-body text-fg transition-colors duration-120 placeholder:text-fg-subtle focus:border-accent ${valid ? 'border-line' : 'border-loss'}`}
           />
           {!valid && <span className="type-caption text-loss">A full http:// or https:// address</span>}
         </div>
@@ -47,7 +47,7 @@ export function ServerDialog({ current, onClose }: { current: string; onClose: (
           </Button>
           <Button
             size={size}
-            kind="profit"
+            kind="accent"
             disabled={!valid || normalizeServerBase(value) === normalizeServerBase(current)}
             onClick={() => {
               persistServerBase(value);

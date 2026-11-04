@@ -1,7 +1,8 @@
 import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { PALETTE as P } from '../lib/palette';
 
-// The design's tokens as plain values: SVG attributes can't read CSS variables.
-const C = { indicator: '#79a7f2', loss: '#ee705c', grid: '#2c3442', muted: '#8e97a7', line: '#353e4d', raised: '#2c3442' };
+// SVG attributes can't read a CSS token, so the colours come from the one
+// TypeScript copy of the palette: the chart draws on white.
 
 const CLOCK = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const CLOCK_S = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
@@ -21,9 +22,10 @@ function niceTop(n: number): number {
 }
 
 /**
- * One series over the last 15 minutes, in the indicator blue over a light
- * wash: a time axis with its ends, a value axis from zero, and the value
- * and time under the pointer. `reference` draws a dashed limit (a budget).
+ * One series over the last 15 minutes, in the indicator blue over a faint
+ * wash of it: a time axis with its ends, a value axis from zero, and the
+ * value and time under the pointer. `reference` draws a dashed limit (a
+ * budget) in loss red.
  */
 export function MetricChart({ points, height, format, value = format, label, reference, atLeast = 0 }: {
   points: MetricPoint[];
@@ -41,7 +43,7 @@ export function MetricChart({ points, height, format, value = format, label, ref
   const data = points.filter((p) => Number.isFinite(p.v));
   if (data.length < 2) {
     return (
-      <div className="grid place-items-center type-caption text-fg-muted" style={{ height }}>
+      <div className="grid place-items-center type-caption text-fg-subtle" style={{ height }}>
         Collecting samples…
       </div>
     );
@@ -53,14 +55,14 @@ export function MetricChart({ points, height, format, value = format, label, ref
     <div style={{ height }} role="img" aria-label={`${label}, now ${value(data[data.length - 1].v)}`}>
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={data} margin={{ top: reference ? 18 : 6, right: 0, bottom: 0, left: 0 }}>
-          <CartesianGrid vertical={false} stroke={C.grid} />
+          <CartesianGrid vertical={false} stroke={P.grid} />
           <XAxis
             dataKey="ts"
             type="number"
             domain={[first, last]}
             ticks={[first, last]}
             tick={({ x, y, payload }) => (
-              <text x={Number(x)} y={Number(y) + 12} fill={C.muted} fontSize={11} textAnchor={Number(payload.value) === first ? 'start' : 'end'}>
+              <text x={Number(x)} y={Number(y) + 12} fill={P.subtle} fontSize={11} textAnchor={Number(payload.value) === first ? 'start' : 'end'}>
                 {CLOCK.format(new Date(Number(payload.value)))}
               </text>
             )}
@@ -73,23 +75,23 @@ export function MetricChart({ points, height, format, value = format, label, ref
             domain={[0, top]}
             ticks={[0, top / 2, top]}
             tickFormatter={(v: number) => format(v)}
-            tick={{ fill: C.muted, fontSize: 11 }}
+            tick={{ fill: P.subtle, fontSize: 11 }}
             tickLine={false}
             axisLine={false}
             width={44}
           />
           {reference && (
-            <ReferenceLine y={reference.value} stroke={C.loss} strokeDasharray="4 4" label={{ value: reference.text, position: 'insideTopLeft', fill: C.loss, fontSize: 11 }} />
+            <ReferenceLine y={reference.value} stroke={P.loss} strokeDasharray="4 4" label={{ value: reference.text, position: 'insideTopLeft', fill: P.loss, fontSize: 11 }} />
           )}
           <Tooltip
-            cursor={{ stroke: C.line, strokeWidth: 1 }}
+            cursor={{ stroke: P.lineStrong, strokeWidth: 1 }}
             content={({ active, payload }) => {
               const p = active && payload?.[0] ? (payload[0].payload as MetricPoint) : null;
               if (!p) return null;
               return (
-                <div className="rounded-8 border border-line bg-raised px-3 py-2 shadow-lg">
+                <div className="rounded-8 border border-line bg-panel px-3 py-2 shadow-md">
                   <div className="type-label text-fg tnum">{value(p.v)}</div>
-                  <div className="mt-0.5 type-caption text-fg-muted tnum">{CLOCK_S.format(new Date(p.ts))}</div>
+                  <div className="mt-0.5 type-caption text-fg-subtle tnum">{CLOCK_S.format(new Date(p.ts))}</div>
                 </div>
               );
             }}
@@ -97,12 +99,12 @@ export function MetricChart({ points, height, format, value = format, label, ref
           <Area
             type="linear"
             dataKey="v"
-            stroke={C.indicator}
+            stroke={P.indicator}
             strokeWidth={1.5}
-            fill={C.indicator}
-            fillOpacity={0.1}
+            fill={P.indicator}
+            fillOpacity={0.08}
             isAnimationActive={false}
-            activeDot={{ r: 4, fill: C.indicator, stroke: C.raised, strokeWidth: 2 }}
+            activeDot={{ r: 4, fill: P.indicator, stroke: P.surface, strokeWidth: 2 }}
           />
         </AreaChart>
       </ResponsiveContainer>

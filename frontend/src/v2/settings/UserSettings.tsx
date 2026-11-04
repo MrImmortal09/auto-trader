@@ -31,7 +31,8 @@ export function UserSettings({ serverBase, desktop }: { serverBase: string; desk
       title={
         <span className="flex items-center gap-2">
           {displayName(user)}
-          <Chip kind={user.role === 'admin' ? 'live' : 'neutral'}>{user.role === 'admin' ? 'Admin' : 'Paper trader'}</Chip>
+          {/* Admin is blue: marigold would say "real money" about a role. */}
+          <Chip kind={user.role === 'admin' ? 'accent' : 'neutral'}>{user.role === 'admin' ? 'Admin' : 'Paper trader'}</Chip>
         </span>
       }
       caption={`+91 ${formatPhone(user.phone)} · signed in with a WhatsApp code`}
@@ -42,7 +43,7 @@ export function UserSettings({ serverBase, desktop }: { serverBase: string; desk
     </Row>
   ) : (
     <Row title="Not signed in" caption="Sign in with your mobile number to trade on paper with your own portfolio. A code comes to your WhatsApp.">
-      <Button size={large ? 'lg' : 'md'} kind="profit" icon={<LogIn size={14} />} onClick={() => openSignIn()}>
+      <Button size={large ? 'lg' : 'md'} kind="accent" icon={<LogIn size={14} />} onClick={() => openSignIn()}>
         Sign in
       </Button>
     </Row>
@@ -104,10 +105,10 @@ function Portfolio({ serverBase, large }: { serverBase: string; large: boolean }
           <h2 className="type-title text-fg">Start over?</h2>
           <p className="type-body text-fg-muted">Your paper wallet goes back to ₹10,00,000 and your trade history is cleared from the Desk. This can't be undone.</p>
           <div className="mt-2 flex justify-end gap-2">
-            <Button size="md" kind="quiet" onClick={() => setAsking(false)} disabled={resetting} data-autofocus>
+            <Button size="md" kind="neutral" onClick={() => setAsking(false)} disabled={resetting} data-autofocus>
               Cancel
             </Button>
-            <Button size="md" kind="alert" onClick={() => void reset()} disabled={resetting}>
+            <Button size="md" kind="loss" onClick={() => void reset()} disabled={resetting}>
               {resetting ? 'Resetting…' : 'Reset portfolio'}
             </Button>
           </div>

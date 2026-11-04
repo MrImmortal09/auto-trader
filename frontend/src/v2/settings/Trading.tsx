@@ -61,9 +61,10 @@ export function Trading({ serverBase, settings, onKillSwitch, onModeChanged, id,
             if (m === 'LIVE') setLiveOpen(true);
             else void toPaper();
           }}
+          // Selected, LIVE is the marigold pill: real money, and nothing else is.
           options={[
             { value: 'PAPER', label: 'Paper' },
-            { value: 'LIVE', label: 'LIVE' },
+            { value: 'LIVE', label: 'LIVE', kind: 'live' },
           ]}
         />
       </Row>

@@ -88,6 +88,7 @@ function levelLine(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel, cx: Lin
           key: 'label',
           text: past ? `${word} · past the price, sells all on release` : `${word} ${approxMoney(levelPnl(moved, p, cx.spot[p.index] ?? null, delta))}`,
           color,
+          filled: past,
           icon: draggable ? 'grip' : 'lock',
         },
       ];

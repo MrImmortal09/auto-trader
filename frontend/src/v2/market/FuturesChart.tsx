@@ -5,6 +5,7 @@ import { apiUrl } from '../../lib/api';
 import { streamToken } from '../lib/api';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { MarketIndex } from '../lib/types';
+import { useTickFlash } from '../lib/useTickFlash';
 import { fetchBars, toK, upsert } from '../trade/bars';
 import { CHART_STYLES, showOscillator, THOUSANDS, VWAP_SERIES } from '../trade/chartSetup';
 import { DrawBanner, DrawMenu } from '../trade/DrawMenu';
@@ -227,16 +228,20 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
   }, [loaded, symbol, tf]);
 
   const last = bars?.[bars.length - 1] ?? null;
+  // The header price flashes its tint when the future ticks.
+  const flash = useTickFlash(last?.c);
   const change = bars ? dayChange(bars) : null;
   const label = `${index} futures`;
 
+  // The header is sized by the panel (a container): below 480 px — a phone — it tightens, the day
+  // change hides and the name gives way with an ellipsis, so the price and the controls never wrap.
   return (
-    <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-12 border border-line bg-inset">
-      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-3">
-        <div className="relative">
-          <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} className="flex items-center gap-1 type-body-strong text-fg">
-            {label}
-            <ChevronDown size={14} className="text-fg-muted" />
+    <section className="@container flex h-full min-h-0 min-w-0 flex-col rounded-12 border border-line bg-panel">
+      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-3 @max-[480px]:gap-1.5 @max-[480px]:px-2.5">
+        <div className="relative min-w-0">
+          <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} className="flex max-w-full items-center gap-1 type-body-strong text-fg">
+            <span className="truncate">{label}</span>
+            <ChevronDown size={14} className="shrink-0 text-fg-muted" />
           </button>
           <Popover open={menu === 'pick'} onClose={close}>
             {MARKET_INDICES.map((i) => (
@@ -244,40 +249,40 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
                 key={i.id}
                 type="button"
                 onClick={() => (onIndex(i.id), close())}
-                className={`flex h-9 w-full items-center rounded-6 px-2 type-label ${i.id === index ? 'bg-raised text-fg' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}
+                className={`flex h-9 w-full items-center rounded-6 px-2 type-label ${i.id === index ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}
               >
                 {i.id} futures
               </button>
             ))}
           </Popover>
         </div>
-        <span className="num-medium text-fg">{last ? price(last.c) : '—'}</span>
-        {change != null && <span className={`num-small ${TONE_TEXT[toneOf(change)]}`}>{signedPct(change)}</span>}
+        <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium text-fg ${flash.className}`}>{last ? price(last.c) : '—'}</span>
+        {change != null && <span className={`num-small @max-[480px]:hidden ${TONE_TEXT[toneOf(change)]}`}>{signedPct(change)}</span>}
         <span className="flex-1" />
         {compact ? (
           <div className="relative">
-            <button type="button" aria-expanded={menu === 'tf'} onClick={() => setMenu(menu === 'tf' ? null : 'tf')} className="flex h-8 items-center gap-1 rounded-6 border border-line px-2.5 type-label text-fg">
+            <button type="button" aria-expanded={menu === 'tf'} onClick={() => setMenu(menu === 'tf' ? null : 'tf')} className="flex h-8 items-center gap-1 rounded-6 border border-line px-2.5 type-label text-fg @max-[480px]:px-2">
               {tf}
               <ChevronDown size={14} className="text-fg-muted" />
             </button>
             <Popover open={menu === 'tf'} onClose={close} align="right">
               {TFS.map((t) => (
-                <button key={t} type="button" onClick={() => (onTf(t), close())} className={`flex h-10 w-full items-center rounded-6 px-3 type-label ${t === tf ? 'bg-raised text-fg' : 'text-fg-muted'}`}>
+                <button key={t} type="button" onClick={() => (onTf(t), close())} className={`flex h-10 w-full items-center rounded-6 px-3 type-label ${t === tf ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}>
                   {t}
                 </button>
               ))}
             </Popover>
           </div>
         ) : (
-          <div role="tablist" aria-label="Timeframe" className="flex gap-0.5 rounded-6 bg-canvas p-0.5">
+          <div role="tablist" aria-label="Timeframe" className="flex gap-0.5 rounded-6 border border-line bg-inset p-0.5">
             {TFS.map((t) => (
-              <button key={t} type="button" role="tab" aria-selected={t === tf} onClick={() => onTf(t)} className={`h-6 rounded-4 px-2.5 type-label ${t === tf ? 'bg-raised text-fg' : 'text-fg-muted hover:text-fg'}`}>
+              <button key={t} type="button" role="tab" aria-selected={t === tf} onClick={() => onTf(t)} className={`h-6 rounded-4 px-2.5 type-label transition-colors duration-120 ${t === tf ? 'bg-panel text-accent shadow-sm' : 'text-fg-muted hover:text-fg'}`}>
                 {t}
               </button>
             ))}
           </div>
         )}
-        <DrawMenu open={menu === 'draw'} onToggle={() => setMenu(menu === 'draw' ? null : 'draw')} onClose={close} onPick={pickTool} onClear={() => drawings.current?.clear()} compact={compact} />
+        <DrawMenu open={menu === 'draw'} onToggle={() => setMenu(menu === 'draw' ? null : 'draw')} onClose={close} onPick={pickTool} onClear={() => drawings.current?.clear()} active={drawing} compact={compact} />
         <div className="relative">
           <button type="button" aria-label="Layers" aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <LayersIcon size={16} />
@@ -291,12 +296,13 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
           </Popover>
         </div>
       </header>
-      <div className="relative min-h-0 flex-1">
+      {/* The chart is clipped to the panel's corners here, not by the panel: the header's menus may hang below it. */}
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-b-12">
         <div ref={host} className="absolute inset-0" />
         {drawing && <DrawBanner tool={drawing} onCancel={cancelDrawing} />}
         {(bars == null || error) && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
-            <span className={`rounded-8 bg-inset/90 px-3 py-1.5 type-caption ${error ? 'text-loss' : 'text-fg-muted'}`}>{error ?? 'Loading bars…'}</span>
+            <span className={`rounded-8 bg-panel/90 px-3 py-1.5 type-caption ${error ? 'text-loss' : 'text-fg-subtle'}`}>{error ?? 'Loading bars…'}</span>
           </div>
         )}
       </div>

@@ -11,6 +11,12 @@ import { railFor } from './rail';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 
+/** A phone card: white with a hairline, the figures read off it. */
+const CARD = 'flex flex-col gap-3 rounded-12 border border-line bg-panel p-4';
+
+/** A desktop row: a hairline under it, 20 px of air around the 46 px rail. */
+const ROW = 'flex items-center gap-6 border-b border-line py-2.5';
+
 const BUSY: Record<NonNullable<DeskPosition['busy']>, string> = {
   exiting: 'Exiting…',
   selling: 'Selling…',
@@ -74,7 +80,7 @@ export function OpenRow({ p, desktop, sending, levelsOn, onLessLot, onExit }: {
         <span className="type-body-strong text-fg">{p.contract}</span>
         <SourceChip source={p.source} />
       </div>
-      <div className="mt-1 type-caption text-fg-muted tnum">
+      <div className="mt-1 type-caption text-fg-subtle tnum">
         {openMeta(p)}
         {note && <span className={p.busy === 'halted' ? 'text-loss' : 'text-fg'}> · {note}</span>}
       </div>
@@ -83,12 +89,13 @@ export function OpenRow({ p, desktop, sending, levelsOn, onLessLot, onExit }: {
 
   if (desktop) {
     return (
-      <div className="flex items-center gap-6 border-b border-line py-3.5">
+      <div className={ROW}>
         <div className="w-[260px] shrink-0">{head}</div>
         <div className="min-w-[200px] max-w-[440px] flex-1">
-          <PositionRail spec={railFor(p, levelsOn)} />
+          <PositionRail spec={railFor(p, levelsOn)} surface="canvas" />
         </div>
-        <div className="ml-auto w-[130px]">{pnl}</div>
+        {/* Inter's 22 px digits: "−₹1,23,456.00" measures 158 px. */}
+        <div className="ml-auto w-[160px]">{pnl}</div>
         <div className="flex shrink-0 gap-2">
           {lessLot}
           {exit}
@@ -97,12 +104,12 @@ export function OpenRow({ p, desktop, sending, levelsOn, onLessLot, onExit }: {
     );
   }
   return (
-    <div className="flex flex-col gap-3 rounded-12 bg-panel p-4">
+    <div className={CARD}>
       <div className="flex items-start justify-between gap-3">
         {head}
         {pnl}
       </div>
-      <PositionRail spec={railFor(p, levelsOn)} />
+      <PositionRail spec={railFor(p, levelsOn)} surface="panel" />
       <div className="grid grid-cols-2 gap-2">
         {lessLot}
         {exit}
@@ -141,7 +148,7 @@ export function WaitingRow({ p, desktop, lots, sending, onLots, onCancel }: {
         <span className="type-body-strong text-fg">{p.contract}</span>
         <SourceChip source={p.source} />
       </div>
-      <div className="mt-1 type-caption text-fg-muted tnum">
+      <div className="mt-1 type-caption text-fg-subtle tnum">
         {waitingLine(p)}
         {note && <span className="text-fg"> · {note}</span>}
       </div>
@@ -158,10 +165,10 @@ export function WaitingRow({ p, desktop, lots, sending, onLots, onCancel }: {
 
   if (desktop) {
     return (
-      <div className="flex items-center gap-6 border-b border-line py-3.5">
+      <div className={ROW}>
         <div className="w-[260px] shrink-0">{head}</div>
         <div className="min-w-[200px] max-w-[440px] flex-1">
-          <PositionRail spec={railFor(p)} />
+          <PositionRail spec={railFor(p)} surface="canvas" />
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-4">
           {stepper}
@@ -171,9 +178,9 @@ export function WaitingRow({ p, desktop, lots, sending, onLots, onCancel }: {
     );
   }
   return (
-    <div className="flex flex-col gap-3 rounded-12 bg-panel p-4">
+    <div className={CARD}>
       {head}
-      <PositionRail spec={railFor(p)} />
+      <PositionRail spec={railFor(p)} surface="panel" />
       {!scalp && (
         <div className="flex items-center gap-3">
           {stepper}
@@ -194,11 +201,11 @@ function CallDetail({ call, messageAt, desktop }: { call: Call; messageAt: strin
       <table className="w-full type-caption tnum">
         <thead className="text-fg-muted">
           <tr className="text-left">
-            <th className="pb-1.5 font-normal">Time</th>
-            <th className="pb-1.5 font-normal">Side</th>
-            <th className="pb-1.5 font-normal">Qty</th>
-            <th className="pb-1.5 font-normal">Price</th>
-            <th className="pb-1.5 font-normal">Reason</th>
+            <th className="pb-1.5 type-eyebrow">Time</th>
+            <th className="pb-1.5 type-eyebrow">Side</th>
+            <th className="pb-1.5 type-eyebrow">Qty</th>
+            <th className="pb-1.5 type-eyebrow">Price</th>
+            <th className="pb-1.5 type-eyebrow">Reason</th>
           </tr>
         </thead>
         <tbody className="text-fg">
@@ -216,21 +223,23 @@ function CallDetail({ call, messageAt, desktop }: { call: Call; messageAt: strin
           })}
         </tbody>
       </table>
-      <p className="mt-2 type-caption text-fg-muted tnum">
+      <p className="mt-2 type-caption text-fg-subtle tnum">
         Gross {signedMoney(gross)} · charges {money(call.charges)} · net {call.pnl == null ? '—' : signedMoney(call.pnl)}
       </p>
     </div>
   );
   const message = call.message && (
     <div className="min-w-0">
-      <div className="mb-1.5 type-caption text-fg-muted">
+      <div className="mb-1.5 type-caption text-fg-subtle">
         Original message · {scalp ? 'Scalp' : call.channel}
         {messageAt ? ` · ${hhmm(messageAt)}` : ''}
       </div>
-      <div className="whitespace-pre-wrap rounded-8 bg-inset px-3 py-2.5 type-body text-fg">{call.message}</div>
+      {/* The message as posted, quoted in a white block. */}
+      <div className="whitespace-pre-wrap rounded-8 border border-line bg-panel px-3 py-2.5 type-body text-fg">{call.message}</div>
     </div>
   );
-  return <div className={`pb-4 ${desktop ? 'grid grid-cols-2 gap-8 pl-14' : 'flex flex-col gap-3'}`}>{legs}{message}</div>;
+  // On desktop the detail starts under the contract: past the 48 px time column and its gap.
+  return <div className={`pb-4 ${desktop ? 'grid grid-cols-2 gap-8 pl-16' : 'flex flex-col gap-3'}`}>{legs}{message}</div>;
 }
 
 export function CallRow({ call, desktop }: { call: Call | ClosedCall; desktop: boolean }) {
@@ -242,10 +251,16 @@ export function CallRow({ call, desktop }: { call: Call | ClosedCall; desktop: b
   const messageAt = 'message_at' in call ? call.message_at : null;
 
   return (
-    <div className="border-b border-line">
+    <div className={`border-b border-line ${open ? 'bg-inset/40' : ''}`}>
       {desktop ? (
-        <button type="button" aria-expanded={open} onClick={() => setOpen((o) => !o)} className="flex w-full items-center gap-4 py-3 text-left">
-          <span className="w-10 shrink-0 num-small text-fg-muted">{hhmm(call.opened_at)}</span>
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((o) => !o)}
+          className="flex w-full items-center gap-4 py-2.5 text-left transition-colors duration-120 hover:bg-raised/40"
+        >
+          {/* Inter's "10:40" at 12 px needs the 48 px. */}
+          <span className="w-12 shrink-0 num-small text-fg-subtle">{hhmm(call.opened_at)}</span>
           <span className="type-body-strong text-fg">{callContract(call)}</span>
           <SourceChip source={source} />
           {call.outcome && <ToneChip tone={call.outcome.tone}>{call.outcome.label}</ToneChip>}
@@ -257,7 +272,7 @@ export function CallRow({ call, desktop }: { call: Call | ClosedCall; desktop: b
         <button type="button" aria-expanded={open} onClick={() => setOpen((o) => !o)} className="flex min-h-14 w-full items-center gap-3 py-3 text-left">
           <div className="min-w-0 flex-1">
             <div className="type-body-strong text-fg">{callContract(call)}</div>
-            <div className="mt-0.5 truncate type-caption text-fg-muted tnum">
+            <div className="mt-0.5 truncate type-caption text-fg-subtle tnum">
               {[hhmm(call.opened_at), call.outcome?.label, source.title].filter(Boolean).join(' · ')}
             </div>
           </div>

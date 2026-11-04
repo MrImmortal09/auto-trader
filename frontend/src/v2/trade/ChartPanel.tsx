@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, Layers as LayersIcon } from 'lucide-react';
 import { INDEX_ORDER } from '../../lib/execute';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
+import { useTickFlash } from '../lib/useTickFlash';
 import { CheckboxRow } from '../ui/CheckboxRow';
 import { Popover } from '../ui/Popover';
 import { Segment } from '../ui/Segment';
@@ -78,6 +79,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   }, [menu, pickExpiry, onNeedChain]);
 
   const shown = sym.kind === 'index' ? spot[index] ?? chartState.last?.c ?? null : chartState.last?.c ?? null;
+  const flash = useTickFlash(shown);
   const pct = sym.kind === 'index' ? change[index] ?? null : null;
   const spotNow = spot[index];
   const chain = chainAt(pickExpiry);
@@ -95,12 +97,14 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   }, [menu, chain, atm]);
 
   return (
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-12 border border-line bg-inset">
-      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3">
-        <div className="relative">
-          <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} className="flex items-center gap-1 type-body-strong text-fg">
-            {symbolLabel(sym)}
-            <ChevronDown size={14} className="text-fg-muted" />
+    <section className="@container flex min-h-0 min-w-0 flex-1 flex-col rounded-12 border border-line bg-panel">
+      {/* Below 480 px (a phone, three charts side by side) the header tightens and the name
+          gives way with an ellipsis, so the price and the controls never wrap. */}
+      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 @max-[480px]:gap-1.5 @max-[480px]:px-2.5">
+        <div className="relative min-w-0">
+          <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} className="flex max-w-full items-center gap-1 type-body-strong text-fg">
+            <span className="truncate">{symbolLabel(sym)}</span>
+            <ChevronDown size={14} className="shrink-0 text-fg-muted" />
           </button>
           <Popover open={menu === 'pick'} onClose={close}>
             <div className="px-2 pt-1 pb-1.5 type-caption text-fg-muted">Index</div>
@@ -108,7 +112,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               {INDEX_ORDER.map((i) => {
                 const s: ChartSym = { kind: 'index', index: i };
                 return (
-                  <button key={i} type="button" onClick={() => (onSym(s), close())} className={`h-8 rounded-6 px-2 type-label ${sameSym(s, sym) ? 'bg-raised text-fg' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}>
+                  <button key={i} type="button" onClick={() => (onSym(s), close())} className={`h-8 rounded-6 px-2 type-label ${sameSym(s, sym) ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}>
                     {i}
                   </button>
                 );
@@ -126,7 +130,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                       role="tab"
                       aria-selected={on}
                       onClick={() => setPickExpiry(i === 0 ? null : e.date)}
-                      className={`h-7 shrink-0 whitespace-nowrap rounded-6 px-2 type-caption tnum ${on ? 'bg-raised text-fg' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}
+                      className={`h-7 shrink-0 whitespace-nowrap rounded-6 px-2 type-caption tnum ${on ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}
                     >
                       {expiryChip(e, all)}
                     </button>
@@ -135,11 +139,11 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               </div>
             )}
             {strikes.length === 0 ? (
-              <p className="px-2 pb-2 type-caption text-fg-muted">{all.length === 0 ? 'The option list loads after the Kotak login.' : 'Loading strikes…'}</p>
+              <p className="px-2 pb-2 type-caption text-fg-subtle">{all.length === 0 ? 'The option list loads after the Kotak login.' : 'Loading strikes…'}</p>
             ) : (
               <div ref={strikeList} className="relative max-h-64 overflow-y-auto">
                 {strikes.map((s, i) => (
-                  <div key={s.strike} ref={i === atm ? atmRow : undefined} className={`flex items-center gap-1 ${i === atm ? 'rounded-6 bg-canvas' : ''}`}>
+                  <div key={s.strike} ref={i === atm ? atmRow : undefined} className={`flex items-center gap-1 ${i === atm ? 'rounded-6 bg-raised' : ''}`}>
                     {(['CE', 'PE'] as const).map((side) => {
                       const opt: ChartSym = { kind: 'option', index, expiry: chain!.expiry, strike: s.strike, side };
                       const has = side === 'CE' ? s.ce : s.pe;
@@ -149,7 +153,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                           type="button"
                           disabled={!has}
                           onClick={() => (onSym(opt), close())}
-                          className={`h-8 flex-1 rounded-6 px-2 text-left num-small ${sameSym(opt, sym) ? 'bg-raised text-fg' : 'text-fg-muted hover:bg-raised hover:text-fg'} disabled:opacity-30`}
+                          className={`h-8 flex-1 rounded-6 px-2 text-left num-small ${sameSym(opt, sym) ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'} disabled:opacity-50`}
                         >
                           {s.strike} {side}
                         </button>
@@ -161,32 +165,43 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             )}
           </Popover>
         </div>
-        <span className="num-medium text-fg">{shown == null ? '—' : price(shown)}</span>
-        {pct != null && <span className={`num-small ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</span>}
+        <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium text-fg ${flash.className}`}>
+          {shown == null ? '—' : price(shown)}
+        </span>
+        {pct != null && <span className={`num-small @max-[499px]:hidden ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</span>}
         <span className="flex-1" />
-        {compact ? (
-          <div className="relative">
-            <button type="button" aria-expanded={menu === 'tf'} onClick={() => setMenu(menu === 'tf' ? null : 'tf')} className="flex h-8 items-center gap-1 rounded-6 border border-line px-2.5 type-label text-fg">
-              {tf}
-              <ChevronDown size={14} className="text-fg-muted" />
-            </button>
-            <Popover open={menu === 'tf'} onClose={close} align="right">
+        {/* The timeframe: a tablist where the header has room for one, the menu
+            where it hasn't — three charts side by side — and on the phone.
+            Measured with the Draw button: an index chart's header needs 454-478 px
+            with the tablist and the change, 402-426 with the tablist alone,
+            318-347 with the menu alone; the change shows only from 500 px. */}
+        <div className="relative flex items-center">
+          {!compact && (
+            <div role="tablist" aria-label="Timeframe" className="flex gap-0.5 rounded-6 border border-line bg-inset p-0.5 @max-[447px]:hidden">
               {TFS.map((t) => (
-                <button key={t} type="button" onClick={() => (onTf(t), close())} className={`flex h-10 w-full items-center rounded-6 px-3 type-label ${t === tf ? 'bg-raised text-fg' : 'text-fg-muted'}`}>
+                <button key={t} type="button" role="tab" aria-selected={t === tf} onClick={() => onTf(t)} className={`h-6 rounded-4 px-2.5 type-label transition-colors duration-120 ${t === tf ? 'bg-panel text-accent shadow-sm' : 'text-fg-muted hover:text-fg'}`}>
                   {t}
                 </button>
               ))}
-            </Popover>
-          </div>
-        ) : (
-          <div role="tablist" aria-label="Timeframe" className="flex gap-0.5 rounded-6 bg-canvas p-0.5">
+            </div>
+          )}
+          <button
+            type="button"
+            aria-expanded={menu === 'tf'}
+            onClick={() => setMenu(menu === 'tf' ? null : 'tf')}
+            className={`flex h-8 items-center gap-1 rounded-6 border border-line px-2.5 type-label text-fg transition-colors duration-120 hover:bg-raised/40 @max-[480px]:px-2 ${compact ? '' : '@min-[448px]:hidden'}`}
+          >
+            {tf}
+            <ChevronDown size={14} className="text-fg-muted" />
+          </button>
+          <Popover open={menu === 'tf'} onClose={close} align="right">
             {TFS.map((t) => (
-              <button key={t} type="button" role="tab" aria-selected={t === tf} onClick={() => onTf(t)} className={`h-6 rounded-4 px-2.5 type-label ${t === tf ? 'bg-raised text-fg' : 'text-fg-muted hover:text-fg'}`}>
+              <button key={t} type="button" onClick={() => (onTf(t), close())} className={`flex h-10 w-full items-center rounded-6 px-3 type-label ${t === tf ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}>
                 {t}
               </button>
             ))}
-          </div>
-        )}
+          </Popover>
+        </div>
         {lib !== 'vela' && (
           <DrawMenu
             open={menu === 'draw'}
@@ -194,6 +209,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             onClose={close}
             onPick={pickTool}
             onClear={() => drawApi.current?.clear()}
+            active={drawing}
             disabled={placing != null}
             compact={compact}
           />
@@ -240,7 +256,8 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           </button>
         )}
       </header>
-      <div className="relative min-h-0 flex-1">
+      {/* The chart is clipped to the panel's corners here, not by the panel: the header's menus may hang below it. */}
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-b-12">
         {lib === 'vela' ? (
           <Suspense fallback={null}>
             <VChart
@@ -289,7 +306,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
         {drawing && !placing && lib !== 'vela' && <DrawBanner tool={drawing} onCancel={cancelDrawing} />}
         {placing && (
           <div className="pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center">
-            <div className="pointer-events-auto flex items-center gap-3 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-lg">
+            <div className="pointer-events-auto flex items-center gap-3 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-md">
               <span className="type-label text-fg">Tap where the {placing.what} goes</span>
               <button type="button" onClick={onCancelPlacing} className="type-label text-fg-muted hover:text-fg">
                 Cancel
@@ -299,7 +316,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
         )}
         {(chartState.loading || chartState.error) && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
-            <span className={`rounded-8 bg-inset/90 px-3 py-1.5 type-caption ${chartState.error ? 'text-loss' : 'text-fg-muted'}`}>{chartState.error ?? 'Loading bars…'}</span>
+            <span className={`rounded-8 bg-panel/90 px-3 py-1.5 type-caption ${chartState.error ? 'text-loss' : 'text-fg-subtle'}`}>{chartState.error ?? 'Loading bars…'}</span>
           </div>
         )}
       </div>

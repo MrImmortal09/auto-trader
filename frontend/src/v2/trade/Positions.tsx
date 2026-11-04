@@ -3,6 +3,7 @@ import type { ExecutePosition } from '../../types';
 import { contractLabel, expiryLabel } from '../../lib/execute';
 import { money, price, signedMoney, signedPct, toneOf } from '../lib/format';
 import type { Call, DeskAnswer, DeskPosition, FillMark, PaperActivity } from '../lib/types';
+import { useTickFlash } from '../lib/useTickFlash';
 import { PositionRail } from '../desk/PositionRail';
 import { railFor } from '../desk/rail';
 import { Button } from '../ui/Button';
@@ -44,15 +45,20 @@ export interface PositionHandlers {
  * Exit all held. A tap opens the sheet. */
 export function ScalpBar({ scalps, h, onOpen, paper }: { scalps: ExecutePosition[]; h: PositionHandlers; onOpen: () => void; paper?: PaperAccount }) {
   const open = scalps.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
+  const flash = useTickFlash(open);
   return (
     <div className="flex shrink-0 items-center gap-3 border-t border-line bg-inset px-4 py-2">
       <button type="button" onClick={onOpen} className="min-w-0 flex-1 text-left">
         <div className="type-caption text-fg-muted">Open · {scalps.length === 1 ? '1 trade' : `${scalps.length} trades`}</div>
-        <div className={`num-medium ${TONE_TEXT[toneOf(open)]}`}>{signedMoney(open)}</div>
+        <div key={flash.key} className={`-mx-1 w-fit rounded-4 px-1 num-medium ${TONE_TEXT[toneOf(open)]} ${flash.className}`}>
+          {signedMoney(open)}
+        </div>
         {paper && (
-          <div className="type-caption text-fg-muted tnum">
-            Wallet {paper.balance == null ? '—' : money(paper.balance)} · today{' '}
-            <span className={TONE_TEXT[toneOf(paper.today)]}>{paper.today == null ? '—' : signedMoney(paper.today)}</span>
+          <div className="type-caption text-fg-subtle tnum">
+            <span className="whitespace-nowrap">Wallet {paper.balance == null ? '—' : money(paper.balance)}</span> ·{' '}
+            <span className="whitespace-nowrap">
+              today <span className={TONE_TEXT[toneOf(paper.today)]}>{paper.today == null ? '—' : signedMoney(paper.today)}</span>
+            </span>
           </div>
         )}
       </button>
@@ -146,7 +152,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
         />
         {tab === 'history' && <HistoryList calls={closed} large />}
         {tab === 'activity' && (paper ? <PaperActivityList items={paper.activity} large /> : <ActivityList events={activityEvents(fills, errors)} large />)}
-        {tab === 'positions' && scalps.length === 0 && <p className="type-body text-fg-muted">No open trade.</p>}
+        {tab === 'positions' && scalps.length === 0 && <p className="type-body text-fg-subtle">No open trade.</p>}
         {tab === 'positions' &&
           scalps.map((p) => {
             const note = busyNote(p, !!h.sending[p.id]);
@@ -167,7 +173,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                         {levelWords(p, kind, lvl)} · {approxMoney(levelPnl(lvl, p, indexNow(p.index), delta.value))}
                       </div>
                     ) : (
-                      <div className="type-body text-fg-muted">None</div>
+                      <div className="type-body text-fg-subtle">None</div>
                     )}
                   </div>
                   {lvl ? (
@@ -192,7 +198,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                       <span className="type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
                       <SourceChip source={{ kind: 'scalp', title: 'Scalp' }} />
                     </div>
-                    <div className="mt-1 type-caption text-fg-muted tnum">
+                    <div className="mt-1 type-caption text-fg-subtle tnum">
                       {[p.expiry ? expiryLabel(p.expiry) : null, `${p.qty} qty (${lots} ${lots === 1 ? 'lot' : 'lots'})`, `avg ${price(p.avg)}`, bought ? `since ${bought}` : null].filter(Boolean).join(' · ')}
                       {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
                     </div>
@@ -204,7 +210,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                 </header>
                 {p.placing ? (
                   mode === 'LIVE' ? (
-                    <p className="type-caption text-fg-muted">Buying at market. The engine drops a buy it couldn't send within 15 s.</p>
+                    <p className="type-caption text-fg-subtle">Buying at market. The engine drops a buy it couldn't send within 15 s.</p>
                   ) : (
                     <Button pointerOnly size="lg" kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
                       Cancel the buy
@@ -212,12 +218,12 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                   )
                 ) : (
                   <>
-                    <PositionRail spec={railOf(p, indexNow(p.index), canSet)} />
+                    <PositionRail spec={railOf(p, indexNow(p.index), canSet)} surface="panel" />
                     <div>
                       {row('stop')}
                       {row('target')}
                     </div>
-                    <p className="type-caption text-fg-muted">
+                    <p className="type-caption text-fg-subtle">
                       Drag the lines on the {p.index} chart to move them. ≈ amounts use{' '}
                       {delta.assumed ? 'an assumed option delta (0.50) — Upstox has none for this contract' : `the option delta (${Math.abs(delta.value).toFixed(2)})`}.
                     </p>

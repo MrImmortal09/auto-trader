@@ -1,5 +1,7 @@
-// Figma "Toggle": on is a light track with the knob right, off a raised
-// track with a grey knob left.
+// Figma "Toggle": on is an accent track with the white knob right, off a
+// raised track with the white knob left. Off, the track's line-strong edge
+// (3.80:1 on white) and the knob's (3.08:1 on raised) are what make the
+// control and its state visible: raised on white alone is 1.23:1.
 
 export function Toggle({ checked, onChange, disabled = false, label }: {
   checked: boolean;
@@ -16,13 +18,13 @@ export function Toggle({ checked, onChange, disabled = false, label }: {
       aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-        checked ? 'border-fg bg-fg' : 'border-line bg-raised'
+      className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full border transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${
+        checked ? 'border-accent bg-accent' : 'border-line-strong bg-raised'
       }`}
     >
       <span
         aria-hidden
-        className={`absolute top-1/2 size-4 -translate-y-1/2 rounded-full transition-[left,background-color] ${checked ? 'left-[19px] bg-canvas' : 'left-[3px] bg-fg-muted'}`}
+        className={`absolute top-1/2 size-4 -translate-y-1/2 rounded-full border bg-panel shadow-sm transition-[left,border-color] duration-150 ${checked ? 'left-[19px] border-accent' : 'left-[3px] border-line-strong'}`}
       />
     </button>
   );

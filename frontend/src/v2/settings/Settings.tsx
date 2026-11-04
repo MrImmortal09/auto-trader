@@ -76,7 +76,7 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
     const large = !desktop;
     switch (id) {
       case 'connections':
-        return <Connections id={sid} title={title} serverBase={serverBase} health={health} system={system.data} />;
+        return <Connections id={sid} title={title} serverBase={serverBase} health={health} system={system.data} large={large} />;
       case 'trading':
         return <Trading id={sid} title={title} serverBase={serverBase} settings={settings} onKillSwitch={onKillSwitch} onModeChanged={onModeChanged} large={large} />;
       case 'lots':
@@ -85,7 +85,7 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
         return (
           <div className="flex flex-col gap-3">
             <Exits id={sid} title={title} settings={settings} large={large} />
-            <p className="type-caption text-fg-muted">{EXITS_NOTE}</p>
+            <p className="type-caption text-fg-subtle">{EXITS_NOTE}</p>
           </div>
         );
       case 'telegram':
@@ -102,14 +102,14 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
   };
 
   if (!cfg) {
-    return <p className="p-6 type-body text-fg-muted">{settings.error ?? 'Loading settings…'}</p>;
+    return <p className={`p-6 type-body ${settings.error ? 'text-loss' : 'text-fg-subtle'}`}>{settings.error ?? 'Loading settings…'}</p>;
   }
 
   if (!desktop) {
     if (opened) {
       return (
         <div className="flex flex-col gap-3 p-4">
-          <button type="button" onClick={() => setOpened(null)} className="flex items-center gap-1 self-start type-label text-fg-muted hover:text-fg">
+          <button type="button" onClick={() => setOpened(null)} className="flex items-center gap-1 self-start type-label text-fg-muted transition-colors duration-120 hover:text-fg">
             <ChevronLeft size={16} /> Settings
           </button>
           <h2 className="type-title text-fg">{SECTIONS.find((s) => s.id === opened)!.title}</h2>
@@ -130,17 +130,17 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
     };
     return (
       <div className="flex flex-col gap-4 p-4">
-        <div className="rounded-12 bg-panel">
+        <div className="rounded-12 border border-line bg-panel">
           {SECTIONS.map((s) => (
             <button
               key={s.id}
               type="button"
               onClick={() => setOpened(s.id)}
-              className="flex min-h-[60px] w-full items-center gap-3 border-t border-line px-4 py-3 text-left first:border-t-0"
+              className="flex min-h-[60px] w-full items-center gap-3 border-t border-line px-4 py-3 text-left transition-colors duration-120 first:rounded-t-12 first:border-t-0 last:rounded-b-12 hover:bg-raised/40"
             >
               <span className="min-w-0 flex-1">
                 <span className="block type-body-strong text-fg">{s.title}</span>
-                <span className="mt-0.5 block type-caption text-fg-muted">{lines[s.id]}</span>
+                <span className="mt-0.5 block type-caption text-fg-subtle">{lines[s.id]}</span>
               </span>
               <ChevronRight size={16} className="shrink-0 text-fg-muted" />
             </button>

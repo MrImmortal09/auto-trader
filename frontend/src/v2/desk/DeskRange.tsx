@@ -15,6 +15,9 @@ const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg'
 
 const RANGE_NAME: Record<Exclude<RangeId, 'today'>, string> = { '7d': '7 days', '30d': '30 days', all: 'all time' };
 
+/** A row that opens its calls: a hairline under it, tinted on hover. */
+const PICK_ROW = 'border-b border-line text-left transition-colors duration-120 hover:bg-raised/40';
+
 /** A source the way the table names it: the Execute screen's scalps are yours. */
 function sourceName(label: string, group: GroupId): string {
   if (group === 'channel' && label === 'Scalps') return 'Scalp (you)';
@@ -38,9 +41,9 @@ function exportCsv(h: HistoryAnswer) {
   downloadCsv(`auto-trader-${h.mode.toLowerCase()}-${h.range}-${h.to}.csv`, [head, ...rows]);
 }
 
-/** A panel; `bare` drops its fill and padding (phone's By source list). */
+/** A white card with a hairline; `bare` drops its fill and padding (phone's By source list). */
 function Card({ children, className = '', bare = false }: { children: ReactNode; className?: string; bare?: boolean }) {
-  return <section className={`flex min-w-0 flex-col gap-3 ${bare ? '' : 'rounded-12 bg-panel p-4'} ${className}`}>{children}</section>;
+  return <section className={`flex min-w-0 flex-col gap-3 ${bare ? '' : 'rounded-12 border border-line bg-panel p-4'} ${className}`}>{children}</section>;
 }
 
 function SourceTable({ groups, group, rangeName, onPick, desktop }: {
@@ -50,17 +53,17 @@ function SourceTable({ groups, group, rangeName, onPick, desktop }: {
   onPick: (label: string) => void;
   desktop: boolean;
 }) {
-  if (groups.length === 0) return <p className="py-2 type-body text-fg-muted">No closed calls in this range.</p>;
+  if (groups.length === 0) return <p className="py-2 type-body text-fg-subtle">No closed calls in this range.</p>;
   if (!desktop) {
     return (
       <div className="flex flex-col">
         {groups.map((g) => {
           const losing = g.net < 0;
           return (
-            <button key={g.label} type="button" onClick={() => onPick(g.label)} className="flex min-h-14 items-center gap-3 border-b border-line py-3 text-left">
+            <button key={g.label} type="button" onClick={() => onPick(g.label)} className={`flex min-h-14 items-center gap-3 py-3 ${PICK_ROW}`}>
               <div className="min-w-0 flex-1">
                 <div className="type-body-strong text-fg">{sourceName(g.label, group)}</div>
-                <div className={`mt-0.5 type-caption tnum ${losing ? 'text-loss' : 'text-fg-muted'}`}>
+                <div className={`mt-0.5 type-caption tnum ${losing ? 'text-loss' : 'text-fg-subtle'}`}>
                   {[plural(g.calls, group === 'channel' && g.label === 'Scalps' ? 'trade' : 'call'), `${pct((g.wins / g.calls) * 100)} win`, `PF ${g.profit_factor == null ? '—' : g.profit_factor.toFixed(2)}`, losing ? 'losing money' : null]
                     .filter(Boolean)
                     .join(' · ')}
@@ -77,29 +80,29 @@ function SourceTable({ groups, group, rangeName, onPick, desktop }: {
   return (
     <table className="w-full">
       <thead>
-        <tr className="border-b border-line type-caption text-fg-muted">
-          <th className="pb-2 text-left font-normal">Source</th>
-          <th className="pb-2 text-right font-normal">Calls</th>
-          <th className="pb-2 text-right font-normal">Win</th>
-          <th className="pb-2 text-right font-normal">PF</th>
-          <th className="pb-2 text-right font-normal">Net</th>
+        <tr className="border-b border-line text-fg-muted">
+          <th className="py-2 text-left type-eyebrow">Source</th>
+          <th className="py-2 text-right type-eyebrow">Calls</th>
+          <th className="py-2 text-right type-eyebrow">Win</th>
+          <th className="py-2 text-right type-eyebrow">PF</th>
+          <th className="py-2 text-right type-eyebrow">Net</th>
         </tr>
       </thead>
       <tbody>
         {groups.map((g) => {
           const losing = g.net < 0;
           return (
-            <tr key={g.label} onClick={() => onPick(g.label)} className="cursor-pointer border-b border-line hover:bg-raised/40">
-              <td className="py-3">
+            <tr key={g.label} onClick={() => onPick(g.label)} className={`cursor-pointer ${PICK_ROW}`}>
+              <td className="py-2.5">
                 <div className="type-body-strong text-fg">{sourceName(g.label, group)}</div>
                 {losing && <div className="type-caption text-loss">Losing money over {rangeName}</div>}
               </td>
-              <td className="py-3 text-right num-medium text-fg">{g.calls}</td>
-              <td className="py-3 text-right num-medium text-fg">{pct((g.wins / g.calls) * 100)}</td>
-              <td className={`py-3 text-right num-medium ${g.profit_factor != null && g.profit_factor < 1 ? 'text-loss' : 'text-fg'}`}>
+              <td className="py-2.5 text-right num-medium text-fg">{g.calls}</td>
+              <td className="py-2.5 text-right num-medium text-fg">{pct((g.wins / g.calls) * 100)}</td>
+              <td className={`py-2.5 text-right num-medium ${g.profit_factor != null && g.profit_factor < 1 ? 'text-loss' : 'text-fg'}`}>
                 {g.profit_factor == null ? '—' : g.profit_factor.toFixed(2)}
               </td>
-              <td className={`py-3 text-right num-medium ${TONE_TEXT[toneOf(g.net)]}`}>{signedMoney(g.net)}</td>
+              <td className={`py-2.5 text-right num-medium ${TONE_TEXT[toneOf(g.net)]}`}>{signedMoney(g.net)}</td>
             </tr>
           );
         })}
@@ -150,7 +153,7 @@ export function DeskRange({ serverBase, range, desktop, rangeSwitch, paper = fal
   const header = desktop ? (
     <div className="flex items-center gap-4">
       {rangeSwitch}
-      {h && <span className="type-caption text-fg-muted tnum">{[span, plural(h.days.length, 'trading day')].filter(Boolean).join(' · ')}</span>}
+      {h && <span className="type-caption text-fg-subtle tnum">{[span, plural(h.days.length, 'trading day')].filter(Boolean).join(' · ')}</span>}
       <span className="flex-1" />
       <Button size="md" disabled={!h || h.calls.length === 0} onClick={() => h && exportCsv(h)} title={h && h.more_calls > 0 ? `Exports the newest ${h.calls.length} calls` : undefined}>
         Export CSV
@@ -162,7 +165,7 @@ export function DeskRange({ serverBase, range, desktop, rangeSwitch, paper = fal
 
   const kpis = k && (
     desktop ? (
-      <div className="flex flex-wrap items-end gap-x-10 gap-y-4 border-b border-line pb-5">
+      <div className="flex flex-wrap items-end gap-x-8 gap-y-4 border-b border-line pb-5">
         <Stat label={`Net · ${rangeName}`} value={signedMoney(k.net)} size="hero" tone={toneOf(k.net)} />
         <Stat label="Win rate" value={k.win_rate == null ? '—' : pct(k.win_rate)} />
         <Stat label="Profit factor" value={k.profit_factor == null ? '—' : k.profit_factor.toFixed(2)} tone={k.profit_factor != null && k.profit_factor < 1 ? 'loss' : 'neutral'} />
@@ -173,7 +176,8 @@ export function DeskRange({ serverBase, range, desktop, rangeSwitch, paper = fal
     ) : (
       <div className="flex flex-col gap-3">
         <Stat label={span ? `Net · ${span}` : `Net · ${rangeName}`} value={signedMoney(k.net)} size="hero" tone={toneOf(k.net)} />
-        <div className="grid grid-cols-4 gap-2">
+        {/* Two by two on a phone: four 83 px columns can't hold "MAX DRAWDOWN" over "−₹5,295.67" in Inter. */}
+        <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4 sm:gap-2">
           <Stat label="Win rate" value={k.win_rate == null ? '—' : pct(k.win_rate)} size="medium" />
           <Stat label="Profit factor" value={k.profit_factor == null ? '—' : k.profit_factor.toFixed(2)} size="medium" />
           <Stat label="Max drawdown" value={signedMoney(-k.max_drawdown)} size="medium" tone={k.max_drawdown > 0 ? 'loss' : 'neutral'} />
@@ -187,7 +191,7 @@ export function DeskRange({ serverBase, range, desktop, rangeSwitch, paper = fal
     <Card className={desktop ? 'lg:col-span-3' : ''}>
       <div className="flex items-baseline gap-2">
         <h2 className="type-title text-fg">Cumulative P&amp;L</h2>
-        {desktop && <span className="type-caption text-fg-muted">Realised, after charges</span>}
+        {desktop && <span className="type-caption text-fg-subtle">Realised, after charges</span>}
       </div>
       <PnlChart days={h.days} curve={h.curve} maxDrawdown={h.kpis.max_drawdown} height={desktop ? 270 : 170} compact={!desktop} />
     </Card>
@@ -201,26 +205,27 @@ export function DeskRange({ serverBase, range, desktop, rangeSwitch, paper = fal
         {groupSwitch}
       </div>
       <SourceTable groups={h.groups} group={group} rangeName={rangeName} desktop={desktop} onPick={(label) => setPick({ kind: 'source', label })} />
-      {desktop && h.groups.length > 0 && <p className="type-caption text-fg-muted">Net after charges. Select a source to see its calls.</p>}
+      {desktop && h.groups.length > 0 && <p className="type-caption text-fg-subtle">Net after charges. Select a source to see its calls.</p>}
     </Card>
   );
 
   const days = h && (
     <section className="flex flex-col">
       <h2 className="mb-1 type-title text-fg">Days</h2>
-      {h.days.length === 0 && <p className="py-2 type-body text-fg-muted">No closed calls in this range.</p>}
+      {h.days.length === 0 && <p className="py-2 type-body text-fg-subtle">No closed calls in this range.</p>}
       {h.days.map((d) => {
         const tone = toneOf(d.net);
         const note = [plural(d.calls, 'call'), d.expiries.length ? `${d.expiries.map(indexName).join(', ')} expiry` : null].filter(Boolean).join(' · ');
         return (
-          <button key={d.date} type="button" onClick={() => setPick({ kind: 'day', date: d.date })} className="flex min-h-12 items-center gap-4 border-b border-line py-3 text-left">
+          <button key={d.date} type="button" onClick={() => setPick({ kind: 'day', date: d.date })} className={`flex min-h-12 items-center gap-4 py-3 ${PICK_ROW}`}>
             <span className={`shrink-0 type-body-strong text-fg ${desktop ? 'w-36' : 'w-24'}`}>{dayLabel(d.date)}</span>
-            <span className={`shrink-0 type-caption text-fg-muted ${desktop ? 'w-44' : 'min-w-0 flex-1 truncate'}`}>{note}</span>
+            <span className={`shrink-0 type-caption text-fg-subtle ${desktop ? 'w-44' : 'min-w-0 flex-1 truncate'}`}>{note}</span>
             {desktop && (
               <span className="flex-1">
+                {/* The day's net against the range's biggest day, across the free span. */}
                 <span
                   className={`block h-1 rounded-full ${tone === 'loss' ? 'bg-loss' : 'bg-profit'}`}
-                  style={{ width: `${Math.max(2, (Math.abs(d.net) / maxDay) * 100) * 0.4}%`, minWidth: 4 }}
+                  style={{ width: `${Math.max(2, (Math.abs(d.net) / maxDay) * 100)}%`, minWidth: 4 }}
                 />
               </span>
             )}
@@ -236,21 +241,26 @@ export function DeskRange({ serverBase, range, desktop, rangeSwitch, paper = fal
     <section className="flex flex-col">
       <div className="mb-1 flex items-center gap-2">
         <h2 className="type-title text-fg">{pick.kind === 'day' ? dayLabel(pick.date) : sourceName(pick.label, group)}</h2>
-        <span className="type-caption text-fg-muted tnum">{plural(picked.length, 'call')}</span>
-        <button type="button" aria-label="Show all" onClick={() => setPick(null)} className="ml-auto grid size-7 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
+        <span className="type-caption text-fg-subtle tnum">{plural(picked.length, 'call')}</span>
+        <button
+          type="button"
+          aria-label="Show all"
+          onClick={() => setPick(null)}
+          className="ml-auto grid size-7 place-items-center rounded-6 text-fg-muted transition-colors duration-120 hover:bg-raised hover:text-fg"
+        >
           <X size={16} />
         </button>
       </div>
       {picked.map((c) => (
         <CallRow key={c.key} call={c} desktop={desktop} />
       ))}
-      {h.more_calls > 0 && <p className="pt-2 type-caption text-fg-muted">From the newest {h.calls.length} calls in this range.</p>}
-      {picked.length === 0 && <p className="py-2 type-body text-fg-muted">None of the newest {h.calls.length} calls.</p>}
+      {h.more_calls > 0 && <p className="pt-2 type-caption text-fg-subtle">From the newest {h.calls.length} calls in this range.</p>}
+      {picked.length === 0 && <p className="py-2 type-body text-fg-subtle">None of the newest {h.calls.length} calls.</p>}
     </section>
   );
 
   const loading = !h && (
-    <p className={`type-body ${history.error ? 'text-loss' : 'text-fg-muted'}`}>{history.error ? `Couldn't load the history: ${history.error}` : 'Loading…'}</p>
+    <p className={`type-body ${history.error ? 'text-loss' : 'text-fg-subtle'}`}>{history.error ? `Couldn't load the history: ${history.error}` : 'Loading…'}</p>
   );
 
   return (

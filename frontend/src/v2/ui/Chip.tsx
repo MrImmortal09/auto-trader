@@ -2,15 +2,17 @@ import type { ReactNode } from 'react';
 import { Send, Zap } from 'lucide-react';
 import type { Source, Tone } from '../lib/types';
 
-// Figma "Chip".
-export type ChipKind = 'outline' | 'live' | 'neutral' | 'profit' | 'loss';
+// Figma "Chip". Marigold is real money and nothing else: `live` is the LIVE
+// chip alone; a role or a selection is `accent`.
+export type ChipKind = 'outline' | 'live' | 'neutral' | 'profit' | 'loss' | 'accent';
 
 const KIND: Record<ChipKind, string> = {
-  outline: 'border border-line text-fg-muted',
-  live: 'bg-live text-on-accent',
+  outline: 'border border-line-strong/50 text-fg-muted',
+  live: 'border border-live-ink bg-live font-semibold text-fg',
   neutral: 'bg-raised text-fg-muted',
   profit: 'bg-profit-subtle text-profit',
   loss: 'bg-loss-subtle text-loss',
+  accent: 'bg-accent-subtle text-accent',
 };
 
 export function Chip({ kind = 'outline', icon, className = '', children }: {

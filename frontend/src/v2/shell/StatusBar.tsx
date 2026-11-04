@@ -4,6 +4,7 @@ import { AccountChip, AccountRow } from '../auth/AccountChip';
 import { signedMoney, toneOf } from '../lib/format';
 import { useIstClock } from '../lib/hooks';
 import type { Health, HealthSet, Level, Mode, Role, StatusAnswer } from '../lib/types';
+import { useTickFlash } from '../lib/useTickFlash';
 import { Button } from '../ui/Button';
 import { Chip } from '../ui/Chip';
 import { HealthDot } from '../ui/Health';
@@ -34,6 +35,12 @@ function ModeChip({ mode }: { mode: Mode | undefined }) {
   return <Chip>{mode === 'PAPER' ? 'Paper' : '…'}</Chip>;
 }
 
+/** The bar's surface: quiet grey, or, while real money is on, the marigold
+ * wash edge to edge with its 3 px ink rule on top. Paper has neither. */
+function barLook(mode: Mode | undefined): string {
+  return mode === 'LIVE' ? 'border-t-[3px] border-t-live-ink bg-live-subtle' : 'bg-inset';
+}
+
 /** A dot's level, or every dot down while the server can't be reached. */
 function dotOf(status: StatusAnswer | null, unreachable: boolean, key: keyof HealthSet): Health {
   if (unreachable) return { level: 'down', label: "Can't reach the server" };
@@ -47,13 +54,14 @@ export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
   onKillSwitch: () => void;
 }) {
   const clock = useIstClock();
+  const flash = useTickFlash(status?.day_pnl);
   const ownerView = role === 'admin';
   return (
-    <header className="flex h-10 shrink-0 items-center gap-4 border-b border-line bg-inset px-4">
+    <header className={`flex h-10 shrink-0 items-center gap-4 border-b border-line px-4 ${barLook(status?.mode)}`}>
       <div className="flex min-w-0 flex-1 items-center gap-3">
         <ModeChip mode={status?.mode} />
         <span className="num-small text-fg">{clock} IST</span>
-        <span className="truncate type-caption text-fg-muted">{status?.market ?? ''}</span>
+        <span className="truncate type-caption text-fg-subtle">{status?.market ?? ''}</span>
       </div>
       <div className="flex items-center gap-4">
         {dotsFor(role).map((d) => {
@@ -70,7 +78,9 @@ export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
         {role !== 'anon' && (
           <>
             <span className="type-label text-fg-muted">Day</span>
-            <span className={`num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]}`}>{status ? signedMoney(status.day_pnl) : '—'}</span>
+            <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]} ${flash.className}`}>
+              {status ? signedMoney(status.day_pnl) : '—'}
+            </span>
             <span aria-hidden className="h-5 w-px bg-line" />
           </>
         )}
@@ -105,25 +115,30 @@ export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
   onKillSwitch: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const flash = useTickFlash(status?.day_pnl);
   const ownerView = role === 'admin';
   const dots = dotsFor(role).map((d) => ({ ...d, ...dotOf(status, unreachable, d.key) }));
   const worst: Level = dots.some((d) => d.level === 'down') ? 'down' : dots.every((d) => d.level === 'off') ? 'off' : 'ok';
   return (
-    <header className="relative z-30 shrink-0 border-b border-line bg-inset pt-safe">
+    <header className={`relative z-30 shrink-0 border-b border-line pt-safe ${barLook(status?.mode)}`}>
       <div className="flex h-11 items-center gap-2 px-4">
         <ModeChip mode={status?.mode} />
         <button
           type="button"
           aria-expanded={open}
           onClick={() => setOpen((o) => !o)}
-          className="flex min-w-0 items-center gap-1.5 rounded-6 px-1.5 py-1 type-label text-fg hover:bg-raised"
+          className="flex min-w-0 items-center gap-1.5 rounded-6 px-1.5 py-1 type-label text-fg transition-colors duration-120 hover:bg-raised"
         >
           <HealthDot level={worst} />
           <span className="truncate">{summary(dots, unreachable)}</span>
           <ChevronDown size={14} className={`shrink-0 text-fg-muted transition-transform ${open ? 'rotate-180' : ''}`} />
         </button>
         <span className="flex-1" />
-        {role !== 'anon' && <span className={`num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]}`}>{status ? signedMoney(status.day_pnl) : '—'}</span>}
+        {role !== 'anon' && (
+          <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]} ${flash.className}`}>
+            {status ? signedMoney(status.day_pnl) : '—'}
+          </span>
+        )}
         {ownerView &&
           (status?.kill_switch ? (
             <span role="img" aria-label="Trading stopped" className="grid size-9 place-items-center rounded-8 border border-loss bg-loss-subtle text-loss">
@@ -135,7 +150,7 @@ export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
               aria-label="Kill switch"
               onClick={onKillSwitch}
               disabled={!status}
-              className="grid size-9 place-items-center rounded-8 border border-loss text-loss hover:bg-loss-subtle disabled:opacity-50"
+              className="grid size-9 place-items-center rounded-8 border border-loss text-loss transition-colors duration-120 hover:bg-loss-subtle disabled:opacity-50"
             >
               <CircleAlert size={18} />
             </button>
@@ -147,7 +162,7 @@ export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
             <div key={d.key} className="flex h-10 items-center gap-2.5">
               <HealthDot level={d.level} />
               <span className="type-body-strong text-fg">{d.name}</span>
-              <span className="ml-auto type-caption text-fg-muted">{d.label}</span>
+              <span className="ml-auto type-caption text-fg-subtle">{d.label}</span>
             </div>
           ))}
           <div className="mt-1">

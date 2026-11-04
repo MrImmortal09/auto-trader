@@ -2,7 +2,8 @@ import { useEffect, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 
 /**
- * A dialog over a scrim: centred on desktop, a bottom sheet on phone.
+ * A dialog over a scrim: centred on desktop (white, a hairline and the lg
+ * shadow), a bottom sheet on phone (the scrim does the work, no shadow).
  * Escape or a tap on the scrim closes it, unless `locked` (an action is in
  * flight and must finish first).
  */
@@ -46,7 +47,7 @@ export function Modal({ open, onClose, label, locked = false, width = 'lg:max-w-
         role="dialog"
         aria-modal="true"
         aria-label={label}
-        className={`relative flex max-h-[92dvh] w-full flex-col overflow-hidden rounded-t-16 border-line bg-panel pb-safe animate-sheet-in lg:rounded-16 lg:border lg:pb-0 lg:animate-rise-in ${width}`}
+        className={`relative flex max-h-[92dvh] w-full flex-col overflow-hidden rounded-t-16 border-line bg-panel pb-safe animate-sheet-in lg:rounded-16 lg:border lg:pb-0 lg:shadow-lg lg:animate-rise-in ${width}`}
       >
         <div aria-hidden className="mx-auto mt-2 h-1 w-9 shrink-0 rounded-full bg-line-strong lg:hidden" />
         {children}
