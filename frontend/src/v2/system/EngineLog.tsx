@@ -14,8 +14,10 @@ const FILTERS: { value: Filter; label: string }[] = [
   { value: 'error', label: 'Errors' },
 ];
 
+// Grey for the everyday kinds (a faint edge, a raised fill, a strong edge);
+// red only on an error.
 const LOOK: Record<LogKind, string> = {
-  info: 'border border-line text-fg-muted',
+  info: 'border border-line-strong/50 text-fg-muted',
   order: 'bg-raised text-fg',
   signal: 'border border-line-strong text-fg',
   error: 'bg-loss-subtle text-loss',
@@ -31,25 +33,27 @@ function when(at: string, today: string): string {
   return at.startsWith(today) ? at.slice(11, 19) : `${shortDate(at)} ${at.slice(11, 16)}`;
 }
 
-/** Figma "Log row". */
+/** Figma "Log row", in the mono face so the times line up: an error's text
+ * is red, everything else ink. */
 function Row({ line, today, compact }: { line: LogLine; today: string; compact: boolean }) {
-  const text = <span className={`min-w-0 break-words type-body ${line.kind === 'error' ? 'text-loss' : 'text-fg'}`}>{line.text}</span>;
+  const ink = line.kind === 'error' ? 'text-loss' : 'text-fg';
   if (compact) {
     return (
       <li className="border-b border-line py-2.5 last:border-0">
         <div className="mb-1 flex items-center gap-2">
           <KindChip kind={line.kind} />
-          <span className="num-small text-fg-muted">{when(line.at, today)}</span>
+          <span className="type-mono text-fg-subtle">{when(line.at, today)}</span>
         </div>
-        {text}
+        <span className={`block min-w-0 break-words type-mono ${ink}`}>{line.text}</span>
       </li>
     );
   }
+  // 96 px holds "21 Oct 15:39"; the 2 px top padding centres a line on the chip.
   return (
-    <li className="grid grid-cols-[88px_56px_minmax(0,1fr)] items-start gap-4 py-2">
-      <span className="pt-0.5 num-small text-fg-muted">{when(line.at, today)}</span>
+    <li className="grid grid-cols-[96px_56px_minmax(0,1fr)] items-start gap-4 py-2">
+      <span className="pt-0.5 type-mono text-fg-subtle">{when(line.at, today)}</span>
       <KindChip kind={line.kind} />
-      {text}
+      <span className={`min-w-0 break-words pt-0.5 type-mono ${ink}`}>{line.text}</span>
     </li>
   );
 }
@@ -58,7 +62,7 @@ function Row({ line, today, compact }: { line: LogLine; today: string; compact: 
 export function LogPreview({ lines, count }: { lines: LogLine[]; count: number }) {
   const today = todayIst();
   const shown = lines.slice(0, count);
-  if (shown.length === 0) return <p className="py-4 type-body text-fg-muted">Waiting for engine events…</p>;
+  if (shown.length === 0) return <p className="py-4 type-body text-fg-subtle">Waiting for engine events…</p>;
   return (
     <ul>
       {shown.map((l) => (
@@ -95,8 +99,9 @@ export function EngineLog({ lines, connected, compact, maxHeight }: {
       <Toggle label="Follow new lines" checked={held == null} onChange={(on) => setHeld(on ? null : lines)} />
     </label>
   );
+  // An inset well with a hairline; its edge turns accent while it has focus.
   const search = (
-    <label className={`flex h-8 items-center gap-2 rounded-6 border border-line bg-inset px-2.5 focus-within:border-line-strong ${compact ? 'w-full' : 'w-[220px]'}`}>
+    <label className={`flex h-8 items-center gap-2 rounded-6 border border-line bg-inset px-2.5 transition-colors duration-120 focus-within:border-accent ${compact ? 'w-full' : 'w-[220px]'}`}>
       <Search size={14} className="shrink-0 text-fg-muted" />
       <input
         type="search"
@@ -104,7 +109,7 @@ export function EngineLog({ lines, connected, compact, maxHeight }: {
         placeholder="Search the log"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
-        className="min-w-0 flex-1 bg-transparent type-body text-fg outline-none placeholder:text-fg-muted"
+        className="min-w-0 flex-1 bg-transparent type-body text-fg outline-none placeholder:text-fg-subtle"
       />
     </label>
   );
@@ -130,12 +135,16 @@ export function EngineLog({ lines, connected, compact, maxHeight }: {
         </div>
       )}
       {newer > 0 && (
-        <button type="button" onClick={() => setHeld(null)} className="mt-2 self-start rounded-6 bg-raised px-2.5 py-1 type-label text-fg hover:bg-line">
+        <button
+          type="button"
+          onClick={() => setHeld(null)}
+          className="mt-2 self-start rounded-6 bg-raised px-2.5 py-1 type-label text-fg transition-colors duration-120 hover:bg-raised-strong"
+        >
           {newer} new {newer === 1 ? 'line' : 'lines'} · show
         </button>
       )}
       {shown.length === 0 ? (
-        <p className="py-6 type-body text-fg-muted">{source.length === 0 ? 'Waiting for engine events…' : 'Nothing matches.'}</p>
+        <p className="py-6 type-body text-fg-subtle">{source.length === 0 ? 'Waiting for engine events…' : 'Nothing matches.'}</p>
       ) : (
         <ul className="mt-2 overflow-y-auto" style={maxHeight ? { maxHeight } : undefined}>
           {shown.map((l) => (
