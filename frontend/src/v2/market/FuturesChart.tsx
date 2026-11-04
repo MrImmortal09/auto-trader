@@ -7,7 +7,9 @@ import { price, signedPct, toneOf } from '../lib/format';
 import type { MarketIndex } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
 import { fetchBars, toK, upsert } from '../trade/bars';
-import { CHART_STYLES, THOUSANDS, VWAP_SERIES } from '../trade/chartSetup';
+import { CHART_STYLES, showOscillator, THOUSANDS, VWAP_SERIES } from '../trade/chartSetup';
+import { DrawBanner, DrawMenu } from '../trade/DrawMenu';
+import { KlineDrawings, useDrawing } from '../trade/drawings';
 import { countdown, futureName, inSession, TF_MS, vwapOf, type Bar, type Tf } from '../trade/model';
 import { CheckboxRow } from '../ui/CheckboxRow';
 import { Popover } from '../ui/Popover';
@@ -22,6 +24,9 @@ const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg'
 export interface MarketLayers {
   vwap: boolean;
   pcr: boolean;
+  /** RSI (14) and CCI (20), each in a pane under the PCR. */
+  rsi: boolean;
+  cci: boolean;
 }
 
 /** The PCR pane's range, stretched to take in the thresholds. */
@@ -42,8 +47,8 @@ function rangeWith(values: { current: number[] }): AxisCreateRangeCallback {
 
 /**
  * The index future on KLineChart, with its VWAP and a PCR pane — the two
- * things the indicator scores. Bars come from the candle service; the PCR
- * from the checks.
+ * things the indicator scores — and RSI, CCI and drawings when asked for.
+ * Bars come from the candle service; the PCR from the checks.
  */
 export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buyAbove, sellBelow, layers, onLayers, compact }: {
   serverBase: string;
@@ -70,8 +75,10 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
   const version = useRef({ vwap: 0, pcr: 0 });
   const [bars, setBars] = useState<Bar[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [menu, setMenu] = useState<'pick' | 'tf' | 'layers' | null>(null);
+  const [menu, setMenu] = useState<'pick' | 'tf' | 'layers' | 'draw' | null>(null);
   const close = useCallback(() => setMenu(null), []);
+  const drawings = useRef<KlineDrawings | null>(null);
+  const { drawing, pick: pickTool, cancel: cancelDrawing } = useDrawing(useCallback(() => drawings.current, []));
 
   useEffect(() => {
     tfRef.current = tf;
@@ -97,6 +104,8 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
     });
     if (!c) return;
     chart.current = c;
+    const drawn = new KlineDrawings(c);
+    drawings.current = drawn;
     c.setDataLoader({
       getBars: async ({ type, callback }) => {
         if (type !== 'init') return callback([], false);
@@ -122,6 +131,8 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
     return () => {
       VWAP_SERIES.delete(CHART_ID);
       PCR_SERIES.delete(CHART_ID);
+      drawn.cancel();
+      drawings.current = null;
       dispose(el);
       chart.current = null;
     };
@@ -132,6 +143,7 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
   useEffect(() => {
     const c = chart.current;
     if (!c) return;
+    drawings.current?.hide();
     c.setSymbol({ ticker: symbol, pricePrecision: 2, volumePrecision: 0 });
     c.setPeriod({ type: 'minute', span: TF_MS[tf] / 60_000 });
     const token = streamToken();
@@ -201,6 +213,20 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
     c.overrideYAxis({ paneId: PCR_PANE, createRange: rangeWith(pcrRange) });
   }, [layers.pcr, bars, checks, buyAbove, sellBelow, tf, compact]);
 
+  // RSI and CCI: KLineChart's own, each in its pane.
+  useEffect(() => {
+    if (chart.current) showOscillator(chart.current, 'rsi', layers.rsi, compact);
+  }, [layers.rsi, compact]);
+  useEffect(() => {
+    if (chart.current) showOscillator(chart.current, 'cci', layers.cci, compact);
+  }, [layers.cci, compact]);
+
+  // The future's saved drawings, once its bars are in.
+  const loaded = bars != null;
+  useEffect(() => {
+    if (loaded) drawings.current?.show(symbol);
+  }, [loaded, symbol, tf]);
+
   const last = bars?.[bars.length - 1] ?? null;
   // The header price flashes its tint when the future ticks.
   const flash = useTickFlash(last?.c);
@@ -256,6 +282,7 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
             ))}
           </div>
         )}
+        <DrawMenu open={menu === 'draw'} onToggle={() => setMenu(menu === 'draw' ? null : 'draw')} onClose={close} onPick={pickTool} onClear={() => drawings.current?.clear()} active={drawing} compact={compact} />
         <div className="relative">
           <button type="button" aria-label="Layers" aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <LayersIcon size={16} />
@@ -264,11 +291,14 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
             <div className="px-2 pt-1 pb-1 type-caption text-fg-muted">Show on this chart</div>
             <CheckboxRow checked={layers.vwap} title="VWAP" note="From the future's own trades, today" onChange={(v) => onLayers({ ...layers, vwap: v })} />
             <CheckboxRow checked={layers.pcr} title="PCR" note="At each check, with the lines it is read against" onChange={(v) => onLayers({ ...layers, pcr: v })} />
+            <CheckboxRow checked={layers.rsi} title="RSI" note="14 bars, lines at 70 and 30" onChange={(v) => onLayers({ ...layers, rsi: v })} />
+            <CheckboxRow checked={layers.cci} title="CCI" note="20 bars, lines at +100 and −100" onChange={(v) => onLayers({ ...layers, cci: v })} />
           </Popover>
         </div>
       </header>
       <div className="relative min-h-0 flex-1">
         <div ref={host} className="absolute inset-0" />
+        {drawing && <DrawBanner tool={drawing} onCancel={cancelDrawing} />}
         {(bars == null || error) && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
             <span className={`rounded-8 bg-panel/90 px-3 py-1.5 type-caption ${error ? 'text-loss' : 'text-fg-subtle'}`}>{error ?? 'Loading bars…'}</span>

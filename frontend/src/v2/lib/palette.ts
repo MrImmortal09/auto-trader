@@ -24,6 +24,10 @@ export const PALETTE = {
   liveInk: '#8a4b00',
   grid: '#e9edf2',
   indicator: '#2a6fe3',
+  /** The second indicator line (`--color-chart-indicator-2`): the CCI pane's
+   * violet, 5.43:1 on white. It never shares a pane with the blue: each
+   * oscillator sits in its own, named in its legend. */
+  indicator2: '#7a4fd1',
   up: '#0f9f80',
   down: '#e0433f',
   /** Pivot levels on both chart libraries (`--color-chart-pivot`; the owner's
@@ -58,6 +62,7 @@ export const C = {
   onAccent: PALETTE.onAccent,
   grid: PALETTE.grid,
   indicator: PALETTE.indicator,
+  indicator2: PALETTE.indicator2,
   up: PALETTE.up,
   down: PALETTE.down,
   accent: PALETTE.accent,
@@ -73,6 +78,7 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
       ['--color-profit', PALETTE.profit],
       ['--color-loss', PALETTE.loss],
       ['--color-chart-indicator', PALETTE.indicator],
+      ['--color-chart-indicator-2', PALETTE.indicator2],
       ['--color-chart-pivot', PALETTE.pivot],
     ];
     for (const [name, hex] of expected) {

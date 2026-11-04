@@ -59,6 +59,7 @@
   /* Charts. */
   --color-chart-grid: #e9edf2;           /* horizontal grid on every chart: 1.18 vs white, recessive by design */
   --color-chart-indicator: #2a6fe3;      /* VWAP, PCR, sparklines, metric areas, puts OI bars, call markers: 4.69 white (ok as 11 px legend text), 4.40 canvas */
+  --color-chart-indicator-2: #7a4fd1;    /* the second indicator line, the CCI pane's violet: 5.43 white / 5.10 canvas (ok as legend text); never in the same pane as the blue */
   --color-candle-up: #0f9f80;            /* up bar body, border, wick (hollow by default): 3.34 white; deutan dE 9.3 from candle-down (validator PASS) */
   --color-candle-down: #e0433f;          /* down bar: 4.16 white */
   --color-chart-pivot: #d97706;          /* pivot levels on both chart libraries (the owner's call: orange, not line-strong): 3.19 white; their names are fg-muted */
@@ -210,4 +211,46 @@
   .animate-rise-in, .animate-sheet-in { animation: v2-fade-in 150ms ease-out; }
   .animate-tick-up, .animate-tick-down, .animate-saved { animation: none; }
   * { transition-duration: 0ms !important; }
+}
+
+/* Vela's style menu: Heikin Ashi draws made-up candles under real-price stop
+   lines (VChart also switches straight back from it). */
+[data-vei-id="heikinashi"] {
+  display: none !important;
+}
+
+/* Vela 0.9.0 drops a menu's z-index once the pointer moves over it, and the
+   menu falls behind the chart, out of reach: keep the one it opened with. */
+.vela-workspace [data-part="positioner"][style*="--z-index"] {
+  z-index: var(--z-index) !important;
+}
+
+/* Vela's own chrome (its drawing toolbar, menus, dialogs and tooltips) takes
+   its colours from the seven theme keys VChart sets from the palette, plus a
+   few fixed ones of its own: TradingView's blue, a cyan "bright" accent, an
+   ink-filled selected state and 50 % black shadows. Those take the app's
+   tokens instead. Vela writes every token inline on its root and on each
+   tooltip, so these need !important. */
+.vela-workspace,
+.vela-workspace *,
+.vela-ui-layer,
+.vela-ui-layer * {
+  --vela-fg: var(--color-fg-muted) !important;
+  --vela-fg-bright: var(--color-fg) !important;
+  --vela-fg-muted: var(--color-fg-subtle) !important;
+  --vela-border-strong: var(--color-line-strong) !important;
+  --vela-surface-elev: var(--color-panel) !important;
+  --vela-surface-overlay: var(--color-panel) !important;
+  --vela-surface-sunken: var(--color-inset) !important;
+  --vela-accent: var(--color-accent) !important;
+  --vela-accent-bright: var(--color-accent-strong) !important;
+  --vela-selected-bg: var(--color-accent) !important;
+  --vela-selected-fg: var(--color-on-accent) !important;
+  --vela-focus: var(--color-focus) !important;
+  --vela-focus-soft: var(--color-accent-subtle) !important;
+  --vela-danger: var(--color-loss) !important;
+  --vela-scroll: var(--color-line-strong) !important;
+  --vela-shadow: var(--shadow-md) !important;
+  --vela-shadow-dialog: var(--shadow-lg) !important;
+  --vela-backdrop: var(--color-scrim) !important;
 }

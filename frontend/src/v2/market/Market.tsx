@@ -18,7 +18,7 @@ interface Saved {
   layers: MarketLayers;
 }
 
-const DEFAULTS: Saved = { index: 'NIFTY', tf: '5m', layers: { vwap: true, pcr: true } };
+const DEFAULTS: Saved = { index: 'NIFTY', tf: '5m', layers: { vwap: true, pcr: true, rsi: false, cci: false } };
 
 function loadSaved(): Saved {
   try {
@@ -27,7 +27,7 @@ function loadSaved(): Saved {
     return {
       index: MARKET_INDICES.some((i) => i.id === raw.index) ? (raw.index as MarketIndex) : DEFAULTS.index,
       tf: raw.tf === '1m' || raw.tf === '15m' ? raw.tf : '5m',
-      layers: { vwap: raw.layers?.vwap !== false, pcr: raw.layers?.pcr !== false },
+      layers: { vwap: raw.layers?.vwap !== false, pcr: raw.layers?.pcr !== false, rsi: raw.layers?.rsi === true, cci: raw.layers?.cci === true },
     };
   } catch {
     return DEFAULTS;
