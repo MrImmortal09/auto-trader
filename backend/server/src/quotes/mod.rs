@@ -1,6 +1,6 @@
 //! Quotes for anything in the catalog, during hours and after.
 //!
-//! The hub (`hub`) answers `get(key)` for a price-map key from the best
+//! The hub (`hub`) answers `get_at(key, now)` for a price-map key from the best
 //! source it has: the Kotak feed's tick for a key the feed carries (read
 //! from the shared price map, which only the feed task writes), else the
 //! latest read of Kotak's REST quotes API (`rest`), which a poller

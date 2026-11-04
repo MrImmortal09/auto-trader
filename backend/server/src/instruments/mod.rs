@@ -20,7 +20,7 @@
 pub mod load;
 pub mod search;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -55,6 +55,10 @@ pub struct CatalogStatus {
     pub loaded_at: Option<String>,
     /// Rows per segment (`nse_cm`, `nse_fo`, `bse_fo`) and the six `index` rows.
     pub rows: BTreeMap<String, i64>,
+    /// Rows read per kind (`INDEX`, `EQ`, `FUT`, `CE`, `PE`), counted as the
+    /// files were parsed — never by counting the table. A token repeated in
+    /// a file counts at each row here and once in `rows`.
+    pub kinds: BTreeMap<String, i64>,
     /// Symbols in the search list.
     pub underlyings: usize,
     /// Name words are searched with FTS5; else in memory.
@@ -143,6 +147,26 @@ pub struct SearchAnswer {
     pub stocks: Vec<SearchRow>,
     pub futures: Vec<SearchRow>,
     pub options: Vec<SearchRow>,
+}
+
+/// One instrument as its page shows it (`GET /api/v2/instruments/:id`): its
+/// row, and what the page needs beside it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Instrument {
+    #[serde(flatten)]
+    pub row: SearchRow,
+    pub segment: String,
+    /// `pSymbol`: the token the feed and the quotes API take.
+    pub token: String,
+    pub isin: Option<String>,
+    /// The price-map key of the underlying's cash or index row: a
+    /// derivative's spot, a cash row's own key. `None` for an underlying
+    /// with no cash or index row (`NIFTYNXT50`).
+    pub underlying_key: Option<String>,
+    /// The nearest expiry listed under the underlying from today, for an
+    /// F&O underlying's cash or index row; `None` on a contract or a stock
+    /// with no F&O.
+    pub nearest_expiry: Option<String>,
 }
 
 /// The catalog handle in `AppState`. Cheap to share; one build at a time.
@@ -249,29 +273,47 @@ impl Catalog {
             .collect()
     }
 
-    /// The last build's `instrument_load` rows: `(segment, rows, source_mtime)`
-    /// with the day and time of that build.
-    async fn last_load(pool: &SqlitePool) -> Result<Option<(String, String, Vec<(String, i64, Option<i64>)>)>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (String, String, String, i64, Option<i64>)>(
-            "SELECT day, loaded_at, segment, rows, source_mtime FROM instrument_load
+    /// The last build's `instrument_load` rows, one per segment, with the
+    /// day and time of that build.
+    async fn last_load(pool: &SqlitePool) -> Result<Option<(String, String, Vec<LoadRow>)>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (String, String, String, i64, Option<i64>, Option<String>)>(
+            "SELECT day, loaded_at, segment, rows, source_mtime, kinds FROM instrument_load
              WHERE loaded_at = (SELECT MAX(loaded_at) FROM instrument_load)",
         )
         .fetch_all(pool)
         .await?;
         let Some((day, loaded_at, ..)) = rows.first().cloned() else { return Ok(None) };
-        Ok(Some((day, loaded_at, rows.into_iter().map(|(_, _, segment, n, mtime)| (segment, n, mtime)).collect())))
+        let segments = rows
+            .into_iter()
+            .map(|(_, _, segment, rows, mtime, kinds)| LoadRow {
+                segment,
+                rows,
+                mtime,
+                kinds: kinds.and_then(|k| serde_json::from_str(&k).ok()).unwrap_or_default(),
+            })
+            .collect();
+        Ok(Some((day, loaded_at, segments)))
     }
 
     /// Puts the search list and the status back from the database.
     async fn restore(&self, pool: &SqlitePool) {
         match Self::last_load(pool).await {
             Ok(Some((day, loaded_at, segments))) => {
-                let mut rows: BTreeMap<String, i64> = segments.into_iter().map(|(segment, n, _)| (segment, n)).collect();
+                let mut rows: BTreeMap<String, i64> = BTreeMap::new();
+                let mut kinds: BTreeMap<String, i64> = BTreeMap::new();
+                for s in segments {
+                    rows.insert(s.segment, s.rows);
+                    for (kind, n) in s.kinds {
+                        *kinds.entry(kind).or_insert(0) += n;
+                    }
+                }
                 rows.insert("index".into(), shared_domain::INDEX_NAMES.len() as i64);
+                kinds.insert("INDEX".into(), shared_domain::INDEX_NAMES.len() as i64);
                 self.update_status(|s| {
                     s.day = Some(day);
                     s.loaded_at = Some(loaded_at);
                     s.rows = rows;
+                    s.kinds = kinds;
                 });
                 let status = self.status();
                 tracing::info!(
@@ -320,9 +362,7 @@ impl Catalog {
         }
         if let Ok(Some((_, _, last))) = Self::last_load(&pool).await {
             let same = last.len() == sources.len()
-                && sources
-                    .iter()
-                    .all(|s| last.iter().any(|(segment, _, mtime)| *segment == s.segment && *mtime == Some(s.mtime)));
+                && sources.iter().all(|s| last.iter().any(|l| l.segment == s.segment && l.mtime == Some(s.mtime)));
             if same {
                 return Ok(LoadOutcome::Unchanged);
             }
@@ -337,10 +377,18 @@ impl Catalog {
                 self.set_index(Arc::clone(&report.index));
                 let mut rows: BTreeMap<String, i64> = report.segments.iter().map(|r| (r.segment.to_string(), r.stored() as i64)).collect();
                 rows.insert("index".into(), report.index_rows as i64);
+                let mut kinds: BTreeMap<String, i64> = BTreeMap::new();
+                for r in &report.segments {
+                    for (kind, n) in &r.kinds {
+                        *kinds.entry(kind.to_string()).or_insert(0) += *n as i64;
+                    }
+                }
+                kinds.insert("INDEX".into(), report.index_rows as i64);
                 self.update_status(|s| {
                     s.day = Some(report.day.clone());
                     s.loaded_at = Some(report.loaded_at.clone());
                     s.rows = rows.clone();
+                    s.kinds = kinds;
                     s.underlyings = report.underlyings;
                     s.loading = false;
                     s.last_error = None;
@@ -384,17 +432,114 @@ impl Catalog {
     }
 
     // -----------------------------------------------------------------------
+    // Lookups for the quote and instrument routes
+    // -----------------------------------------------------------------------
+
+    /// The price-map key an underlying's spot ticks under: its cash or
+    /// index row's. From the search list in memory.
+    pub fn spot_key(&self, symbol: &str) -> Option<String> {
+        self.index().get(symbol).and_then(|u| u.ws_key.clone())
+    }
+
+    /// Those of `keys` that are a catalog row's price-map key: equities and
+    /// indices from the search list in memory, contracts by one primary-key
+    /// lookup of their `<segment>:<token>` ids, each accepted only when the
+    /// row's `ws_key` is the key asked for (an index's REST spelling,
+    /// `nse_cm|Nifty 50`, names its virtual row's id but is not its key).
+    /// What `GET /api/v2/quotes` accepts, so nothing a caller types goes to
+    /// Kotak's quotes API unchecked.
+    pub async fn known_keys(&self, keys: &[String]) -> HashSet<String> {
+        let index = self.index();
+        let mut known = HashSet::new();
+        let mut ids: Vec<String> = Vec::new();
+        for key in keys {
+            if index.by_ws_key(key).is_some() {
+                known.insert(key.clone());
+            } else if let Some((segment, token)) = key.split_once('|') {
+                if !segment.is_empty() && !token.is_empty() {
+                    ids.push(format!("{segment}:{token}"));
+                }
+            }
+        }
+        let Some(pool) = &self.pool else { return known };
+        if ids.is_empty() {
+            return known;
+        }
+        let sql = format!("SELECT ws_key FROM instruments WHERE id IN ({})", vec!["?"; ids.len()].join(","));
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for id in &ids {
+            query = query.bind(id);
+        }
+        match query.fetch_all(pool).await {
+            Ok(found) => {
+                for key in keys {
+                    if found.contains(key) {
+                        known.insert(key.clone());
+                    }
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "Instrument catalog: key lookup failed"),
+        }
+        known
+    }
+
+    /// The instrument with `id` (`<segment>:<token>`), with its underlying's
+    /// key and, for an F&O underlying's own row, the nearest expiry listed
+    /// from `today`. One primary-key lookup, and one indexed range for the
+    /// expiry. `None` for an id the catalog has no row for.
+    pub async fn instrument(&self, id: &str, today: NaiveDate) -> Option<Instrument> {
+        let pool = self.pool.as_ref()?;
+        let row = sqlx::query_as::<_, DetailRow>(SELECT_DETAIL)
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, id, "Instrument catalog: instrument lookup failed");
+                None
+            })?;
+        let index = self.index();
+        let underlying = index.get(&row.row.underlying);
+        let underlying_key = underlying.and_then(|u| u.ws_key.clone());
+        let row_kind = Kind::parse(&row.row.kind).unwrap_or(Kind::Eq);
+        let nearest_expiry = match underlying {
+            Some(u) if u.has_fo && matches!(row_kind, Kind::Eq | Kind::Index) => self.nearest_expiry(&u.symbol, today).await,
+            _ => None,
+        };
+        Some(Instrument {
+            row: row.row.into_row(&index),
+            segment: row.segment,
+            token: row.token,
+            isin: row.isin,
+            underlying_key,
+            nearest_expiry: nearest_expiry.map(day_text),
+        })
+    }
+
+    /// The nearest expiry any contract under `underlying` is listed for
+    /// from `today`.
+    async fn nearest_expiry(&self, underlying: &str, today: NaiveDate) -> Option<NaiveDate> {
+        let pool = self.pool.as_ref()?;
+        sqlx::query_scalar::<_, Option<String>>("SELECT MIN(expiry) FROM instruments WHERE underlying = ? AND expiry >= ?")
+            .bind(underlying)
+            .bind(day_text(today))
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Instrument catalog: nearest expiry lookup failed");
+                None
+            })
+            .and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok())
+    }
+
+    // -----------------------------------------------------------------------
     // Search
     // -----------------------------------------------------------------------
 
     /// Everything `raw` matches, grouped and ranked, with derivatives listed
     /// from `today`. `spot` gives an underlying's current price when known,
     /// so the options listed are the strikes around it; without one, the
-    /// middle of the chain.
-    // The caller is Phase 1's search route (`GET /api/v2/search`, the next
-    // slice); until it lands only the tests call this.
-    #[allow(dead_code)]
-    pub async fn search(&self, raw: &str, today: NaiveDate, spot: &dyn Fn(&str) -> Option<f64>) -> SearchAnswer {
+    /// middle of the chain. Behind `GET /api/v2/search`.
+    pub async fn search(&self, raw: &str, today: NaiveDate, spot: &(dyn Fn(&str) -> Option<f64> + Sync)) -> SearchAnswer {
         let parsed = parse_query(raw);
         let mut answer = SearchAnswer { query: raw.trim().to_string(), parsed: parsed.label(), ..Default::default() };
         let text = parsed.text();
@@ -679,8 +824,20 @@ fn cash_row(u: &Underlying, tier: Tier) -> Option<SearchRow> {
     })
 }
 
+/// One segment's row of the last build, as `instrument_load` keeps it.
+struct LoadRow {
+    segment: String,
+    rows: i64,
+    mtime: Option<i64>,
+    kinds: BTreeMap<String, i64>,
+}
+
 const SELECT_ROW: &str =
     "SELECT id, kind, symbol, name, exchange, trading_symbol, underlying, expiry, strike, lot_size, tick_size, ws_key FROM instruments";
+
+/// `SELECT_ROW`'s columns and the instrument page's, by primary key.
+const SELECT_DETAIL: &str =
+    "SELECT id, kind, symbol, name, exchange, trading_symbol, underlying, expiry, strike, lot_size, tick_size, ws_key, segment, token, isin FROM instruments WHERE id = ?";
 
 #[derive(sqlx::FromRow)]
 struct DbRow {
@@ -718,6 +875,16 @@ impl DbRow {
             tier: None,
         }
     }
+}
+
+/// A row with what the instrument page shows beyond a search row.
+#[derive(sqlx::FromRow)]
+struct DetailRow {
+    #[sqlx(flatten)]
+    row: DbRow,
+    segment: String,
+    token: String,
+    isin: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

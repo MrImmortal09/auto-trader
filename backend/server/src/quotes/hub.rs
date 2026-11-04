@@ -1,14 +1,14 @@
 //! The hub: one quote per key from the best source there is, and the
 //! bookkeeping the poller and the close sweep work from.
 //!
-//! `get(key)` answers for a price-map key (`nse_cm|2885`, `nse_fo|51386`,
-//! `idx|NIFTY 50`). The candidates are the feed's tick for a key the feed
-//! carries (read from the shared price map, which only the feed task
-//! writes), the latest Kotak REST read, and Upstox's quote while Kotak is
-//! down during hours; the freshest of them gives the price, a feed tick of
-//! the last ten seconds ahead of any REST read, and the others fill in the
-//! day's figures it lacks. After the close, the 15:35 sweep's row is served
-//! as the day's close instead, until the next day's quotes arrive.
+//! `get_at(key, now)` answers for a price-map key (`nse_cm|2885`,
+//! `nse_fo|51386`, `idx|NIFTY 50`). The candidates are the feed's tick for
+//! a key the feed carries (read from the shared price map, which only the
+//! feed task writes), the latest Kotak REST read, and Upstox's quote while
+//! Kotak is down during hours; the freshest of them gives the price, a feed
+//! tick of the last ten seconds ahead of any REST read, and the others fill
+//! in the day's figures it lacks. After the close, the 15:35 sweep's row is
+//! served as the day's close instead, until the next day's quotes arrive.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -263,6 +263,9 @@ struct UpstoxState {
     backoff: rest::Backoff,
 }
 
+/// How far back the request rate counts.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+
 #[derive(Default)]
 struct Stats {
     calls: u64,
@@ -277,6 +280,24 @@ struct Stats {
     error_streak: u32,
     last_call_at: Option<String>,
     last_error: Option<String>,
+    /// When each Kotak call of the last [`RATE_WINDOW`] was made, oldest
+    /// first: the request rate the System screen shows.
+    recent_calls: VecDeque<Instant>,
+    recent_upstox_calls: VecDeque<Instant>,
+}
+
+impl Stats {
+    /// Notes a call at `now` and drops those older than the window.
+    fn note(recent: &mut VecDeque<Instant>, now: Instant) {
+        recent.push_back(now);
+        Self::prune(recent, now);
+    }
+
+    fn prune(recent: &mut VecDeque<Instant>, now: Instant) {
+        while recent.front().is_some_and(|at| now.saturating_duration_since(*at) >= RATE_WINDOW) {
+            recent.pop_front();
+        }
+    }
 }
 
 /// The close sweep's progress, for the System screen.
@@ -313,6 +334,12 @@ pub struct HubStatus {
     pub unmatched: u64,
     pub upstox_calls: u64,
     pub upstox_errors: u64,
+    /// Kotak quotes calls in the last minute, and the same as calls a
+    /// second: the hub's share of the 10 requests a second Kotak allows.
+    pub calls_last_minute: u64,
+    pub calls_per_sec: f64,
+    /// Upstox quotes calls in the last minute (the fallback while Kotak is down).
+    pub upstox_calls_last_minute: u64,
     /// IST `HH:MM:SS` of the last call that answered.
     pub last_call_at: Option<String>,
     pub last_error: Option<String>,
@@ -378,10 +405,8 @@ impl QuoteHub {
 
     /// Marks `keys` as wanted now: the poller refreshes them for the next
     /// 15 s, and the close sweep includes them for 15 minutes. A key with
-    /// no REST form is still answered from the feed or the close.
-    // The callers are Phase 1's quote and search routes (the next slice);
-    // until they land only the tests call this.
-    #[allow(dead_code)]
+    /// no REST form is still answered from the feed or the close. Called by
+    /// the search, quote and instrument routes for every key they answer.
     pub fn want<I: IntoIterator<Item = String>>(&self, keys: I) {
         let now = Instant::now();
         let mut wanted = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
@@ -408,27 +433,15 @@ impl QuoteHub {
         self.wanted_within(WATCH_WINDOW, Instant::now())
     }
 
-    /// The quote for `key` now, if any source has one.
-    #[allow(dead_code)]
-    pub fn get(&self, key: &str) -> Option<Quote> {
-        self.get_at(key, shared_domain::now_ist())
-    }
-
-    /// The quote for `key` as of `now` — see the module doc for which
-    /// source answers.
+    /// The quote for `key` as of `now` (the routes pass the clock through,
+    /// so their tests can set it) — see the module doc for which source
+    /// answers.
     pub fn get_at(&self, key: &str, now: DateTime<FixedOffset>) -> Option<Quote> {
         let rest = self.rest.get(key).map(|h| h.quote.clone());
         let upstox = self.upstox.get(key).map(|h| h.quote.clone());
         let live = merge_live(self.feed_quote(key), rest, upstox, now.timestamp_millis());
         let close = self.snapshot().and_then(|s| s.quote(key).map(|q| (s.day, q)));
         serve(live, close, now)
-    }
-
-    /// The quotes for `keys` now, in order, those with none left out.
-    #[allow(dead_code)]
-    pub fn get_many(&self, keys: &[String]) -> Vec<Quote> {
-        let now = shared_domain::now_ist();
-        keys.iter().filter_map(|k| self.get_at(k, now)).collect()
     }
 
     /// The feed's price for a key it carries, stamped with its last tick;
@@ -476,7 +489,10 @@ impl QuoteHub {
             taken_at: s.taken_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             rows: s.rows.len(),
         });
-        let stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        Stats::prune(&mut stats.recent_calls, now);
+        Stats::prune(&mut stats.recent_upstox_calls, now);
+        let calls_last_minute = stats.recent_calls.len() as u64;
         HubStatus {
             wanted,
             quotes: self.rest.len(),
@@ -490,6 +506,9 @@ impl QuoteHub {
             unmatched: stats.unmatched,
             upstox_calls: stats.upstox_calls,
             upstox_errors: stats.upstox_errors,
+            calls_last_minute,
+            calls_per_sec: calls_last_minute as f64 / RATE_WINDOW.as_secs_f64(),
+            upstox_calls_last_minute: stats.recent_upstox_calls.len() as u64,
             last_call_at: stats.last_call_at.clone(),
             last_error: stats.last_error.clone(),
             paused,
@@ -581,6 +600,7 @@ impl QuoteHub {
 
         let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         stats.calls += 1;
+        Stats::note(&mut stats.recent_calls, now);
         stats.unmatched += unmatched;
         if unmatched > 0 {
             tracing::debug!(unmatched, asked = keys.len(), "Kotak quotes: answers for keys that were not asked");
@@ -648,6 +668,7 @@ impl QuoteHub {
         let result = client.quotes(&asked).await;
         let mut state = self.upstox_state.lock().unwrap_or_else(|e| e.into_inner());
         let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        Stats::note(&mut stats.recent_upstox_calls, Instant::now());
         match result {
             Ok(quotes) => {
                 let at = now_ms();
@@ -917,6 +938,9 @@ mod tests {
         let status = hub.status();
         assert_eq!((status.calls, status.quotes, status.unmatched, status.wanted), (1, 2, 1, 5));
         assert!(status.paused.is_none());
+        // The rate counts the last minute's calls, whatever came of them.
+        assert_eq!((status.calls_last_minute, status.upstox_calls_last_minute), (1, 0));
+        assert!((status.calls_per_sec - 1.0 / 60.0).abs() < 1e-9);
         assert_eq!(hub.get_at("nse_cm|2885", shared_domain::now_ist()).unwrap().ltp, 1_400.0);
         // Nothing is sent while the session is down, and the status says so.
         assert!(hub.plan(false, now + Duration::from_secs(3)).is_empty());
@@ -953,5 +977,20 @@ mod tests {
         let status = hub.status();
         assert_eq!((status.refused, status.quarantined), (1, 1));
         assert!(status.last_error.as_deref().unwrap().contains("Invalid instrument/code"));
+        assert_eq!(status.calls_last_minute, 3);
+    }
+
+    #[test]
+    fn the_request_rate_forgets_calls_older_than_a_minute() {
+        let mut stats = Stats::default();
+        let start = Instant::now();
+        Stats::note(&mut stats.recent_calls, start);
+        Stats::note(&mut stats.recent_calls, start + Duration::from_secs(30));
+        Stats::note(&mut stats.recent_calls, start + Duration::from_secs(59));
+        assert_eq!(stats.recent_calls.len(), 3);
+        Stats::prune(&mut stats.recent_calls, start + Duration::from_secs(60));
+        assert_eq!(stats.recent_calls.len(), 2, "the call a minute ago is out");
+        Stats::note(&mut stats.recent_calls, start + Duration::from_secs(120));
+        assert_eq!(stats.recent_calls.len(), 1);
     }
 }

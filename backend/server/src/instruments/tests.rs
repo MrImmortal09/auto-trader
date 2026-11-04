@@ -99,13 +99,14 @@ EQ,2885,nse_cm,0,RELIANCE-EQ,RELIANCE,0.05,1,x\n\
 EQ,500,nse_cm,0,\"LT-EQ\",LT,0.05,1,x\n";
 
 /// A scratch `data/` directory of its own: `scrip/` for the CSVs and the
-/// catalog database beside it. Removed when dropped.
-struct Scratch {
+/// catalog database beside it. Removed when dropped. The route tests
+/// (`routes::v2::instruments`) build their catalog with it too.
+pub(crate) struct Scratch {
     dir: PathBuf,
 }
 
 impl Scratch {
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("auto-trader-catalog-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("scrip")).unwrap();
@@ -126,13 +127,13 @@ impl Scratch {
         self.files().write(segment, csv).unwrap();
     }
 
-    fn write_all(&self) {
+    pub(crate) fn write_all(&self) {
         self.write("nse_cm", NSE_CM);
         self.write("nse_fo", NSE_FO);
         self.write("bse_fo", BSE_FO);
     }
 
-    async fn catalog(&self) -> Arc<Catalog> {
+    pub(crate) async fn catalog(&self) -> Arc<Catalog> {
         Catalog::open(self.files(), &self.db()).await
     }
 }
@@ -233,6 +234,13 @@ async fn the_fixture_loads_into_the_catalog() {
     assert_eq!(status.rows.get("bse_fo"), Some(&4));
     assert_eq!(status.rows.get("index"), Some(&6));
     assert_eq!(status.total_rows(), 65);
+    // Per kind, as the files were read: 18 equities, 6 indices, the futures
+    // and options of both F&O files (the duplicated token at each row).
+    assert_eq!(fo.kinds.get("FUT"), Some(&6));
+    assert_eq!((fo.kinds.get("CE"), fo.kinds.get("PE")), (Some(&20), Some(&12)));
+    let kinds: Vec<(&str, i64)> = status.kinds.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+    assert_eq!(kinds, vec![("CE", 22), ("EQ", 18), ("FUT", 7), ("INDEX", 6), ("PE", 13)]);
+    assert_eq!(status.kinds.values().sum::<i64>(), 66, "one more than the table: the duplicate");
     assert!(status.fts && !status.loading && status.last_error.is_none());
     assert_eq!(status.loaded_at.as_deref(), Some(report.loaded_at.as_str()));
     assert_eq!(status.day.as_deref(), Some(report.day.as_str()));
@@ -323,6 +331,7 @@ async fn a_restart_restores_the_search_list_without_a_build() {
     let status = catalog.status();
     assert_eq!(status.rows.get("nse_fo"), Some(&37));
     assert_eq!(status.rows.get("index"), Some(&6));
+    assert_eq!((status.kinds.get("CE"), status.kinds.get("EQ"), status.kinds.get("INDEX")), (Some(&22), Some(&18), Some(&6)));
     assert!(status.day.is_some() && status.loaded_at.is_some());
     assert!(status.underlyings > 0);
     let answer = catalog.search("reliance", today(), &no_spot).await;
@@ -615,4 +624,79 @@ async fn the_quote_hub_gets_the_cash_keys_and_upstox_keys_from_the_search_list()
     let again = scratch.catalog().await;
     assert_eq!(again.cash_keys().len(), 24);
     assert_eq!(again.upstox_key("nse_cm|2885").as_deref(), Some("NSE_EQ|INE002A01018"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_quote_route_checks_its_keys_against_the_catalog() {
+    let scratch = Scratch::new("known-keys");
+    let catalog = scratch.catalog().await;
+    // An empty catalog knows nothing.
+    assert!(catalog.known_keys(&["nse_cm|2885".to_string()]).await.is_empty());
+    scratch.write_all();
+    loaded(catalog.load_if_changed("test").await);
+
+    let keys: Vec<String> = [
+        "nse_cm|2885",      // an equity, from the search list
+        "idx|NIFTY 50",     // an index, likewise
+        "nse_fo|51386",     // a contract, by its id
+        "bse_fo|874001",    // a BSE index option
+        "nse_cm|99002",     // the BE row: in the table, not the search list
+        "nse_fo|999999",    // no such token
+        "nse_cm|Nifty 50",  // the REST form of an index is not a price-map key
+        "idx_close|NIFTY 50",
+        "junk",
+        "|",
+        "nse_fo|",
+    ]
+    .iter()
+    .map(|k| k.to_string())
+    .collect();
+    let known = catalog.known_keys(&keys).await;
+    let mut known: Vec<&str> = known.iter().map(|k| k.as_str()).collect();
+    known.sort();
+    assert_eq!(known, vec!["bse_fo|874001", "idx|NIFTY 50", "nse_cm|2885", "nse_cm|99002", "nse_fo|51386"]);
+
+    assert_eq!(catalog.spot_key("RELIANCE").as_deref(), Some("nse_cm|2885"));
+    assert_eq!(catalog.spot_key("NIFTY").as_deref(), Some("idx|NIFTY 50"));
+    assert_eq!(catalog.spot_key("NIFTYNXT50"), None, "an F&O-only underlying has no spot row");
+    assert_eq!(catalog.spot_key("nope"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instrument_page_row_carries_its_underlying_and_nearest_expiry() {
+    let scratch = Scratch::new("instrument");
+    scratch.write_all();
+    let catalog = scratch.catalog().await;
+    loaded(catalog.load_if_changed("test").await);
+
+    // An F&O stock: lot and tick from its cash row, the nearest expiry from its contracts.
+    let reliance = catalog.instrument("nse_cm:2885", today()).await.unwrap();
+    assert_eq!((reliance.row.kind, reliance.row.symbol.as_str(), reliance.row.name.as_str()), (Kind::Eq, "RELIANCE", "Reliance Industries"));
+    assert_eq!((reliance.row.lot_size, reliance.row.tick_size, reliance.row.has_fo, reliance.row.exchange.as_str()), (1, 0.05, true, "NSE"));
+    assert_eq!((reliance.segment.as_str(), reliance.token.as_str(), reliance.isin.as_deref()), ("nse_cm", "2885", Some("INE002A01018")));
+    assert_eq!(reliance.underlying_key.as_deref(), Some("nse_cm|2885"));
+    assert_eq!(reliance.nearest_expiry.as_deref(), Some("2026-11-24"));
+    assert_eq!(reliance.row.tier, None);
+    // A stock with no F&O has no expiry to show.
+    let tcs = catalog.instrument("nse_cm:11536", today()).await.unwrap();
+    assert_eq!((tcs.row.has_fo, tcs.nearest_expiry), (false, None));
+    // An index: on the 3rd its weekly expiry, on the 4th the monthly.
+    let nifty = catalog.instrument("nse_cm:Nifty 50", d(2026, 11, 3)).await.unwrap();
+    assert_eq!((nifty.row.kind, nifty.row.ws_key.as_str(), nifty.nearest_expiry.as_deref()), (Kind::Index, "idx|NIFTY 50", Some("2026-11-03")));
+    assert_eq!(catalog.instrument("nse_cm:Nifty 50", today()).await.unwrap().nearest_expiry.as_deref(), Some("2026-11-24"));
+    assert_eq!(catalog.instrument("nse_cm:Nifty 50", d(2027, 1, 1)).await.unwrap().nearest_expiry, None);
+    // A contract: its strike and expiry, its underlying's spot key, no nearest expiry of its own.
+    let option = catalog.instrument("nse_fo:51386", today()).await.unwrap();
+    assert_eq!((option.row.kind, option.row.strike, option.row.expiry.as_deref()), (Kind::Ce, Some(23_000.0), Some("2026-11-03")));
+    assert_eq!((option.row.lot_size, option.row.underlying.as_str(), option.row.has_fo), (65, "NIFTY", true));
+    assert_eq!((option.underlying_key.as_deref(), option.nearest_expiry), (Some("idx|NIFTY 50"), None));
+    let sensex_fut = catalog.instrument("bse_fo:874003", today()).await.unwrap();
+    assert_eq!((sensex_fut.row.kind, sensex_fut.row.exchange.as_str(), sensex_fut.underlying_key.as_deref()), (Kind::Fut, "BSE", Some("idx|SENSEX")));
+    // An underlying with no row of its own.
+    let nxt = catalog.instrument("nse_fo:49001", today()).await.unwrap();
+    assert_eq!((nxt.underlying_key, nxt.row.has_fo), (None, true));
+    // Unknown ids.
+    assert!(catalog.instrument("nse_cm:0", today()).await.is_none());
+    assert!(catalog.instrument("status", today()).await.is_none());
+    assert!(catalog.instrument("", today()).await.is_none());
 }

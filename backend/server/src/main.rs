@@ -1187,6 +1187,13 @@ async fn main() {
         .route("/api/v2/mode-check",                get(routes::v2::mode_check_handler))
         .route("/api/v2/candles",                   get(routes::v2::candles_handler))
         .route("/api/v2/candles/stream",            get(routes::v2::candles_stream_handler))
+        // The instrument search and its quotes, behind the `search` flag —
+        // see `routes::v2::instruments`. The static `status` path is
+        // registered beside the `:id` one; axum matches it first.
+        .route("/api/v2/search",                    get(routes::v2::search_handler))
+        .route("/api/v2/quotes",                    get(routes::v2::quotes_handler))
+        .route("/api/v2/instruments/status",        get(routes::v2::instruments_status_handler))
+        .route("/api/v2/instruments/:id",           get(routes::v2::instrument_handler))
         .route("/api/v2/me/desk",                   get(routes::v2::me::desk_handler))
         .route("/api/v2/me/history",                get(routes::v2::me::history_handler))
         .route("/api/v2/me/marks",                  get(routes::v2::me::marks_handler))

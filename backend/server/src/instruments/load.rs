@@ -155,6 +155,10 @@ pub struct SegmentReport {
     pub unresolved_strikes: u64,
     /// Rows whose id a row before them already used.
     pub duplicates: u64,
+    /// Rows kept per kind (`EQ`, `FUT`, `CE`, `PE`), counted as the file is
+    /// read: a token repeated in the file counts at each row here and once
+    /// in `stored`.
+    pub kinds: BTreeMap<&'static str, u64>,
 }
 
 impl SegmentReport {
@@ -725,6 +729,7 @@ impl<R: BufRead> SegmentParser<R> {
                         self.report.unresolved_strikes += 1;
                     }
                     self.report.kept += 1;
+                    *self.report.kinds.entry(parsed.row.kind.as_str()).or_insert(0) += 1;
                     batch.push(parsed.row);
                 }
                 Err(Skip(reason)) => self.report.note_skip(reason, &text),
@@ -816,13 +821,14 @@ async fn build(mut conn: PoolConnection<Sqlite>, sources: Vec<Source>, fts: bool
 
     for (source, report) in sources.iter().zip(&segments) {
         sqlx::query(
-            "INSERT OR REPLACE INTO instrument_load (day, segment, rows, loaded_at, source_mtime) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO instrument_load (day, segment, rows, loaded_at, source_mtime, kinds) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&day)
         .bind(source.segment)
         .bind(report.stored() as i64)
         .bind(&loaded_at)
         .bind(source.mtime)
+        .bind(serde_json::to_string(&report.kinds).unwrap_or_else(|_| "{}".into()))
         .execute(&mut *tx)
         .await?;
     }

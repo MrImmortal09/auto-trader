@@ -501,6 +501,10 @@ pub async fn init_catalog_db(path: &Path) -> Result<(SqlitePool, bool), sqlx::Er
     )
     .execute(&pool)
     .await?;
+    // Rows read per kind (`{"CE": n, "PE": n, "FUT": n}` as JSON), counted
+    // as the file is parsed, so the status never counts the table. Additive,
+    // so a catalog from before the column keeps working.
+    ensure_column(&pool, "ALTER TABLE instrument_load ADD COLUMN kinds TEXT").await;
     let fts = match sqlx::query(
         "CREATE VIRTUAL TABLE IF NOT EXISTS instruments_fts USING fts5(symbol, name, tokenize = 'unicode61')",
     )
@@ -1296,12 +1300,12 @@ mod tests {
         let pool = init_db(&db.url()).await;
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: true, chart_stops: false },
+            FeatureFlags { index_options_only: true, chart_stops: false, search: false },
         );
-        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true)]).await.unwrap();
+        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true), ("search", true)]).await.unwrap();
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: false, chart_stops: true },
+            FeatureFlags { index_options_only: false, chart_stops: true, search: true },
         );
         pool.close().await;
     }

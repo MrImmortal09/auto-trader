@@ -24,6 +24,7 @@ static SAVE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 pub struct FlagsUpdate {
     pub index_options_only: Option<bool>,
     pub chart_stops: Option<bool>,
+    pub search: Option<bool>,
 }
 
 /// `before` with `update` applied, and the `(name, on)` of each switch that
@@ -35,6 +36,9 @@ fn apply_update(before: FeatureFlags, update: &FlagsUpdate) -> (FeatureFlags, Ve
     }
     if let Some(on) = update.chart_stops {
         after.chart_stops = on;
+    }
+    if let Some(on) = update.search {
+        after.search = on;
     }
     let changes = after
         .entries()
@@ -98,11 +102,15 @@ mod tests {
 
     #[test]
     fn an_update_changes_only_the_switches_it_names() {
-        let before = FeatureFlags { index_options_only: false, chart_stops: true };
+        let before = FeatureFlags { index_options_only: false, chart_stops: true, search: false };
 
         let (after, changes) = apply_update(before, &FlagsUpdate { index_options_only: Some(true), ..Default::default() });
-        assert_eq!(after, FeatureFlags { index_options_only: true, chart_stops: true });
+        assert_eq!(after, FeatureFlags { index_options_only: true, chart_stops: true, search: false });
         assert_eq!(changes, vec![("index_options_only", true)]);
+
+        let (after, changes) = apply_update(before, &FlagsUpdate { search: Some(true), ..Default::default() });
+        assert_eq!(after, FeatureFlags { index_options_only: false, chart_stops: true, search: true });
+        assert_eq!(changes, vec![("search", true)]);
 
         // Re-sending a value that is already set is not a change.
         let (after, changes) = apply_update(before, &FlagsUpdate { chart_stops: Some(true), ..Default::default() });
@@ -118,6 +126,6 @@ mod tests {
     fn an_unknown_switch_is_rejected() {
         assert!(serde_json::from_str::<FlagsUpdate>(r#"{"index_only": true}"#).is_err());
         let update: FlagsUpdate = serde_json::from_str(r#"{"chart_stops": false}"#).unwrap();
-        assert_eq!((update.index_options_only, update.chart_stops), (None, Some(false)));
+        assert_eq!((update.index_options_only, update.chart_stops, update.search), (None, Some(false), None));
     }
 }

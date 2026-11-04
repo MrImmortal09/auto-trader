@@ -473,7 +473,7 @@ impl TradingConfig {
 /// Engine switches for the v2 redesign, stored in their own `feature_flags`
 /// table behind `GET/PUT /api/v2/flags` — never in [`TradingConfig`], which
 /// `POST /api/settings` replaces whole, so a switch kept there would be turned
-/// off every time v1 saves a setting. Both default to off, and with both off
+/// off every time v1 saves a setting. All default to off, and with all off
 /// the engine trades exactly as it did before they existed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureFlags {
@@ -485,15 +485,21 @@ pub struct FeatureFlags {
     /// (`PATCH /api/v2/positions/:id`). While off, no new level can be set;
     /// levels already set stay until their position closes.
     pub chart_stops: bool,
+    /// The instrument search and its quotes for anyone signed in:
+    /// `GET /api/v2/search`, `/api/v2/quotes` and `/api/v2/instruments/*`.
+    /// While off they answer 404. Nothing in the engine reads it.
+    #[serde(default)]
+    pub search: bool,
 }
 
 impl FeatureFlags {
     /// Every switch as `(name, on)`; `name` is both its `feature_flags` row
     /// and its JSON field.
-    pub fn entries(&self) -> [(&'static str, bool); 2] {
+    pub fn entries(&self) -> [(&'static str, bool); 3] {
         [
             ("index_options_only", self.index_options_only),
             ("chart_stops", self.chart_stops),
+            ("search", self.search),
         ]
     }
 
@@ -502,6 +508,7 @@ impl FeatureFlags {
         match name {
             "index_options_only" => self.index_options_only = on,
             "chart_stops" => self.chart_stops = on,
+            "search" => self.search = on,
             _ => return false,
         }
         true
@@ -1577,15 +1584,18 @@ mod tests {
 
     #[test]
     fn feature_flags_default_off_and_keep_their_api_names() {
-        assert_eq!(FeatureFlags::default(), FeatureFlags { index_options_only: false, chart_stops: false });
+        assert_eq!(FeatureFlags::default(), FeatureFlags { index_options_only: false, chart_stops: false, search: false });
         assert_eq!(
-            serde_json::to_value(FeatureFlags { index_options_only: true, chart_stops: false }).unwrap(),
-            serde_json::json!({ "index_options_only": true, "chart_stops": false }),
+            serde_json::to_value(FeatureFlags { index_options_only: true, chart_stops: false, search: false }).unwrap(),
+            serde_json::json!({ "index_options_only": true, "chart_stops": false, "search": false }),
         );
+        // A client from before the switch existed leaves it off.
+        let old: FeatureFlags = serde_json::from_str(r#"{"index_options_only": true, "chart_stops": true}"#).unwrap();
+        assert_eq!(old, FeatureFlags { index_options_only: true, chart_stops: true, search: false });
 
         // `entries` and `set` use exactly the JSON field names, so a stored
         // row always lands on the switch the API shows.
-        let flags = FeatureFlags { index_options_only: true, chart_stops: false };
+        let flags = FeatureFlags { index_options_only: true, chart_stops: false, search: true };
         let json = serde_json::to_value(flags).unwrap();
         assert_eq!(json.as_object().unwrap().len(), flags.entries().len());
         for (name, on) in flags.entries() {
