@@ -76,7 +76,7 @@ export function LiveDialog({ serverBase, onConfirm, onClose }: {
           <label htmlFor="live-confirm" className="type-label text-fg-muted">
             Type {WORD} to confirm
           </label>
-          <div className="flex h-11 items-center gap-2 rounded-6 border border-line bg-inset px-3 transition-colors duration-120 focus-within:border-accent">
+          <div className="flex h-11 items-center gap-2 rounded-6 border border-line bg-inset px-3 transition-colors duration-120 focus-within:border-accent has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-accent has-[:focus-visible]:outline-offset-2">
             <input
               id="live-confirm"
               data-autofocus

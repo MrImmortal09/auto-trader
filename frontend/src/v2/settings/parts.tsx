@@ -47,6 +47,8 @@ export function StateDot({ level, children }: { level: Level; children: ReactNod
 /** A link styled as the `neutral` sm button: the few settings that still
  * open in the old design (/v1/settings). */
 export const LINK_BUTTON = 'inline-flex h-7 items-center rounded-6 bg-raised px-2.5 type-button text-fg transition-colors duration-120 hover:bg-raised-strong';
+/** The same link at the phone's lg size: a 44 px touch target. */
+export const LINK_BUTTON_LG = 'inline-flex h-11 items-center justify-center rounded-8 bg-raised px-4 type-button-lg text-fg transition-colors duration-120 hover:bg-raised-strong';
 
 /** Figma "Section nav item": blue marks the section being read. */
 export function NavItem({ selected, onClick, children }: { selected: boolean; onClick: () => void; children: ReactNode }) {

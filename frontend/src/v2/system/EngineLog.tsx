@@ -99,9 +99,9 @@ export function EngineLog({ lines, connected, compact, maxHeight }: {
       <Toggle label="Follow new lines" checked={held == null} onChange={(on) => setHeld(on ? null : lines)} />
     </label>
   );
-  // An inset well with a hairline; its edge turns accent while it has focus.
+  // An inset well with a hairline; its edge turns accent while it has focus, and it carries the focus ring for its input.
   const search = (
-    <label className={`flex h-8 items-center gap-2 rounded-6 border border-line bg-inset px-2.5 transition-colors duration-120 focus-within:border-accent ${compact ? 'w-full' : 'w-[220px]'}`}>
+    <label className={`flex h-8 items-center gap-2 rounded-6 border border-line bg-inset px-2.5 transition-colors duration-120 focus-within:border-accent has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-accent has-[:focus-visible]:outline-offset-2 ${compact ? 'w-full' : 'w-[220px]'}`}>
       <Search size={14} className="shrink-0 text-fg-muted" />
       <input
         type="search"

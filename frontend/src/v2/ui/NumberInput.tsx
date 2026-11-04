@@ -55,7 +55,7 @@ export function NumberInput({ value, onCommit, unit, min, max, decimals = 0, gro
     <div className="flex flex-col items-end gap-1">
       <label
         key={saves}
-        className={`flex items-center gap-2 border bg-inset px-3 transition-colors duration-120 focus-within:border-accent ${
+        className={`flex items-center gap-2 border bg-inset px-3 transition-colors duration-120 focus-within:border-accent has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-accent has-[:focus-visible]:outline-offset-2 ${
           size === 'lg' ? 'h-11 rounded-8' : 'h-9 rounded-6'
         } ${valid ? 'border-line' : 'border-loss'} ${disabled ? 'opacity-50' : ''} ${saves > 0 ? 'animate-saved' : ''} ${width}`}
       >

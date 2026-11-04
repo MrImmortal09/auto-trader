@@ -29,7 +29,7 @@ interface ManualInputs {
 const EMPTY_MANUAL: ManualInputs = { stop_loss: '', target: '', avg_buy_price: '' };
 
 // An inset well; its border turns accent while it has focus.
-const FIELD = 'h-9 w-full rounded-6 border border-line bg-inset px-2.5 num-medium text-fg outline-none transition-colors duration-120 placeholder:text-fg-subtle focus:border-accent';
+const FIELD = 'h-9 w-full rounded-6 border border-line bg-inset px-2.5 num-medium text-fg transition-colors duration-120 placeholder:text-fg-subtle focus:border-accent';
 
 // An option: a choice, not a buy, so the selected one is blue.
 const OPTION = 'h-8 rounded-6 px-3 type-button transition-colors duration-120';
@@ -120,7 +120,7 @@ export function SyncWithKotak({ serverBase, onSynced }: { serverBase: string; on
 
   return (
     <>
-      <Button size="md" onClick={openPreview} disabled={loading} icon={<RefreshCw size={14} className={loading ? 'animate-spin' : ''} />}>
+      <Button size="md" onClick={openPreview} disabled={loading} icon={<RefreshCw size={14} />}>
         {loading ? 'Checking Kotak…' : 'Sync with Kotak'}
       </Button>
 

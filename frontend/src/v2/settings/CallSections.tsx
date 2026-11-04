@@ -98,7 +98,7 @@ export function IndicatorSizing({ settings, id, title, large = false }: { settin
               value={cfg.indicator_topup_mode}
               disabled={!on || !cfg.indicator_topup}
               onChange={(e) => void save(() => ({ indicator_topup_mode: e.target.value as TopupMode }), `Top-up rule: ${TOPUP_RULES.find((r) => r.value === e.target.value)?.label}`)}
-              className={`w-full appearance-none border border-line bg-panel pl-2.5 pr-8 type-body text-fg outline-none transition-colors duration-120 focus:border-accent ${large ? 'h-11 rounded-8' : 'h-9 rounded-6'}`}
+              className={`w-full appearance-none border border-line bg-panel pl-2.5 pr-8 type-body text-fg transition-colors duration-120 focus:border-accent ${large ? 'h-11 rounded-8' : 'h-9 rounded-6'}`}
             >
               {TOPUP_RULES.map((r) => (
                 <option key={r.value} value={r.value}>

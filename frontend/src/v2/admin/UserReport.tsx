@@ -18,7 +18,7 @@ import { PaperLine } from './PaperActivity';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 // A white well; its border is `border-line`, or `border-loss` while the dates are the wrong way round.
-const DATE_INPUT = 'min-w-0 rounded-6 border bg-panel px-2 type-body text-fg outline-none transition-colors duration-120 focus:border-accent tnum';
+const DATE_INPUT = 'min-w-0 rounded-6 border bg-panel px-2 type-body text-fg transition-colors duration-120 focus:border-accent tnum';
 // The chart's colours as plain values (SVG attributes can't read CSS tokens), from the one source every chart shares.
 const C = { profit: PALETTE.profit, loss: PALETTE.loss, grid: PALETTE.grid, text: PALETTE.subtle, ring: PALETTE.surface, cursor: PALETTE.lineStrong };
 

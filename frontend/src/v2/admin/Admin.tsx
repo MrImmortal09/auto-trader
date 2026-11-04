@@ -15,7 +15,7 @@ import { useToast } from '../ui/toast';
 import { Note, PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
 import { UserReport } from './UserReport';
 
-const INPUT = 'rounded-6 border border-line bg-inset px-2.5 text-fg outline-none transition-colors duration-120 placeholder:text-fg-subtle focus:border-accent disabled:opacity-50';
+const INPUT = 'rounded-6 border border-line bg-inset px-2.5 text-fg transition-colors duration-120 placeholder:text-fg-subtle focus:border-accent disabled:opacity-50';
 
 /** "Last signed in 26 Oct 15:44", or "Never signed in". */
 function lastLogin(u: AdminUser): string {

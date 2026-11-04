@@ -19,7 +19,7 @@ export function SignInSheet() {
   return signInOpen ? <SignInForm reason={signInReason} onClose={closeSignIn} /> : null;
 }
 
-const INPUT = 'h-12 w-full rounded-8 border border-line bg-inset px-3 text-fg outline-none transition-colors duration-120 focus:border-accent disabled:opacity-50';
+const INPUT = 'h-12 w-full rounded-8 border border-line bg-inset px-3 text-fg transition-colors duration-120 focus:border-accent disabled:opacity-50';
 
 function mmss(secs: number): string {
   return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;

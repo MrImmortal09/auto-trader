@@ -61,6 +61,7 @@
   --color-chart-indicator: #2a6fe3;      /* VWAP, PCR, sparklines, metric areas, puts OI bars, call markers: 4.69 white (ok as 11 px legend text), 4.40 canvas */
   --color-candle-up: #0f9f80;            /* up bar body, border, wick (hollow by default): 3.34 white; deutan dE 9.3 from candle-down (validator PASS) */
   --color-candle-down: #e0433f;          /* down bar: 4.16 white */
+  --color-chart-pivot: #d97706;          /* pivot levels on both chart libraries (the owner's call: orange, not line-strong): 3.19 white; their names are fg-muted */
 
   --color-selection: rgb(27 100 218 / 0.18); /* ::selection: fg on the composite #d6e3f8 is 13.35 */
   --color-focus: #1b64da;                /* :focus-visible ring, 2 px solid, 2 px offset: 5.41 / 5.08 / 4.64 on panel / canvas / inset */

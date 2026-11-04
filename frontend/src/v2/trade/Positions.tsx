@@ -218,7 +218,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                   )
                 ) : (
                   <>
-                    <PositionRail spec={railOf(p, indexNow(p.index), canSet)} />
+                    <PositionRail spec={railOf(p, indexNow(p.index), canSet)} surface="panel" />
                     <div>
                       {row('stop')}
                       {row('target')}

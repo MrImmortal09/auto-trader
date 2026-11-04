@@ -16,7 +16,8 @@ export function CheckboxRow({ checked, disabled = false, title, note, onChange }
       </span>
       <span className="min-w-0">
         <span className="block type-body text-fg">{title}</span>
-        <span className="block type-caption text-fg-subtle">{note}</span>
+        {/* fg-muted, not fg-subtle: the row tints raised on hover (fg-subtle on raised is 4.34:1). */}
+        <span className="block type-caption text-fg-muted">{note}</span>
       </span>
     </button>
   );

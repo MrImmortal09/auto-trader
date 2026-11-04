@@ -2,7 +2,7 @@
 // the order-line and marker overlays, VWAP and pivots. Registered once, globally.
 
 import { registerIndicator, registerOverlay, utils, type DeepPartial, type OverlayFigure, type Styles } from 'klinecharts';
-import { C, FONT, PALETTE } from '../lib/palette';
+import { C, FONT, PALETTE, alpha } from '../lib/palette';
 import { pivotLines, type PivotLevels } from './pivots';
 
 // The design tokens as plain values (the chart draws on a canvas), from the
@@ -46,6 +46,18 @@ export const CHART_STYLES: DeepPartial<Styles> = {
       },
     },
     tooltip: { showRule: 'none' },
+    // The Area style: the candle-up line over a flat, faint fill of the same
+    // colour, ending in a still 4 px dot. Without this the library draws its
+    // own blue, a gradient and a rippling end point; the ripple is drawn even
+    // when its animation is off, so it gets the dot's own radius and colour.
+    area: {
+      lineSize: 2,
+      lineColor: C.up,
+      smooth: false,
+      value: 'close',
+      backgroundColor: alpha(C.up, 0.1),
+      point: { show: true, color: C.up, radius: 4, rippleColor: C.up, rippleRadius: 4, animation: false, animationDuration: 0 },
+    },
   },
   indicator: {
     lines: [{ color: C.indicator, size: 1.5, style: 'solid', smooth: false }],

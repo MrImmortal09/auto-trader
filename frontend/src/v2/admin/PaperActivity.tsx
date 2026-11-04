@@ -11,7 +11,7 @@ import { Chip } from '../ui/Chip';
 import { Segment } from '../ui/Segment';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
-const SELECT = 'h-8 appearance-none rounded-6 border border-line bg-panel pl-2 pr-7 type-body text-fg outline-none transition-colors duration-120 focus:border-accent';
+const SELECT = 'h-8 appearance-none rounded-6 border border-line bg-panel pl-2 pr-7 type-body text-fg transition-colors duration-120 focus:border-accent';
 
 type Range = 'today' | '7d' | 'all';
 const RANGES: { value: Range; label: string }[] = [
@@ -130,8 +130,9 @@ export function PaperTrades({ serverBase, users, desktop }: { serverBase: string
           <Row
             key={t.id}
             title={
-              <span className="flex min-w-0 items-center gap-2">
-                <Chip kind={buy ? 'profit' : 'neutral'}>{buy ? 'Buy' : 'Sell'}</Chip>
+              // On a phone the name drops under the contract (Inter's width) rather than both being cut.
+              <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+                <Chip kind={buy ? 'profit' : 'loss'}>{buy ? 'Buy' : 'Sell'}</Chip>
                 <span className="truncate">{t.contract}</span>
                 <span className="truncate font-normal text-fg-muted">{nameOf(users, t.user_id)}</span>
                 {t.before_reset && <Chip>Before reset</Chip>}
@@ -155,7 +156,7 @@ export function PaperTrades({ serverBase, users, desktop }: { serverBase: string
     <Section title="Paper trades" lead="Every user's buys and sells, newest first, with each sell's P&L after charges. Trades from before a user started over are kept, marked. Read-only.">
       {controls}
       {rows}
-      {d && d.more > 0 && <p className="border-t border-line px-4 py-3 type-caption text-fg-subtle tnum">{`${plural(d.more, 'older trade')} not shown · Pick one user or a shorter range to see them.`}</p>}
+      {d && d.more > 0 && <Row title={`${plural(d.more, 'older trade')} not shown`} caption="Pick one user or a shorter range to see them." />}
     </Section>
   );
 }

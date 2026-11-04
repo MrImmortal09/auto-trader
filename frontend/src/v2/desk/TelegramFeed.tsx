@@ -46,7 +46,7 @@ export function TelegramFeed({ feed, error, showTitle = true }: { feed: FeedAnsw
           <select
             value={filter === 'all' ? 'all' : String(filter)}
             onChange={(e) => setChat(e.target.value === 'all' ? 'all' : Number(e.target.value))}
-            className="h-7 appearance-none rounded-6 border border-line bg-panel pl-2.5 pr-7 type-label text-fg-muted outline-none transition-colors duration-120 hover:text-fg focus:border-accent"
+            className="h-7 appearance-none rounded-6 border border-line bg-panel pl-2.5 pr-7 type-label text-fg-muted transition-colors duration-120 hover:text-fg focus:border-accent"
           >
             <option value="all">All channels</option>
             {channels.map((c) => (

@@ -5,7 +5,7 @@ import { useGuard } from '../shell/useGuard';
 import { NumberInput } from '../ui/NumberInput';
 import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
-import { LINK_BUTTON, Row, Section } from './parts';
+import { LINK_BUTTON, LINK_BUTTON_LG, Row, Section } from './parts';
 import { uptimeText } from './summary';
 import { UpdateServer } from './UpdateServer';
 import type { SettingsState } from './useSettings';
@@ -66,7 +66,7 @@ export function ServerData({ serverBase, settings, system, onRestarted, id, titl
         <UpdateServer serverBase={serverBase} size={size} onRestarted={onRestarted} />
       </Row>
       <Row title="Clear the database" caption="In the old design, which asks first.">
-        <a href="/v1/settings" className={LINK_BUTTON}>
+        <a href="/v1/settings" className={large ? LINK_BUTTON_LG : LINK_BUTTON}>
           Open
         </a>
       </Row>
