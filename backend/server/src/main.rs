@@ -16,6 +16,7 @@ mod instruments;
 mod market_data;
 mod paper;
 mod pulse;
+mod quotes;
 mod routes;
 mod scrip_files;
 mod system;
@@ -169,6 +170,10 @@ pub(crate) struct AppState {
     /// Signed-in users' own paper portfolios — see `paper`. Nothing in it
     /// reaches the owner's engine or the broker.
     pub paper: Arc<paper::PaperDesk>,
+    /// Quotes for the catalog's instruments: Kotak REST, the feed's tick for
+    /// keys it carries, Upstox while Kotak is down, the 15:35 close after
+    /// hours — see `quotes`. Its own map; it never writes `prices`.
+    pub quotes: Arc<quotes::QuoteHub>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,6 +1045,27 @@ async fn main() {
             .expect("cannot read the users' paper positions"),
     );
 
+    // 9e. The quote hub: what the search and the instrument page price
+    // by. Its poller asks Kotak only while the session watchdog finds the
+    // session healthy, and its close sweep runs at 15:35 IST.
+    let quotes = {
+        let catalog = Arc::clone(&instruments);
+        Arc::new(quotes::QuoteHub::new(Arc::clone(&prices), Box::new(move |key: &str| catalog.upstox_key(key))))
+    };
+    quotes::spawn(
+        Arc::clone(&quotes),
+        quotes::Deps {
+            kotak: Arc::clone(&kotak_client_opt),
+            healthy: Arc::clone(&kotak_session_healthy),
+            upstox: upstox.clone(),
+            pool: pool.clone(),
+            catalog: Arc::clone(&instruments),
+            paper: Arc::clone(&paper_desk),
+            positions: Arc::clone(&positions),
+        },
+    )
+    .await;
+
     // 10. Router
     let state = AppState {
         signal_tx,
@@ -1071,6 +1097,7 @@ async fn main() {
         limits: Arc::new(auth::ratelimit::Limiter::new()),
         whatsapp,
         paper: paper_desk,
+        quotes,
     };
     pulse::spawn_sampler(state.clone());
     // Users' paper positions: chart levels and the expiry square-off, and

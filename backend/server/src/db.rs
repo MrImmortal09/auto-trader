@@ -255,6 +255,25 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    // The close snapshot the quote hub sweeps at 15:35 IST (see
+    // `quotes::eod`): one row per instrument per day, served as the day's
+    // close once the Kotak session is cleared and until the next login. New
+    // table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS quote_eod (
+            key TEXT NOT NULL,
+            day TEXT NOT NULL,
+            ltp REAL NOT NULL,
+            close REAL,
+            open REAL,
+            high REAL,
+            low REAL,
+            volume REAL,
+            taken_at TEXT NOT NULL,
+            PRIMARY KEY (key, day)
+        )",
+    ).execute(&pool).await.unwrap();
+
     // Upstox option-chain analytics (see `market_data.rs`). New table, so this
     // is backward compatible with existing databases.
     sqlx::query(

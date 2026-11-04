@@ -68,6 +68,9 @@ struct SystemAnswer {
     /// The instrument catalog: its data day, rows and last error — see
     /// `instruments`.
     catalog: crate::instruments::CatalogStatus,
+    /// The quote hub: what it polls, its calls and the close on file — see
+    /// `quotes`.
+    quotes: crate::quotes::HubStatus,
 }
 
 fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
@@ -185,6 +188,7 @@ pub async fn system_handler(State(state): State<AppState>) -> Response {
         kotak: Kotak { relogins, logged_in_at },
         upstox: Upstox { configured: state.market.configured, token_expires },
         catalog: state.instruments.status(),
+        quotes: state.quotes.status(),
     })
     .into_response()
 }

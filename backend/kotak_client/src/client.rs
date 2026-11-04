@@ -325,6 +325,190 @@ fn find_csv_url(val: &serde_json::Value, segment: &str) -> Option<String> {
     None
 }
 
+/// Day's open, high and low, and the previous close, of a [`KotakQuote`]
+/// (`ohlc` in the quotes response; `close` is the *previous* close).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct KotakOhlc {
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub close: Option<f64>,
+}
+
+/// One instrument's quote from the REST quotes API, every documented field
+/// read leniently (`kotak-api-docs/quotes.md` §5 — the API sends them all as
+/// strings): a field that is missing or unreadable is `None`, never an
+/// error, so a response shaped a little differently from the documentation
+/// still yields what it carries. `depth` is not kept.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct KotakQuote {
+    /// `pSymbol` for a contract or an equity; an index's name.
+    pub exchange_token: String,
+    pub display_symbol: String,
+    /// `nse_cm`, `nse_fo`, `bse_cm`, `bse_fo`, …
+    pub exchange: String,
+    /// `lstup_time`: Unix seconds of the last update.
+    pub updated_at: Option<i64>,
+    pub ltp: Option<f64>,
+    pub last_traded_quantity: Option<f64>,
+    /// Top bid quantity.
+    pub total_buy: Option<f64>,
+    /// Top offer quantity.
+    pub total_sell: Option<f64>,
+    /// `last_volume`, documented as "most recent trade volume".
+    pub last_volume: Option<f64>,
+    /// Net change from the previous close.
+    pub change: Option<f64>,
+    pub per_change: Option<f64>,
+    /// Open interest, when the response carries one (`oi` filter, F&O).
+    pub oi: Option<f64>,
+    pub year_high: Option<f64>,
+    pub year_low: Option<f64>,
+    pub ohlc: KotakOhlc,
+}
+
+impl KotakQuote {
+    /// `<exchange>|<exchange_token>` — the key the quote was asked for by.
+    pub fn key(&self) -> String {
+        format!("{}|{}", self.exchange, self.exchange_token)
+    }
+
+    fn from_object(map: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let text = |name: &str| map.get(name).map(loose_text).unwrap_or_default();
+        let number = |name: &str| map.get(name).and_then(loose_f64);
+        let ohlc = map.get("ohlc").and_then(|v| v.as_object());
+        let ohlc_number = |name: &str| ohlc.and_then(|o| o.get(name)).and_then(loose_f64);
+        KotakQuote {
+            exchange_token: text("exchange_token"),
+            display_symbol: text("display_symbol"),
+            exchange: text("exchange"),
+            updated_at: map.get("lstup_time").and_then(loose_i64),
+            ltp: number("ltp"),
+            last_traded_quantity: number("last_traded_quantity"),
+            total_buy: number("total_buy"),
+            total_sell: number("total_sell"),
+            last_volume: number("last_volume"),
+            change: number("change"),
+            per_change: number("per_change"),
+            oi: number("oi").or_else(|| number("open_interest")).or_else(|| number("openInterest")),
+            year_high: number("year_high"),
+            year_low: number("year_low"),
+            ohlc: KotakOhlc {
+                open: ohlc_number("open"),
+                high: ohlc_number("high"),
+                low: ohlc_number("low"),
+                close: ohlc_number("close"),
+            },
+        }
+    }
+}
+
+/// A JSON string or number as text; anything else as its JSON.
+fn loose_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// A finite number from a JSON number or a numeric string (`"81809.3400"`);
+/// `None` for anything else, an empty string included.
+fn loose_f64(v: &serde_json::Value) -> Option<f64> {
+    let n = match v {
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    n.is_finite().then_some(n)
+}
+
+fn loose_i64(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+        }
+        _ => None,
+    }
+}
+
+/// Set once the first quotes response has had its shape logged.
+static QUOTE_SHAPE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The field names of a quotes response, for the one-time log: the first
+/// element's keys (its `ohlc` and `depth` objects summarised), or an error
+/// object's keys.
+fn quote_shape(value: &serde_json::Value) -> String {
+    fn keys(map: &serde_json::Map<String, serde_json::Value>) -> String {
+        let mut names: Vec<String> = map
+            .iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::Object(inner) if k == "ohlc" => format!("{k}{{{}}}", keys(inner)),
+                serde_json::Value::Object(_) => format!("{k}{{…}}"),
+                serde_json::Value::Array(items) => format!("{k}[{}]", items.len()),
+                _ => k.clone(),
+            })
+            .collect();
+        names.sort();
+        names.join(", ")
+    }
+    match value {
+        serde_json::Value::Array(items) => match items.first() {
+            Some(serde_json::Value::Object(first)) => format!("array of {} {{{}}}", items.len(), keys(first)),
+            Some(other) => format!("array of {} starting with {other}", items.len()),
+            None => "empty array".to_string(),
+        },
+        serde_json::Value::Object(map) => format!("object {{{}}}", keys(map)),
+        other => format!("{other}"),
+    }
+}
+
+/// `body` up to 200 characters, for an error message.
+fn snippet(body: &str) -> String {
+    let short: String = body.chars().take(200).collect();
+    if short.len() < body.len() { format!("{short}…") } else { short }
+}
+
+/// The quotes in a response body: an array of quote objects on success,
+/// else the documented error object (`stat`, `emsg`, `stCode`), mapped to
+/// [`KotakError::ApiError`] with Kotak's own code.
+fn parse_quotes(body: &str, http_status: u16) -> Result<Vec<KotakQuote>, KotakError> {
+    let value: serde_json::Value = serde_json::from_str(body)?;
+    if !QUOTE_SHAPE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(shape = %quote_shape(&value), "Kotak quotes: first response shape");
+    }
+    let items = match &value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(map) => match map.get("data") {
+            Some(serde_json::Value::Array(items)) => items,
+            _ => {
+                let stat = map.get("stat").map(loose_text).unwrap_or_default();
+                let message = map
+                    .get("emsg")
+                    .or_else(|| map.get("errMsg"))
+                    .or_else(|| map.get("message"))
+                    .map(loose_text)
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| snippet(body));
+                let status_code = map.get("stCode").and_then(loose_i64).unwrap_or(http_status as i64) as i32;
+                return Err(KotakError::ApiError {
+                    status_code,
+                    message: if stat.is_empty() { message } else { format!("{message} ({stat})") },
+                });
+            }
+        },
+        _ => {
+            return Err(KotakError::ApiError {
+                status_code: http_status as i32,
+                message: format!("unexpected quotes response: {}", snippet(body)),
+            })
+        }
+    };
+    Ok(items.iter().filter_map(|v| v.as_object()).map(KotakQuote::from_object).collect())
+}
+
 // ---------------------------------------------------------------------------
 // KotakClient
 // ---------------------------------------------------------------------------
@@ -373,6 +557,10 @@ fn check_session_status(resp: reqwest::Response) -> Result<reqwest::Response, Ko
 /// checks). Order placement and cancels keep the full 30 s: giving up on a
 /// send early only turns it into an ambiguous outcome.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Timeout for a quotes call. A background poller's read, never the engine's
+/// tick, but a stalled one would hold that poller's whole cycle.
+const QUOTES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Async HTTP client for the Kotak Neo Trade API.
 #[derive(Clone)]
@@ -548,6 +736,47 @@ impl KotakClient {
 
         let csv_text = self.http.get(&csv_url).send_timed("scrip_master_csv").await?.text().await?;
         Ok(csv_text)
+    }
+
+    /// Quotes for `keys` — each `<exchange_segment>|<pSymbol>`, or an index
+    /// by its exact, case-sensitive name (`nse_cm|Nifty 50`) — via
+    /// `GET {baseUrl}/script-details/1.0/quotes/neosymbol/<keys>/<filter>`,
+    /// `filter` one of `all`, `ltp`, `ohlc`, `oi`, `depth`, `52W`,
+    /// `circuit_limits`, `scrip_details` (`kotak-api-docs/quotes.md`). Like
+    /// the scrip master, the call is authorised by the dashboard access
+    /// token alone; the session supplies only the base URL, which is why no
+    /// quote is possible once the session is cleared.
+    ///
+    /// How many keys one call may carry, and whether these calls count
+    /// against the 10 requests a second the trading APIs share, are not
+    /// documented: the caller batches and shrinks on a refusal. An HTTP
+    /// error or a `Not_Ok` body is [`KotakError::ApiError`] with the HTTP
+    /// status or Kotak's `stCode`, so 429 can be told apart from a refusal.
+    pub async fn quotes(&self, keys: &[String], filter: &str) -> Result<Vec<KotakQuote>, KotakError> {
+        let sess = self.session.as_ref().ok_or(KotakError::NotAuthenticated)?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The URL crate percent-encodes the spaces of an index name; `|` and
+        // `,` go as they are, as the documented example sends them.
+        let url = format!("{}/script-details/1.0/quotes/neosymbol/{}/{}", sess.base_url, keys.join(","), filter);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(QUOTES_TIMEOUT)
+            .header("Authorization", self.access_token.trim())
+            .header(header::CONTENT_TYPE, "application/json")
+            .send_timed("quotes")
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(KotakError::ApiError {
+                status_code: status.as_u16() as i32,
+                message: format!("HTTP {}: {}", status.as_u16(), snippet(&body)),
+            });
+        }
+        parse_quotes(&body, status.as_u16())
     }
 
     /// Place a live order via `POST {baseUrl}/quick/order/rule/ms/place`.
@@ -956,6 +1185,78 @@ mod tests {
         assert_eq!(
             find_csv_url(&sample_response, "mcx_fo"),
             None
+        );
+    }
+
+    #[test]
+    fn quotes_parse_the_documented_response_with_every_field_a_string() {
+        // The sample response of kotak-api-docs/quotes.md §5, plus an `oi`.
+        let body = r#"[{
+            "exchange_token": "SENSEX", "display_symbol": "SENSEX-IN", "exchange": "bse_cm",
+            "lstup_time": "1757915078", "ltp": "81809.3400", "last_traded_quantity": "0",
+            "total_buy": "0", "total_sell": "0", "last_volume": "0", "change": "-95.3600",
+            "per_change": "-0.1200", "year_high": "0", "year_low": "0",
+            "ohlc": { "open": "81925.5100", "high": "81998.5100", "low": "81779.8200", "close": "81904.7000" },
+            "depth": { "buy": [{ "price": "0", "quantity": "0", "orders": "0" }], "sell": [] }
+        }, {
+            "exchange_token": "51386", "exchange": "nse_fo", "ltp": 142.5, "oi": 1234567, "lstup_time": 1757915078,
+            "ohlc": { "open": "", "high": "n/a" }
+        }]"#;
+        let quotes = super::parse_quotes(body, 200).unwrap();
+        assert_eq!(quotes.len(), 2);
+        let sensex = &quotes[0];
+        assert_eq!(sensex.key(), "bse_cm|SENSEX");
+        assert_eq!(sensex.display_symbol, "SENSEX-IN");
+        assert_eq!(sensex.updated_at, Some(1_757_915_078));
+        assert_eq!(sensex.ltp, Some(81_809.34));
+        assert_eq!(sensex.change, Some(-95.36));
+        assert_eq!(sensex.per_change, Some(-0.12));
+        assert_eq!(sensex.last_volume, Some(0.0));
+        assert_eq!(sensex.oi, None);
+        assert_eq!(
+            sensex.ohlc,
+            super::KotakOhlc { open: Some(81_925.51), high: Some(81_998.51), low: Some(81_779.82), close: Some(81_904.70) }
+        );
+        // Numbers as numbers, blanks and junk as None, missing fields tolerated.
+        let option = &quotes[1];
+        assert_eq!(option.key(), "nse_fo|51386");
+        assert_eq!(option.ltp, Some(142.5));
+        assert_eq!(option.oi, Some(1_234_567.0));
+        assert_eq!(option.updated_at, Some(1_757_915_078));
+        assert_eq!(option.ohlc, super::KotakOhlc::default());
+        assert_eq!(option.change, None);
+        assert!(option.display_symbol.is_empty());
+        // A `data` envelope is read the same way.
+        assert_eq!(super::parse_quotes(r#"{"data": [{"exchange_token": "1", "exchange": "nse_cm", "ltp": "1"}]}"#, 200).unwrap().len(), 1);
+        assert!(super::parse_quotes("[]", 200).unwrap().is_empty());
+    }
+
+    #[test]
+    fn quotes_errors_carry_kotaks_code_or_the_http_status() {
+        let err = super::parse_quotes(r#"{"stat": "Not_Ok", "emsg": "Invalid instrument/code", "stCode": 1009}"#, 200).unwrap_err();
+        match err {
+            crate::KotakError::ApiError { status_code, message } => {
+                assert_eq!(status_code, 1009);
+                assert_eq!(message, "Invalid instrument/code (Not_Ok)");
+            }
+            other => panic!("expected ApiError, got {other}"),
+        }
+        // An error object with no code takes the HTTP status; junk is a JSON error.
+        match super::parse_quotes(r#"{"message": "nope"}"#, 200).unwrap_err() {
+            crate::KotakError::ApiError { status_code, message } => {
+                assert_eq!(status_code, 200);
+                assert_eq!(message, "nope");
+            }
+            other => panic!("expected ApiError, got {other}"),
+        }
+        assert!(matches!(super::parse_quotes("<html>", 200).unwrap_err(), crate::KotakError::Json(_)));
+        match super::parse_quotes("42", 200).unwrap_err() {
+            crate::KotakError::ApiError { status_code: 200, message } => assert!(message.starts_with("unexpected quotes response")),
+            other => panic!("expected ApiError, got {other}"),
+        }
+        assert_eq!(
+            super::quote_shape(&serde_json::from_str(r#"[{"ltp": "1", "ohlc": {"open": "1"}, "depth": {"buy": []}}]"#).unwrap()),
+            "array of 1 {depth{…}, ltp, ohlc{open}}"
         );
     }
 }

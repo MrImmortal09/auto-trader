@@ -198,6 +198,36 @@ impl Catalog {
         Arc::clone(&self.index.read().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// The price-map key of every equity and index in the catalog: what
+    /// the quote hub's close sweep asks Kotak for. From the search list in
+    /// memory; the contract rows are not touched.
+    pub fn cash_keys(&self) -> Vec<String> {
+        self.index()
+            .entries()
+            .iter()
+            .filter(|u| matches!(u.kind, UnderlyingKind::Index | UnderlyingKind::Equity))
+            .filter_map(|u| u.ws_key.clone())
+            .collect()
+    }
+
+    /// Upstox's instrument key for a cash or index row's price-map key: an
+    /// equity by its ISIN (`NSE_EQ|INE002A01018`), one of the six indices by
+    /// the name Upstox gives it. `None` for a contract: whether Kotak's and
+    /// Upstox's F&O tokens are the same number is not verified, and a wrong
+    /// price is worse than none.
+    pub fn upstox_key(&self, ws_key: &str) -> Option<String> {
+        let index = self.index();
+        let u = index.by_ws_key(ws_key)?;
+        match u.kind {
+            UnderlyingKind::Index => crate::candles::symbols::upstox_index_key(&u.symbol).map(str::to_string),
+            UnderlyingKind::Equity => {
+                let isin = u.isin.as_deref().map(str::trim).filter(|i| !i.is_empty())?;
+                Some(format!("{}_EQ|{isin}", u.exchange.as_deref().unwrap_or("NSE")))
+            }
+            UnderlyingKind::FoOnly => None,
+        }
+    }
+
     fn set_index(&self, index: Arc<SearchIndex>) {
         *self.index.write().unwrap_or_else(|e| e.into_inner()) = index;
     }

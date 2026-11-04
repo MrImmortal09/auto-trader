@@ -111,6 +111,8 @@ pub struct SearchIndex {
     words: Vec<Vec<String>>,
     upper_names: Vec<String>,
     by_symbol: HashMap<String, usize>,
+    /// By the cash or index row's price-map key.
+    by_ws_key: HashMap<String, usize>,
 }
 
 impl SearchIndex {
@@ -120,7 +122,8 @@ impl SearchIndex {
         let words = entries.iter().map(|e| tokens(&format!("{} {}", e.symbol, e.name))).collect();
         let upper_names = entries.iter().map(|e| e.name.to_uppercase()).collect();
         let by_symbol = entries.iter().enumerate().map(|(i, e)| (e.symbol.clone(), i)).collect();
-        Self { entries, words, upper_names, by_symbol }
+        let by_ws_key = entries.iter().enumerate().filter_map(|(i, e)| e.ws_key.clone().map(|k| (k, i))).collect();
+        Self { entries, words, upper_names, by_symbol, by_ws_key }
     }
 
     pub fn empty() -> Self {
@@ -137,6 +140,11 @@ impl SearchIndex {
 
     pub fn get(&self, symbol: &str) -> Option<&Underlying> {
         self.by_symbol.get(symbol).map(|&i| &self.entries[i])
+    }
+
+    /// The underlying whose cash or index row ticks under `ws_key`.
+    pub fn by_ws_key(&self, ws_key: &str) -> Option<&Underlying> {
+        self.by_ws_key.get(ws_key).map(|&i| &self.entries[i])
     }
 
     /// The underlyings `text` matches, best first: by tier, then F&O

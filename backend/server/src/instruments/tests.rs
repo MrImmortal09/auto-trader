@@ -583,3 +583,36 @@ fn the_catalog_agrees_with_the_engine_on_strikes_and_expiries() {
     assert_eq!(idea.normalized_strike(), None);
     assert_eq!(strike_of(&idea.trading_symbol, &idea.option_type, idea.strike_price), Some(7.5));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_quote_hub_gets_the_cash_keys_and_upstox_keys_from_the_search_list() {
+    let scratch = Scratch::new("quote-keys");
+    let catalog = scratch.catalog().await;
+    assert!(catalog.cash_keys().is_empty());
+    assert_eq!(catalog.upstox_key("nse_cm|2885"), None);
+    scratch.write_all();
+    loaded(catalog.load_if_changed("test").await);
+
+    // Every equity and index row's price-map key, no contract's.
+    let keys: HashSet<String> = catalog.cash_keys().into_iter().collect();
+    assert_eq!(keys.len(), 18 + 6);
+    for key in ["nse_cm|2885", "nse_cm|99002", "idx|NIFTY 50", "idx|SENSEX", "idx|NIFTY MID SELECT"] {
+        assert!(keys.contains(key), "{key}");
+    }
+    assert!(keys.iter().all(|k| k.starts_with("nse_cm|") || k.starts_with("idx|")), "{keys:?}");
+
+    // An equity by its ISIN, an index by Upstox's name; a contract, an
+    // equity with no ISIN and an F&O-only underlying have none.
+    assert_eq!(catalog.upstox_key("nse_cm|2885").as_deref(), Some("NSE_EQ|INE002A01018"));
+    assert_eq!(catalog.upstox_key("nse_cm|11536").as_deref(), Some("NSE_EQ|INE467B01029"));
+    assert_eq!(catalog.upstox_key("idx|NIFTY 50").as_deref(), Some("NSE_INDEX|Nifty 50"));
+    assert_eq!(catalog.upstox_key("idx|SENSEX").as_deref(), Some("BSE_INDEX|SENSEX"));
+    assert_eq!(catalog.upstox_key("nse_fo|51386"), None);
+    assert_eq!(catalog.upstox_key("nse_cm|99003"), None, "JUNK is not in the catalog");
+    assert_eq!(catalog.upstox_key("nse_cm|9999999"), None);
+
+    // Both survive a restart from the saved search list.
+    let again = scratch.catalog().await;
+    assert_eq!(again.cash_keys().len(), 24);
+    assert_eq!(again.upstox_key("nse_cm|2885").as_deref(), Some("NSE_EQ|INE002A01018"));
+}
