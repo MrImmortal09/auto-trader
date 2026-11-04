@@ -31,13 +31,13 @@ export function OiByStrike({ chain, basis, window, configured }: {
   const spotAt = spot == null ? -1 : rows.findIndex((s) => s.strike > spot);
 
   return (
-    <section className="flex min-w-0 flex-col rounded-12 bg-panel p-4">
+    <section className="flex min-w-0 flex-col rounded-12 border border-line bg-panel p-4">
       <h3 className="type-title text-fg">{basis === 'chg' ? 'Change in OI by strike' : 'Total OI by strike'}</h3>
-      <p className="mt-0.5 type-caption text-fg-muted">
+      <p className="mt-0.5 type-caption text-fg-subtle">
         {windowLabel(window)} · in lakh{basis === 'chg' ? ', since yesterday' : ''}
       </p>
       {rows.length === 0 ? (
-        <p className="py-8 text-center type-body text-fg-muted">
+        <p className="py-8 text-center type-body text-fg-subtle">
           {configured ? 'The option chain shows once Upstox has been polled, in market hours.' : "Upstox isn't set up on the server."}
         </p>
       ) : (
@@ -56,6 +56,7 @@ export function OiByStrike({ chain, basis, window, configured }: {
             {rows.map((s, i) => {
               const [c, p] = values[i];
               const atm = s.strike === chain?.atm_strike;
+              // A fall in OI is an outline in the bar's colour, not a faded fill.
               return (
                 <Fragment key={s.strike}>
                   {i === spotAt && spot != null && (
@@ -67,13 +68,13 @@ export function OiByStrike({ chain, basis, window, configured }: {
                   )}
                   <div className="flex items-center justify-end gap-2">
                     <span className="num-small text-fg-muted">{barValue(c)}</span>
-                    <span className={`h-2.5 rounded-l-[2px] bg-fg-muted ${c < 0 ? 'opacity-40' : ''}`} style={{ width: `calc((100% - 40px) * ${(Math.abs(c) / widest).toFixed(4)})` }} />
+                    <span className={`h-2.5 rounded-l-[2px] ${c < 0 ? 'border border-fg-muted bg-transparent' : 'bg-fg-muted'}`} style={{ width: `calc((100% - 40px) * ${(Math.abs(c) / widest).toFixed(4)})` }} />
                   </div>
                   <div className="flex justify-center">
-                    <span className={`rounded-4 px-1.5 num-small ${atm ? 'border border-line-strong text-fg' : 'text-fg-muted'}`}>{s.strike}</span>
+                    <span className={`rounded-4 px-1.5 num-small ${atm ? 'border border-line-strong text-fg' : 'text-fg-subtle'}`}>{s.strike}</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className={`h-2.5 rounded-r-[2px] bg-chart-indicator ${p < 0 ? 'opacity-40' : ''}`} style={{ width: `calc((100% - 40px) * ${(Math.abs(p) / widest).toFixed(4)})` }} />
+                    <span className={`h-2.5 rounded-r-[2px] ${p < 0 ? 'border border-chart-indicator bg-transparent' : 'bg-chart-indicator'}`} style={{ width: `calc((100% - 40px) * ${(Math.abs(p) / widest).toFixed(4)})` }} />
                     <span className="num-small text-fg-muted">{barValue(p)}</span>
                   </div>
                 </Fragment>

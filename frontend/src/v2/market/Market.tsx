@@ -145,7 +145,7 @@ export function Market({ serverBase, desktop, canReadOwner }: {
     return (
       <div className="flex flex-col gap-3 p-4">
         <Segment label="Index" size="lg" stretch value={index} onChange={setIndex} options={MARKET_INDICES.map((i) => ({ value: i.id, label: i.label }))} />
-        {!configured && <p className="rounded-12 bg-panel p-4 type-body text-fg-muted">{caption}</p>}
+        {!configured && <p className="rounded-12 border border-line bg-panel p-4 type-body text-fg-subtle">{caption}</p>}
         {card(index, MARKET_INDICES.find((i) => i.id === index)!.label)}
         <div className="h-[300px]">{chart}</div>
         <div className="flex flex-col gap-2">
@@ -162,7 +162,7 @@ export function Market({ serverBase, desktop, canReadOwner }: {
     <div className="flex flex-col gap-4 p-6">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <Segment label="Index" value={index} onChange={setIndex} options={MARKET_INDICES.map((i) => ({ value: i.id, label: i.label }))} />
-        <span className="type-caption text-fg-muted">{caption}</span>
+        <span className="type-caption text-fg-subtle tnum">{caption}</span>
         <span className="flex-1" />
         <span className="type-label text-fg-muted">Strikes</span>
         {strikes}
