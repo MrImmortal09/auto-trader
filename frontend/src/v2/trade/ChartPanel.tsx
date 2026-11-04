@@ -97,12 +97,14 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   }, [menu, chain, atm]);
 
   return (
-    <section className="@container flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-12 border border-line bg-panel">
-      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3">
-        <div className="relative">
-          <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} className="flex items-center gap-1 type-body-strong text-fg">
-            {symbolLabel(sym)}
-            <ChevronDown size={14} className="text-fg-muted" />
+    <section className="@container flex min-h-0 min-w-0 flex-1 flex-col rounded-12 border border-line bg-panel">
+      {/* Below 480 px (a phone, three charts side by side) the header tightens and the name
+          gives way with an ellipsis, so the price and the controls never wrap. */}
+      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 @max-[480px]:gap-1.5 @max-[480px]:px-2.5">
+        <div className="relative min-w-0">
+          <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} className="flex max-w-full items-center gap-1 type-body-strong text-fg">
+            <span className="truncate">{symbolLabel(sym)}</span>
+            <ChevronDown size={14} className="shrink-0 text-fg-muted" />
           </button>
           <Popover open={menu === 'pick'} onClose={close}>
             <div className="px-2 pt-1 pb-1.5 type-caption text-fg-muted">Index</div>
@@ -166,15 +168,16 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
         <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium text-fg ${flash.className}`}>
           {shown == null ? '—' : price(shown)}
         </span>
-        {pct != null && <span className={`num-small @max-[384px]:hidden ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</span>}
+        {pct != null && <span className={`num-small @max-[499px]:hidden ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</span>}
         <span className="flex-1" />
-        {/* The timeframe: a tablist where the header has room for one (measured:
-            an index chart's header needs 430-454 px with it, 353-382 with the
-            menu, 298-327 without the change), the menu where it hasn't — three
-            charts side by side — and on the phone. */}
+        {/* The timeframe: a tablist where the header has room for one, the menu
+            where it hasn't — three charts side by side — and on the phone.
+            Measured with the Draw button: an index chart's header needs 454-478 px
+            with the tablist and the change, 402-426 with the tablist alone,
+            318-347 with the menu alone; the change shows only from 500 px. */}
         <div className="relative flex items-center">
           {!compact && (
-            <div role="tablist" aria-label="Timeframe" className="flex gap-0.5 rounded-6 border border-line bg-inset p-0.5 @max-[440px]:hidden">
+            <div role="tablist" aria-label="Timeframe" className="flex gap-0.5 rounded-6 border border-line bg-inset p-0.5 @max-[447px]:hidden">
               {TFS.map((t) => (
                 <button key={t} type="button" role="tab" aria-selected={t === tf} onClick={() => onTf(t)} className={`h-6 rounded-4 px-2.5 type-label transition-colors duration-120 ${t === tf ? 'bg-panel text-accent shadow-sm' : 'text-fg-muted hover:text-fg'}`}>
                   {t}
@@ -186,7 +189,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             type="button"
             aria-expanded={menu === 'tf'}
             onClick={() => setMenu(menu === 'tf' ? null : 'tf')}
-            className={`flex h-8 items-center gap-1 rounded-6 border border-line px-2.5 type-label text-fg transition-colors duration-120 hover:bg-raised/40 ${compact ? '' : '@min-[440px]:hidden'}`}
+            className={`flex h-8 items-center gap-1 rounded-6 border border-line px-2.5 type-label text-fg transition-colors duration-120 hover:bg-raised/40 @max-[480px]:px-2 ${compact ? '' : '@min-[448px]:hidden'}`}
           >
             {tf}
             <ChevronDown size={14} className="text-fg-muted" />
@@ -253,7 +256,8 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           </button>
         )}
       </header>
-      <div className="relative min-h-0 flex-1">
+      {/* The chart is clipped to the panel's corners here, not by the panel: the header's menus may hang below it. */}
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-b-12">
         {lib === 'vela' ? (
           <Suspense fallback={null}>
             <VChart

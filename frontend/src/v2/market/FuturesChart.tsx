@@ -236,7 +236,7 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
   // The header is sized by the panel (a container): below 480 px — a phone — it tightens, the day
   // change hides and the name gives way with an ellipsis, so the price and the controls never wrap.
   return (
-    <section className="@container flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-12 border border-line bg-panel">
+    <section className="@container flex h-full min-h-0 min-w-0 flex-col rounded-12 border border-line bg-panel">
       <header className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-3 @max-[480px]:gap-1.5 @max-[480px]:px-2.5">
         <div className="relative min-w-0">
           <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} className="flex max-w-full items-center gap-1 type-body-strong text-fg">
@@ -296,7 +296,8 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
           </Popover>
         </div>
       </header>
-      <div className="relative min-h-0 flex-1">
+      {/* The chart is clipped to the panel's corners here, not by the panel: the header's menus may hang below it. */}
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-b-12">
         <div ref={host} className="absolute inset-0" />
         {drawing && <DrawBanner tool={drawing} onCancel={cancelDrawing} />}
         {(bars == null || error) && (

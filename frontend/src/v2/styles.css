@@ -225,6 +225,14 @@
   z-index: var(--z-index) !important;
 }
 
+/* Vela 0.9.0's dialogs (Indicators, the settings) open on a fixed positioner
+   whose own layer index is auto, which the rule above would keep, so the next
+   chart paints over them: they take the dialog layer's z-index instead. */
+.vela-workspace .vela-dialog-positioner,
+.vela-workspace .vela-dialog-positioner[data-part="positioner"] {
+  z-index: var(--vela-z-dialog, 40) !important;
+}
+
 /* Vela's own chrome (its drawing toolbar, menus, dialogs and tooltips) takes
    its colours from the seven theme keys VChart sets from the palette, plus a
    few fixed ones of its own: TradingView's blue, a cyan "bright" accent, an
