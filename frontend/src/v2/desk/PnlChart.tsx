@@ -1,9 +1,12 @@
 import { Area, AreaChart, CartesianGrid, ReferenceArea, ReferenceDot, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { axisMoney, dateRange, dayLabel, shortDate, signedMoney } from '../lib/format';
+import { PALETTE } from '../lib/palette';
 import type { CurvePoint, DayRow } from '../lib/types';
 
-// The design's tokens as plain values: SVG attributes can't read CSS variables.
-const C = { profit: '#22b47f', loss: '#ee705c', grid: '#2c3442', muted: '#8e97a7', fg: '#e8eaee', raised: '#2c3442', line: '#353e4d' };
+// The design's tokens as plain values: SVG attributes can't read CSS
+// variables. The chart draws on a white card: a recessive horizontal grid,
+// the third ink for the axes, a white ring around the dots.
+const C = { profit: PALETTE.profit, loss: PALETTE.loss, grid: PALETTE.grid, text: PALETTE.subtle, ring: PALETTE.surface, cursor: PALETTE.lineStrong };
 
 interface DayPoint {
   i: number;
@@ -47,7 +50,7 @@ export function PnlChart({ days, curve, maxDrawdown, height, compact = false }: 
 }) {
   const data = byDay(days);
   if (data.length === 0) {
-    return <div className="grid place-items-center type-body text-fg-muted" style={{ height }}>No closed calls in this range.</div>;
+    return <div className="grid place-items-center type-body text-fg-subtle" style={{ height }}>No closed calls in this range.</div>;
   }
   const last = data[data.length - 1];
   const color = last.pnl < 0 ? C.loss : C.profit;
@@ -67,12 +70,6 @@ export function PnlChart({ days, curve, maxDrawdown, height, compact = false }: 
     <div style={{ height }} role="img" aria-label={`Cumulative realised P&L, ending at ${signedMoney(last.pnl)}`}>
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={data} margin={{ top: 22, right: compact ? 4 : 0, bottom: 0, left: compact ? 4 : 0 }}>
-          <defs>
-            <linearGradient id="pnl-fill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={color} stopOpacity={0.28} />
-              <stop offset="100%" stopColor={color} stopOpacity={0.04} />
-            </linearGradient>
-          </defs>
           <CartesianGrid vertical={false} stroke={C.grid} />
           <XAxis
             dataKey="i"
@@ -84,7 +81,7 @@ export function PnlChart({ days, curve, maxDrawdown, height, compact = false }: 
               const i = Number(payload.value);
               const anchor = i === 0 ? 'start' : i === data.length - 1 ? 'end' : 'middle';
               return (
-                <text x={Number(x)} y={Number(y) + 12} fill={C.muted} fontSize={11} textAnchor={anchor}>
+                <text x={Number(x)} y={Number(y) + 12} fill={C.text} fontSize={11} textAnchor={anchor}>
                   {data[i] ? shortDate(data[i].date) : ''}
                 </text>
               );
@@ -97,7 +94,7 @@ export function PnlChart({ days, curve, maxDrawdown, height, compact = false }: 
             orientation="right"
             hide={compact}
             tickFormatter={(v: number) => axisMoney(v)}
-            tick={{ fill: C.muted, fontSize: 11 }}
+            tick={{ fill: C.text, fontSize: 11 }}
             tickLine={false}
             axisLine={false}
             width={52}
@@ -107,33 +104,34 @@ export function PnlChart({ days, curve, maxDrawdown, height, compact = false }: 
               x1={band.x1}
               x2={band.x2}
               fill={C.loss}
-              fillOpacity={0.16}
+              fillOpacity={0.1}
               stroke="none"
               label={{ value: bandLabel, position: 'insideTopLeft', fill: C.loss, fontSize: 11 }}
             />
           )}
           <Tooltip
-            cursor={{ stroke: C.line, strokeWidth: 1 }}
+            cursor={{ stroke: C.cursor, strokeWidth: 1 }}
             content={({ active, payload }) => {
               const p = active && payload?.[0] ? (payload[0].payload as DayPoint) : null;
               if (!p) return null;
               return (
-                <div className="rounded-8 border border-line bg-raised px-3 py-2 shadow-lg">
+                <div className="rounded-8 border border-line bg-panel px-3 py-2 shadow-md">
                   <div className="type-label text-fg">{dayLabel(p.date)}</div>
-                  <div className="mt-0.5 type-caption text-fg-muted tnum">
+                  <div className="mt-0.5 type-caption text-fg-subtle tnum">
                     To date {signedMoney(p.pnl)} · that day {signedMoney(p.net)}
                   </div>
                 </div>
               );
             }}
           />
-          <Area type="linear" dataKey="pnl" stroke={color} strokeWidth={2} fill="url(#pnl-fill)" isAnimationActive={false} activeDot={{ r: 4, fill: color, stroke: C.raised, strokeWidth: 2 }} />
+          {/* A flat fill under the line, in the line's own colour. */}
+          <Area type="linear" dataKey="pnl" stroke={color} strokeWidth={2} fill={color} fillOpacity={0.1} isAnimationActive={false} activeDot={{ r: 4, fill: color, stroke: C.ring, strokeWidth: 2 }} />
           <ReferenceDot
             x={last.i}
             y={last.pnl}
             r={4}
             fill={color}
-            stroke={C.raised}
+            stroke={C.ring}
             strokeWidth={2}
             label={
               compact
