@@ -1,3 +1,4 @@
+import { ChevronDown } from 'lucide-react';
 import type { TopupMode } from '../../types';
 import { NumberInput } from '../ui/NumberInput';
 import { Segment } from '../ui/Segment';
@@ -73,6 +74,7 @@ export function IndicatorSizing({ settings, id, title, large = false }: { settin
         <Row indent title="When it disagrees" caption="Keep the call waiting until it agrees, or drop it.">
           <Segment
             label="When it disagrees"
+            size={large ? 'lg' : 'sm'}
             value={cfg.indicator_wait_on_disagree ? 'wait' : 'drop'}
             disabled={!on}
             onChange={(v) => void save(() => ({ indicator_wait_on_disagree: v === 'wait' }), v === 'wait' ? 'Disagreeing calls wait' : 'Disagreeing calls are dropped')}
@@ -89,37 +91,43 @@ export function IndicatorSizing({ settings, id, title, large = false }: { settin
           <Toggle label="Top up when it agrees" checked={cfg.indicator_topup} disabled={!on} onChange={(v) => void save(() => ({ indicator_topup: v }), `Top-up ${v ? 'on' : 'off'}`)} />
         </Row>
         <Row indent stacked={large} title="Top-up rule" caption="Which reading tops up, and to which size">
-          <select
-            aria-label="Top-up rule"
-            value={cfg.indicator_topup_mode}
-            disabled={!on || !cfg.indicator_topup}
-            onChange={(e) => void save(() => ({ indicator_topup_mode: e.target.value as TopupMode }), `Top-up rule: ${TOPUP_RULES.find((r) => r.value === e.target.value)?.label}`)}
-            className={`rounded-6 border border-line bg-inset px-2.5 type-body text-fg outline-none focus:border-line-strong disabled:opacity-50 ${large ? 'h-11' : 'h-9'}`}
-          >
-            {TOPUP_RULES.map((r) => (
-              <option key={r.value} value={r.value}>
-                {r.label}
-              </option>
-            ))}
-          </select>
+          {/* A native select as a white well with its own chevron; color-scheme light keeps its menu light. */}
+          <span className={`relative ${!on || !cfg.indicator_topup ? 'opacity-50' : ''}`}>
+            <select
+              aria-label="Top-up rule"
+              value={cfg.indicator_topup_mode}
+              disabled={!on || !cfg.indicator_topup}
+              onChange={(e) => void save(() => ({ indicator_topup_mode: e.target.value as TopupMode }), `Top-up rule: ${TOPUP_RULES.find((r) => r.value === e.target.value)?.label}`)}
+              className={`w-full appearance-none border border-line bg-panel pl-2.5 pr-8 type-body text-fg outline-none transition-colors duration-120 focus:border-accent ${large ? 'h-11 rounded-8' : 'h-9 rounded-6'}`}
+            >
+              {TOPUP_RULES.map((r) => (
+                <option key={r.value} value={r.value}>
+                  {r.label}
+                </option>
+              ))}
+            </select>
+            <ChevronDown size={14} className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-fg-muted" />
+          </span>
         </Row>
         <Row title="Lower a stop only on a strong agree" caption="A channel moving a stop down applies only on +2 for CE or −2 for PE. Moving it up always applies.">
           <Toggle label="Lower a stop only on a strong agree" checked={cfg.indicator_sl_lower_gate} onChange={(v) => void save(() => ({ indicator_sl_lower_gate: v }), `Lower-stop check ${v ? 'on' : 'off'}`)} />
         </Row>
       </Section>
       <Section lead="How a check is scored: score = option signal + VWAP signal. Market shows the same.">
-        <Row title="Checks every" caption="Read one minute after each boundary; the first at 09:16">
-          <Segment label="Checks every" value={String(cfg.indicator_interval_min)} onChange={(v) => void save(() => ({ indicator_interval_min: Number(v) }), `Checks every ${v} min`)} options={INTERVALS.map((m) => ({ value: m, label: `${m} min` }))} />
+        <Row stacked={large} title="Checks every" caption="Read one minute after each boundary; the first at 09:16">
+          <Segment label="Checks every" size={large ? 'lg' : 'sm'} stretch={large} value={String(cfg.indicator_interval_min)} onChange={(v) => void save(() => ({ indicator_interval_min: Number(v) }), `Checks every ${v} min`)} options={INTERVALS.map((m) => ({ value: m, label: `${m} min` }))} />
         </Row>
         <Row title="Opening checks" caption="09:16 reads neutral, then 5-minute checks until the first regular one">
           <Toggle label="Opening checks" checked={cfg.indicator_early_checks} onChange={(v) => void save(() => ({ indicator_early_checks: v }), `Opening checks ${v ? 'on' : 'off'}`)} />
         </Row>
-        <Row title="Strikes" caption="Strikes each side of ATM that count">
-          <Segment label="Strikes" value={String(cfg.indicator_strike_window)} onChange={(v) => void save(() => ({ indicator_strike_window: Number(v) }), `Strikes: ${WINDOWS.find((w) => w.value === v)?.label}`)} options={WINDOWS} />
+        <Row stacked={large} title="Strikes" caption="Strikes each side of ATM that count">
+          <Segment label="Strikes" size={large ? 'lg' : 'sm'} stretch={large} value={String(cfg.indicator_strike_window)} onChange={(v) => void save(() => ({ indicator_strike_window: Number(v) }), `Strikes: ${WINDOWS.find((w) => w.value === v)?.label}`)} options={WINDOWS} />
         </Row>
-        <Row title="Basis" caption="Change since yesterday's close, or total open interest">
+        <Row stacked={large} title="Basis" caption="Change since yesterday's close, or total open interest">
           <Segment
             label="Basis"
+            size={large ? 'lg' : 'sm'}
+            stretch={large}
             value={cfg.indicator_basis}
             onChange={(v) => void save(() => ({ indicator_basis: v }), v === 'chg' ? 'Basis: change in OI' : 'Basis: total OI')}
             options={[

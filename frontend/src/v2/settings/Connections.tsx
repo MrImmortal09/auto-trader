@@ -7,7 +7,7 @@ import { useGuard } from '../shell/useGuard';
 import { Button } from '../ui/Button';
 import { useToast } from '../ui/toast';
 import { KotakDisconnectDialog, ServerDialog } from './dialogs';
-import { Row, Section, StateDot } from './parts';
+import { LINK_BUTTON, Row, Section, StateDot } from './parts';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -23,7 +23,15 @@ const V1_SETTINGS = '/v1/settings';
  * Connections: the server, Kotak, Telegram and Upstox — each with its
  * state, and what can be done about it from here.
  */
-export function Connections({ serverBase, health, system, id, title }: { serverBase: string; health: HealthSet | null; system: SystemAnswer | null; id?: string; title?: string }) {
+export function Connections({ serverBase, health, system, id, title, large = false }: {
+  serverBase: string;
+  health: HealthSet | null;
+  system: SystemAnswer | null;
+  id?: string;
+  title?: string;
+  /** Phone: the Kotak row's three controls go under its text, not beside it. */
+  large?: boolean;
+}) {
   const version = usePoll(() => getVersion(serverBase), 60_000, serverBase);
   const kotak = usePoll(() => getKotak(serverBase), 10_000, serverBase);
   const guard = useGuard();
@@ -66,26 +74,28 @@ export function Connections({ serverBase, health, system, id, title }: { serverB
           Change
         </Button>
       </Row>
-      <Row title="Kotak Neo" caption={kotakLine}>
-        <StateDot level={kotakState[0]}>{kotakState[1]}</StateDot>
-        {k?.has_env_credentials ? (
-          <Button size="sm" onClick={() => void reconnect()} disabled={connecting}>
-            {connecting ? 'Logging in…' : k.connected ? 'Reconnect' : 'Connect'}
-          </Button>
-        ) : (
-          <a href={V1_SETTINGS} className="inline-flex h-7 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">
-            Log in
-          </a>
-        )}
-        {k?.session_present && (
-          <Button size="sm" kind="ghost" onClick={() => setDialog('disconnect')}>
-            Disconnect
-          </Button>
-        )}
+      <Row stacked={large} title="Kotak Neo" caption={!k && kotak.error ? <span className="text-loss">{kotakLine}</span> : kotakLine}>
+        <div className="flex items-center gap-4">
+          <StateDot level={kotakState[0]}>{kotakState[1]}</StateDot>
+          {k?.has_env_credentials ? (
+            <Button size="sm" kind="accent" onClick={() => void reconnect()} disabled={connecting}>
+              {connecting ? 'Logging in…' : k.connected ? 'Reconnect' : 'Connect'}
+            </Button>
+          ) : (
+            <a href={V1_SETTINGS} className={LINK_BUTTON}>
+              Log in
+            </a>
+          )}
+          {k?.session_present && (
+            <Button size="sm" kind="ghost" onClick={() => setDialog('disconnect')}>
+              Disconnect
+            </Button>
+          )}
+        </div>
       </Row>
       <Row title="Telegram" caption={telegramLine}>
         <StateDot level={dot('telegram')}>{health?.telegram.level === 'ok' ? 'Connected' : 'Not running'}</StateDot>
-        <a href={V1_SETTINGS} className="inline-flex h-7 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">
+        <a href={V1_SETTINGS} className={LINK_BUTTON}>
           Manage channels
         </a>
       </Row>

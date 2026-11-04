@@ -77,9 +77,9 @@ export function UpdateServer({ serverBase, size, onRestarted }: { serverBase: st
             It downloads the latest release, restarts on it and checks it's healthy, going back to this one if not. For about a minute nothing
             watches the market or the positions, and Kotak disconnects; the new server logs in to Kotak again as it starts.
           </p>
-          {phase === 'waiting' && <p className="type-caption text-fg-muted">Waiting for the new server…</p>}
+          {phase === 'waiting' && <p className="type-caption text-fg-subtle">Waiting for the new server…</p>}
           <div className="mt-2 flex justify-end gap-2">
-            <Button size="md" kind="quiet" onClick={() => setAsking(false)} disabled={busy} data-autofocus>
+            <Button size="md" kind="neutral" onClick={() => setAsking(false)} disabled={busy} data-autofocus>
               Cancel
             </Button>
             <Button size="md" kind="alert" onClick={() => void run()} disabled={busy}>
