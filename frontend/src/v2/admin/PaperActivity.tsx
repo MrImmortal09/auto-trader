@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
+import { ChevronDown } from 'lucide-react';
 import { formatPhone } from '../auth/phone';
 import { getAdminPositions, getAdminTrades } from '../lib/api';
 import { hhmm, hhmmss, money, plural, price, shortDate, signedMoney, todayIst, toneOf } from '../lib/format';
@@ -10,7 +11,7 @@ import { Chip } from '../ui/Chip';
 import { Segment } from '../ui/Segment';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
-const SELECT = 'h-8 rounded-6 border border-line bg-inset px-2 type-body text-fg outline-none focus:border-line-strong';
+const SELECT = 'h-8 appearance-none rounded-6 border border-line bg-panel pl-2 pr-7 type-body text-fg outline-none transition-colors duration-120 focus:border-accent';
 
 type Range = 'today' | '7d' | 'all';
 const RANGES: { value: Range; label: string }[] = [
@@ -41,6 +42,11 @@ function nameOf(users: AdminUser[], id: number): string {
   return u ? u.name?.trim() || formatPhone(u.phone) : `User ${id}`;
 }
 
+/** One line in place of a card's rows: "Loading…", nothing to show, or (in loss) why it failed. */
+export function Note({ tone = 'subtle', children }: { tone?: 'subtle' | 'loss'; children: ReactNode }) {
+  return <p className={`border-t border-line px-4 py-3.5 type-body first:border-t-0 ${tone === 'loss' ? 'text-loss' : 'text-fg-subtle'}`}>{children}</p>;
+}
+
 /** "Wallet ₹9,88,000.00 · 2 open · today +₹1,500.00 · 14 trades". */
 export function PaperLine({ p }: { p: AdminPaper }) {
   const parts = [
@@ -50,7 +56,7 @@ export function PaperLine({ p }: { p: AdminPaper }) {
     p.resets ? `reset ${plural(p.resets, 'time')}` : null,
   ].filter(Boolean);
   return (
-    <div className="tnum">
+    <div className="text-fg-subtle tnum">
       {parts.join(' · ')} · today <span className={TONE_TEXT[toneOf(p.day_pnl)]}>{signedMoney(p.day_pnl)}</span>
     </div>
   );
@@ -63,15 +69,15 @@ export function PaperPositions({ serverBase, users }: { serverBase: string; user
   return (
     <Section title="Open paper positions" lead="What every user holds now, at the live price. Read-only.">
       {positions.data == null ? (
-        <Row title={positions.error ? `Couldn't load the positions: ${positions.error}` : 'Loading…'} />
+        <Note tone={positions.error ? 'loss' : 'subtle'}>{positions.error ? `Couldn't load the positions: ${positions.error}` : 'Loading…'}</Note>
       ) : list.length === 0 ? (
-        <Row title="Nobody holds a paper position" />
+        <Note>Nobody holds a paper position</Note>
       ) : (
         list.map((p) => (
-          <Row key={p.id} title={`${p.contract} · ${nameOf(users, p.user_id)}`} caption={`${p.qty} qty · avg ${price(p.avg)} · since ${when(p.opened_at)} · expires ${shortDate(p.expiry)}`}>
+          <Row key={p.id} title={`${p.contract} · ${nameOf(users, p.user_id)}`} caption={<span className="text-fg-subtle tnum">{`${p.qty} qty · avg ${price(p.avg)} · since ${when(p.opened_at)} · expires ${shortDate(p.expiry)}`}</span>}>
             <div className="shrink-0 text-right">
               <div className={`num-medium ${TONE_TEXT[toneOf(p.pnl)]}`}>{p.pnl == null ? '—' : signedMoney(p.pnl)}</div>
-              <div className="type-caption text-fg-muted tnum">{p.ltp == null ? 'No price yet' : price(p.ltp)}</div>
+              <div className="type-caption text-fg-subtle tnum">{p.ltp == null ? 'No price yet' : price(p.ltp)}</div>
             </div>
           </Row>
         ))
@@ -91,17 +97,20 @@ export function PaperTrades({ serverBase, users, desktop }: { serverBase: string
 
   const controls = (
     <div className={`flex gap-2 px-4 py-3 ${desktop ? 'items-center' : 'flex-col'}`}>
-      <select aria-label="User" value={user ?? ''} onChange={(e) => setUser(e.target.value ? Number(e.target.value) : null)} className={SELECT}>
-        <option value="">All users</option>
-        {traders.map((u) => (
-          <option key={u.id} value={u.id}>
-            {nameOf(users, u.id)}
-          </option>
-        ))}
-      </select>
+      <span className="relative flex items-center">
+        <select aria-label="User" value={user ?? ''} onChange={(e) => setUser(e.target.value ? Number(e.target.value) : null)} className={`${SELECT} ${desktop ? '' : 'w-full'}`}>
+          <option value="">All users</option>
+          {traders.map((u) => (
+            <option key={u.id} value={u.id}>
+              {nameOf(users, u.id)}
+            </option>
+          ))}
+        </select>
+        <ChevronDown size={14} aria-hidden className="pointer-events-none absolute right-2 text-fg-muted" />
+      </span>
       <Segment label="Range" size="sm" value={range} onChange={setRange} options={RANGES} stretch={!desktop} />
       {d && (
-        <span className={`type-caption text-fg-muted tnum ${desktop ? 'ml-auto' : ''}`}>
+        <span className={`type-caption text-fg-subtle tnum ${desktop ? 'ml-auto' : ''}`}>
           {plural(d.count, 'trade')} · sells booked <span className={TONE_TEXT[toneOf(d.realized)]}>{signedMoney(d.realized)}</span>
         </span>
       )}
@@ -110,9 +119,9 @@ export function PaperTrades({ serverBase, users, desktop }: { serverBase: string
 
   const rows =
     d == null ? (
-      <Row title={trades.error ? `Couldn't load the trades: ${trades.error}` : 'Loading…'} />
+      <Note tone={trades.error ? 'loss' : 'subtle'}>{trades.error ? `Couldn't load the trades: ${trades.error}` : 'Loading…'}</Note>
     ) : d.trades.length === 0 ? (
-      <Row title={range === 'today' ? 'No paper trades today' : 'No paper trades in this range'} />
+      <Note>{range === 'today' ? 'No paper trades today' : 'No paper trades in this range'}</Note>
     ) : (
       d.trades.map((t) => {
         const buy = t.action === 'BUY';
@@ -128,7 +137,7 @@ export function PaperTrades({ serverBase, users, desktop }: { serverBase: string
                 {t.before_reset && <Chip>Before reset</Chip>}
               </span>
             }
-            caption={[when(t.t, true), `${t.qty} @ ${price(t.price)}`, `charges ${money(t.charges)}`, reason || null].filter(Boolean).join(' · ')}
+            caption={<span className="text-fg-subtle tnum">{[when(t.t, true), `${t.qty} @ ${price(t.price)}`, `charges ${money(t.charges)}`, reason || null].filter(Boolean).join(' · ')}</span>}
           >
             <div className="shrink-0 text-right">
               {buy ? (
@@ -146,7 +155,7 @@ export function PaperTrades({ serverBase, users, desktop }: { serverBase: string
     <Section title="Paper trades" lead="Every user's buys and sells, newest first, with each sell's P&L after charges. Trades from before a user started over are kept, marked. Read-only.">
       {controls}
       {rows}
-      {d && d.more > 0 && <Row title={`${plural(d.more, 'older trade')} not shown`} caption="Pick one user or a shorter range to see them." />}
+      {d && d.more > 0 && <p className="border-t border-line px-4 py-3 type-caption text-fg-subtle tnum">{`${plural(d.more, 'older trade')} not shown · Pick one user or a shorter range to see them.`}</p>}
     </Section>
   );
 }
