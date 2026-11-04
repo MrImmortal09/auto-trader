@@ -16,6 +16,7 @@ mod market_data;
 mod paper;
 mod pulse;
 mod routes;
+mod scrip_files;
 mod system;
 
 use std::sync::Arc;
@@ -121,8 +122,9 @@ pub(crate) struct AppState {
     /// IST timestamp of the last successful Scrip Master download — see
     /// `routes::KotakLoginDeps::scrip_loaded_at`.
     pub scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
-    /// Raw CSV string for frontend download.
-    pub raw_scrip_csv: Arc<RwLock<Option<String>>>,
+    /// The scrip-master CSVs on disk, streamed by the admin's downloads —
+    /// see `scrip_files`. Only the parsed store above stays in memory.
+    pub scrip_files: scrip_files::ScripFiles,
     /// Handle to the currently running WebSocket task, so we can cancel it on re-auth.
     pub ws_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Channel sender to forward dynamic messages to the Node bridge.
@@ -182,7 +184,7 @@ struct KotakAutoLoginHandles {
     prices: Arc<DashMap<String, f64>>,
     positions: Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
     scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
-    raw_scrip_csv: Arc<RwLock<Option<String>>>,
+    scrip_files: scrip_files::ScripFiles,
     scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     login_lock: Arc<Mutex<()>>,
 }
@@ -199,7 +201,7 @@ impl KotakAutoLoginHandles {
             prices: &self.prices,
             positions: &self.positions,
             scrip_store: &self.scrip_store,
-            raw_scrip_csv: &self.raw_scrip_csv,
+            scrip_files: &self.scrip_files,
             scrip_loaded_at: &self.scrip_loaded_at,
             login_lock: &self.login_lock,
         }
@@ -766,8 +768,17 @@ async fn main() {
 
     let ws_scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
     let scrip_store = Arc::new(RwLock::new(None));
-    let raw_scrip_csv = Arc::new(RwLock::new(None));
+    // Every downloaded segment is saved under `data/` (beside trades.db) and
+    // streamed from there by the admin's CSV downloads — see `scrip_files`.
+    let scrip_files = scrip_files::ScripFiles::at_default_location();
+    match scrip_files.prepare() {
+        Ok(()) => tracing::info!(dir = %scrip_files.dir().display(), "Scrip Master CSVs are kept on disk"),
+        Err(e) => tracing::error!(dir = %scrip_files.dir().display(), error = %e, "Cannot create the data directory — the Scrip Master CSVs will not be kept on disk"),
+    }
     let scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>> = Arc::new(RwLock::new(None));
+    // Set when a login below has started a Scrip Master download that will
+    // fill the store in the background.
+    let mut scrip_download_pending = false;
 
     // 7. Try to restore Kotak session from DB
     if let Some(session) = db::load_kotak_session(&pool).await {
@@ -777,31 +788,9 @@ async fn main() {
             
             // Fetch Scrip Master before starting WebSocket
             tracing::info!("Fetching Scrip Master...");
-            let mut store = trading_engine::ScripStore::default();
-            let mut raw_sections: Vec<(&str, String)> = Vec::new();
-            
-            for segment in ["nse_fo", "bse_fo", "nse_cm"] {
-                if let Ok(csv) = client.get_scrip_master_csv(segment).await {
-                    store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
-                    raw_sections.push((segment, csv));
-                }
-            }
-            
-            if !raw_sections.is_empty() {
+            let scrip_files::Downloaded { store, .. } = scrip_files::download(&client, &scrip_files).await;
+            if let Some(store) = store {
                 *scrip_store.write().await = Some(store);
-                
-                // Combine raw CSVs (simplified for startup)
-                let mut combined = String::new();
-                for (i, (_, csv)) in raw_sections.iter().enumerate() {
-                    let mut lines = csv.lines();
-                    if let Some(header) = lines.next() {
-                        if i == 0 { combined.push_str(header); combined.push('\n'); }
-                        for line in lines {
-                            if !line.trim().is_empty() { combined.push_str(line); combined.push('\n'); }
-                        }
-                    }
-                }
-                *raw_scrip_csv.write().await = Some(combined);
                 *scrip_loaded_at.write().await = Some(shared_domain::now_ist());
                 tracing::info!("Scrip Master fetched successfully.");
             }
@@ -851,12 +840,43 @@ async fn main() {
             positions: &positions,
             scrip_store: &scrip_store,
             scrip_loaded_at: &scrip_loaded_at,
-            raw_scrip_csv: &raw_scrip_csv,
+            scrip_files: &scrip_files,
             login_lock: &kotak_login_lock,
         };
         match routes::try_env_auto_login(deps, "server startup").await {
-            Ok(()) => tracing::info!("Kotak auto-login succeeded at startup"),
+            Ok(()) => {
+                tracing::info!("Kotak auto-login succeeded at startup");
+                scrip_download_pending = true;
+            }
             Err(e) => tracing::info!(reason = %e, "Kotak auto-login not performed at startup — bridge startup deferred until login"),
+        }
+    }
+
+    // 7a. A server that stays up overnight still holds the last download's
+    // Scrip Master until the morning login replaces it; a restart used to
+    // lose it. When nothing above produced one — no session to restore and
+    // no auto-login, or every segment failed to download — the CSVs the
+    // last download saved give it back. Not while a login's download is in
+    // flight: that store arrives within minutes, and until then no signal
+    // resolves, as before. `scrip_loaded_at` stays unset: it means
+    // "downloaded today", and the 09:10 recycle decides on it whether it has
+    // anything to do.
+    if !scrip_download_pending && scrip_store.read().await.is_none() {
+        let files = scrip_files.clone();
+        match tokio::task::spawn_blocking(move || files.load_store()).await {
+            Ok(Some(on_disk)) => {
+                tracing::info!(
+                    segments = ?on_disk.segments,
+                    saved_at = on_disk.saved_at_ist().as_deref().unwrap_or("unknown"),
+                    "Scrip Master restored from disk — that download's contracts until the next login replaces them"
+                );
+                let mut store = scrip_store.write().await;
+                if store.is_none() {
+                    *store = Some(on_disk.store);
+                }
+            }
+            Ok(None) => tracing::info!("No Scrip Master on disk — no signal resolves until a login downloads it"),
+            Err(e) => tracing::error!(error = %e, "Scrip Master restore from disk failed"),
         }
     }
 
@@ -917,7 +937,7 @@ async fn main() {
             positions: Arc::clone(&positions),
             scrip_store: Arc::clone(&scrip_store),
             scrip_loaded_at: Arc::clone(&scrip_loaded_at),
-            raw_scrip_csv: Arc::clone(&raw_scrip_csv),
+            scrip_files: scrip_files.clone(),
             login_lock: Arc::clone(&kotak_login_lock),
         };
 
@@ -1013,7 +1033,7 @@ async fn main() {
         telegram: Arc::new(Mutex::new(telegram_ingester::TelegramManager::new())),
         positions,
         scrip_store,
-        raw_scrip_csv,
+        scrip_files,
         scrip_loaded_at,
         ws_task,
         ws_tx,

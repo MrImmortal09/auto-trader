@@ -107,14 +107,14 @@ pub async fn scrip_search_handler(
 }
 
 
+/// `GET /api/scrip/download` — the scrip-master segments on disk, streamed
+/// as one CSV (see `crate::scrip_files`).
 pub async fn scrip_download_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let raw_guard = state.raw_scrip_csv.read().await;
-    if let Some(csv) = &*raw_guard {
-        ([(axum::http::header::CONTENT_TYPE, "text/csv")], csv.clone()).into_response()
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "Scrip Master not loaded".to_string()).into_response()
+    match state.scrip_files.merged_body() {
+        Some(body) => ([(axum::http::header::CONTENT_TYPE, "text/csv")], body).into_response(),
+        None => (StatusCode::SERVICE_UNAVAILABLE, "Scrip Master not loaded".to_string()).into_response(),
     }
 }
 

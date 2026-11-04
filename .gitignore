@@ -11,6 +11,11 @@ trades.db-*
 # The admin's latest sign-in code (routes::auth_phone::ADMIN_OTP_FILE).
 admin-otp.log
 **/admin-otp.log
+# Files the server keeps between runs (the scrip-master CSVs, see
+# server/src/scrip_files.rs): `data/` under its working directory, which is
+# backend/ on the VM and the repo root for `cargo run -p server`.
+backend/data/
+/data/
 
 # Downloaded / installed server release binaries on the deploy host
 backend/server-v*

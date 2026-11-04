@@ -177,6 +177,17 @@ WA_API_KEY=change-me
 # ── SQLite ───────────────────────────────────────────────
 DATABASE_URL=sqlite://trades.db          # default
 
+# ── Files kept between runs ──────────────────────────────
+# The Kotak scrip-master CSVs are saved here after every download and
+# streamed back by the admin's CSV download, so only the parsed store stays
+# in memory. Relative to the working directory, like trades.db.
+DATA_DIR=data                            # default
+
+# ── Memory alarm ─────────────────────────────────────────
+# Server resident memory (MB) above which the log warns once and the System
+# screen's pulse reports memory_warn: true, until it falls 5% back under.
+MEMORY_WARN_MB=600                       # default
+
 # Trading mode (PAPER/LIVE), max trade size, brokerage, and target/SL
 # settings all live in the `trading_config` SQLite table, not env vars —
 # edit them via the Settings bar in the UI or POST /api/settings.
@@ -278,7 +289,7 @@ The backend binary itself does **not** need to be built on the VM — see step 4
 
 Important runtime note — **PATH CONTRACT**:
 
-- the server binary must run with `auto-trader/backend/` as its working directory, not the repo root — it resolves `trades.db`, `session.json`, `../frontend/dist`, and `../kotak-bridge` relative to the working directory it was started from. Starting it from anywhere else breaks those lookups. In production the binary itself also lives directly inside `backend/` (see step 4), so in practice this means: `cd ~/auto-trader/backend && ./the-binary`.
+- the server binary must run with `auto-trader/backend/` as its working directory, not the repo root — it resolves `trades.db`, `session.json`, `data/` (the saved scrip-master CSVs), `../frontend/dist`, and `../kotak-bridge` relative to the working directory it was started from. Starting it from anywhere else breaks those lookups. In production the binary itself also lives directly inside `backend/` (see step 4), so in practice this means: `cd ~/auto-trader/backend && ./the-binary`.
 - `frontend/dist` doesn't need to contain a real build in production, since the frontend is served by Vercel, not this server — the static-fallback route just won't have anything to serve if you hit the VM's IP directly, which is expected.
 
 ### 3. Build the frontend for Vercel
