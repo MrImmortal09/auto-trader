@@ -65,6 +65,9 @@ struct SystemAnswer {
     telegram: Telegram,
     kotak: Kotak,
     upstox: Upstox,
+    /// The instrument catalog: its data day, rows and last error — see
+    /// `instruments`.
+    catalog: crate::instruments::CatalogStatus,
 }
 
 fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
@@ -181,6 +184,7 @@ pub async fn system_handler(State(state): State<AppState>) -> Response {
         telegram: Telegram { listening: listening(&state).await, messages, last_at },
         kotak: Kotak { relogins, logged_in_at },
         upstox: Upstox { configured: state.market.configured, token_expires },
+        catalog: state.instruments.status(),
     })
     .into_response()
 }

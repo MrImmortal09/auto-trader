@@ -180,7 +180,8 @@ DATABASE_URL=sqlite://trades.db          # default
 # ── Files kept between runs ──────────────────────────────
 # The Kotak scrip-master CSVs are saved here after every download and
 # streamed back by the admin's CSV download, so only the parsed store stays
-# in memory. Relative to the working directory, like trades.db.
+# in memory; the instrument catalog (search) is built from them into
+# data/instruments.db. Relative to the working directory, like trades.db.
 DATA_DIR=data                            # default
 
 # ── Memory alarm ─────────────────────────────────────────

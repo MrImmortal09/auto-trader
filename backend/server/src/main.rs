@@ -12,6 +12,7 @@ mod db;
 mod desk;
 mod execute;
 mod history;
+mod instruments;
 mod market_data;
 mod paper;
 mod pulse;
@@ -125,6 +126,9 @@ pub(crate) struct AppState {
     /// The scrip-master CSVs on disk, streamed by the admin's downloads —
     /// see `scrip_files`. Only the parsed store above stays in memory.
     pub scrip_files: scrip_files::ScripFiles,
+    /// The instrument catalog built from those CSVs — see `instruments`.
+    /// Search only; the engine never reads it.
+    pub instruments: Arc<instruments::Catalog>,
     /// Handle to the currently running WebSocket task, so we can cancel it on re-auth.
     pub ws_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Channel sender to forward dynamic messages to the Node bridge.
@@ -185,6 +189,7 @@ struct KotakAutoLoginHandles {
     positions: Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
     scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
     scrip_files: scrip_files::ScripFiles,
+    instruments: Arc<instruments::Catalog>,
     scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     login_lock: Arc<Mutex<()>>,
 }
@@ -202,6 +207,7 @@ impl KotakAutoLoginHandles {
             positions: &self.positions,
             scrip_store: &self.scrip_store,
             scrip_files: &self.scrip_files,
+            instruments: &self.instruments,
             scrip_loaded_at: &self.scrip_loaded_at,
             login_lock: &self.login_lock,
         }
@@ -775,6 +781,10 @@ async fn main() {
         Ok(()) => tracing::info!(dir = %scrip_files.dir().display(), "Scrip Master CSVs are kept on disk"),
         Err(e) => tracing::error!(dir = %scrip_files.dir().display(), error = %e, "Cannot create the data directory — the Scrip Master CSVs will not be kept on disk"),
     }
+    // The instrument catalog (`instruments`): the search tables built from
+    // those CSVs, in their own SQLite file beside them. Search only; the
+    // engine never reads it.
+    let instruments = instruments::Catalog::open(scrip_files.clone(), &scrip_files::data_dir().join("instruments.db")).await;
     let scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>> = Arc::new(RwLock::new(None));
     // Set when a login below has started a Scrip Master download that will
     // fill the store in the background.
@@ -841,6 +851,7 @@ async fn main() {
             scrip_store: &scrip_store,
             scrip_loaded_at: &scrip_loaded_at,
             scrip_files: &scrip_files,
+            instruments: &instruments,
             login_lock: &kotak_login_lock,
         };
         match routes::try_env_auto_login(deps, "server startup").await {
@@ -886,6 +897,14 @@ async fn main() {
     // today's oi_snapshots so a mid-session restart keeps its closed checks.
     let indicator_feed = shared_domain::entry_gate::new_indicator_feed();
     market_data::seed_indicator_feed(&pool, &indicator_feed).await;
+
+    // 7c. The instrument catalog: rebuilt from the CSVs on disk when they
+    // are newer than its last build. Not while a login's download is in
+    // flight: `fetch_scrip_master_background` rebuilds it once the new
+    // files are written.
+    if !scrip_download_pending {
+        instruments.rebuild_in_background("startup");
+    }
 
     // 8. Position Monitor
     tracing::info!(mode = %trading_cfg.read().await.mode, "Starting position monitor");
@@ -938,6 +957,7 @@ async fn main() {
             scrip_store: Arc::clone(&scrip_store),
             scrip_loaded_at: Arc::clone(&scrip_loaded_at),
             scrip_files: scrip_files.clone(),
+            instruments: Arc::clone(&instruments),
             login_lock: Arc::clone(&kotak_login_lock),
         };
 
@@ -1034,6 +1054,7 @@ async fn main() {
         positions,
         scrip_store,
         scrip_files,
+        instruments,
         scrip_loaded_at,
         ws_task,
         ws_tx,

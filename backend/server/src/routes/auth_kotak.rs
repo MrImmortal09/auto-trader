@@ -136,6 +136,9 @@ pub struct KotakLoginDeps<'a> {
     pub scrip_store: &'a Arc<RwLock<Option<trading_engine::ScripStore>>>,
     /// Where each downloaded segment is saved — see `crate::scrip_files`.
     pub scrip_files: &'a crate::scrip_files::ScripFiles,
+    /// The instrument catalog, rebuilt from those files after each
+    /// download — see `crate::instruments`.
+    pub instruments: &'a Arc<crate::instruments::Catalog>,
     /// IST timestamp of the last *successful* Scrip Master download. Only ever set
     /// after a login has succeeded (the download runs off the resulting
     /// session), so `Some(today)` means both "logged in today" and "holding
@@ -163,6 +166,7 @@ impl<'a> KotakLoginDeps<'a> {
             positions: &state.positions,
             scrip_store: &state.scrip_store,
             scrip_files: &state.scrip_files,
+            instruments: &state.instruments,
             scrip_loaded_at: &state.scrip_loaded_at,
             login_lock: &state.kotak_login_lock,
         }
@@ -301,6 +305,7 @@ async fn perform_kotak_login(
         Arc::clone(deps.kotak),
         Arc::clone(deps.scrip_store),
         deps.scrip_files.clone(),
+        Arc::clone(deps.instruments),
         Arc::clone(deps.scrip_loaded_at),
         deps.db_tx.clone(),
         deps.log_tx.clone(),
@@ -312,11 +317,13 @@ async fn perform_kotak_login(
 /// Downloads the three segments against the session just opened, saves each
 /// to disk and swaps the parsed store in. Only the parsed store stays in
 /// memory; the admin's CSV downloads stream the files — see
-/// `crate::scrip_files`.
+/// `crate::scrip_files` — and the instrument catalog is rebuilt from them
+/// in the background.
 async fn fetch_scrip_master_background(
     kotak: Arc<Mutex<Option<kotak_client::KotakClient>>>,
     scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
     scrip_files: crate::scrip_files::ScripFiles,
+    instruments: Arc<crate::instruments::Catalog>,
     scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     db_tx: mpsc::Sender<shared_domain::DbWriteMessage>,
     log_tx: broadcast::Sender<String>,
@@ -364,6 +371,9 @@ async fn fetch_scrip_master_background(
             // Stamped only here, on the success path, so a day where every segment
             // failed never looks "ready" to the 09:10 recycle.
             *scrip_loaded_at.write().await = Some(shared_domain::now_ist());
+            // The files just written are the catalog's source; search
+            // keeps answering from the previous build until this lands.
+            instruments.rebuild_in_background("Scrip Master download");
             send_log(&db_tx, &log_tx, "INFO", serde_json::json!({
                 "event": "SCRIP_FETCH_SUCCESS",
                 "level": "INFO",
