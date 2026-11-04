@@ -2,42 +2,32 @@
 // the order-line and marker overlays, VWAP and pivots. Registered once, globally.
 
 import { registerIndicator, registerOverlay, utils, type DeepPartial, type OverlayFigure, type Styles } from 'klinecharts';
+import { C, FONT, PALETTE } from '../lib/palette';
 import { pivotLines, type PivotLevels } from './pivots';
 
-/** The design tokens as plain values: the chart draws on a canvas. */
-export const C = {
-  canvas: '#1a1f29',
-  panel: '#242b37',
-  raised: '#2c3442',
-  inset: '#141820',
-  line: '#353e4d',
-  lineStrong: '#4a5465',
-  fg: '#e8eaee',
-  muted: '#8e97a7',
-  profit: '#22b47f',
-  loss: '#ee705c',
-  onAccent: '#1a1f29',
-  grid: '#2c3442',
-  indicator: '#79a7f2',
-} as const;
-
-export const FONT = '"Anek Latin", ui-sans-serif, system-ui, sans-serif';
+// The design tokens as plain values (the chart draws on a canvas), from the
+// one source every chart shares; lines.ts, VChart.tsx and pcrIndicator.ts
+// read them from here.
+export { C, FONT };
 
 const IN = new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+// The chart draws on white: a recessive horizontal grid, solid candles in the
+// candle pair (a hue family apart from the money greens and reds), dark tags
+// with white text for the last price and the crosshair, as TradingView light.
 export const CHART_STYLES: DeepPartial<Styles> = {
   grid: { horizontal: { color: C.grid, style: 'solid', size: 1 }, vertical: { show: false } },
   candle: {
     type: 'candle_solid',
     bar: {
-      upColor: C.profit,
-      downColor: C.loss,
+      upColor: C.up,
+      downColor: C.down,
       noChangeColor: C.muted,
-      upBorderColor: C.profit,
-      downBorderColor: C.loss,
+      upBorderColor: C.up,
+      downBorderColor: C.down,
       noChangeBorderColor: C.muted,
-      upWickColor: C.profit,
-      downWickColor: C.loss,
+      upWickColor: C.up,
+      downWickColor: C.down,
       noChangeWickColor: C.muted,
     },
     priceMark: {
@@ -45,7 +35,7 @@ export const CHART_STYLES: DeepPartial<Styles> = {
       low: { show: false },
       last: {
         show: true,
-        // The price tag is white whichever way the bar went; the line is quiet.
+        // The price tag is dark whichever way the bar went; the line is quiet.
         upColor: C.fg,
         downColor: C.fg,
         noChangeColor: C.fg,
@@ -69,22 +59,22 @@ export const CHART_STYLES: DeepPartial<Styles> = {
   xAxis: {
     axisLine: { show: false },
     tickLine: { show: false },
-    tickText: { color: C.muted, size: 11, family: FONT },
+    tickText: { color: C.subtle, size: 11, family: FONT },
   },
   yAxis: {
     axisLine: { show: false },
     tickLine: { show: false },
-    tickText: { color: C.muted, size: 11, family: FONT },
+    tickText: { color: C.subtle, size: 11, family: FONT },
   },
   separator: { color: C.line },
   crosshair: {
     horizontal: {
       line: { color: C.lineStrong, style: 'dashed', dashedValue: [3, 3] },
-      text: { color: C.fg, backgroundColor: C.raised, borderColor: C.lineStrong, family: FONT, size: 11 },
+      text: { color: C.onAccent, backgroundColor: C.fg, borderColor: C.fg, family: FONT, size: 11 },
     },
     vertical: {
       line: { color: C.lineStrong, style: 'dashed', dashedValue: [3, 3] },
-      text: { color: C.fg, backgroundColor: C.raised, borderColor: C.lineStrong, family: FONT, size: 11 },
+      text: { color: C.onAccent, backgroundColor: C.fg, borderColor: C.fg, family: FONT, size: 11 },
     },
   },
 };
@@ -99,7 +89,7 @@ export interface LinePart {
   key: string;
   text: string;
   color: string;
-  /** Filled with `color`, text dark; else outlined. */
+  /** Filled with `color`, text white; else outlined on white. */
   filled?: boolean;
   /** Drawn before the text: a grip (drag me) or a lock (read-only). */
   icon?: 'grip' | 'lock';
@@ -297,12 +287,13 @@ registerIndicator<{ vwap?: number; day?: number }, number, { key: string }>({
 /** Each chart's pivots by IST day number, keyed by the chart's id. */
 export const PIVOT_SERIES = new Map<string, Map<number, PivotLevels>>();
 
-/** TradingView's pivot orange, for every level and its name. */
-const PIVOT_ORANGE = '#fb8c00';
+/** The pivot orange, for every level (3.2:1 on white); the names are `C.muted`. Vela draws the same. */
+export const PIVOT_ORANGE = PALETTE.pivot;
 
 // Standard pivots, drawn straight onto the candle pane the way TradingView
-// draws them: solid orange levels across each day, named at the day's start.
-// No figures, so the price axis never stretches to take in a far R5 or S5.
+// draws them: solid orange levels across each day, named at the day's start
+// in the muted ink. No figures, so the price axis never stretches to take in
+// a far R5 or S5.
 registerIndicator<Record<string, never>, number, { key: string }>({
   name: 'v2Pivots',
   shortName: 'Pivots',
@@ -329,7 +320,7 @@ registerIndicator<Record<string, never>, number, { key: string }>({
     ctx.setLineDash([]);
     ctx.lineWidth = 1;
     ctx.strokeStyle = PIVOT_ORANGE;
-    ctx.fillStyle = PIVOT_ORANGE;
+    ctx.fillStyle = C.muted;
     ctx.font = `10px ${FONT}`;
     ctx.textBaseline = 'bottom';
     ctx.textAlign = 'left';

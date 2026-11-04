@@ -1,12 +1,15 @@
 /*
- * v2 styles: the redesign's tokens from the Figma variables (file
- * e3VTbfjdKm17YiNQ2Tgvem), dark theme only. Imported only by src/v2/main.tsx,
- * so none of this reaches v1, and v1's src/index.css never reaches v2.
+ * v2 styles: the light theme ("Kite-clear"), tokens only. Imported only by
+ * src/v2/main.tsx, so none of this reaches v1, and v1's src/index.css never
+ * reaches v2. Every text/surface pair in use was measured with a node script
+ * (scratchpad/contrast.mjs): body text >= 4.5:1, UI chrome and graphics >= 3:1.
  *
- * Spacing needs no tokens: Tailwind's 4 px scale covers every Figma value.
+ * Spacing needs no tokens: Tailwind's 4 px scale covers every value.
+ *
+ * The chart constants in src/v2/lib/palette.ts must equal the hexes here.
  */
 
-@import url("https://fonts.googleapis.com/css2?family=Anek+Latin:wdth,wght@75..125,100..800&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&family=JetBrains+Mono:wght@400;500&display=swap");
 /* Only v2's own files are scanned for classes. */
 @import "tailwindcss" source(".");
 
@@ -14,36 +17,73 @@
   /* Only the design palette exists, so colour keeps its meaning. */
   --color-*: initial;
 
-  --font-sans: "Anek Latin", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
-  --color-canvas: #1a1f29;               /* color/bg/canvas: app background */
-  --color-panel: #242b37;                /* color/bg/panel: panels, sheets, ladder */
-  --color-raised: #2c3442;               /* color/bg/raised: selected, hover, ITM shading */
-  --color-inset: #141820;                /* color/bg/inset: status bar, nav rail, wells */
-  --color-scrim: rgb(14 17 22 / 0.66);   /* color/bg/scrim: behind sheets and dialogs */
-  --color-line: #353e4d;                 /* color/border/default: hairlines, dividers */
-  --color-line-strong: #4a5465;          /* color/border/strong: rail track, focus */
-  --color-fg: #e8eaee;                   /* color/text/primary: 13.7:1 on canvas */
-  --color-fg-muted: #8e97a7;             /* color/text/secondary: 5.6:1 on canvas */
-  --color-on-accent: #1a1f29;            /* color/text/on-accent: text on jade, brick, marigold */
-  --color-profit: #22b47f;               /* profit, buy, targets: 6.2:1 on canvas */
-  --color-loss: #ee705c;                 /* loss, stop, exit, kill switch: 5.6:1 on canvas */
-  --color-live: #f0a63a;                 /* real money (LIVE) only */
-  --color-profit-subtle: rgb(34 180 127 / 0.16);
-  --color-loss-subtle: rgb(238 112 92 / 0.16);
-  --color-live-subtle: rgb(240 166 58 / 0.18);
-  --color-chart-grid: #2c3442;
-  --color-chart-indicator: #79a7f2;      /* VWAP, PCR, first indicator line */
+  /* Surfaces, from the ground up. Light inverts the dark ramp: the chrome
+     and the wells are the lowest layer, white is what you read numbers from. */
+  --color-canvas: #f6f8fb;               /* the page: Desk tables and KPIs, Market/System/Settings/Admin bodies */
+  --color-panel: #ffffff;                /* cards, ladder, charts, trading panel, dialogs, sheets, popovers, toasts, bubbles */
+  --color-raised: #e3e8ee;               /* a tint, not a layer: hover rows (/40), neutral buttons and chips, drag tracks */
+  --color-raised-strong: #d3dae3;        /* pressed/hover of a raised or inset control (neutral button hover, stepper hover) */
+  --color-inset: #eaeef3;                /* the lowest layer: status bar, nav rail, tab bar, ScalpBar, input wells, Segment tracks, dialog wells */
+  --color-itm: #dbe2ea;                  /* in-the-money cells of the ladder/option chain: 1.31:1 on white, with the spot rule and ATM box */
+  --color-scrim: rgb(22 27 34 / 0.48);   /* behind sheets and dialogs: a white dialog is 3.30:1 from the scrimmed page */
+  --color-line: #dde3ea;                 /* hairlines: dividers, card edges, chrome edges, input wells (decorative: 1.29:1 on white) */
+  --color-line-strong: #788494;          /* boundaries that mean something: rail track, spot/ATM lines, checkbox, handles, crosshair, pivots, scrollbar: 3.80 / 3.57 / 3.26 / 3.08 on panel / canvas / inset / raised */
+
+  /* Text: three inks, each ~1.5-2x apart so they read as levels. */
+  --color-fg: #161b22;                   /* primary text, prices, contract names, price tags: 17.30 on white */
+  --color-fg-muted: #46505d;             /* labels, secondary text, table heads, nav labels, legends: 8.18 on white, 6.64 on raised */
+  --color-fg-subtle: #606c7a;            /* captions, helper lines, axis text, placeholders: 5.35 white / 5.03 canvas / 4.59 inset. NEVER on raised, raised-strong or itm (4.34 / 3.80 / 4.10) */
+  --color-on-accent: #ffffff;            /* text on accent, profit, loss, fg and live-ink fills (never on live: that takes fg) */
+
+  /* The one blue: where you are and what to press. */
+  --color-accent: #1b64da;               /* selected nav/segment/tab, focus, links, toggles on, non-trade primary buttons, the mark: 5.41 white / 5.08 canvas / 4.64 inset. Not on raised (4.39) */
+  --color-accent-strong: #154fb0;        /* accent hover/pressed: white on it 7.56 */
+  --color-accent-subtle: #e8f0fb;        /* selected fills: nav item, settings nav, index tile, search highlight (accent at 10 % over white): accent on it 4.71 */
+
+  /* Money. Green is money made or a buy, red is money lost or a sell. */
+  --color-profit: #087551;               /* profit text, Buy/Add fill, targets, ok dots: 5.72 white / 5.37 canvas / 4.91 inset / 4.64 raised; white on it 5.72 */
+  --color-profit-strong: #065c40;        /* Buy/Add hover and pressed: white on it 8.04 */
+  --color-profit-subtle: #e6f1ee;        /* opaque, = profit at 10 % over white: held ladder cells, Buy chips, tick-up flash, entry zone: profit on it 4.95, loss on it 4.86 */
+  --color-loss: #c62828;                 /* loss text, Exit/Sell fills and outlines, stops, kill switch, errors, down dots: 5.62 / 5.28 / 4.82 / 4.56; white on it 5.62 */
+  --color-loss-strong: #a31f1f;          /* Exit/Sell/hold hover and pressed: white on it 7.57 */
+  --color-loss-subtle: #f9eaea;          /* opaque: stopped/disconnected banners, loss chips, error log chips, tick-down flash: loss on it 4.81 */
+
+  /* Real money. Marigold, hue 36 degrees, 36 degrees from loss red; ink text on it, never white. */
+  --color-live: #bf7407;                 /* the LIVE chip and the Switch-to-LIVE button fills, the Mode segment's selected LIVE pill: fg on it 4.71; the fill is 3.67 / 3.32 / 3.15 / 3.15 vs panel / canvas / inset / live-subtle */
+  --color-live-ink: #8a4b00;             /* LIVE as text, the chip's and button's 1 px edge, the 3 px rule on the status bar, the LIVE button's hover fill (white on it 6.80): 6.80 white / 5.84 inset / 5.83 on live-subtle */
+  --color-live-subtle: #fbeccf;          /* the whole status bar and phone app bar while LIVE, the LIVE dialog's figures well: fg 14.83, fg-muted 7.02, fg-subtle 4.59, profit 4.90, loss 4.82, accent 4.64 on it */
+
+  /* Charts. */
+  --color-chart-grid: #e9edf2;           /* horizontal grid on every chart: 1.18 vs white, recessive by design */
+  --color-chart-indicator: #2a6fe3;      /* VWAP, PCR, sparklines, metric areas, puts OI bars, call markers: 4.69 white (ok as 11 px legend text), 4.40 canvas */
+  --color-candle-up: #0f9f80;            /* up bar body, border, wick (hollow by default): 3.34 white; deutan dE 9.3 from candle-down (validator PASS) */
+  --color-candle-down: #e0433f;          /* down bar: 4.16 white */
+
+  --color-selection: rgb(27 100 218 / 0.18); /* ::selection: fg on the composite #d6e3f8 is 13.35 */
+  --color-focus: #1b64da;                /* :focus-visible ring, 2 px solid, 2 px offset: 5.41 / 5.08 / 4.64 on panel / canvas / inset */
 
   --radius-4: 4px;                       /* chips, axis tags */
-  --radius-6: 6px;                       /* desktop buttons, segments, inputs */
-  --radius-8: 8px;                       /* phone buttons, tracks, nav items */
-  --radius-12: 12px;                     /* panels, cards */
+  --radius-6: 6px;                       /* desktop buttons, segments, inputs, strike boxes */
+  --radius-8: 8px;                       /* phone buttons, tracks, nav items, toasts */
+  --radius-12: 12px;                     /* panels, cards, popovers */
   --radius-16: 16px;                     /* dialogs, bottom sheets (top corners) */
+
+  /* These replace Tailwind's default shadow-sm / shadow-md / shadow-lg utilities. */
+  --shadow-sm: 0 1px 2px rgb(22 27 34 / 0.06);                                   /* the selected Segment pill, Toggle knob */
+  --shadow-md: 0 2px 6px rgb(22 27 34 / 0.08), 0 8px 24px rgb(22 27 34 / 0.10);  /* popovers, menus, tooltips, the ATM pill, the placing pill, search results */
+  --shadow-lg: 0 4px 12px rgb(22 27 34 / 0.10), 0 16px 48px rgb(22 27 34 / 0.16); /* desktop dialogs and toasts only */
 
   --animate-fade-in: v2-fade-in 150ms ease-out;
   --animate-rise-in: v2-rise-in 180ms ease-out;
   --animate-sheet-in: v2-sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  /* A figure that just rose or fell: its wrapper flashes the tint, then clears. */
+  --animate-tick-up: v2-tick-up 400ms ease-out;
+  --animate-tick-down: v2-tick-down 400ms ease-out;
+  /* A number input that just saved. */
+  --animate-saved: v2-saved 300ms ease-out;
 
   @keyframes v2-fade-in {
     from { opacity: 0; }
@@ -57,22 +97,41 @@
     from { transform: translateY(100%); }
     to { transform: none; }
   }
+  @keyframes v2-tick-up {
+    from { background-color: var(--color-profit-subtle); }
+    to { background-color: transparent; }
+  }
+  @keyframes v2-tick-down {
+    from { background-color: var(--color-loss-subtle); }
+    to { background-color: transparent; }
+  }
+  @keyframes v2-saved {
+    from { background-color: var(--color-accent-subtle); }
+    to { background-color: var(--color-inset); }
+  }
 }
 
 /* The exact names set as code syntax on the Figma variables, for plain CSS and
    chart styles. */
 :root {
-  color-scheme: dark;
+  color-scheme: light;
   --color-bg-canvas: var(--color-canvas);
   --color-bg-panel: var(--color-panel);
   --color-bg-raised: var(--color-raised);
+  --color-bg-raised-strong: var(--color-raised-strong);
   --color-bg-inset: var(--color-inset);
+  --color-bg-itm: var(--color-itm);
   --color-bg-scrim: var(--color-scrim);
   --color-border-default: var(--color-line);
   --color-border-strong: var(--color-line-strong);
   --color-text-primary: var(--color-fg);
   --color-text-secondary: var(--color-fg-muted);
+  --color-text-tertiary: var(--color-fg-subtle);
   --color-text-on-accent: var(--color-on-accent);
+  --color-accent-default: var(--color-accent);
+  --color-accent-hover: var(--color-accent-strong);
+  --color-accent-tint: var(--color-accent-subtle);
+  --color-live-text: var(--color-live-ink);
 
   /* Layout sizes used in the Figma frames */
   --layout-status-bar: 40px;      /* desktop; the phone app bar is 44px */
@@ -82,20 +141,27 @@
   --layout-touch: 44px;           /* minimum phone touch target */
 }
 
-/* Text styles: Figma Num/* and Text/* */
-@utility num-hero   { font-size: 34px; line-height: 38px; font-weight: 600; letter-spacing: -0.5px; font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
-@utility num-large  { font-size: 22px; line-height: 26px; font-weight: 600; letter-spacing: -0.2px; font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
-@utility num-medium { font-size: 15px; line-height: 20px; font-weight: 500; font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
-@utility num-small  { font-size: 12px; line-height: 16px; font-weight: 500; font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
-@utility type-title       { font-size: 16px; line-height: 22px; font-weight: 600; }
+/* Text styles: Figma Num/* and Text/*. Sizes and line heights are unchanged
+   (layouts depend on them); Inter replaces Anek Latin, so the 87.5 % stretch
+   goes and the tracking tightens. Every num-* is tabular so live figures never
+   jitter; Inter's optical-size axis is automatic (font-optical-sizing: auto). */
+@utility num-hero   { font-size: 34px; line-height: 38px; font-weight: 600; letter-spacing: -0.6px; font-variant-numeric: tabular-nums; }
+@utility num-large  { font-size: 22px; line-height: 26px; font-weight: 600; letter-spacing: -0.3px; font-variant-numeric: tabular-nums; }
+@utility num-medium { font-size: 15px; line-height: 20px; font-weight: 500; font-variant-numeric: tabular-nums; }
+@utility num-small  { font-size: 12px; line-height: 16px; font-weight: 500; font-variant-numeric: tabular-nums; }
+@utility type-title       { font-size: 16px; line-height: 22px; font-weight: 600; letter-spacing: -0.2px; }
 @utility type-body-strong { font-size: 14px; line-height: 20px; font-weight: 600; }
 @utility type-body        { font-size: 14px; line-height: 20px; font-weight: 400; }
-@utility type-label       { font-size: 12px; line-height: 16px; font-weight: 500; letter-spacing: 0.1px; }
-@utility type-caption     { font-size: 11px; line-height: 14px; font-weight: 400; letter-spacing: 0.1px; }
-@utility type-button      { font-size: 13px; line-height: 16px; font-weight: 600; letter-spacing: 0.1px; }
-@utility type-button-lg   { font-size: 15px; line-height: 20px; font-weight: 600; letter-spacing: 0.1px; }
+@utility type-label       { font-size: 12px; line-height: 16px; font-weight: 500; }
+@utility type-caption     { font-size: 11px; line-height: 14px; font-weight: 450; letter-spacing: 0.1px; }
+/* Column heads and KPI labels only: table <th>, the ladder's Calls · Strike · Puts, Stat labels. */
+@utility type-eyebrow     { font-size: 11px; line-height: 14px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+@utility type-button      { font-size: 13px; line-height: 16px; font-weight: 600; }
+@utility type-button-lg   { font-size: 15px; line-height: 20px; font-weight: 600; }
+/* The engine log and order/trade ids: fixed-width timestamps line up. */
+@utility type-mono        { font-family: var(--font-mono); font-size: 12px; line-height: 16px; font-weight: 400; font-variant-numeric: tabular-nums; }
 /* Digits in running text line up the way the numbers do. */
-@utility tnum { font-variant-numeric: tabular-nums; font-stretch: 87.5%; }
+@utility tnum { font-variant-numeric: tabular-nums; }
 
 @utility pt-safe { padding-top: env(safe-area-inset-top); }
 @utility pb-safe { padding-bottom: env(safe-area-inset-bottom); }
@@ -118,8 +184,6 @@
   }
   body {
     margin: 0;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
   }
   /* No double-tap zoom on a button tapped twice in a row. */
   button, a, [role="button"], [role="tab"] {
@@ -128,11 +192,21 @@
   }
   button:not(:disabled) { cursor: pointer; }
   :focus-visible {
-    outline: 2px solid var(--color-line-strong);
+    outline: 2px solid var(--color-focus);
     outline-offset: 2px;
   }
+  ::selection { background: var(--color-selection); }
   * {
     scrollbar-width: thin;
-    scrollbar-color: var(--color-line) transparent;
+    scrollbar-color: var(--color-line-strong) transparent;
   }
+}
+
+/* Reduced motion: dialogs and sheets fade instead of rising, figures and
+   inputs don't flash, and nothing transitions. Unlayered on purpose: the
+   animate-* utilities live in @layer utilities, which beats @layer base. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-rise-in, .animate-sheet-in { animation: v2-fade-in 150ms ease-out; }
+  .animate-tick-up, .animate-tick-down, .animate-saved { animation: none; }
+  * { transition-duration: 0ms !important; }
 }

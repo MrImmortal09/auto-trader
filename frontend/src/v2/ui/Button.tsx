@@ -1,19 +1,26 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 
-// Figma "Button". On jade, brick and marigold fills the text is dark.
-export type ButtonKind = 'profit' | 'loss' | 'loss-outline' | 'neutral' | 'ghost' | 'quiet' | 'alert' | 'live';
+// Figma "Button". A filled kind carries white text and darkens to its
+// *-strong token on hover (never brightens); LIVE is marigold with ink text
+// and its ink edge. Blue is what you press that is not an order; green is
+// Buy and Add only; red is Exit, Sell and the kill switch.
+export type ButtonKind = 'accent' | 'profit' | 'loss' | 'loss-outline' | 'neutral' | 'ghost' | 'quiet' | 'alert' | 'live';
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
 const KIND: Record<ButtonKind, string> = {
-  profit: 'bg-profit text-on-accent hover:brightness-110',
-  loss: 'bg-loss text-on-accent hover:brightness-110',
+  // Send code, Sign in, Add, Save, Reconnect, Add funds.
+  accent: 'bg-accent text-on-accent hover:bg-accent-strong active:brightness-90',
+  // Buy and Add only.
+  profit: 'bg-profit text-on-accent hover:bg-profit-strong active:brightness-90',
+  // Exit, Sell, Remove, the kill-switch hold.
+  loss: 'bg-loss text-on-accent hover:bg-loss-strong active:brightness-90',
   'loss-outline': 'border border-loss text-loss hover:bg-loss-subtle',
-  neutral: 'bg-raised text-fg hover:bg-line',
+  neutral: 'bg-raised text-fg hover:bg-raised-strong',
   ghost: 'text-fg hover:bg-raised',
   quiet: 'text-fg-muted hover:bg-raised hover:text-fg',
   alert: 'border border-loss text-loss hover:bg-loss-subtle',
   // Real money: marigold, only for going LIVE.
-  live: 'bg-live text-on-accent hover:brightness-110',
+  live: 'bg-live text-fg border border-live-ink hover:bg-live-ink hover:text-on-accent active:brightness-90',
 };
 
 const SIZE: Record<ButtonSize, string> = {
@@ -52,7 +59,7 @@ export function Button({
             }
           : onClick
       }
-      className={`inline-flex shrink-0 select-none items-center justify-center whitespace-nowrap transition-[background-color,filter] disabled:cursor-not-allowed disabled:opacity-50 ${KIND[kind]} ${SIZE[size]} ${className}`}
+      className={`inline-flex shrink-0 select-none items-center justify-center whitespace-nowrap transition-[background-color,color] duration-120 disabled:cursor-not-allowed disabled:opacity-50 ${KIND[kind]} ${SIZE[size]} ${className}`}
     >
       {icon}
       {children}

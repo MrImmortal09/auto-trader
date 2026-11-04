@@ -93,11 +93,11 @@ export default function App() {
     screen === 'desk' ? (
       <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} role={role} />
     ) : screen === 'trade' ? (
-      <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>
+      <Suspense fallback={<p className="p-6 type-body text-fg-subtle">Loading charts…</p>}>
         <Trade serverBase={serverBase} desktop={desktop} />
       </Suspense>
     ) : screen === 'market' ? (
-      <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>
+      <Suspense fallback={<p className="p-6 type-body text-fg-subtle">Loading charts…</p>}>
         <Market serverBase={serverBase} desktop={desktop} canReadOwner={canReadOwner} />
       </Suspense>
     ) : (

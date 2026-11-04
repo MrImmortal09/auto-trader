@@ -1,6 +1,7 @@
 import { useEffect, useRef, type ReactNode } from 'react';
 
-/** A popover anchored under its button; a click outside or Escape closes it. */
+/** A popover anchored under its button: white, a hairline and the floating
+ * shadow. A click outside or Escape closes it. */
 export function Popover({ open, onClose, align = 'left', children }: { open: boolean; onClose: () => void; align?: 'left' | 'right'; children: ReactNode }) {
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -18,7 +19,7 @@ export function Popover({ open, onClose, align = 'left', children }: { open: boo
   }, [open, onClose]);
   if (!open) return null;
   return (
-    <div ref={box} className={`absolute top-full z-30 mt-1 min-w-[260px] animate-fade-in rounded-12 border border-line bg-panel p-2 shadow-lg ${align === 'right' ? 'right-0' : 'left-0'}`}>
+    <div ref={box} className={`absolute top-full z-30 mt-1 min-w-[260px] animate-fade-in rounded-12 border border-line bg-panel p-2 shadow-md ${align === 'right' ? 'right-0' : 'left-0'}`}>
       {children}
     </div>
   );
