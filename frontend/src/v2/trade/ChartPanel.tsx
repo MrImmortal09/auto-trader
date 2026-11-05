@@ -127,14 +127,28 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   }, [menu, chain, atm]);
 
   return (
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-12 border border-line bg-inset">
-      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3">
-        <div className="relative">
-          <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} className="flex items-center gap-1 type-body-strong text-fg">
-            {symbolLabel(sym)}
-            <ChevronDown size={14} className="text-fg-muted" />
+    // Not clipped as a whole: its menus (the symbol picker, Layers) open over
+    // whatever is below a short chart. Only the chart itself is clipped.
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col rounded-12 border border-line bg-inset">
+      {/* The controls on the right never shrink, so Hide chart stays on screen;
+          the instrument's name and the price give way instead. */}
+      <header className={`@container flex h-10 shrink-0 items-center border-b border-line ${compact ? 'gap-1.5 pr-1 pl-3' : 'gap-2 px-3'}`}>
+        <div className="relative min-w-0">
+          <button type="button" aria-expanded={menu === 'pick'} onClick={() => setMenu(menu === 'pick' ? null : 'pick')} title={symbolLabel(sym)} className="flex max-w-full items-center gap-1 text-left text-fg">
+            {sym.kind === 'option' ? (
+              // The index over the strike, so the strike is never cut off.
+              <span className="flex min-w-0 flex-col">
+                <span className="truncate type-caption leading-none text-fg-muted">{sym.index}</span>
+                <span className="truncate type-body-strong leading-tight">
+                  {sym.strike} {sym.side}
+                </span>
+              </span>
+            ) : (
+              <span className="truncate type-body-strong">{symbolLabel(sym)}</span>
+            )}
+            <ChevronDown size={14} className="shrink-0 text-fg-muted" />
           </button>
-          <Popover open={menu === 'pick'} onClose={close}>
+          <Popover open={menu === 'pick'} onClose={close} backdrop={compact}>
             <div className="px-2 pt-1 pb-1.5 type-caption text-fg-muted">Index</div>
             <div className="grid grid-cols-3 gap-1">
               {INDEX_ORDER.map((i) => {
@@ -193,16 +207,18 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             )}
           </Popover>
         </div>
-        <span className="num-medium text-fg">{shown == null ? '—' : price(shown)}</span>
-        {pct != null && <span className={`num-small ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</span>}
-        <span className="flex-1" />
+        {/* On a narrow header the price is left to the chart's own axis label,
+            and the day's change to the index tabs above. */}
+        <span className={`hidden shrink-0 num-medium text-fg ${compact ? '@[21rem]:inline' : '@[28rem]:inline'}`}>{shown == null ? '—' : price(shown)}</span>
+        {pct != null && !compact && <span className={`hidden shrink-0 num-small @[34rem]:inline ${TONE_TEXT[toneOf(pct)]}`}>{signedPct(pct)}</span>}
+        <span className="min-w-0 flex-1" />
         {compact ? (
-          <div className="relative">
+          <div className="relative shrink-0">
             <button type="button" aria-expanded={menu === 'tf'} onClick={() => setMenu(menu === 'tf' ? null : 'tf')} className="flex h-8 items-center gap-1 rounded-6 border border-line px-2.5 type-label text-fg">
               {tf}
               <ChevronDown size={14} className="text-fg-muted" />
             </button>
-            <Popover open={menu === 'tf'} onClose={close} align="right">
+            <Popover open={menu === 'tf'} onClose={close} align="right" backdrop>
               {TFS.map((t) => (
                 <button key={t} type="button" onClick={() => (onTf(t), close())} className={`flex h-10 w-full items-center rounded-6 px-3 type-label ${t === tf ? 'bg-raised text-fg' : 'text-fg-muted'}`}>
                   {t}
@@ -230,11 +246,11 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             compact={compact}
           />
         )}
-        <div className="relative">
+        <div className="relative shrink-0">
           <button type="button" aria-label="Layers" aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <LayersIcon size={16} />
           </button>
-          <Popover open={menu === 'layers'} onClose={close} align="right">
+          <Popover open={menu === 'layers'} onClose={close} align="right" backdrop={compact}>
             <div className="px-2 pt-1 pb-1 type-caption text-fg-muted">Show on this chart</div>
             <CheckboxRow checked={layers.myTrades} title="My trades" note="Entry, stop, target · drag to move" onChange={(v) => onLayers({ ...layers, myTrades: v })} />
             <CheckboxRow checked={layers.telegramTrades} title="Telegram trades" note="Lines show on the option chart" onChange={(v) => onLayers({ ...layers, telegramTrades: v })} />
@@ -267,12 +283,12 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           </Popover>
         </div>
         {onHide && (
-          <button type="button" aria-label="Hide chart" title="Hide chart" onClick={onHide} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
+          <button type="button" aria-label="Hide chart" title="Hide chart" onClick={onHide} className="grid size-8 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <ChevronUp size={16} />
           </button>
         )}
       </header>
-      <div className="relative min-h-0 flex-1">
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-b-12">
         {lib === 'vela' ? (
           <Suspense fallback={null}>
             <VChart

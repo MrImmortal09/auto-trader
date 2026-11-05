@@ -5,12 +5,14 @@ import { Minus, Plus } from 'lucide-react';
 export const MAX_STEPPER_LOTS = 10;
 
 // Figma "Lots stepper": "Lots [− 2 +] 130 qty".
-export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 'sm' }: {
+export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 'sm', label = true }: {
   lots: number;
   lotSize: number;
   onChange: (lots: number) => void;
   disabled?: boolean;
   size?: 'sm' | 'lg';
+  /** The "Lots" word before it; off where room is short (the buttons still say what they do). */
+  label?: boolean;
 }) {
   const lg = size === 'lg';
   const step = (by: number) => {
@@ -20,8 +22,8 @@ export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 
   const button = `grid place-items-center text-fg transition-colors hover:bg-raised disabled:opacity-40 ${lg ? 'size-11 rounded-8' : 'size-7 rounded-6'}`;
   return (
     <div className="flex items-center gap-2">
-      <span className="type-label text-fg-muted">Lots</span>
-      <div className={`flex items-center border border-line bg-inset ${lg ? 'rounded-8' : 'rounded-6'}`}>
+      {label && <span className="type-label text-fg-muted">Lots</span>}
+      <div role="group" aria-label="Lots" className={`flex items-center border border-line bg-inset ${lg ? 'rounded-8' : 'rounded-6'}`}>
         <button type="button" aria-label="One lot fewer" className={button} disabled={disabled || lots <= 1} onClick={() => step(-1)}>
           <Minus size={lg ? 18 : 14} />
         </button>

@@ -48,6 +48,8 @@ import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
 import { approxMoney, CHART_LIBS, istClock, levelCrossed, levelPnl, optionOf, sameSym, symbolLabel, toTick, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
+import { usePhoneSplit } from './phoneSplit';
+import { SplitHandle } from './SplitHandle';
 import { TradingPanel } from './panel/TradingPanel';
 import { PositionSheet, ScalpBar, type PaperAccount, type PositionHandlers } from './Positions';
 
@@ -67,6 +69,8 @@ interface Saved {
   lots: Record<string, number>;
   /** Phone: the chart folded away, the whole ladder shown instead. */
   chartHidden: boolean;
+  /** Phone: the chart's height as last dragged, in px; null until it is. */
+  phoneChartHeight: number | null;
   /** The ladder's expiry per index, `YYYY-MM-DD`; missing means the nearest. */
   expiry: Record<string, string | null>;
   /** Which library draws every chart. */
@@ -85,7 +89,7 @@ const STORE_KEY = 'v2.trade';
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false };
 
 /** The saved layout, with any option that has since expired back on its
  * index, and any chosen expiry that has passed back to the nearest. */
@@ -106,6 +110,7 @@ function loadSaved(): Saved {
     index: INDEX_ORDER.includes(saved.index ?? '') ? saved.index! : 'NIFTY',
     lots: saved.lots ?? {},
     chartHidden: saved.chartHidden === true,
+    phoneChartHeight: typeof saved.phoneChartHeight === 'number' && saved.phoneChartHeight > 0 ? saved.phoneChartHeight : null,
     expiry,
     chartLib: saved.chartLib === 'vela' ? 'vela' : 'kline',
     panelOpen: saved.panelOpen !== false,
@@ -219,6 +224,11 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // Desktop: the charts row, which the trading panel grows up into.
   const chartsRef = useRef<HTMLDivElement>(null);
   const setPanelHeight = useCallback((panelHeight: number) => save((s) => ({ ...s, panelHeight })), [save]);
+  // Phone: the chart and the ladder share the screen; a handle drags the split.
+  const { attach: splitBox, height: chartHeight, dragging: splitDragging, handle: splitHandle } = usePhoneSplit(
+    saved.phoneChartHeight,
+    useCallback((phoneChartHeight: number) => save((s) => ({ ...s, phoneChartHeight })), [save]),
+  );
 
   // Each index on screen: its listed expiries, before the stream opens.
   const shownSlots = desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1);
@@ -619,8 +629,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     );
   });
 
-  const expiryPicker = (size: 'sm' | 'lg') => (
-    <ExpiryPicker expiries={expiries[saved.index]?.expiries} value={board?.expiry ?? ladderExpiry} onChange={selectExpiry} size={size} align={size === 'lg' ? 'left' : 'right'} />
+  const expiryPicker = (size: 'sm' | 'lg', short = false) => (
+    <ExpiryPicker expiries={expiries[saved.index]?.expiries} value={board?.expiry ?? ladderExpiry} onChange={selectExpiry} size={size} align={size === 'lg' && !short ? 'left' : 'right'} short={short} />
   );
 
   const ladder = board ? (
@@ -636,7 +646,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       onChart={chartContract}
       onCentre={(strike) => setCentreAt(strike == null ? null : { key: ladderKey, strike })}
       desktop={desktop}
-      header={desktop ? undefined : expiryPicker('lg')}
+      header={desktop ? undefined : expiryPicker('lg', true)}
     />
   ) : (
     <p className="px-4 py-6 type-body text-fg-muted">{frame?.board_error ?? (frame ? 'No option chain yet — it loads after the Kotak login.' : 'Connecting…')}</p>
@@ -677,21 +687,30 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         <div className="shrink-0 px-4 pt-3 pb-2">
           <IndexTabs indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
         </div>
-        {chartHidden ? (
-          <div className="shrink-0 px-2">
-            <button type="button" onClick={() => showChart(true)} className="flex h-10 w-full items-center gap-2 rounded-12 border border-line bg-inset px-3 text-left">
-              <ChartCandlestick size={16} className="text-fg-muted" />
-              <span className="type-label text-fg">Show chart</span>
-              <span className="min-w-0 flex-1 truncate type-caption text-fg-muted">
-                {symbolLabel(saved.slots[0].sym)} · {saved.slots[0].tf}
-              </span>
-              <ChevronDown size={16} className="text-fg-muted" />
-            </button>
-          </div>
-        ) : (
-          <div className="flex h-[260px] shrink-0 px-2">{charts[0]}</div>
-        )}
-        <div className="flex min-h-0 flex-1 flex-col pt-3">{ladder}</div>
+        {/* The chart and the ladder share this box: the chart is never so tall
+            that the ladder loses its lots row and its first strikes. */}
+        <div ref={splitBox} className="flex min-h-0 flex-1 flex-col">
+          {chartHidden ? (
+            <div className="shrink-0 px-2 pb-3">
+              <button type="button" onClick={() => showChart(true)} className="flex h-10 w-full items-center gap-2 rounded-12 border border-line bg-inset px-3 text-left">
+                <ChartCandlestick size={16} className="text-fg-muted" />
+                <span className="type-label text-fg">Show chart</span>
+                <span className="min-w-0 flex-1 truncate type-caption text-fg-muted">
+                  {symbolLabel(saved.slots[0].sym)} · {saved.slots[0].tf}
+                </span>
+                <ChevronDown size={16} className="text-fg-muted" />
+              </button>
+            </div>
+          ) : (
+            <>
+              <div style={{ height: chartHeight }} className="flex shrink-0 px-2">
+                {charts[0]}
+              </div>
+              <SplitHandle height={chartHeight} dragging={splitDragging} handle={splitHandle} />
+            </>
+          )}
+          <div className="flex min-h-0 flex-1 flex-col">{ladder}</div>
+        </div>
         <ScalpBar scalps={scalps.filter((p) => !p.placing)} h={handlers} onOpen={() => setSheet(true)} paper={account} />
         {sheetEl}
       </div>

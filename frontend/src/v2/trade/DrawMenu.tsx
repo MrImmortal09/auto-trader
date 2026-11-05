@@ -24,7 +24,7 @@ export function DrawMenu({ open, onToggle, onClose, onPick, onClear, disabled = 
   compact?: boolean;
 }) {
   return (
-    <div className="relative">
+    <div className="relative shrink-0">
       <button
         type="button"
         aria-label="Draw"
@@ -36,7 +36,7 @@ export function DrawMenu({ open, onToggle, onClose, onPick, onClear, disabled = 
       >
         <Pencil size={16} />
       </button>
-      <Popover open={open && !disabled} onClose={onClose} align="right">
+      <Popover open={open && !disabled} onClose={onClose} align="right" backdrop={compact}>
         <div className="px-2 pt-1 pb-1 type-caption text-fg-muted">Draw on this chart</div>
         {DRAW_TOOLS.map(({ tool, label }) => {
           const Icon = ICONS[tool];
