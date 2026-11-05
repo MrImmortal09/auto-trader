@@ -2,7 +2,7 @@
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-import type { ChartLevel, MonitoredPosition, PaperTrade } from '../types';
+import type { ChartLevel, ChartLevels, ChartTarget, MonitoredPosition, PaperTrade } from '../types';
 
 /** Full contract label — "SENSEX 82000 CE" — instead of the bare underlying,
  * which is ambiguous when several strikes are being traded at once. Falls back
@@ -35,6 +35,19 @@ export function chartLevelLabel(
   const falls = (kind === 'stop') === (optionType === 'CE');
   const value = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(level.price);
   return `${index} ${falls ? '≤' : '≥'} ${value}`;
+}
+
+/** A scalp's chart targets, in the order they were set — an older server's
+ * one target as an "all left" one. */
+export function chartTargets(chart: ChartLevels | null | undefined): ChartTarget[] {
+  if (!chart) return [];
+  if (chart.targets) return chart.targets;
+  return chart.target ? [{ ...chart.target, id: '', lots: null }] : [];
+}
+
+/** "2 lots", or "all left" for a target that sells whatever is still held. */
+export function targetLotsLabel(lots: number | null): string {
+  return lots == null ? 'all left' : `${lots} ${lots === 1 ? 'lot' : 'lots'}`;
 }
 
 export function totalCharges(t: PaperTrade) {

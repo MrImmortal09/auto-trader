@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { ExecutePosition } from '../../types';
 import { contractLabel, expiryLabel } from '../../lib/execute';
+import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { money, price, signedMoney, signedPct, toneOf } from '../lib/format';
 import type { Call, DeskAnswer, DeskPosition, FillMark, PaperActivity } from '../lib/types';
 import { PositionRail } from '../desk/PositionRail';
@@ -10,7 +11,7 @@ import { SourceChip } from '../ui/Chip';
 import { HoldButton } from '../ui/HoldButton';
 import { Modal } from '../ui/Modal';
 import { Segment } from '../ui/Segment';
-import type { LevelKind } from './lines';
+import { targetQty, targetRoom, type LevelKind, type LevelRef } from './lines';
 import { approxMoney, levelPnl } from './model';
 import { AccountColumn } from './panel/TradingPanel';
 import { activityEvents, type EngineError } from './panel/activity';
@@ -91,7 +92,7 @@ function railOf(p: ExecutePosition, indexNow: number | null, levelsOn: boolean) 
     signal_stop: 0,
     targets: [],
     next_target: null,
-    chart: p.chart ?? { stop: null, target: null },
+    chart: { stop: p.chart?.stop ?? null, targets: chartTargets(p.chart) },
     index_ltp: indexNow,
     busy: null,
   } satisfies DeskPosition, levelsOn);
@@ -118,7 +119,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
   /** When each was first bought today, IST `HH:MM`. */
   since: (p: ExecutePosition) => string | null;
   canSet: boolean;
-  onRemove: (p: ExecutePosition, kind: LevelKind) => void;
+  onRemove: (p: ExecutePosition, ref: LevelRef) => void;
   /** Put a level on the chart: the sheet closes so the chart can be tapped. */
   onAdd: (p: ExecutePosition, kind: LevelKind) => void;
   onClose: () => void;
@@ -155,23 +156,27 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
             const pct = p.ltp != null && p.avg > 0 ? ((p.ltp - p.avg) / p.avg) * 100 : null;
             const lots = p.lot_size > 0 ? Math.round(p.qty / p.lot_size) : 0;
             const bought = since(p);
-            const row = (kind: LevelKind) => {
-              const lvl = p.chart?.[kind] ?? null;
-              const word = kind === 'stop' ? 'Stop' : 'Target';
+            const targets = chartTargets(p.chart);
+            const lone = targets.length === 1 && targets[0].lots == null;
+            const room = canSet && targetRoom(p) != null;
+            /** One level's row, `null` for an empty one with "Add …". */
+            const row = (kind: LevelKind, ref: LevelRef | null, key: string, title: string) => {
+              const lvl = ref ? (ref.kind === 'stop' ? p.chart?.stop ?? null : ref.target) : null;
+              const qty = ref?.kind === 'target' ? targetQty(p, ref.target.lots, ref.target.id) : p.qty;
               return (
-                <div className="flex items-center gap-3 border-t border-line py-3">
+                <div key={key} className="flex items-center gap-3 border-t border-line py-3">
                   <div className="min-w-0 flex-1">
-                    <div className="type-label text-fg-muted">{word}</div>
+                    <div className="type-label text-fg-muted">{title}</div>
                     {lvl ? (
                       <div className={`type-body-strong tnum ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-                        {levelWords(p, kind, lvl)} · {approxMoney(levelPnl(lvl, p, indexNow(p.index), delta.value))}
+                        {levelWords(p, kind, lvl)} · {approxMoney(levelPnl(lvl, { ...p, qty }, indexNow(p.index), delta.value))}
                       </div>
                     ) : (
-                      <div className="type-body text-fg-muted">None</div>
+                      <div className="type-body text-fg-muted">{kind === 'target' && targets.length > 0 ? 'For the lots no target has yet' : 'None'}</div>
                     )}
                   </div>
-                  {lvl ? (
-                    <Button size="lg" kind="ghost" disabled={locked} onClick={() => onRemove(p, kind)}>
+                  {ref ? (
+                    <Button size="lg" kind="ghost" disabled={locked} onClick={() => onRemove(p, ref)}>
                       Remove
                     </Button>
                   ) : (
@@ -184,6 +189,12 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                 </div>
               );
             };
+            const targetRows = [
+              ...targets.map((target, i) =>
+                row('target', { kind: 'target', target }, target.id || `t${i}`, lone ? 'Target' : `Target ${i + 1} · ${targetLotsLabel(target.lots)}`),
+              ),
+              ...(targets.length === 0 || room ? [row('target', null, 'add-target', targets.length ? 'Another target' : 'Target')] : []),
+            ];
             return (
               <article key={p.id} className="flex flex-col gap-3">
                 <header className="flex items-start justify-between gap-3">
@@ -214,8 +225,8 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                   <>
                     <PositionRail spec={railOf(p, indexNow(p.index), canSet)} />
                     <div>
-                      {row('stop')}
-                      {row('target')}
+                      {row('stop', p.chart?.stop ? { kind: 'stop' } : null, 'stop', 'Stop')}
+                      {targetRows}
                     </div>
                     <p className="type-caption text-fg-muted">
                       Drag the lines on the {p.index} chart to move them. ≈ amounts use{' '}

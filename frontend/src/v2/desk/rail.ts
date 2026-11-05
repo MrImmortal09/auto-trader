@@ -1,5 +1,6 @@
+import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { level, price } from '../lib/format';
-import type { ChartLevel, DeskPosition } from '../lib/types';
+import type { ChartLevel, ChartTarget, DeskPosition } from '../lib/types';
 
 // What a Figma "Position rail" shows for a Desk position — its marks, the
 // price marker and the fill. Drawn by PositionRail.tsx.
@@ -39,16 +40,20 @@ export function railFor(p: DeskPosition, levelsOn = true): RailSpec {
 
   if (p.source.kind === 'scalp') {
     if (p.state === 'waiting') return none('Buying at market');
-    const { stop, target } = p.chart;
-    if (!stop && !target) return none(levelsOn ? 'No stop or target yet · add them from the chart' : 'No stop or target · chart stops are off (Settings → Beta)');
-    if (stop && target && stop.trigger !== target.trigger) {
-      return none(`${chartText('Stop', stop, p.index, p.side)} · ${chartText('Target', target, p.index, p.side)}`);
+    const stop = p.chart.stop;
+    const targets = chartTargets(p.chart);
+    if (!stop && targets.length === 0) return none(levelsOn ? 'No stop or target yet · add them from the chart' : 'No stop or target · chart stops are off (Settings → Beta)');
+    const lots = (t: ChartTarget) => (targets.length === 1 && t.lots == null ? '' : ` · ${targetLotsLabel(t.lots)}`);
+    const triggers = new Set([...(stop ? [stop.trigger] : []), ...targets.map((t) => t.trigger)]);
+    if (triggers.size > 1) {
+      const words = [...(stop ? [chartText('Stop', stop, p.index, p.side)] : []), ...targets.map((t) => `${chartText('Target', t, p.index, p.side)}${lots(t)}`)];
+      return none(words.join(' · '));
     }
     const marks: RailMark[] = [];
     if (stop) marks.push({ at: stop.price, label: `Stop ${level(stop.price)}`, tone: 'loss', priority: 0 });
-    if (target) marks.push({ at: target.price, label: `Target ${level(target.price)}`, tone: 'profit', priority: 0 });
-    if ((stop ?? target)!.trigger === 'index') {
-      // An index level's rail: the stop and target, and where the index is.
+    for (const t of targets) marks.push({ at: t.price, label: `Target ${level(t.price)}${lots(t)}`, tone: 'profit', priority: 0 });
+    if ((stop ?? targets[0]).trigger === 'index') {
+      // An index level's rail: the stop and targets, and where the index is.
       const marker = p.index_ltp != null ? { at: p.index_ltp, label: price(p.index_ltp) } : null;
       return { marks, marker, fill: null, zone: null, dashed: false };
     }

@@ -260,7 +260,7 @@ export interface MonitoredPosition {
   manual?: boolean;
   /** A manual add still waiting to be sent. */
   manual_add?: { lots: number; requested_at: string } | null;
-  /** A scalp's stop and target set from a v2 chart; absent while none is set. */
+  /** A scalp's stop and targets set from a v2 chart; absent while none is set. */
   chart?: ChartLevels;
 }
 
@@ -270,10 +270,20 @@ export interface ChartLevel {
   trigger: 'premium' | 'index';
 }
 
-/** A scalp's chart stop and target. Reaching either sells the whole holding. */
+/** A chart target: a level and the lots it sells — `null` sells all that is
+ * left when it is reached. */
+export interface ChartTarget extends ChartLevel {
+  id: string;
+  lots: number | null;
+}
+
+/** A scalp's chart stop and targets. The stop sells the whole holding; a
+ * target its own lots. Read them with `chartTargets`. */
 export interface ChartLevels {
   stop: ChartLevel | null;
-  target: ChartLevel | null;
+  targets?: ChartTarget[];
+  /** An older server's one target, which sold the whole holding. */
+  target?: ChartLevel | null;
 }
 
 export interface KotakForm {
@@ -544,7 +554,7 @@ export interface ExecutePosition {
   adding: boolean;
   exiting: boolean;
   halted: boolean;
-  /** Chart stop and target, when set from a v2 chart. */
+  /** Chart stop and targets, when set from a v2 chart. */
   chart?: ChartLevels;
 }
 

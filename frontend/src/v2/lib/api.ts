@@ -238,8 +238,7 @@ export const paperSellLots = (base: string, id: string, lots: number) => send(ba
 export const paperClose = (base: string, id: string) => send(base, `${mine(id)}/close`, 'POST');
 /** Sells everything: `{sold, not_sold}`, the second saying why each wasn't. */
 export const paperExitAll = (base: string) => send(base, '/api/v2/me/exit-all', 'POST');
-export const setPaperLevels = (base: string, id: string, levels: { stop?: ChartLevel | null; target?: ChartLevel | null }) =>
-  send(base, mine(id), 'PATCH', levels);
+export const setPaperLevels = (base: string, id: string, levels: LevelsUpdate) => send(base, mine(id), 'PATCH', levels);
 /** Back to ₹10,00,000 and no history; refused while anything is open. */
 export const resetPortfolio = (base: string) => send(base, '/api/v2/me/reset', 'POST');
 
@@ -260,10 +259,28 @@ export const executeBuy = (base: string, tradingSymbol: string, lots: number) =>
   send(base, '/api/execute/buy', 'POST', { trading_symbol: tradingSymbol, lots });
 /** Sell every scalp at market — v1's Exit all. */
 export const executeExitAll = (base: string) => send(base, '/api/execute/exit-all', 'POST');
-/** Set (`{price, trigger}`), clear (`null`) or keep (left out) a scalp's chart
- * stop and target — PR 4's endpoint, behind the `chart_stops` switch. */
-export const setChartLevels = (base: string, id: string, levels: { stop?: ChartLevel | null; target?: ChartLevel | null }) =>
-  send(base, `/api/v2/positions/${encodeURIComponent(id)}`, 'PATCH', levels);
+/** A change to a scalp's chart levels; anything left out stays as it is.
+ * `stop`: `{price, trigger}` sets it, `null` clears it. `set_target`: a new
+ * target (no `id`) or one moved or resized (its `id`), with `lots` — `null`
+ * for "all left", left out to keep a moved target's. `remove_target`: an id. */
+export interface LevelsUpdate {
+  stop?: ChartLevel | null;
+  set_target?: ChartLevel & { id?: string; lots?: number | null };
+  remove_target?: string;
+}
+
+/** What a levels change answers: `sells_now` when a level set is already
+ * past the price — `sells_lots` of them, or everything when `null` —
+ * and the id of a target it set. */
+export interface LevelsAnswer {
+  sells_now?: boolean;
+  sells_lots?: number | null;
+  target_id?: string | null;
+}
+
+/** Change a scalp's chart stop and targets — PR 4's endpoint, behind the
+ * `chart_stops` switch. */
+export const setChartLevels = (base: string, id: string, levels: LevelsUpdate) => send(base, `/api/v2/positions/${encodeURIComponent(id)}`, 'PATCH', levels);
 
 /** Replace the whole trading config — v1's save. Send back every field,
  * including those v2 doesn't show. */

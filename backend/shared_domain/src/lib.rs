@@ -820,6 +820,11 @@ pub struct MonitoredPosition {
     /// exactly as before.
     #[serde(default, skip_serializing_if = "ChartLevels::is_empty")]
     pub chart: ChartLevels,
+    /// LIVE: the chart targets the sell now at the broker is for
+    /// (`pending_exit_reason` `CHART_TARGET`), out of `chart` while it
+    /// settles. An IOC that misses puts back what it didn't sell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chart_targets_selling: Vec<ChartTarget>,
 }
 
 /// What a chart stop or target watches.
@@ -841,60 +846,253 @@ pub struct ChartLevel {
     pub trigger: LevelTrigger,
 }
 
-/// A scalp's stop and target, set from a v2 chart
+/// Most chart targets one position may have.
+pub const MAX_CHART_TARGETS: usize = 5;
+
+/// One chart target: a level, and how many lots reaching it sells.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartTarget {
+    /// Names it in an edit, so a move never lands on a target that has
+    /// already sold and been replaced.
+    pub id: String,
+    pub price: f64,
+    pub trigger: LevelTrigger,
+    /// Lots it sells. `None` is "all left": whatever is still held when it
+    /// is reached, lots added later included — what a target was before
+    /// targets had lots.
+    #[serde(default)]
+    pub lots: Option<i32>,
+}
+
+impl ChartTarget {
+    pub fn new_id() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+    }
+}
+
+/// A scalp's stop and targets, set from a v2 chart
 /// (`PATCH /api/v2/positions/:id`, behind `FeatureFlags::chart_stops`).
-/// Reaching either sells the whole holding at market, through the same exit
-/// as any stop. Once set they protect the position until it closes, whatever
-/// the switch says later.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+/// The stop sells the whole holding at market, through the same exit as any
+/// stop; each target sells its own lots (see [`chart_hit`]). Once set they
+/// protect the position until it closes, whatever the switch says later.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ChartLevels {
-    #[serde(default)]
     pub stop: Option<ChartLevel>,
+    /// In the order they were set.
+    pub targets: Vec<ChartTarget>,
+}
+
+/// Also reads the one-target shape stored before targets had lots
+/// (`{stop, target}`), as an "all left" target, so a position open across
+/// the upgrade keeps its target.
+impl<'de> Deserialize<'de> for ChartLevels {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            #[serde(default)]
+            stop: Option<ChartLevel>,
+            #[serde(default)]
+            targets: Option<Vec<ChartTarget>>,
+            #[serde(default)]
+            target: Option<ChartLevel>,
+        }
+        let s = Stored::deserialize(d)?;
+        let targets = match (s.targets, s.target) {
+            (Some(targets), _) => targets,
+            (None, Some(t)) => vec![ChartTarget { id: ChartTarget::new_id(), price: t.price, trigger: t.trigger, lots: None }],
+            (None, None) => Vec::new(),
+        };
+        Ok(Self { stop: s.stop, targets })
+    }
+}
+
+/// One target set or moved from a chart. `id` names the target to move or
+/// resize; without one it is a new target. `lots`: left out keeps a moved
+/// target's lots, `None` is "all left", `Some(n)` is `n` lots.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetEdit {
     #[serde(default)]
-    pub target: Option<ChartLevel>,
+    pub id: Option<String>,
+    pub price: f64,
+    pub trigger: LevelTrigger,
+    #[serde(default, deserialize_with = "present_lots")]
+    pub lots: Option<Option<i32>>,
+}
+
+/// Tells `lots: null` from `lots` left out.
+fn present_lots<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<i32>>, D::Error> {
+    Option::<i32>::deserialize(d).map(Some)
+}
+
+/// Why a chart level edit can't be applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LevelRefusal {
+    /// The request itself is wrong (a bad price or lot count).
+    BadRequest(String),
+    /// It can't apply to the position as it stands now.
+    Conflict(String),
 }
 
 impl ChartLevels {
     pub fn is_empty(&self) -> bool {
-        self.stop.is_none() && self.target.is_none()
+        self.stop.is_none() && self.targets.is_empty()
+    }
+
+    /// Every level, stop first.
+    pub fn levels(&self) -> impl Iterator<Item = ChartLevel> + '_ {
+        self.stop.into_iter().chain(self.targets.iter().map(|t| ChartLevel { price: t.price, trigger: t.trigger }))
+    }
+
+    /// Set or move one target on a position holding `held_lots`; its id.
+    /// A target's lots may only use what no other target has: a change that
+    /// would have the targets sell more lots than are held is refused (a
+    /// move that keeps its lots is always taken).
+    pub fn set_target(&mut self, edit: &TargetEdit, held_lots: i32) -> Result<String, LevelRefusal> {
+        if !(edit.price.is_finite() && edit.price > 0.0) {
+            return Err(LevelRefusal::BadRequest("a level's price must be a positive number".to_string()));
+        }
+        if let Some(Some(n)) = edit.lots {
+            if n < 1 {
+                return Err(LevelRefusal::BadRequest("a target sells at least 1 lot".to_string()));
+            }
+        }
+        let at = match edit.id.as_deref() {
+            Some(id) => Some(self.targets.iter().position(|t| t.id == id).ok_or_else(|| {
+                LevelRefusal::Conflict("that target is gone — it may just have sold".to_string())
+            })?),
+            None if self.targets.len() >= MAX_CHART_TARGETS => {
+                return Err(LevelRefusal::Conflict(format!("a trade can have at most {MAX_CHART_TARGETS} targets")));
+            }
+            None => None,
+        };
+        let lots = match (edit.lots, at) {
+            (Some(lots), _) => lots,
+            (None, Some(i)) => self.targets[i].lots,
+            (None, None) => None,
+        };
+        let resized = at.is_none_or(|i| self.targets[i].lots != lots);
+        if let (Some(n), true) = (lots, resized) {
+            let others: i32 = self
+                .targets
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != at)
+                .filter_map(|(_, t)| t.lots)
+                .sum();
+            if others + n > held_lots {
+                return Err(LevelRefusal::Conflict(format!(
+                    "the targets would sell {} lots — you hold {held_lots}",
+                    others + n
+                )));
+            }
+        }
+        let target = ChartTarget {
+            id: at.map(|i| self.targets[i].id.clone()).unwrap_or_else(ChartTarget::new_id),
+            price: edit.price,
+            trigger: edit.trigger,
+            lots,
+        };
+        let id = target.id.clone();
+        match at {
+            Some(i) => self.targets[i] = target,
+            None => self.targets.push(target),
+        }
+        Ok(id)
+    }
+
+    /// Remove the target `id`; whether it was there.
+    pub fn remove_target(&mut self, id: &str) -> bool {
+        let before = self.targets.len();
+        self.targets.retain(|t| t.id != id);
+        self.targets.len() != before
+    }
+
+    /// Take the targets `ids` out (those still there), as a sell for them
+    /// goes out.
+    pub fn take_targets(&mut self, ids: &[String]) -> Vec<ChartTarget> {
+        let (taken, kept) = std::mem::take(&mut self.targets).into_iter().partition(|t| ids.contains(&t.id));
+        self.targets = kept;
+        taken
+    }
+
+    /// Put back what a sell for `taken` left unsold: `sold_lots` come off
+    /// the first targets, the rest return with what they still have to sell.
+    pub fn restore_unsold(&mut self, taken: Vec<ChartTarget>, mut sold_lots: i32) {
+        for mut t in taken {
+            let Some(lots) = t.lots else {
+                self.targets.push(t);
+                continue;
+            };
+            let sold = sold_lots.clamp(0, lots);
+            sold_lots -= sold;
+            if lots > sold {
+                t.lots = Some(lots - sold);
+                self.targets.push(t);
+            }
+        }
     }
 }
 
-/// The exit reason once an option's `premium`, or its index's `index` value,
-/// has reached `chart`'s stop (checked first) or target. `option_type` is
+/// What reaching a chart level sells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChartHit {
+    /// The whole holding: the stop, or targets that cover all of it.
+    All { reason: &'static str },
+    /// `lots` lots for the targets `ids`, leaving the rest held — reason
+    /// `CHART_TARGET`.
+    Part { lots: i32, ids: Vec<String> },
+}
+
+/// What a position holding `held_lots` sells now that an option's `premium`,
+/// or its index's `index` value, has reached `chart`'s stop (checked first)
+/// or targets. Targets reached together sell together; "all left" among
+/// them, or lots covering the holding, sell everything. `option_type` is
 /// `CE` or `PE`; anything else never reaches a level. Shared by the engine's
 /// scalps and the users' paper positions.
-pub fn chart_level_reached(option_type: Option<&str>, chart: &ChartLevels, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
+pub fn chart_hit(option_type: Option<&str>, chart: &ChartLevels, premium: Option<f64>, index: Option<f64>, held_lots: i32) -> Option<ChartHit> {
     let call = match option_type {
         Some(t) if t.eq_ignore_ascii_case("CE") => true,
         Some(t) if t.eq_ignore_ascii_case("PE") => false,
         _ => return None,
     };
-    let reached = |level: &ChartLevel, is_stop: bool| {
-        let (value, falling) = match level.trigger {
+    let reached = |price: f64, trigger: LevelTrigger, is_stop: bool| {
+        let (value, falling) = match trigger {
             // On its own premium a stop is reached falling and a target
             // rising, for a call and a put alike.
             LevelTrigger::Premium => (premium, is_stop),
             // On the index a call loses as it falls, a put as it rises.
             LevelTrigger::Index => (index, is_stop == call),
         };
-        value.is_some_and(|v| v > 0.0 && if falling { v <= level.price } else { v >= level.price })
+        value.is_some_and(|v| v > 0.0 && if falling { v <= price } else { v >= price })
     };
-    if chart.stop.as_ref().is_some_and(|l| reached(l, true)) {
-        return Some("CHART_STOP");
+    if chart.stop.as_ref().is_some_and(|l| reached(l.price, l.trigger, true)) {
+        return Some(ChartHit::All { reason: "CHART_STOP" });
     }
-    if chart.target.as_ref().is_some_and(|l| reached(l, false)) {
-        return Some("CHART_TARGET");
+    let hit: Vec<&ChartTarget> = chart.targets.iter().filter(|t| reached(t.price, t.trigger, false)).collect();
+    if hit.is_empty() {
+        return None;
     }
-    None
+    let mut lots = 0;
+    for t in &hit {
+        match t.lots {
+            Some(n) => lots += n.max(0),
+            None => return Some(ChartHit::All { reason: "CHART_TARGET" }),
+        }
+    }
+    if lots >= held_lots {
+        return Some(ChartHit::All { reason: "CHART_TARGET" });
+    }
+    Some(ChartHit::Part { lots, ids: hit.iter().map(|t| t.id.clone()).collect() })
 }
 
 impl MonitoredPosition {
-    /// The exit reason once the option's `premium`, or its index's `index`
-    /// value, has reached this position's chart stop (checked first) or
-    /// target — see [`chart_level_reached`].
-    pub fn chart_level_hit(&self, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
-        chart_level_reached(self.signal.option_type.as_deref(), &self.chart, premium, index)
+    /// What this position sells now that the option's `premium`, or its
+    /// index's `index` value, has reached its chart stop or targets — see
+    /// [`chart_hit`]. `lot` is the contract's lot size.
+    pub fn chart_hit(&self, premium: Option<f64>, index: Option<f64>, lot: i32) -> Option<ChartHit> {
+        let held_lots = if lot > 0 { self.executed_qty / lot } else { self.executed_qty };
+        chart_hit(self.signal.option_type.as_deref(), &self.chart, premium, index, held_lots)
     }
     /// A buy on top of the holding is pending: a manual add not sent yet, a
     /// top-up order at the broker, or one whose send outcome is unknown.
@@ -1519,45 +1717,141 @@ mod tests {
         ChartLevel { price, trigger: LevelTrigger::Premium }
     }
 
+    /// An "all left" target at `l`.
+    fn all_at(l: ChartLevel) -> ChartTarget {
+        ChartTarget { id: format!("t{}", l.price), price: l.price, trigger: l.trigger, lots: None }
+    }
+
+    fn lots_at(id: &str, l: ChartLevel, lots: i32) -> ChartTarget {
+        ChartTarget { id: id.into(), price: l.price, trigger: l.trigger, lots: Some(lots) }
+    }
+
+    fn levels(stop: Option<ChartLevel>, targets: Vec<ChartTarget>) -> ChartLevels {
+        ChartLevels { stop, targets }
+    }
+
+    /// The exit reason a whole-holding hit gives, for a position of 4 lots.
+    fn reason(p: &MonitoredPosition, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
+        match p.chart_hit(premium, index, 1) {
+            Some(ChartHit::All { reason }) => Some(reason),
+            Some(ChartHit::Part { .. }) => Some("PART"),
+            None => None,
+        }
+    }
+
+    fn holding(side: &str, chart: ChartLevels) -> MonitoredPosition {
+        MonitoredPosition { executed_qty: 4, ..scalp(side, chart) }
+    }
+
     #[test]
     fn index_levels_follow_the_side_of_the_option() {
         // A call: stop below the index, target above it.
-        let call = scalp("CE", ChartLevels { stop: Some(on_index(25_060.0)), target: Some(on_index(25_180.0)) });
-        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_100.0)), None);
-        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_060.0)), Some("CHART_STOP"));
-        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_000.0)), Some("CHART_STOP"));
-        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_180.0)), Some("CHART_TARGET"));
+        let call = holding("CE", levels(Some(on_index(25_060.0)), vec![all_at(on_index(25_180.0))]));
+        assert_eq!(reason(&call, Some(100.0), Some(25_100.0)), None);
+        assert_eq!(reason(&call, Some(100.0), Some(25_060.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&call, Some(100.0), Some(25_000.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&call, Some(100.0), Some(25_180.0)), Some("CHART_TARGET"));
         // A put: stop above the index, target below it.
-        let put = scalp("PE", ChartLevels { stop: Some(on_index(25_140.0)), target: Some(on_index(25_020.0)) });
-        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_100.0)), None);
-        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_140.0)), Some("CHART_STOP"));
-        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_200.0)), Some("CHART_STOP"));
-        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_020.0)), Some("CHART_TARGET"));
+        let put = holding("PE", levels(Some(on_index(25_140.0)), vec![all_at(on_index(25_020.0))]));
+        assert_eq!(reason(&put, Some(100.0), Some(25_100.0)), None);
+        assert_eq!(reason(&put, Some(100.0), Some(25_140.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&put, Some(100.0), Some(25_200.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&put, Some(100.0), Some(25_020.0)), Some("CHART_TARGET"));
         // No index value yet: nothing fires.
-        assert_eq!(call.chart_level_hit(Some(100.0), None), None);
+        assert_eq!(reason(&call, Some(100.0), None), None);
     }
 
     #[test]
     fn premium_levels_work_the_same_for_calls_and_puts() {
         for side in ["CE", "PE"] {
-            let pos = scalp(side, ChartLevels { stop: Some(on_premium(92.5)), target: Some(on_premium(140.0)) });
-            assert_eq!(pos.chart_level_hit(Some(100.0), Some(25_000.0)), None, "{side}");
-            assert_eq!(pos.chart_level_hit(Some(92.5), None), Some("CHART_STOP"), "{side}");
-            assert_eq!(pos.chart_level_hit(Some(140.05), None), Some("CHART_TARGET"), "{side}");
-            assert_eq!(pos.chart_level_hit(None, Some(25_000.0)), None, "{side}");
+            let pos = holding(side, levels(Some(on_premium(92.5)), vec![all_at(on_premium(140.0))]));
+            assert_eq!(reason(&pos, Some(100.0), Some(25_000.0)), None, "{side}");
+            assert_eq!(reason(&pos, Some(92.5), None), Some("CHART_STOP"), "{side}");
+            assert_eq!(reason(&pos, Some(140.05), None), Some("CHART_TARGET"), "{side}");
+            assert_eq!(reason(&pos, None, Some(25_000.0)), None, "{side}");
         }
     }
 
     #[test]
     fn a_stop_wins_over_a_target_and_only_real_prices_count() {
-        let mixed = scalp("CE", ChartLevels { stop: Some(on_premium(92.5)), target: Some(on_index(25_180.0)) });
-        assert_eq!(mixed.chart_level_hit(Some(90.0), Some(25_200.0)), Some("CHART_STOP"));
-        assert_eq!(mixed.chart_level_hit(Some(0.0), Some(0.0)), None);
-        assert_eq!(scalp("CE", ChartLevels::default()).chart_level_hit(Some(1.0), Some(1.0)), None);
+        let mixed = holding("CE", levels(Some(on_premium(92.5)), vec![all_at(on_index(25_180.0))]));
+        assert_eq!(reason(&mixed, Some(90.0), Some(25_200.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&mixed, Some(0.0), Some(0.0)), None);
+        assert_eq!(reason(&holding("CE", ChartLevels::default()), Some(1.0), Some(1.0)), None);
         // Only options have chart levels.
         let mut not_an_option = mixed;
         not_an_option.signal.option_type = None;
-        assert_eq!(not_an_option.chart_level_hit(Some(90.0), Some(25_200.0)), None);
+        assert_eq!(reason(&not_an_option, Some(90.0), Some(25_200.0)), None);
+    }
+
+    #[test]
+    fn a_target_with_lots_sells_only_its_lots() {
+        // 4 lots of 75: 2 at ₹120, 2 at ₹140.
+        let mut pos = holding("CE", levels(Some(on_premium(90.0)), vec![lots_at("a", on_premium(120.0), 2), lots_at("b", on_premium(140.0), 2)]));
+        pos.executed_qty = 300;
+        assert_eq!(pos.chart_hit(Some(110.0), None, 75), None);
+        assert_eq!(pos.chart_hit(Some(120.0), None, 75), Some(ChartHit::Part { lots: 2, ids: vec!["a".into()] }));
+        // Both reached at once (a jump, or a line dropped past the price): one sell for all their lots — here the whole holding.
+        assert_eq!(pos.chart_hit(Some(141.0), None, 75), Some(ChartHit::All { reason: "CHART_TARGET" }));
+        // After the first sold: the second's 2 lots are all that's left.
+        pos.executed_qty = 150;
+        pos.chart.targets.remove(0);
+        assert_eq!(pos.chart_hit(Some(140.0), None, 75), Some(ChartHit::All { reason: "CHART_TARGET" }));
+        // The stop still sells everything.
+        assert_eq!(pos.chart_hit(Some(89.0), None, 75), Some(ChartHit::All { reason: "CHART_STOP" }));
+    }
+
+    #[test]
+    fn an_all_left_target_sells_whatever_is_held() {
+        // 2 lots at ₹120, all left at ₹130 — including lots added later.
+        let mut pos = holding("CE", levels(None, vec![lots_at("a", on_premium(120.0), 2), all_at(on_premium(130.0))]));
+        pos.executed_qty = 6;
+        assert_eq!(pos.chart_hit(Some(120.0), None, 1), Some(ChartHit::Part { lots: 2, ids: vec!["a".into()] }));
+        assert_eq!(pos.chart_hit(Some(130.0), None, 1), Some(ChartHit::All { reason: "CHART_TARGET" }));
+    }
+
+    #[test]
+    fn target_lots_never_add_up_past_the_holding() {
+        let mut chart = ChartLevels::default();
+        let edit = |id: Option<&str>, price: f64, lots: Option<Option<i32>>| TargetEdit { id: id.map(Into::into), price, trigger: LevelTrigger::Premium, lots };
+        let a = chart.set_target(&edit(None, 120.0, Some(Some(2))), 4).unwrap();
+        let b = chart.set_target(&edit(None, 140.0, Some(Some(2))), 4).unwrap();
+        assert_ne!(a, b);
+        assert!(matches!(chart.set_target(&edit(None, 150.0, Some(Some(1))), 4), Err(LevelRefusal::Conflict(_))));
+        // "All left" always fits.
+        chart.set_target(&edit(None, 150.0, Some(None)), 4).unwrap();
+        // A move keeps its lots — even once the holding is smaller than the targets.
+        chart.set_target(&edit(Some(&a), 125.0, None), 3).unwrap();
+        assert_eq!(chart.targets[0], ChartTarget { id: a.clone(), price: 125.0, trigger: LevelTrigger::Premium, lots: Some(2) });
+        // Resizing past the holding is refused; within it, taken.
+        assert!(matches!(chart.set_target(&edit(Some(&a), 125.0, Some(Some(3))), 4), Err(LevelRefusal::Conflict(_))));
+        chart.set_target(&edit(Some(&a), 125.0, Some(Some(1))), 4).unwrap();
+        assert_eq!(chart.targets[0].lots, Some(1));
+        // A target that has sold can't be moved; no lot count below 1, no bad price.
+        assert!(chart.remove_target(&a));
+        assert!(matches!(chart.set_target(&edit(Some(&a), 125.0, None), 4), Err(LevelRefusal::Conflict(_))));
+        assert!(matches!(chart.set_target(&edit(None, 125.0, Some(Some(0))), 4), Err(LevelRefusal::BadRequest(_))));
+        assert!(matches!(chart.set_target(&edit(None, f64::NAN, None), 4), Err(LevelRefusal::BadRequest(_))));
+        // At most MAX_CHART_TARGETS.
+        while chart.targets.len() < MAX_CHART_TARGETS {
+            chart.set_target(&edit(None, 160.0, Some(None)), 4).unwrap();
+        }
+        assert!(matches!(chart.set_target(&edit(None, 170.0, Some(None)), 4), Err(LevelRefusal::Conflict(_))));
+    }
+
+    #[test]
+    fn an_unfilled_target_sell_puts_back_what_it_did_not_sell() {
+        let mut chart = levels(None, vec![lots_at("a", on_premium(120.0), 2), lots_at("b", on_premium(121.0), 3), lots_at("c", on_premium(140.0), 1)]);
+        let taken = chart.take_targets(&["a".into(), "b".into()]);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(chart.targets.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["c"]);
+        // 3 of the 5 lots filled: a is done, b has 2 left.
+        chart.restore_unsold(taken.clone(), 3);
+        assert_eq!(chart.targets.iter().map(|t| (t.id.as_str(), t.lots)).collect::<Vec<_>>(), [("c", Some(1)), ("b", Some(2))]);
+        // Nothing filled: both back as they were.
+        let mut none = levels(None, vec![]);
+        none.restore_unsold(taken, 0);
+        assert_eq!(none.targets.iter().map(|t| (t.id.as_str(), t.lots)).collect::<Vec<_>>(), [("a", Some(2)), ("b", Some(3))]);
     }
 
     #[test]
@@ -1565,14 +1859,30 @@ mod tests {
         let plain = scalp("CE", ChartLevels::default());
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json.get("chart").is_none(), "positions without levels serialize as before");
+        assert!(json.get("chart_targets_selling").is_none());
         let restored: MonitoredPosition = serde_json::from_value(json).unwrap();
         assert!(restored.chart.is_empty());
 
-        let with = scalp("PE", ChartLevels { stop: Some(on_index(25_140.0)), target: None });
+        let with = scalp("PE", levels(Some(on_index(25_140.0)), vec![lots_at("a", on_premium(140.0), 2)]));
         let json = serde_json::to_value(&with).unwrap();
-        assert_eq!(json["chart"], serde_json::json!({ "stop": { "price": 25140.0, "trigger": "index" }, "target": null }));
+        assert_eq!(
+            json["chart"],
+            serde_json::json!({ "stop": { "price": 25140.0, "trigger": "index" }, "targets": [{ "id": "a", "price": 140.0, "trigger": "premium", "lots": 2 }] })
+        );
         let restored: MonitoredPosition = serde_json::from_value(json).unwrap();
         assert_eq!(restored.chart, with.chart);
+    }
+
+    #[test]
+    fn a_target_stored_before_lots_comes_back_as_all_left() {
+        let stored = serde_json::json!({ "stop": null, "target": { "price": 140.0, "trigger": "premium" } });
+        let chart: ChartLevels = serde_json::from_value(stored).unwrap();
+        assert_eq!(chart.stop, None);
+        assert_eq!(chart.targets.len(), 1);
+        assert_eq!((chart.targets[0].price, chart.targets[0].trigger, chart.targets[0].lots), (140.0, LevelTrigger::Premium, None));
+        assert!(!chart.targets[0].id.is_empty());
+        let none: ChartLevels = serde_json::from_value(serde_json::json!({ "stop": null, "target": null })).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]
