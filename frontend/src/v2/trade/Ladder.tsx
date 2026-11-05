@@ -66,7 +66,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
    * around it. `null` is back at ATM. */
   onCentre: (strike: number | null) => void;
   desktop: boolean;
-  /** Phone: a row under the lots stepper (the expiry picker). */
+  /** Phone: next to the lots stepper (the expiry picker). */
   header?: ReactNode;
 }) {
   const rows = ladderRows(chain, board);
@@ -194,11 +194,18 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className={`flex items-center gap-3 ${desktop ? 'px-3 pb-3' : 'px-4 pb-2'}`}>
-        <LotsStepper lots={lots} lotSize={board.lot_size} onChange={onLots} size={desktop ? 'sm' : 'lg'} />
-        <span className="ml-auto type-caption text-fg-muted">Lot size {board.lot_size}</span>
-      </div>
-      {header && <div className="flex items-center px-4 pb-2">{header}</div>}
+      {desktop ? (
+        <div className="flex items-center gap-3 px-3 pb-3">
+          <LotsStepper lots={lots} lotSize={board.lot_size} onChange={onLots} size="sm" />
+          <span className="ml-auto type-caption text-fg-muted">Lot size {board.lot_size}</span>
+        </div>
+      ) : (
+        // One row, so the strikes get the room; the qty beside the stepper says the lot size.
+        <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 pb-2">
+          <LotsStepper lots={lots} lotSize={board.lot_size} onChange={onLots} size="lg" label={false} />
+          {header && <div className="ml-auto">{header}</div>}
+        </div>
+      )}
       {desktop && (
         <div className="flex px-2 pb-1 type-caption text-fg-muted">
           <span className="flex-1">Calls</span>
