@@ -13,6 +13,7 @@ mod desk;
 mod execute;
 mod history;
 mod market_data;
+mod orders;
 mod paper;
 mod pulse;
 mod routes;
@@ -147,6 +148,9 @@ pub(crate) struct AppState {
     /// Kotak balance for `/api/portfolio`, refreshed in the background — see
     /// `balance`. The page never calls Kotak itself.
     pub balance: Arc<balance::BalanceCache>,
+    /// Kotak's order book for v2's Orders tab, read only while it asks — see
+    /// `orders`.
+    pub order_book: Arc<orders::OrderBookCache>,
     /// The Execute screen's option ladders — see `execute`.
     pub execute: Arc<execute::ExecuteBoard>,
     /// Read-only Upstox client (`UPSTOX_ANALYTICS_TOKEN`), when configured.
@@ -1023,6 +1027,7 @@ async fn main() {
         indicator_feed,
         pulse: Arc::new(pulse::PulseHub::new()),
         balance,
+        order_book: Arc::new(orders::OrderBookCache::new()),
         execute: Arc::new(execute::ExecuteBoard::new()),
         upstox,
         candles: Arc::new(candles::CandleService::new()),
@@ -1110,6 +1115,7 @@ async fn main() {
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))
         .route("/api/v2/history",                   get(routes::v2::history_handler))
         .route("/api/v2/desk",                      get(routes::v2::desk_handler))
+        .route("/api/v2/orders",                    get(orders::orders_handler))
         .route("/api/v2/feed",                      get(routes::v2::feed_handler))
         .route("/api/v2/status",                    get(routes::v2::status_handler))
         .route("/api/v2/expiries",                  get(routes::v2::expiries_handler))

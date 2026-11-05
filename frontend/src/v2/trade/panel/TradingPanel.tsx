@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, ty
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import type { ExecutePosition } from '../../../types';
 import { contractLabel, expiryLabel } from '../../../lib/execute';
-import { getPositionsRaw } from '../../lib/api';
+import { getOrders, getPositionsRaw, type KotakOrderRow } from '../../lib/api';
 import { money, plural, price, signedMoney, signedPct, toneOf } from '../../lib/format';
 import { usePoll } from '../../lib/usePoll';
 import type { Call, DeskAnswer, FillMark } from '../../lib/types';
@@ -209,8 +209,11 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   const openPnl = active.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
   const closed = history.filter((c) => c.channel === 'Scalps');
   const shown: TabId = paper && (tab === 'waiting' || tab === 'orders') ? 'positions' : tab;
-  // Resting orders only matter while that tab is open.
-  const raw = usePoll(() => getPositionsRaw(serverBase), 5_000, serverBase, !paper && open && shown === 'orders');
+  // Orders only matter while that tab is open: Kotak's book, and the engine's
+  // own sends it may not list yet.
+  const ordersOpen = !paper && open && shown === 'orders';
+  const raw = usePoll(() => getPositionsRaw(serverBase), 5_000, serverBase, ordersOpen);
+  const book = usePoll(() => getOrders(serverBase), 5_000, serverBase, ordersOpen);
   // Every order of a manual trade that is at Kotak right now.
   const atKotak = (raw.data ?? [])
     .filter((p) => p.manual && p.state !== 'Closed')
@@ -366,25 +369,76 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
       </ul>
     );
 
+  // Kotak's book: still working first, then the rest with what they filled
+  // at, newest first in each (the server's order). The engine's own sends
+  // Kotak doesn't list yet go with the working ones.
+  const kotakOrders = book.data?.orders ?? [];
+  const listed = new Set(kotakOrders.map((o) => o.id));
+  const sending = atKotak.filter((o) => !listed.has(o.id.trim()));
+  const working = kotakOrders.filter((o) => o.open);
+  const done = kotakOrders.filter((o) => !o.open);
+  const ORDER_GRID = 'grid grid-cols-[minmax(150px,1.4fr)_72px_minmax(120px,1fr)_minmax(150px,1.2fr)_64px_minmax(110px,auto)] items-center gap-3';
+  const orderRow = (o: KotakOrderRow) => {
+    const tone = o.side === 'BUY' ? 'text-profit' : 'text-loss';
+    const statusTone = o.status === 'rejected' ? 'text-loss' : o.open ? 'text-fg' : 'text-fg-muted';
+    const asked = o.trigger != null ? `trigger ${price(o.trigger)}` : o.price != null ? `limit ${price(o.price)}` : 'market';
+    return (
+      <li key={o.id} className={`${ORDER_GRID} border-b border-line px-1 py-2.5`}>
+        <span className="min-w-0 truncate type-body-strong text-fg" title={o.symbol}>
+          {o.contract ?? o.symbol}
+        </span>
+        <span className={`type-caption tnum ${tone}`}>
+          {o.side} · {o.order_type || '—'}
+        </span>
+        <span className="type-caption tnum text-fg">{o.filled > 0 ? `${o.filled}${o.filled < o.qty ? ` of ${o.qty}` : ''} @ ${price(o.avg ?? 0)}` : o.open ? `${o.qty} · ${asked}` : `0 of ${o.qty}`}</span>
+        <span className={`min-w-0 truncate type-caption ${statusTone}`} title={o.reason ?? undefined}>
+          {o.status}
+          {o.reason ? ` · ${o.reason}` : ''}
+        </span>
+        <span className="type-caption tnum text-fg-muted">{o.time ?? '—'}</span>
+        <span className="truncate text-right type-caption tnum text-fg-muted">#{o.id}</span>
+      </li>
+    );
+  };
+  const orderGroup = (title: string, count: number, rows: ReactNode) => (
+    <section className="flex flex-col">
+      <div className="sticky top-0 border-b border-line bg-panel px-1 py-2 type-caption text-fg-muted">
+        {title} · {count}
+      </div>
+      <ul className="flex flex-col">{rows}</ul>
+    </section>
+  );
+  const bookNote = book.data?.error ?? (book.data?.fetched_at ? `Kotak's order book as of ${book.data.fetched_at}` : null);
   const orders =
-    atKotak.length === 0 ? (
+    kotakOrders.length === 0 && sending.length === 0 ? (
       <p className="px-1 py-3 type-body text-fg-muted">
-        {raw.data
-          ? mode === 'LIVE'
-            ? 'Nothing is at Kotak right now. A buy or an exit shows here while it fills; chart stops and targets are watched by the engine and sent at market when hit.'
-            : 'Paper trades place no orders at Kotak.'
+        {book.data || raw.data
+          ? (book.data?.error ??
+            (mode === 'LIVE'
+              ? 'No orders at Kotak today. A buy or an exit shows here as it is sent; chart stops and targets are watched by the engine and sent at market when hit.'
+              : 'Paper trades place no orders at Kotak.'))
           : 'Loading…'}
       </p>
     ) : (
-      <ul className="flex flex-col">
-        {atKotak.map((o) => (
-          <li key={o.key} className="flex items-center gap-3 border-b border-line px-1 py-2.5">
-            <span className="min-w-0 flex-1 type-body-strong text-fg">{o.contract}</span>
-            <span className="type-caption text-fg-muted tnum">{o.what}</span>
-            <span className="type-caption text-fg-muted tnum">#{o.id}</span>
-          </li>
-        ))}
-      </ul>
+      <div className="flex flex-col gap-3 pb-3">
+        {orderGroup(
+          'Working',
+          working.length + sending.length,
+          <>
+            {sending.map((o) => (
+              <li key={o.key} className={`${ORDER_GRID} border-b border-line px-1 py-2.5`}>
+                <span className="min-w-0 truncate type-body-strong text-fg">{o.contract}</span>
+                <span className="col-span-4 type-caption tnum text-fg">{o.what} · not in Kotak's book yet</span>
+                <span className="truncate text-right type-caption tnum text-fg-muted">#{o.id}</span>
+              </li>
+            ))}
+            {working.map(orderRow)}
+            {working.length + sending.length === 0 && <li className="px-1 py-2.5 type-caption text-fg-muted">Nothing working at Kotak right now.</li>}
+          </>,
+        )}
+        {done.length > 0 && orderGroup('Filled, rejected or cancelled', done.length, done.map(orderRow))}
+        {bookNote && <p className={`px-1 type-caption ${book.data?.error ? 'text-loss' : 'text-fg-muted'}`}>{bookNote}</p>}
+      </div>
     );
 
   const header = (

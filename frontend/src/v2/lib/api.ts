@@ -73,6 +73,41 @@ export const getHistory = (base: string, range: RangeId, group: GroupId) =>
   getJson<HistoryAnswer>(base, `/api/v2/history?range=${range}&group=${group}`);
 export const getFlags = (base: string) => getJson<Flags>(base, '/api/v2/flags');
 export const getPositionsRaw = (base: string) => getJson<RawPosition[]>(base, '/api/positions');
+
+/** One of today's orders at Kotak. */
+export interface KotakOrderRow {
+  id: string;
+  symbol: string;
+  /** "NIFTY 25100 CE", when the server knows the symbol. */
+  contract: string | null;
+  side: 'BUY' | 'SELL';
+  /** `MKT`, `L`, `SL`, `SL-M`. */
+  order_type: string;
+  qty: number;
+  filled: number;
+  /** What it filled at, once anything did. */
+  avg: number | null;
+  price: number | null;
+  trigger: number | null;
+  /** Kotak's word: `complete`, `rejected`, `cancelled`, `open`, … */
+  status: string;
+  /** Still working at Kotak. */
+  open: boolean;
+  reason: string | null;
+  /** IST `HH:MM:SS`, when Kotak says. */
+  time: string | null;
+}
+
+/** Kotak's order book: working orders first, then the rest, newest first in each. */
+export interface OrdersAnswer {
+  /** IST `HH:MM:SS` of the read. */
+  fetched_at: string | null;
+  orders: KotakOrderRow[];
+  /** Why the latest read failed; the orders are the last good read's. */
+  error: string | null;
+}
+
+export const getOrders = (base: string) => getJson<OrdersAnswer>(base, '/api/v2/orders');
 export const getExpiries = (base: string, index: string) => getJson<ExpiriesAnswer>(base, `/api/v2/expiries?index=${encodeURIComponent(index)}`);
 /** One expiry's strikes; the nearest when `expiry` is left out. */
 export const getChain = (base: string, index: string, expiry?: string | null) =>

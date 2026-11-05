@@ -195,6 +195,7 @@ mod tests {
         (PATCH, "/api/v2/positions/abc-123", Access::Admin),
         (GET, "/api/v2/history", Access::Admin),
         (GET, "/api/v2/desk", Access::Admin),
+        (GET, "/api/v2/orders", Access::Admin),
         (GET, "/api/v2/feed", Access::Admin),
         (GET, "/api/v2/status", Access::SignedIn),
         (GET, "/api/v2/expiries", Access::SignedIn),
