@@ -496,7 +496,7 @@ impl PaperDesk {
         let qty = if still.iter().any(|t| t.lots.is_none()) {
             pos.qty
         } else {
-            still.iter().filter_map(|t| t.lots).sum::<i32>() * pos.lot_size
+            still.iter().filter_map(|t| t.lots).fold(0, i32::saturating_add).saturating_mul(pos.lot_size)
         };
         self.sell_held(&mut book, user_id, &pos, qty, price, "CHART_TARGET", ids).await
     }

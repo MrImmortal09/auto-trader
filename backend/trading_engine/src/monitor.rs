@@ -2969,7 +2969,7 @@ fn decide_live(
             match pos.chart_hit(ltp, index_ltp(ltp_map, &pos.signal.instrument_name), lot) {
                 Some(ChartHit::All { reason }) => return Some(LiveAction::ExitAll { qty: held, reason: reason.to_string() }),
                 Some(ChartHit::Part { lots, ids }) => {
-                    let qty = (lots * lot).min(held);
+                    let qty = lots.saturating_mul(lot).min(held);
                     return Some(if qty >= held {
                         LiveAction::ExitAll { qty: held, reason: "CHART_TARGET".to_string() }
                     } else {
@@ -3939,7 +3939,7 @@ async fn exec_live_action(
             let cap = if taken.iter().any(|t| t.lots.is_none()) {
                 *qty
             } else {
-                taken.iter().filter_map(|t| t.lots).sum::<i32>() * lot
+                taken.iter().filter_map(|t| t.lots).fold(0, i32::saturating_add).saturating_mul(lot)
             };
             let want = (*qty).min(cap);
             if want <= 0 {
@@ -3964,11 +3964,16 @@ async fn exec_live_action(
 
             match send_exit_sell(kotak, db_tx, log_tx, &ctx, cfg, ctx_ltp, sell_qty, "CHART_TARGET").await {
                 ExitSend::Placed(order_id) => {
+                    // Only the lots sent wait on the order; any it was trimmed
+                    // below go straight back on the chart, so neither its fill
+                    // nor its miss can lose them.
+                    let (selling, unsent) = shared_domain::split_target_lots(taken, sell_qty / lot);
                     with_position(positions, &pending.pos_id, |p| {
                         p.pending_exit_order_id = Some(order_id);
                         p.pending_exit_qty = sell_qty;
                         p.pending_exit_reason = Some("CHART_TARGET".to_string());
-                        p.chart_targets_selling = taken;
+                        p.chart_targets_selling = selling;
+                        p.chart.targets.extend(unsent);
                     }).await;
                     tracing::info!(instrument = %ctx.instrument, sell_qty, held = ctx.executed_qty, "LIVE chart target sell placed");
                 }
@@ -4897,7 +4902,7 @@ pub async fn start_position_monitor(
                                     ChartHit::All { reason } => PosAction::ExitSell {
                                         qty: pos.executed_qty, reason: reason.to_string(), new_sl: None, exec_price: None,
                                     },
-                                    ChartHit::Part { lots, ids } => PosAction::ChartTargetSell { qty: lots * lot_size_of(pos), ids },
+                                    ChartHit::Part { lots, ids } => PosAction::ChartTargetSell { qty: lots.saturating_mul(lot_size_of(pos)), ids },
                                 })
                             } else if ltp <= pos.current_sl {
                                 // A stop above the signal's SL while still

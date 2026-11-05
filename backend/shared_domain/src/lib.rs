@@ -946,8 +946,10 @@ impl ChartLevels {
 
     /// Set or move one target on a position holding `held_lots`; its id.
     /// A target's lots may only use what no other target has: a change that
-    /// would have the targets sell more lots than are held is refused (a
-    /// move that keeps its lots is always taken).
+    /// adds lots past the holding is refused. A move that keeps its lots, or
+    /// a resize down, is always taken — the holding may have shrunk below
+    /// the targets after a partial sell. Sums saturate, so no lot count can
+    /// wrap round to pass.
     pub fn set_target(&mut self, edit: &TargetEdit, held_lots: i32) -> Result<String, LevelRefusal> {
         if !(edit.price.is_finite() && edit.price > 0.0) {
             return Err(LevelRefusal::BadRequest("a level's price must be a positive number".to_string()));
@@ -971,20 +973,20 @@ impl ChartLevels {
             (None, Some(i)) => self.targets[i].lots,
             (None, None) => None,
         };
-        let resized = at.is_none_or(|i| self.targets[i].lots != lots);
-        if let (Some(n), true) = (lots, resized) {
-            let others: i32 = self
+        // The explicit lots this target sold before: a new one, or an "all
+        // left" one turned into a count, adds every lot it now asks for.
+        let before = at.and_then(|i| self.targets[i].lots).unwrap_or(0);
+        if let Some(n) = lots.filter(|n| *n > before) {
+            let others = self
                 .targets
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| Some(*i) != at)
                 .filter_map(|(_, t)| t.lots)
-                .sum();
-            if others + n > held_lots {
-                return Err(LevelRefusal::Conflict(format!(
-                    "the targets would sell {} lots — you hold {held_lots}",
-                    others + n
-                )));
+                .fold(0, i32::saturating_add);
+            let total = others.saturating_add(n);
+            if total > held_lots {
+                return Err(LevelRefusal::Conflict(format!("the targets would sell {total} lots — you hold {held_lots}")));
             }
         }
         let target = ChartTarget {
@@ -1018,20 +1020,33 @@ impl ChartLevels {
 
     /// Put back what a sell for `taken` left unsold: `sold_lots` come off
     /// the first targets, the rest return with what they still have to sell.
-    pub fn restore_unsold(&mut self, taken: Vec<ChartTarget>, mut sold_lots: i32) {
-        for mut t in taken {
-            let Some(lots) = t.lots else {
-                self.targets.push(t);
-                continue;
-            };
-            let sold = sold_lots.clamp(0, lots);
-            sold_lots -= sold;
-            if lots > sold {
-                t.lots = Some(lots - sold);
-                self.targets.push(t);
-            }
+    pub fn restore_unsold(&mut self, taken: Vec<ChartTarget>, sold_lots: i32) {
+        let (_, unsold) = split_target_lots(taken, sold_lots);
+        self.targets.extend(unsold);
+    }
+}
+
+/// `taken` split at `lots`: the first `lots` lots, off the first targets
+/// (a target split in two keeps its id on both sides), and what is left of
+/// them. An "all left" target is never counted into the first part.
+pub fn split_target_lots(taken: Vec<ChartTarget>, lots: i32) -> (Vec<ChartTarget>, Vec<ChartTarget>) {
+    let (mut first, mut rest) = (Vec::new(), Vec::new());
+    let mut left = lots.max(0);
+    for t in taken {
+        let Some(n) = t.lots else {
+            rest.push(t);
+            continue;
+        };
+        let now = left.clamp(0, n);
+        left -= now;
+        if now > 0 {
+            first.push(ChartTarget { lots: Some(now), ..t.clone() });
+        }
+        if n > now {
+            rest.push(ChartTarget { lots: Some(n - now), ..t });
         }
     }
+    (first, rest)
 }
 
 /// What reaching a chart level sells.
@@ -1076,7 +1091,7 @@ pub fn chart_hit(option_type: Option<&str>, chart: &ChartLevels, premium: Option
     let mut lots = 0;
     for t in &hit {
         match t.lots {
-            Some(n) => lots += n.max(0),
+            Some(n) => lots = i32::saturating_add(lots, n.max(0)),
             None => return Some(ChartHit::All { reason: "CHART_TARGET" }),
         }
     }
@@ -1837,6 +1852,49 @@ mod tests {
             chart.set_target(&edit(None, 160.0, Some(None)), 4).unwrap();
         }
         assert!(matches!(chart.set_target(&edit(None, 170.0, Some(None)), 4), Err(LevelRefusal::Conflict(_))));
+    }
+
+    #[test]
+    fn no_lot_count_wraps_round_past_the_check() {
+        let edit = |id: Option<&str>, lots: i32| TargetEdit { id: id.map(Into::into), price: 140.0, trigger: LevelTrigger::Premium, lots: Some(Some(lots)) };
+        let mut chart = ChartLevels::default();
+        chart.set_target(&edit(None, 2), 4).unwrap();
+        // 2 + i32::MAX would wrap negative in a release build and pass.
+        assert!(matches!(chart.set_target(&edit(None, i32::MAX), 4), Err(LevelRefusal::Conflict(_))));
+        assert_eq!(chart.targets.len(), 1);
+        // Stored counts that big, reached together, sell everything — never a negative part.
+        let huge = levels(None, vec![lots_at("a", on_premium(120.0), i32::MAX), lots_at("b", on_premium(121.0), i32::MAX)]);
+        assert_eq!(chart_hit(Some("CE"), &huge, Some(125.0), None, 4), Some(ChartHit::All { reason: "CHART_TARGET" }));
+    }
+
+    #[test]
+    fn a_target_can_shrink_after_the_holding_has() {
+        // 2 + 2 lots of targets, then a −2 lots sell: 2 held.
+        let mut chart = levels(None, vec![lots_at("a", on_premium(120.0), 2), lots_at("b", on_premium(140.0), 2)]);
+        let resize = |lots: i32| TargetEdit { id: Some("a".into()), price: 120.0, trigger: LevelTrigger::Premium, lots: Some(Some(lots)) };
+        chart.set_target(&resize(1), 2).unwrap();
+        assert_eq!(chart.targets[0].lots, Some(1));
+        // Growing it back past the holding is still refused.
+        assert!(matches!(chart.set_target(&resize(2), 2), Err(LevelRefusal::Conflict(_))));
+        // "All left" turned into a count adds every lot it asks for.
+        let mut all = levels(None, vec![lots_at("a", on_premium(120.0), 2), all_at(on_premium(140.0))]);
+        let id = all.targets[1].id.clone();
+        let count = TargetEdit { id: Some(id), price: 140.0, trigger: LevelTrigger::Premium, lots: Some(Some(3)) };
+        assert!(matches!(all.set_target(&count, 4), Err(LevelRefusal::Conflict(_))));
+    }
+
+    #[test]
+    fn a_trimmed_target_sell_splits_its_targets_at_the_lots_sent() {
+        let taken = vec![lots_at("a", on_premium(120.0), 2), lots_at("b", on_premium(121.0), 3)];
+        // 3 of the 5 lots sent: all of a and 1 of b go out, 2 of b stay on the chart.
+        let (sent, unsent) = split_target_lots(taken.clone(), 3);
+        assert_eq!(sent.iter().map(|t| (t.id.as_str(), t.lots)).collect::<Vec<_>>(), [("a", Some(2)), ("b", Some(1))]);
+        assert_eq!(unsent.iter().map(|t| (t.id.as_str(), t.lots)).collect::<Vec<_>>(), [("b", Some(2))]);
+        assert_eq!(split_target_lots(taken.clone(), 0).0, vec![]);
+        assert_eq!(split_target_lots(taken.clone(), 9).1, vec![]);
+        // "All left" is never counted as sent.
+        let (sent, unsent) = split_target_lots(vec![all_at(on_premium(150.0))], 4);
+        assert!(sent.is_empty() && unsent.len() == 1);
     }
 
     #[test]
