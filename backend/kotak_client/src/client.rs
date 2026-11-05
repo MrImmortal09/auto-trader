@@ -127,6 +127,17 @@ pub struct KotakOrder {
     pub trigger_price: String,
     #[serde(rename = "rejRsn", default, deserialize_with = "de_loose_string")]
     pub reject_reason: String,
+    /// The limit price asked; `0` for a market order.
+    #[serde(rename = "prc", default, deserialize_with = "de_loose_string")]
+    pub price: String,
+    /// When it was placed, as Kotak writes it (e.g. `05-Nov-2026 10:15:30`);
+    /// empty when not sent. Display only.
+    #[serde(rename = "ordDtTm", default, deserialize_with = "de_loose_string")]
+    pub order_time: String,
+    /// When Kotak last updated it (e.g. `2026/11/05 10:15:31`); empty when
+    /// not sent. Display only.
+    #[serde(rename = "hsUpTm", default, deserialize_with = "de_loose_string")]
+    pub updated_time: String,
 }
 
 impl KotakOrder {
@@ -149,6 +160,10 @@ impl KotakOrder {
     /// Stop trigger price (`0.0` for order types that have none).
     pub fn trigger(&self) -> f64 {
         KotakPosition::parse_f64(&self.trigger_price)
+    }
+    /// The limit price asked; `0.0` for a market order.
+    pub fn limit_price(&self) -> f64 {
+        KotakPosition::parse_f64(&self.price)
     }
     /// `true` for a sell order.
     pub fn is_sell(&self) -> bool {
