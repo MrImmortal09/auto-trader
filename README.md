@@ -745,7 +745,7 @@ The **Daily Reports** page provides an aggregated view of trading performance by
 | `GET` | `/api/v2/me/history?range=&group=` · `/me/marks` · `/me/positions` · `/me/activity` | The user's closed calls (`/api/v2/history`'s shape), today's fills for the charts, open positions, and the last 100 things that happened to them (in memory) |
 | `POST` | `/api/v2/me/buy` | `{trading_symbol, lots}`: a paper buy, filled at once at the live price — the same checks as `/api/execute/buy` but the kill switch, plus 10 open contracts per user, 40 across all users, and no buy of a contract being squared off. Charges are Kotak's with ₹20 brokerage a leg; the wallet never goes below zero |
 | `POST` | `/api/v2/me/positions/:id/sell` · `/close` · `/api/v2/me/exit-all` | `{lots}` / all of one / all of them, at the live price (from the last 10 s), 09:15–15:30 IST. Never more than is held |
-| `PATCH` | `/api/v2/me/positions/:id` | Chart `stop` and `target`, as `/api/v2/positions/:id` (not gated by `chart_stops`). Checked every 500 ms; a crossed level sells everything at a fresh price. An expiring position is sold from 15:29:30 IST |
+| `PATCH` | `/api/v2/me/positions/:id` | Chart `stop` and `target`, as `/api/v2/positions/:id` (not gated by `chart_stops`). Checked every 500 ms; a crossed level sells everything at a fresh price. An expiring position is sold at 15:38 IST on its expiry day |
 | `POST` | `/api/v2/me/reset` | Start over with ₹10,00,000 and an empty history (only when nothing is open) |
 
 ---
