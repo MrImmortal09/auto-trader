@@ -16,9 +16,10 @@ fn at(h: u32, m: u32, s: u32) -> NaiveTime {
     NaiveTime::from_hms_opt(h, m, s).expect("a valid time")
 }
 
-/// From here on its expiry day, a position is sold at the first fresh price.
+/// From here on its expiry day, a position is sold: the owner's engine's
+/// expiry square-off time (15:38 IST), so no desk squares off earlier.
 pub fn square_off_from() -> NaiveTime {
-    at(15, 29, 30)
+    at(shared_domain::EXPIRY_SQUAREOFF_HOUR, shared_domain::EXPIRY_SQUAREOFF_MINUTE, 0)
 }
 
 /// Whether a contract expiring on `expiry` is being squared off at `now`:
@@ -31,10 +32,10 @@ pub fn squaring_off(expiry: chrono::NaiveDate, now: DateTime<FixedOffset>) -> bo
 /// What the watch loop does with `pos` at `now`: sell all of it at a price,
 /// for a reason, or nothing yet. `premium` and `index` are fresh prices only.
 ///
-/// - Expiry: from 15:29:30 IST on its expiry day, at the first fresh price;
-///   with none by the close, at the last one seen (0 if there never was one).
-///   A contract found past its expiry (the server was down) settles at once
-///   the same way.
+/// - Expiry: at 15:38 IST on its expiry day (two minutes before the 15:40
+///   options close), at a fresh price if there is one, else at the last one
+///   seen (0 if there never was one). A contract found past its expiry (the
+///   server was down) settles at once the same way.
 /// - Chart levels: only while the market is open, and only with a fresh
 ///   premium to sell at — a level crossed on a stale price waits.
 pub fn decide(
@@ -138,14 +139,16 @@ mod tests {
     }
 
     #[test]
-    fn an_expiring_position_squares_off_from_15_29_30_and_settles_by_the_close() {
+    fn an_expiring_position_squares_off_at_15_38_and_never_before() {
         let p = held("CE", ChartLevels::default());
         let day = (2026, 10, 27);
-        assert_eq!(decide(&p, ist(day, (15, 29, 29)), true, Some(90.0), None), None);
-        assert_eq!(decide(&p, ist(day, (15, 29, 30)), true, Some(90.0), None), Some((90.0, "EXPIRY_SQUAREOFF")));
-        // No fresh price yet: wait for one until the close, then take the last seen.
-        assert_eq!(decide(&p, ist(day, (15, 29, 45)), true, None, None), None);
-        assert_eq!(decide(&p, ist(day, (15, 30, 0)), true, None, None), Some((101.0, "EXPIRY_SQUAREOFF")));
+        // Nothing before 15:38, fresh price or not.
+        assert_eq!(decide(&p, ist(day, (15, 29, 30)), true, Some(90.0), None), None);
+        assert_eq!(decide(&p, ist(day, (15, 30, 0)), true, None, None), None);
+        assert_eq!(decide(&p, ist(day, (15, 37, 59)), true, Some(90.0), None), None);
+        // At 15:38: a fresh price if there is one, else the last seen.
+        assert_eq!(decide(&p, ist(day, (15, 38, 0)), true, Some(90.0), None), Some((90.0, "EXPIRY_SQUAREOFF")));
+        assert_eq!(decide(&p, ist(day, (15, 38, 0)), true, None, None), Some((101.0, "EXPIRY_SQUAREOFF")));
         let mut never_priced = p.clone();
         never_priced.last_ltp = None;
         assert_eq!(decide(&never_priced, ist(day, (15, 40, 0)), true, None, None), Some((0.0, "EXPIRY_SQUAREOFF")));
@@ -155,7 +158,8 @@ mod tests {
         let mut later = p.clone();
         later.expiry = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
         assert_eq!(decide(&later, ist(day, (15, 35, 0)), true, None, None), None);
-        assert!(squaring_off(p.expiry, ist(day, (15, 29, 30))) && !squaring_off(later.expiry, ist(day, (15, 29, 30))));
+        assert!(!squaring_off(p.expiry, ist(day, (15, 37, 59))));
+        assert!(squaring_off(p.expiry, ist(day, (15, 38, 0))) && !squaring_off(later.expiry, ist(day, (15, 38, 0))));
     }
 
     #[test]
