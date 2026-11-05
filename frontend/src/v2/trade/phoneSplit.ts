@@ -48,6 +48,8 @@ export function usePhoneSplit(saved: number | null, onSave: (h: number) => void)
   }, [box]);
 
   const height = area == null ? (saved ?? 220) : phoneChartHeight(dragged ?? saved, area);
+  const min = area == null ? height : phoneChartHeight(0, area);
+  const max = area == null ? height : phoneChartHeight(Infinity, area);
 
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     setStart({ y: e.clientY, h: height });
@@ -70,7 +72,7 @@ export function usePhoneSplit(saved: number | null, onSave: (h: number) => void)
   };
 
   const attach = useCallback((el: HTMLDivElement | null) => setBox(el), []);
-  return { attach, height, dragging: dragged != null, handle: { onPointerDown, onPointerMove, onPointerUp: onPointerEnd, onPointerCancel: onPointerEnd, onKeyDown } };
+  return { attach, height, min, max, dragging: dragged != null, handle: { onPointerDown, onPointerMove, onPointerUp: onPointerEnd, onPointerCancel: onPointerEnd, onKeyDown } };
 }
 
 export type PhoneSplit = ReturnType<typeof usePhoneSplit>;

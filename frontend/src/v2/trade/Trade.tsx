@@ -225,7 +225,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const chartsRef = useRef<HTMLDivElement>(null);
   const setPanelHeight = useCallback((panelHeight: number) => save((s) => ({ ...s, panelHeight })), [save]);
   // Phone: the chart and the ladder share the screen; a handle drags the split.
-  const { attach: splitBox, height: chartHeight, dragging: splitDragging, handle: splitHandle } = usePhoneSplit(
+  const { attach: splitBox, height: chartHeight, min: splitMin, max: splitMax, dragging: splitDragging, handle: splitHandle } = usePhoneSplit(
     saved.phoneChartHeight,
     useCallback((phoneChartHeight: number) => save((s) => ({ ...s, phoneChartHeight })), [save]),
   );
@@ -706,7 +706,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
               <div style={{ height: chartHeight }} className="flex shrink-0 px-2">
                 {charts[0]}
               </div>
-              <SplitHandle height={chartHeight} dragging={splitDragging} handle={splitHandle} />
+              <SplitHandle height={chartHeight} min={splitMin} max={splitMax} dragging={splitDragging} handle={splitHandle} />
             </>
           )}
           <div className="flex min-h-0 flex-1 flex-col">{ladder}</div>
