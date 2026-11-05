@@ -1,6 +1,10 @@
 // What the v2 endpoints answer — mirrors backend/server/src/desk.rs and
 // history.rs. v1's own types stay in src/types.ts.
 
+import type { ChartLevels } from '../../types';
+
+export type { ChartLevel, ChartLevels, ChartTarget } from '../../types';
+
 export type Mode = 'PAPER' | 'LIVE';
 export type Tone = 'profit' | 'loss' | 'neutral';
 
@@ -10,15 +14,6 @@ export interface Outcome {
   tone: Tone;
 }
 
-export interface ChartLevel {
-  price: number;
-  trigger: 'premium' | 'index';
-}
-
-export interface ChartLevels {
-  stop: ChartLevel | null;
-  target: ChartLevel | null;
-}
 
 export interface Source {
   kind: 'telegram' | 'scalp' | 'other';

@@ -8,6 +8,8 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use chrono::{DateTime, FixedOffset, NaiveTime};
 
+use shared_domain::ChartHit;
+
 use super::{PaperDesk, PaperPosition};
 
 const EVERY: Duration = Duration::from_millis(500);
@@ -29,39 +31,54 @@ pub fn squaring_off(expiry: chrono::NaiveDate, now: DateTime<FixedOffset>) -> bo
     expiry < today || (expiry == today && now.time() >= square_off_from())
 }
 
-/// What the watch loop does with `pos` at `now`: sell all of it at a price,
-/// for a reason, or nothing yet. `premium` and `index` are fresh prices only.
+/// What the watch loop sells of a position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sell {
+    /// All of it, for this reason.
+    All(&'static str),
+    /// The lots of its chart targets `ids`, leaving the rest held.
+    Targets(Vec<String>),
+}
+
+/// What the watch loop does with `pos` at `now`: sell all of it, or its
+/// reached targets' lots, at a price — or nothing yet. `premium` and `index`
+/// are fresh prices only.
 ///
 /// - Expiry: at 15:38 IST on its expiry day (two minutes before the 15:40
 ///   options close), at a fresh price if there is one, else at the last one
 ///   seen (0 if there never was one). A contract found past its expiry (the
 ///   server was down) settles at once the same way.
 /// - Chart levels: only while the market is open, and only with a fresh
-///   premium to sell at — a level crossed on a stale price waits.
+///   premium to sell at — a level crossed on a stale price waits. The stop
+///   sells everything; a target its lots (see `shared_domain::chart_hit`).
 pub fn decide(
     pos: &PaperPosition,
     now: DateTime<FixedOffset>,
     trading_day: bool,
     premium: Option<f64>,
     index: Option<f64>,
-) -> Option<(f64, &'static str)> {
+) -> Option<(f64, Sell)> {
     let t = now.time();
     let close = at(15, 30, 0);
     if squaring_off(pos.expiry, now) {
         let expired = pos.expiry < now.date_naive();
         if let Some(p) = premium.filter(|_| !expired) {
-            return Some((p, "EXPIRY_SQUAREOFF"));
+            return Some((p, Sell::All("EXPIRY_SQUAREOFF")));
         }
         if expired || t >= close {
-            return Some((pos.last_ltp.filter(|p| *p > 0.0).unwrap_or(0.0), "EXPIRY_SQUAREOFF"));
+            return Some((pos.last_ltp.filter(|p| *p > 0.0).unwrap_or(0.0), Sell::All("EXPIRY_SQUAREOFF")));
         }
         return None;
     }
     if !(trading_day && t >= at(9, 15, 0) && t < close) {
         return None;
     }
-    let reason = shared_domain::chart_level_reached(Some(&pos.option_type), &pos.chart, premium, index)?;
-    Some((premium?, reason))
+    let hit = shared_domain::chart_hit(Some(&pos.option_type), &pos.chart, premium, index, pos.lots())?;
+    let sell = match hit {
+        ChartHit::All { reason } => Sell::All(reason),
+        ChartHit::Part { ids, .. } => Sell::Targets(ids),
+    };
+    Some((premium?, sell))
 }
 
 /// One pass over every open position at `now`. `fresh` gives a feed key's
@@ -78,8 +95,12 @@ pub async fn step(desk: &PaperDesk, now: DateTime<FixedOffset>, trading_day: boo
         if let Some(p) = premium {
             seen.push((user_id, pos.id.clone(), p));
         }
-        let Some((price, reason)) = decide(&pos, now, trading_day, premium, index) else { continue };
-        match desk.settle(user_id, &pos.id, price, reason).await {
+        let Some((price, sell)) = decide(&pos, now, trading_day, premium, index) else { continue };
+        let (sold, reason) = match &sell {
+            Sell::All(reason) => (desk.settle(user_id, &pos.id, price, reason).await, *reason),
+            Sell::Targets(ids) => (desk.settle_targets(user_id, &pos.id, ids, price).await, "CHART_TARGET"),
+        };
+        match sold {
             Ok(f) => tracing::info!(user_id, "Paper {reason}: sold {} {} at {:.2}", f.qty, f.contract, f.price),
             // Sold by hand meanwhile.
             Err(r) if r.status == StatusCode::NOT_FOUND => {}
@@ -110,7 +131,12 @@ mod tests {
     use super::*;
     use crate::paper::tests::{desk, nifty};
     use chrono::{NaiveDate, TimeZone};
-    use shared_domain::{ChartLevel, ChartLevels, LevelTrigger};
+    use crate::routes::v2::positions::LevelsUpdate;
+    use shared_domain::{ChartLevel, ChartLevels, ChartTarget, LevelTrigger};
+
+    fn all(reason: &'static str) -> Sell {
+        Sell::All(reason)
+    }
 
     fn ist(d: (i32, u32, u32), t: (u32, u32, u32)) -> DateTime<FixedOffset> {
         FixedOffset::east_opt(5 * 3600 + 1800)
@@ -147,13 +173,13 @@ mod tests {
         assert_eq!(decide(&p, ist(day, (15, 30, 0)), true, None, None), None);
         assert_eq!(decide(&p, ist(day, (15, 37, 59)), true, Some(90.0), None), None);
         // At 15:38: a fresh price if there is one, else the last seen.
-        assert_eq!(decide(&p, ist(day, (15, 38, 0)), true, Some(90.0), None), Some((90.0, "EXPIRY_SQUAREOFF")));
-        assert_eq!(decide(&p, ist(day, (15, 38, 0)), true, None, None), Some((101.0, "EXPIRY_SQUAREOFF")));
+        assert_eq!(decide(&p, ist(day, (15, 38, 0)), true, Some(90.0), None), Some((90.0, all("EXPIRY_SQUAREOFF"))));
+        assert_eq!(decide(&p, ist(day, (15, 38, 0)), true, None, None), Some((101.0, all("EXPIRY_SQUAREOFF"))));
         let mut never_priced = p.clone();
         never_priced.last_ltp = None;
-        assert_eq!(decide(&never_priced, ist(day, (15, 40, 0)), true, None, None), Some((0.0, "EXPIRY_SQUAREOFF")));
+        assert_eq!(decide(&never_priced, ist(day, (15, 40, 0)), true, None, None), Some((0.0, all("EXPIRY_SQUAREOFF"))));
         // Found the day after: settled at once, never at a stale tick of a dead contract.
-        assert_eq!(decide(&p, ist((2026, 10, 28), (9, 0, 0)), true, Some(5.0), None), Some((101.0, "EXPIRY_SQUAREOFF")));
+        assert_eq!(decide(&p, ist((2026, 10, 28), (9, 0, 0)), true, Some(5.0), None), Some((101.0, all("EXPIRY_SQUAREOFF"))));
         // A later expiry is left alone.
         let mut later = p.clone();
         later.expiry = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
@@ -166,13 +192,19 @@ mod tests {
     fn chart_levels_sell_only_in_market_hours_and_only_on_a_fresh_premium() {
         let stop = ChartLevel { price: 25_060.0, trigger: LevelTrigger::Index };
         let target = ChartLevel { price: 140.0, trigger: LevelTrigger::Premium };
-        let p = held("CE", ChartLevels { stop: Some(stop), target: Some(target) });
+        let target = ChartTarget { id: "t".into(), price: target.price, trigger: target.trigger, lots: None };
+        let p = held("CE", ChartLevels { stop: Some(stop), targets: vec![target] });
         let mut later = p.clone();
         later.expiry = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
         let open = ist((2026, 10, 27), (11, 0, 0));
         assert_eq!(decide(&later, open, true, Some(100.0), Some(25_100.0)), None);
-        assert_eq!(decide(&later, open, true, Some(95.0), Some(25_050.0)), Some((95.0, "CHART_STOP")));
-        assert_eq!(decide(&later, open, true, Some(141.0), Some(25_100.0)), Some((141.0, "CHART_TARGET")));
+        assert_eq!(decide(&later, open, true, Some(95.0), Some(25_050.0)), Some((95.0, all("CHART_STOP"))));
+        assert_eq!(decide(&later, open, true, Some(141.0), Some(25_100.0)), Some((141.0, all("CHART_TARGET"))));
+        // A target with fewer lots than are held sells only those.
+        let mut two = later.clone();
+        two.qty = 150;
+        two.chart.targets[0].lots = Some(1);
+        assert_eq!(decide(&two, open, true, Some(141.0), Some(25_100.0)), Some((141.0, Sell::Targets(vec!["t".into()]))));
         // Crossed on the index with no fresh premium to sell at: wait.
         assert_eq!(decide(&later, open, true, None, Some(25_000.0)), None);
         // Closed market, or a holiday.
@@ -189,9 +221,8 @@ mod tests {
         let mut other = nifty(25_100.0, "PE");
         other.expiry = c.expiry;
         let b = desk.buy(1, &other, 1, 80.0).await.unwrap();
-        desk.set_levels(1, &a.position_id, Some(Some(ChartLevel { price: 95.0, trigger: LevelTrigger::Premium })), None)
-            .await
-            .unwrap();
+        let stop = LevelsUpdate { stop: Some(Some(ChartLevel { price: 95.0, trigger: LevelTrigger::Premium })), ..Default::default() };
+        desk.set_levels(1, &a.position_id, &stop).await.unwrap();
         let prices = |key: &str| match key {
             "nse_fo|25000CE" => Some(94.0),
             "nse_fo|25100PE" => Some(82.5),

@@ -20,6 +20,38 @@ const TFS: Tf[] = ['1m', '5m', '15m'];
 // Vela is heavy and optional: only downloaded once a chart is switched to it.
 const VChart = lazy(() => import('./VChart'));
 
+/** A target being placed: how many lots it sells, 1 to `max` — the lots no
+ * other target has. At `max` it sells all that is left when it is reached. */
+export interface LotsPick {
+  value: number;
+  max: number;
+  /** The trade has other targets already. */
+  others: boolean;
+  set: (lots: number) => void;
+}
+
+/** "2 lots", or at the top "all 4 lots" / "all left (2)". */
+function lotsWords(l: LotsPick): string {
+  if (l.value >= l.max) return l.others ? `all left (${l.max})` : `all ${l.max} ${l.max === 1 ? 'lot' : 'lots'}`;
+  return `${l.value} ${l.value === 1 ? 'lot' : 'lots'}`;
+}
+
+/** The lots stepper in the "Tap where the target goes" prompt. */
+function LotsStepper({ lots }: { lots: LotsPick }) {
+  const step = 'grid size-6 place-items-center rounded-4 border border-line text-fg hover:bg-raised disabled:opacity-40';
+  return (
+    <span className="flex items-center gap-1.5" aria-label="Lots this target sells">
+      <button type="button" className={step} disabled={lots.value <= 1} onClick={() => lots.set(lots.value - 1)} aria-label="Fewer lots">
+        −
+      </button>
+      <span className="min-w-[88px] text-center type-label tnum text-profit">{lotsWords(lots)}</span>
+      <button type="button" className={step} disabled={lots.value >= lots.max} onClick={() => lots.set(lots.value + 1)} aria-label="More lots">
+        +
+      </button>
+    </span>
+  );
+}
+
 /** One chart: its header (instrument, timeframe, Layers) and the chart. */
 export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, style, onStyle, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide }: {
   chartId: string;
@@ -43,7 +75,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   onNeedChain: (expiry: string | null) => void;
   lines: ChartLine[];
   markers: ChartMarker[];
-  placing: (Placing & { what: string }) | null;
+  placing: (Placing & { what: string; lots?: LotsPick }) | null;
   onPlacingDone: () => void;
   onCancelPlacing: () => void;
   bus: CrosshairBus;
@@ -291,6 +323,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           <div className="pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center">
             <div className="pointer-events-auto flex items-center gap-3 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-lg">
               <span className="type-label text-fg">Tap where the {placing.what} goes</span>
+              {placing.lots && <LotsStepper lots={placing.lots} />}
               <button type="button" onClick={onCancelPlacing} className="type-label text-fg-muted hover:text-fg">
                 Cancel
               </button>

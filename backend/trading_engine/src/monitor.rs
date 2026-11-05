@@ -7,7 +7,7 @@ use kotak_client::KotakClient;
 use shared_domain::entry_gate::{self, Agreement, IndicatorFeed, SizingVerdict};
 use shared_domain::telemetry::{self, SignalOutcome};
 use shared_domain::{
-    DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradeTag, TradingConfig,
+    ChartHit, DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradeTag, TradingConfig,
 };
 use tokio::sync::{broadcast, mpsc, RwLock};
 
@@ -41,6 +41,9 @@ enum PosAction {
     /// (`dynamic_targeting_single_lot`) and for every later rung, which only
     /// trail and extend.
     DynamicRung { sell: i32, new_sl: f64, next_target: f64, rung_hit: f64 },
+    /// PAPER: a scalp's chart targets `ids` reached — sell their `qty` and
+    /// keep the rest of the holding running, its stop untouched.
+    ChartTargetSell { qty: i32, ids: Vec<String> },
     Cancel { reason: String },
     /// Drop a position that is still waiting for its entry and never will take
     /// one (signal cancelled/changed, or the end-of-day entry cutoff).
@@ -1891,6 +1894,15 @@ async fn reconcile_live_orders(
                         p.pending_exit_order_id = None;
                         p.pending_exit_qty = 0;
                         p.pending_exit_reason = None;
+                        // Chart targets this sell was for: an IOC that missed,
+                        // or filled only some, puts back what it didn't sell,
+                        // to fire again while the price is there. A refusal
+                        // squares off everything (below), so nothing goes back.
+                        let selling = std::mem::take(&mut p.chart_targets_selling);
+                        if was_cancelled && p.executed_qty > 0 && !selling.is_empty() {
+                            let lot = lot_size_of(p);
+                            p.chart.restore_unsold(selling, filled / lot);
+                        }
                         if p.executed_qty <= 0
                             && p.sizing.topup_order_id.is_none()
                             && !p.sizing.topup_send_uncertain
@@ -2715,6 +2727,7 @@ async fn adopt_manual(
         manual: false,
         manual_add: None,
         chart: Default::default(),
+        chart_targets_selling: Vec::new(),
     };
 
     { positions.write().await.push(new_pos); }
@@ -2780,6 +2793,9 @@ enum LiveAction {
     /// User-requested partial market sell for `qty`, leaving the rest of the
     /// holding running exactly as before (state, current_sl untouched).
     ManualSell { qty: i32 },
+    /// A scalp's chart targets `ids` were reached: sell their `qty` (less
+    /// than the holding), leaving the rest running with its stop untouched.
+    ChartTarget { qty: i32, ids: Vec<String> },
     /// A manual add that won't be sent (`manual_add_verdict`): clear it and
     /// say why. No broker call.
     DropManualAdd { reason: String },
@@ -2945,11 +2961,22 @@ fn decide_live(
                 });
             }
 
-            // A scalp's chart stop or target (set from a v2 chart): the whole
-            // holding, through the same exit as any stop — never while another
-            // sell is in flight (checked above).
-            if let Some(reason) = pos.chart_level_hit(ltp, index_ltp(ltp_map, &pos.signal.instrument_name)) {
-                return Some(LiveAction::ExitAll { qty: held, reason: reason.to_string() });
+            // A scalp's chart stop or targets (set from a v2 chart): the stop,
+            // or targets covering the holding, sell all of it through the same
+            // exit as any stop; other targets sell only their lots. Never
+            // while another sell is in flight (checked above).
+            let lot = lot_size_of(pos);
+            match pos.chart_hit(ltp, index_ltp(ltp_map, &pos.signal.instrument_name), lot) {
+                Some(ChartHit::All { reason }) => return Some(LiveAction::ExitAll { qty: held, reason: reason.to_string() }),
+                Some(ChartHit::Part { lots, ids }) => {
+                    let qty = (lots * lot).min(held);
+                    return Some(if qty >= held {
+                        LiveAction::ExitAll { qty: held, reason: "CHART_TARGET".to_string() }
+                    } else {
+                        LiveAction::ChartTarget { qty, ids }
+                    });
+                }
+                None => {}
             }
 
             let trigger = round_down_tick(pos.current_sl, pos.tick_size);
@@ -3302,6 +3329,36 @@ async fn place_exit_sell(
     qty: i32,
     reason: &str,
 ) -> Option<String> {
+    match send_exit_sell(kotak, db_tx, log_tx, ctx, cfg, ref_ltp, qty, reason).await {
+        ExitSend::Placed(order_id) => Some(order_id),
+        ExitSend::Refused | ExitSend::Unknown => None,
+    }
+}
+
+/// How an exit sell's send went.
+#[derive(Debug, Clone, PartialEq)]
+enum ExitSend {
+    /// At the broker, as this order.
+    Placed(String),
+    /// Certainly not placed: refused, a dead session, or nothing to price a
+    /// limit fallback at.
+    Refused,
+    /// The broker gave no verdict: it may have been placed.
+    Unknown,
+}
+
+/// [`place_exit_sell`], telling a refusal from a send whose outcome is unknown.
+#[allow(clippy::too_many_arguments)]
+async fn send_exit_sell(
+    kotak: &KotakHandle,
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    ctx: &LiveCtx,
+    cfg: &TradingConfig,
+    ref_ltp: Option<f64>,
+    qty: i32,
+    reason: &str,
+) -> ExitSend {
     // IOC so that if Kotak internally converts our MKT to a limit (which it
     // does for F&O options), the order auto-cancels the moment it isn't
     // immediately filled rather than sitting open and tying up margin. The
@@ -3319,13 +3376,13 @@ async fn place_exit_sell(
                 "reason": reason,
                 "mode": "LIVE",
             })).await;
-            return Some(order_id);
+            return ExitSend::Placed(order_id);
         }
         Err(e) if e.is_session_expired() || e.is_ambiguous() => {
             loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                 "market exit ({reason}) for {qty} was rejected: {e} — the position is unprotected until a new stop is placed"
             )).await;
-            return None;
+            return if e.is_ambiguous() { ExitSend::Unknown } else { ExitSend::Refused };
         }
         Err(e) => e,
     };
@@ -3335,7 +3392,7 @@ async fn place_exit_sell(
         loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
             "market exit ({reason}) for {qty} was rejected: {rejected} — no live price for a limit fallback, still unprotected"
         )).await;
-        return None;
+        return ExitSend::Refused;
     };
     let floor = round_down_tick(
         ltp * (1.0 - cfg.entry_market_protection.max(0.0) / 100.0),
@@ -3345,7 +3402,7 @@ async fn place_exit_sell(
         loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
             "market exit ({reason}) for {qty} was rejected: {rejected} — could not price a limit fallback, still unprotected"
         )).await;
-        return None;
+        return ExitSend::Refused;
     }
     let lim = build_ioc_limit_order(&ctx.base, shared_domain::TransactionType::Sell, qty, floor);
     match kotak_place(kotak, &lim).await {
@@ -3363,13 +3420,13 @@ async fn place_exit_sell(
                 "limit_price": round2(floor),
                 "mode": "LIVE",
             })).await;
-            Some(order_id)
+            ExitSend::Placed(order_id)
         }
         Err(e2) => {
             loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                 "exit ({reason}) for {qty} rejected as both market ({rejected}) and limit ({e2}) — the position is unprotected"
             )).await;
-            None
+            if e2.is_ambiguous() { ExitSend::Unknown } else { ExitSend::Refused }
         }
     }
 }
@@ -3865,6 +3922,73 @@ async fn exec_live_action(
                 Err(e) => {
                     loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
                         "manual sell of {qty} was rejected: {e} — still holding the full {}, nothing changed, try again",
+                        ctx.executed_qty
+                    )).await;
+                }
+            }
+        }
+
+        LiveAction::ChartTarget { qty, ids } => {
+            // The targets come out of the chart before anything is sent, so a
+            // slow fill can't fire them again; an IOC that misses puts back
+            // what it didn't sell (see `reconcile_live_orders`). Only what is
+            // still there sells: a target removed meanwhile sells nothing.
+            let lot = ctx.base.quantity.parse::<i32>().ok().filter(|v| *v > 0).unwrap_or(1);
+            let mut taken = Vec::new();
+            with_position(positions, &pending.pos_id, |p| taken = p.chart.take_targets(ids)).await;
+            let cap = if taken.iter().any(|t| t.lots.is_none()) {
+                *qty
+            } else {
+                taken.iter().filter_map(|t| t.lots).sum::<i32>() * lot
+            };
+            let want = (*qty).min(cap);
+            if want <= 0 {
+                return true;
+            }
+
+            // Same cross-leg cap as any other live sell (see `sellable_qty`).
+            let sell_qty = sellable_qty(positions, &pending.pos_id, &ctx.trading_symbol, want).await;
+            if sell_qty <= 0 {
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                    "target sell skipped — another tracked leg on {} already accounts for the full holding; the target is dropped, the stop still watches",
+                    ctx.trading_symbol
+                )).await;
+                return true;
+            }
+            if sell_qty < want {
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                    "target sell trimmed from {want} to {sell_qty} — another tracked leg on {} already has a sell in flight",
+                    ctx.trading_symbol
+                )).await;
+            }
+
+            match send_exit_sell(kotak, db_tx, log_tx, &ctx, cfg, ctx_ltp, sell_qty, "CHART_TARGET").await {
+                ExitSend::Placed(order_id) => {
+                    with_position(positions, &pending.pos_id, |p| {
+                        p.pending_exit_order_id = Some(order_id);
+                        p.pending_exit_qty = sell_qty;
+                        p.pending_exit_reason = Some("CHART_TARGET".to_string());
+                        p.chart_targets_selling = taken;
+                    }).await;
+                    tracing::info!(instrument = %ctx.instrument, sell_qty, held = ctx.executed_qty, "LIVE chart target sell placed");
+                }
+                ExitSend::Refused => {
+                    // The owner's rule (2026-11-05): a target sell Kotak
+                    // refuses squares off the whole holding at market, the
+                    // same as a refused target-1 slice.
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                        "target sell of {sell_qty} was refused — squaring off the whole {} at market",
+                        ctx.executed_qty
+                    )).await;
+                    with_position(positions, &pending.pos_id, |p| {
+                        p.force_exit = Some("CHART_TARGET_FAILED".to_string());
+                    }).await;
+                }
+                ExitSend::Unknown => {
+                    // It may be at the broker: a second sell now could sell
+                    // more than is held. Nothing more goes out for it.
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                        "target sell of {sell_qty} got no answer from Kotak — it may or may not have been placed, so nothing more is sent for that target. Check Kotak's order book; the stop still watches the {} held",
                         ctx.executed_qty
                     )).await;
                 }
@@ -4565,6 +4689,7 @@ pub async fn start_position_monitor(
                                     manual: false,
                                     manual_add: None,
                                     chart: Default::default(),
+                                    chart_targets_selling: Vec::new(),
                                 });
                                 telemetry::signal(SignalOutcome::Accepted);
                                 let snapshot = pos_guard.clone();
@@ -4762,12 +4887,17 @@ pub async fn start_position_monitor(
                                 Some(PosAction::ExitSell {
                                     qty: pos.executed_qty, reason: reason.clone(), new_sl: None, exec_price: pos.override_exit_price,
                                 })
-                            } else if let Some(reason) =
-                                pos.chart_level_hit(Some(ltp), index_ltp(&ltp_map, &pos.signal.instrument_name))
+                            } else if let Some(hit) =
+                                pos.chart_hit(Some(ltp), index_ltp(&ltp_map, &pos.signal.instrument_name), lot_size_of(pos))
                             {
-                                // A scalp's chart stop or target: the whole holding.
-                                Some(PosAction::ExitSell {
-                                    qty: pos.executed_qty, reason: reason.to_string(), new_sl: None, exec_price: None,
+                                // A scalp's chart stop or targets: the stop, or
+                                // targets covering the holding, sell all of it;
+                                // other targets only their lots.
+                                Some(match hit {
+                                    ChartHit::All { reason } => PosAction::ExitSell {
+                                        qty: pos.executed_qty, reason: reason.to_string(), new_sl: None, exec_price: None,
+                                    },
+                                    ChartHit::Part { lots, ids } => PosAction::ChartTargetSell { qty: lots * lot_size_of(pos), ids },
                                 })
                             } else if ltp <= pos.current_sl {
                                 // A stop above the signal's SL while still
@@ -4972,6 +5102,19 @@ pub async fn start_position_monitor(
                             positions_mutated = true;
                         }
 
+                        PosAction::ChartTargetSell { qty, ids } => {
+                            let qty = qty.min(pos.executed_qty);
+                            if qty > 0 {
+                                book_paper_sell(&db_tx, &log_tx, pos, &cfg, qty, pa.ltp, "CHART_TARGET").await;
+                                pos.executed_qty -= qty;
+                            }
+                            pos.chart.take_targets(&ids);
+                            if pos.executed_qty <= 0 {
+                                pos.state = TradeState::Closed;
+                            }
+                            positions_mutated = true;
+                        }
+
                         PosAction::DynamicRung { sell, new_sl, next_target, rung_hit } => {
                             // Only target 1 ever sells, and only when more
                             // than one lot is held. A one-lot runner and every
@@ -5130,6 +5273,7 @@ mod tests {
             manual: false,
             manual_add: None,
             chart: Default::default(),
+            chart_targets_selling: Vec::new(),
         }
     }
 
@@ -7043,6 +7187,21 @@ mod tests {
         Some(shared_domain::ChartLevel { price, trigger: shared_domain::LevelTrigger::Premium })
     }
 
+    /// A stop and targets: `lots` `None` is "all left".
+    fn chart_of(stop: Option<shared_domain::ChartLevel>, targets: &[(Option<shared_domain::ChartLevel>, Option<i32>)]) -> shared_domain::ChartLevels {
+        shared_domain::ChartLevels {
+            stop,
+            targets: targets
+                .iter()
+                .enumerate()
+                .map(|(i, (l, lots))| {
+                    let l = l.expect("a level");
+                    shared_domain::ChartTarget { id: format!("t{i}"), price: l.price, trigger: l.trigger, lots: *lots }
+                })
+                .collect(),
+        }
+    }
+
     /// What `decide_live` does with a scalp: an exit `(qty, reason)` or nothing.
     fn live_exit(pos: &MonitoredPosition, ltp: &Arc<DashMap<String, f64>>) -> Option<(i32, String)> {
         match decide_live(pos, ltp, &cfg_with_lots(1, 3), false, true, &test_gate()) {
@@ -7057,14 +7216,14 @@ mod tests {
         let ltp = Arc::new(DashMap::new());
         let exit = |reason: &str| Some((150, reason.to_string()));
         // A call: stop when NIFTY falls to 25,060, target when it rises to 25,180.
-        let levels = shared_domain::ChartLevels { stop: on_index(25_060.0), target: on_index(25_180.0) };
+        let levels = chart_of(on_index(25_060.0), &[(on_index(25_180.0), None)]);
         let call = chart_scalp("CE", levels, &ltp);
         for (spot, want) in [(25_100.0, None), (25_060.0, exit("CHART_STOP")), (25_020.0, exit("CHART_STOP")), (25_180.0, exit("CHART_TARGET"))] {
             ltp.insert(NIFTY_SPOT.into(), spot);
             assert_eq!(live_exit(&call, &ltp), want, "CE with NIFTY at {spot}");
         }
         // A put: stop when NIFTY rises to 25,140, target when it falls to 25,020.
-        let levels = shared_domain::ChartLevels { stop: on_index(25_140.0), target: on_index(25_020.0) };
+        let levels = chart_of(on_index(25_140.0), &[(on_index(25_020.0), None)]);
         let put = chart_scalp("PE", levels, &ltp);
         for (spot, want) in [(25_100.0, None), (25_140.0, exit("CHART_STOP")), (25_200.0, exit("CHART_STOP")), (25_020.0, exit("CHART_TARGET"))] {
             ltp.insert(NIFTY_SPOT.into(), spot);
@@ -7081,7 +7240,7 @@ mod tests {
     #[test]
     fn a_chart_stop_waits_for_a_partial_sell_then_sells_exactly_the_rest() {
         let ltp = Arc::new(DashMap::new());
-        let levels = shared_domain::ChartLevels { stop: on_premium(110.0), target: None };
+        let levels = chart_of(on_premium(110.0), &[]);
         let mut pos = chart_scalp("CE", levels, &ltp);
         ltp.insert("nse_fo|999".into(), 105.0);
 
@@ -7103,6 +7262,52 @@ mod tests {
         // stop sells the whole holding instead — never the two together.
         pos.manual_sell_qty = Some(75);
         assert_eq!(live_exit(&pos, &ltp), Some((75, "CHART_STOP".to_string())));
+    }
+
+    #[test]
+    fn a_target_with_lots_sells_only_its_lots_and_waits_for_any_sell_in_flight() {
+        let ltp = Arc::new(DashMap::new());
+        // 2 lots of 75: 1 lot at ₹130, all left at ₹140.
+        let mut pos = chart_scalp("CE", chart_of(on_premium(110.0), &[(on_premium(130.0), Some(1)), (on_premium(140.0), None)]), &ltp);
+        let decide = |pos: &MonitoredPosition, ltp: &Arc<DashMap<String, f64>>| decide_live(pos, ltp, &cfg_with_lots(1, 3), false, true, &test_gate());
+        ltp.insert("nse_fo|999".into(), 125.0);
+        assert_eq!(decide(&pos, &ltp), None);
+        ltp.insert("nse_fo|999".into(), 130.0);
+        assert_eq!(decide(&pos, &ltp), Some(LiveAction::ChartTarget { qty: 75, ids: vec!["t0".into()] }));
+        // Its sell is at the broker: nothing else goes out, even past the stop.
+        pos.pending_exit_order_id = Some("ORD1".into());
+        pos.pending_exit_qty = 75;
+        pos.pending_exit_reason = Some("CHART_TARGET".into());
+        ltp.insert("nse_fo|999".into(), 105.0);
+        assert_eq!(decide(&pos, &ltp), None);
+        // Both targets at once: the "all left" one sells the whole holding.
+        pos.pending_exit_order_id = None;
+        pos.pending_exit_qty = 0;
+        pos.pending_exit_reason = None;
+        ltp.insert("nse_fo|999".into(), 141.0);
+        assert_eq!(decide(&pos, &ltp), Some(LiveAction::ExitAll { qty: 150, reason: "CHART_TARGET".into() }));
+        // Lots covering the holding sell it all as one exit.
+        let whole = chart_scalp("CE", chart_of(None, &[(on_premium(130.0), Some(2))]), &ltp);
+        ltp.insert("nse_fo|999".into(), 131.0);
+        assert_eq!(decide(&whole, &ltp), Some(LiveAction::ExitAll { qty: 150, reason: "CHART_TARGET".into() }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_sells_each_chart_target_s_lots_in_turn() {
+        let ltp = Arc::new(DashMap::new());
+        ltp.insert(NIFTY_SPOT.into(), 25_100.0);
+        // 2 lots: 1 at ₹130, 1 at ₹140; the stop stays where it was.
+        let levels = chart_of(on_premium(110.0), &[(on_premium(130.0), Some(1)), (on_premium(140.0), Some(1))]);
+        let pos = chart_scalp("CE", levels, &ltp);
+        let (left, sells) = paper_chart_run(pos, ltp.clone(), &[("nse_fo|999", 125.0), ("nse_fo|999", 130.5)]).await;
+        assert_eq!(sells, vec![("SELL".to_string(), 75, "CHART_TARGET".to_string())]);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].executed_qty, 75);
+        assert_eq!(left[0].chart.targets.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["t1"]);
+        assert_eq!(left[0].chart.stop, on_premium(110.0));
+        let (left, sells) = paper_chart_run(left[0].clone(), ltp, &[("nse_fo|999", 140.0)]).await;
+        assert!(left.is_empty());
+        assert_eq!(sells, vec![("SELL".to_string(), 75, "CHART_TARGET".to_string())]);
     }
 
     /// Run the PAPER monitor over one scalp and return its booked sells.
@@ -7144,7 +7349,7 @@ mod tests {
     async fn paper_sells_a_scalp_at_its_chart_target() {
         let ltp = Arc::new(DashMap::new());
         ltp.insert(NIFTY_SPOT.into(), 25_100.0);
-        let levels = shared_domain::ChartLevels { stop: on_index(25_140.0), target: on_premium(130.0) };
+        let levels = chart_of(on_index(25_140.0), &[(on_premium(130.0), None)]);
         let pos = chart_scalp("PE", levels, &ltp);
         // 125 rides on; 130.5 reaches the target and the whole holding goes.
         let (left, sells) = paper_chart_run(pos, ltp, &[("nse_fo|999", 125.0), ("nse_fo|999", 130.5)]).await;
@@ -7156,7 +7361,7 @@ mod tests {
     async fn paper_sells_a_call_scalp_when_the_index_falls_to_its_stop() {
         let ltp = Arc::new(DashMap::new());
         ltp.insert(NIFTY_SPOT.into(), 25_100.0);
-        let levels = shared_domain::ChartLevels { stop: on_index(25_060.0), target: None };
+        let levels = chart_of(on_index(25_060.0), &[]);
         let pos = chart_scalp("CE", levels, &ltp);
         let (left, sells) = paper_chart_run(pos, ltp, &[(NIFTY_SPOT, 25_080.0), (NIFTY_SPOT, 25_055.0)]).await;
         assert!(left.is_empty());

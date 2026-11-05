@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChartCandlestick, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Columns2, Columns3, Square } from 'lucide-react';
-import type { ChartLevel, ExecutePosition } from '../../types';
+import type { ChartLevel, ChartTarget, ExecutePosition } from '../../types';
+import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
 import { useIdentity } from '../auth/identity';
@@ -27,6 +28,8 @@ import {
   setChartLevels,
   setPaperLevels,
   streamToken,
+  type LevelsAnswer,
+  type LevelsUpdate,
   type PaperFill,
   type Sent,
 } from '../lib/api';
@@ -37,12 +40,12 @@ import { useGuard } from '../shell/useGuard';
 import { Segment } from '../ui/Segment';
 import { useToast } from '../ui/toast';
 import { C, type OrderLineData } from './chartSetup';
-import { ChartPanel } from './ChartPanel';
+import { ChartPanel, type LotsPick } from './ChartPanel';
 import { CrosshairBus } from './bus';
 import { ExpiryPicker } from './ExpiryPicker';
 import type { Placing } from './KChart';
 import { Ladder } from './Ladder';
-import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, type LevelActions, type LevelKind, type Layers } from './lines';
+import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
 import { approxMoney, CHART_LIBS, istClock, levelCrossed, levelPnl, optionOf, sameSym, symbolLabel, toTick, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { TradingPanel } from './panel/TradingPanel';
@@ -112,21 +115,38 @@ function loadSaved(): Saved {
   };
 }
 
-/** A level set or cleared here, shown until the stream has it. */
+/** A level set or cleared here, shown until the stream has it: under
+ * `ID:stop` the stop, under `ID:target:TARGET` one target (`null`: removed). */
 interface Pending {
-  level: ChartLevel | null;
+  stop?: ChartLevel | null;
+  target?: ChartTarget | null;
   at: number;
 }
 
 const PENDING_FOR_MS = 3_000;
+/** A new target's id until the server answers with its own. */
+let newTargets = 0;
 
 /** A scalp with the levels just set or cleared from here applied. */
 function withPending(p: ExecutePosition, pending: Record<string, Pending>, now: number): ExecutePosition {
-  const pick = (kind: LevelKind) => {
-    const pend = pending[`${p.id}:${kind}`];
-    return pend && now - pend.at < PENDING_FOR_MS ? pend.level : p.chart?.[kind] ?? null;
+  const fresh = (key: string) => {
+    const pend = pending[key];
+    return pend && now - pend.at < PENDING_FOR_MS ? pend : undefined;
   };
-  return { ...p, chart: { stop: pick('stop'), target: pick('target') } };
+  const stopPend = fresh(`${p.id}:stop`);
+  const stop = stopPend ? (stopPend.stop ?? null) : (p.chart?.stop ?? null);
+  const prefix = `${p.id}:target:`;
+  const shown = chartTargets(p.chart);
+  const targets = shown.flatMap((t) => {
+    const pend = fresh(prefix + t.id);
+    return pend ? (pend.target ? [pend.target] : []) : [t];
+  });
+  // Set from here, not in the stream yet.
+  for (const [key, pend] of Object.entries(pending)) {
+    const t = pend.target;
+    if (key.startsWith(prefix) && t && now - pend.at < PENDING_FOR_MS && !shown.some((s) => s.id === t.id)) targets.push(t);
+  }
+  return { ...p, chart: { stop, targets } };
 }
 
 /** Figma "Index tab": the index, its value and the day's change. */
@@ -174,7 +194,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [pending, setPending] = useState<Record<string, Pending>>({});
   const [sending, setSending] = useState<Record<string, boolean>>({});
   const [exitAllBusy, setExitAllBusy] = useState(false);
-  const [placingAt, setPlacingAt] = useState<{ slot: number; id: string; kind: LevelKind; trigger: ChartLevel['trigger'] } | null>(null);
+  // `lots`: what a target being placed sells — its top value is "all left".
+  const [placingAt, setPlacingAt] = useState<{ slot: number; id: string; kind: LevelKind; trigger: ChartLevel['trigger']; lots: number } | null>(null);
   const [sheet, setSheet] = useState(false);
   // The strike the ladder scrolled to, for the ladder it was scrolled on.
   const [centreAt, setCentreAt] = useState<{ key: string; strike: number } | null>(null);
@@ -370,56 +391,106 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     },
   };
 
-  async function sendLevel(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel | null) {
-    const key = `${p.id}:${kind}`;
-    setPending((s) => ({ ...s, [key]: { level: lvl, at: Date.now() } }));
+  /** Send `update` for `p`, showing `shown` (see {@link Pending}) until the
+   * stream has it; what the server answered, or null when it refused. */
+  async function sendLevels(p: ExecutePosition, update: LevelsUpdate, shown: Record<string, Omit<Pending, 'at'>>, failed: string): Promise<LevelsAnswer | null> {
+    setPending((s) => {
+      const at = Date.now();
+      return { ...s, ...Object.fromEntries(Object.entries(shown).map(([k, v]) => [k, { ...v, at }])) };
+    });
     const sent = await guard(
       'Moving a stop or target needs write access.',
-      () => (paper ? setPaperLevels(serverBase, p.id, { [kind]: lvl }) : setChartLevels(serverBase, p.id, { [kind]: lvl })),
-      `${kind === 'stop' ? 'Stop' : 'Target'} not ${lvl ? 'set' : 'removed'}`,
+      () => (paper ? setPaperLevels(serverBase, p.id, update) : setChartLevels(serverBase, p.id, update)),
+      failed,
       scope,
     );
     if (!sent?.ok) {
       // Back to what the engine has.
       setPending((s) => {
         const next = { ...s };
-        delete next[key];
+        for (const key of Object.keys(shown)) delete next[key];
         return next;
       });
-      return;
+      return null;
     }
-    if ((sent.body as { sells_now?: boolean } | null)?.sells_now) {
+    const answer = (sent.body ?? {}) as LevelsAnswer;
+    if (answer.sells_now) {
       const label = contractLabel(p.index, p.strike, p.option_type);
-      toast({ tone: 'loss', title: `${label}: already past the ${kind}`, body: 'Selling the whole holding at market now.' });
+      const what = update.stop ? 'stop' : 'target';
+      const sells = answer.sells_lots == null ? 'the whole holding' : targetLotsLabel(answer.sells_lots);
+      toast({ tone: 'loss', title: `${label}: already past the ${what}`, body: `Selling ${sells} at market now.` });
     }
+    return answer;
   }
 
   const tick = (p: ExecutePosition) => chainFor(p)?.tick_size ?? chains[p.index]?.tick_size ?? 0.05;
+  /** A level where it was dropped, on the tick. */
+  const ticked = (p: ExecutePosition, lvl: ChartLevel): ChartLevel => ({ ...lvl, price: toTick(lvl.price, lvl.trigger === 'premium' ? tick(p) : 0.05) });
 
-  /** Set a level where it was dropped, on the tick. One past the price sells
-   * the whole holding at market on the engine's next tick — a quick exit. */
-  function trySet(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel): boolean {
-    void sendLevel(p, kind, { ...lvl, price: toTick(lvl.price, lvl.trigger === 'premium' ? tick(p) : 0.05) });
-    return true;
+  /** Set or clear the stop. One past the price sells the whole holding at
+   * market on the engine's next tick — a quick exit. */
+  function setStop(p: ExecutePosition, lvl: ChartLevel | null) {
+    const stop = lvl && ticked(p, lvl);
+    void sendLevels(p, { stop }, { [`${p.id}:stop`]: { stop } }, `Stop not ${lvl ? 'set' : 'removed'}`);
   }
+
+  /** Move `existing` to `lvl` (it keeps its lots), or add a target there
+   * selling `lots` (`null`: all left). One past the price sells its lots at
+   * once. */
+  async function setTarget(p: ExecutePosition, existing: ChartTarget | null, lvl: ChartLevel, lots: number | null = null) {
+    const at = ticked(p, lvl);
+    const id = existing?.id ?? `new-${++newTargets}`;
+    const target: ChartTarget = { ...at, id, lots: existing ? existing.lots : lots };
+    const update: LevelsUpdate = { set_target: existing ? { id: existing.id, ...at } : { ...at, lots } };
+    const answer = await sendLevels(p, update, { [`${p.id}:target:${id}`]: { target } }, `Target not ${existing ? 'moved' : 'set'}`);
+    const real = answer?.target_id;
+    if (!existing && real) {
+      // Shown under the server's id from now on.
+      setPending((s) => {
+        const next = { ...s };
+        const pend = next[`${p.id}:target:${id}`];
+        delete next[`${p.id}:target:${id}`];
+        if (pend) next[`${p.id}:target:${real}`] = { ...pend, target: { ...target, id: real } };
+        return next;
+      });
+    }
+  }
+
+  function removeTarget(p: ExecutePosition, t: ChartTarget) {
+    void sendLevels(p, { remove_target: t.id }, { [`${p.id}:target:${t.id}`]: { target: null } }, 'Target not removed');
+  }
+
+  const clearLevel = (p: ExecutePosition, ref: LevelRef) => (ref.kind === 'stop' ? setStop(p, null) : removeTarget(p, ref.target));
+
+  /** "+ Stop" / "+ Target": the next tap on chart `slot` places it — a target
+   * selling all the lots no other target has, until the picker says fewer. */
+  const startPlacing = (slot: number, p: ExecutePosition, kind: LevelKind, trigger: ChartLevel['trigger']) =>
+    setPlacingAt({ slot, id: p.id, kind, trigger, lots: targetRoom(p) ?? 1 });
 
   const actions = (slot: number): LevelActions => ({
     canSet: chartStopsOn,
-    move: (p, kind, lvl) => void trySet(p, kind, lvl),
-    clear: (p, kind) => void sendLevel(p, kind, null),
-    place: (p, kind, trigger) => setPlacingAt({ slot, id: p.id, kind, trigger }),
+    move: (p, ref, lvl) => (ref.kind === 'stop' ? setStop(p, lvl) : void setTarget(p, ref.target, lvl)),
+    clear: clearLevel,
+    place: (p, kind, trigger) => startPlacing(slot, p, kind, trigger),
   });
 
   // What "+ Stop" is placing, rebuilt each render so its checks see the
   // latest prices; the chart keeps one line for it while `key` stays the same.
   const placingPos = placingAt ? scalps.find((p) => p.id === placingAt.id) ?? null : null;
-  const placing = ((): (Placing & { what: string }) | null => {
+  // A target's lots: up to what no other target has; the top is "all left".
+  // With every lot covered meanwhile, there is nothing to place.
+  const room = placingPos ? targetRoom(placingPos) : null;
+  const placing = ((): (Placing & { what: string; lots?: LotsPick }) | null => {
     if (!placingAt || !placingPos) return null;
     const { kind, trigger } = placingAt;
     const p = placingPos;
+    const isTarget = kind === 'target';
+    if (isTarget && room == null) return null;
+    const chosen = isTarget ? Math.max(1, Math.min(placingAt.lots, room!)) : 0;
+    const lots = isTarget && chosen < room! ? chosen : null;
     const color = kind === 'stop' ? C.loss : C.profit;
     const delta = deltaFor(p, chainFor(p)).value;
-    const word = kind === 'stop' ? 'Stop' : 'Target';
+    const count = chartTargets(p.chart).length + 1;
     const data: OrderLineData = {
       color,
       dashed: true,
@@ -428,7 +499,12 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         const lvl = { price: at, trigger };
         const indexNow = spot[p.index] ?? null;
         const past = levelCrossed(kind, lvl, p.option_type, p.ltp, indexNow) === true;
-        return [{ key: 'label', text: past ? `${word} · past the price, sells all here` : `${word} ${approxMoney(levelPnl(lvl, p, indexNow, delta))}`, color }];
+        const text = isTarget
+          ? targetText(lots, count, past, approxMoney(levelPnl(lvl, { ...p, qty: targetQty(p, lots) }, indexNow, delta)), 'here')
+          : past
+            ? 'Stop · past the price, sells all here'
+            : `Stop ${approxMoney(levelPnl(lvl, p, indexNow, delta))}`;
+        return [{ key: 'label', text, color }];
       },
       axisText: (at) => price(at),
     };
@@ -436,7 +512,14 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       key: `${placingAt.slot}:${p.id}:${kind}:${trigger}`,
       what: kind,
       data,
-      onPlace: (at) => trySet(p, kind, { price: at, trigger }),
+      lots: isTarget
+        ? { value: chosen, max: room!, others: count > 1, set: (n) => setPlacingAt((a) => a && { ...a, lots: Math.max(1, Math.min(n, room!)) }) }
+        : undefined,
+      onPlace: (at) => {
+        if (isTarget) void setTarget(p, null, { price: at, trigger }, lots);
+        else setStop(p, { price: at, trigger });
+        return true;
+      },
     };
   })();
 
@@ -450,14 +533,14 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   function placeFromPanel(p: ExecutePosition, kind: LevelKind) {
     const option = p.expiry ? optionOf(p, p.expiry) : null;
     const onOption = option ? shownSlots.findIndex((s) => sameSym(s.sym, option)) : -1;
-    if (onOption >= 0) return setPlacingAt({ slot: onOption, id: p.id, kind, trigger: 'premium' });
+    if (onOption >= 0) return startPlacing(onOption, p, kind, 'premium');
     let onIndex = shownSlots.findIndex((s) => s.sym.kind === 'index' && s.sym.index === p.index);
     if (onIndex < 0) {
       onIndex = 0;
       setSlot(0, { sym: { kind: 'index', index: p.index } });
     }
     if (!desktop) showChart(true);
-    setPlacingAt({ slot: onIndex, id: p.id, kind, trigger: 'index' });
+    startPlacing(onIndex, p, kind, 'index');
   }
 
   const showChart = (shown: boolean) => save((s) => ({ ...s, chartHidden: !shown }));
@@ -575,13 +658,13 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         return t == null ? null : istClock(t);
       }}
       canSet={chartStopsOn}
-      onRemove={(p, kind) => void sendLevel(p, kind, null)}
+      onRemove={clearLevel}
       onAdd={(p, kind) => {
         setSheet(false);
         // Phone's one chart: put it on this scalp's index, and place there.
         if (saved.slots[0].sym.index !== p.index || saved.slots[0].sym.kind !== 'index') setSlot(0, { sym: { kind: 'index', index: p.index } });
         showChart(true);
-        setPlacingAt({ slot: 0, id: p.id, kind, trigger: 'index' });
+        startPlacing(0, p, kind, 'index');
       }}
       onClose={() => setSheet(false)}
       paper={account}
@@ -699,7 +782,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         h={handlers}
         canSet={chartStopsOn}
         onAdd={placeFromPanel}
-        onRemove={(p, kind) => void sendLevel(p, kind, null)}
+        onRemove={clearLevel}
         open={saved.panelOpen}
         onToggle={() => save((s) => ({ ...s, panelOpen: !s.panelOpen }))}
         height={saved.panelHeight}

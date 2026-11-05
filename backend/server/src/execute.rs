@@ -610,7 +610,7 @@ fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
         adding: p.buy_in_flight(),
         exiting: p.sell_in_flight(),
         halted: p.live_halt.is_some(),
-        chart: p.chart,
+        chart: p.chart.clone(),
     }
 }
 
@@ -635,7 +635,7 @@ fn paper_row(state: &AppState, p: &PaperPosition) -> PositionRow {
         adding: false,
         exiting: false,
         halted: false,
-        chart: p.chart,
+        chart: p.chart.clone(),
     }
 }
 

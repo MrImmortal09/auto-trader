@@ -328,7 +328,7 @@ impl DeskPosition {
             signal_stop: 0.0,
             targets: Vec::new(),
             next_target: None,
-            chart: p.chart,
+            chart: p.chart.clone(),
             index_ltp: index_ltp.filter(|v| *v > 0.0),
             busy: None,
         }

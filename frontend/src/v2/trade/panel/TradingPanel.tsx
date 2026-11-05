@@ -9,7 +9,8 @@ import type { Call, DeskAnswer, FillMark } from '../../lib/types';
 import { Button } from '../../ui/Button';
 import { Chip } from '../../ui/Chip';
 import { HoldButton } from '../../ui/HoldButton';
-import type { LevelKind } from '../lines';
+import { chartTargets, targetLotsLabel } from '../../../lib/format';
+import { targetRoom, type LevelKind, type LevelRef } from '../lines';
 import type { PaperAccount, PositionHandlers } from '../Positions';
 import { busyNote, levelWords } from '../words';
 import { activityEvents, type EngineError } from './activity';
@@ -183,7 +184,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   h: PositionHandlers;
   canSet: boolean;
   onAdd: (p: ExecutePosition, kind: LevelKind) => void;
-  onRemove: (p: ExecutePosition, kind: LevelKind) => void;
+  onRemove: (p: ExecutePosition, ref: LevelRef) => void;
   /** The body shown; the tab row stays either way. */
   open: boolean;
   onToggle: () => void;
@@ -254,24 +255,36 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
     setDragged(null);
   };
 
-  const level = (p: ExecutePosition, kind: LevelKind, locked: boolean) => {
-    const lvl = p.chart?.[kind] ?? null;
-    const word = kind === 'stop' ? 'Stop' : 'Target';
-    if (lvl) {
-      return (
-        <span className={`inline-flex items-center gap-1 type-caption tnum ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-          {levelWords(p, kind, lvl)}
-          <button type="button" disabled={locked} title={`Remove the ${kind}`} aria-label={`Remove the ${kind}`} onClick={() => onRemove(p, kind)} className="grid size-5 place-items-center rounded-4 border border-current/40 hover:bg-raised disabled:opacity-40">
-            ×
-          </button>
-        </span>
-      );
-    }
-    if (!canSet) return <span className="type-caption text-fg-muted">—</span>;
-    return (
-      <button type="button" disabled={locked} onClick={() => onAdd(p, kind)} className={`type-caption hover:underline disabled:opacity-40 ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-        + {word}
+  /** A level with its × — a target with the lots it sells. */
+  const setLevel = (p: ExecutePosition, ref: LevelRef, words: string, locked: boolean) => (
+    <span key={ref.kind === 'stop' ? 'stop' : ref.target.id} className={`inline-flex items-center gap-1 type-caption tnum ${ref.kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
+      {words}
+      <button type="button" disabled={locked} title={`Remove the ${ref.kind}`} aria-label={`Remove the ${ref.kind}`} onClick={() => onRemove(p, ref)} className="grid size-5 place-items-center rounded-4 border border-current/40 hover:bg-raised disabled:opacity-40">
+        ×
       </button>
+    </span>
+  );
+  const addLevel = (p: ExecutePosition, kind: LevelKind, locked: boolean) => (
+    <button type="button" disabled={locked} onClick={() => onAdd(p, kind)} className={`self-start type-caption hover:underline disabled:opacity-40 ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
+      + {kind === 'stop' ? 'Stop' : 'Target'}
+    </button>
+  );
+  const stopCell = (p: ExecutePosition, locked: boolean) => {
+    const stop = p.chart?.stop ?? null;
+    if (stop) return setLevel(p, { kind: 'stop' }, levelWords(p, 'stop', stop), locked);
+    return canSet ? addLevel(p, 'stop', locked) : <span className="type-caption text-fg-muted">—</span>;
+  };
+  // Each target with its lots, then "+ Target" while some lots have none.
+  const targetCell = (p: ExecutePosition, locked: boolean) => {
+    const targets = chartTargets(p.chart);
+    const lone = targets.length === 1 && targets[0].lots == null;
+    const room = canSet && targetRoom(p) != null;
+    if (targets.length === 0 && !room) return <span className="type-caption text-fg-muted">—</span>;
+    return (
+      <span className="flex flex-col gap-1">
+        {targets.map((target) => setLevel(p, { kind: 'target', target }, `${levelWords(p, 'target', target)}${lone ? '' : ` · ${targetLotsLabel(target.lots)}`}`, locked))}
+        {room && addLevel(p, 'target', locked)}
+      </span>
     );
   };
 
@@ -314,8 +327,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
               </span>
               <span className="text-right num-medium text-fg">{price(p.avg)}</span>
               <span className="text-right num-medium text-fg">{p.ltp == null ? '—' : price(p.ltp)}</span>
-              <span>{level(p, 'stop', locked)}</span>
-              <span>{level(p, 'target', locked)}</span>
+              <span>{stopCell(p, locked)}</span>
+              <span>{targetCell(p, locked)}</span>
               <span className="flex justify-end gap-2">
                 <Button pointerOnly kind="ghost" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)} title={`Sell ${p.lot_size} at market`}>
                   −1 lot

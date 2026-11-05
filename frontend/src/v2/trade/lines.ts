@@ -1,7 +1,8 @@
 // What each Trade chart draws: a scalp's position line with its stop and
 // target, Telegram trades' read-only lines, and the day's markers.
 
-import type { ChartLevel, ExecutePosition } from '../../types';
+import type { ChartLevel, ChartTarget, ExecutePosition } from '../../types';
+import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { level, price, signedMoney } from '../lib/format';
 import type { CallMark, ChainAnswer, FillMark, TelegramLine } from '../lib/types';
 import { C, type LinePart, type MarkerData, type OrderLineData } from './chartSetup';
@@ -9,6 +10,46 @@ import type { ChartLine, ChartMarker } from './KChart';
 import { approxMoney, istMs, levelCrossed, levelPnl, optionOf, sameSym, type ChartSym } from './model';
 
 export type LevelKind = 'stop' | 'target';
+
+/** One of a scalp's levels: its stop, or one of its targets. */
+export type LevelRef = { kind: 'stop' } | { kind: 'target'; target: ChartTarget };
+
+/** Most targets one trade may have (the server's `MAX_CHART_TARGETS`). */
+export const MAX_TARGETS = 5;
+
+/** Whole lots `p` holds. */
+export function heldLots(p: Pick<ExecutePosition, 'qty' | 'lot_size'>): number {
+  return p.lot_size > 0 ? Math.floor(p.qty / p.lot_size) : 0;
+}
+
+/** The lots a new target on `p` may sell — those no other target has — or
+ * `null` when every lot already has one (an "all left" target covers them
+ * all) or the trade has its {@link MAX_TARGETS}. Its top value is "all left". */
+export function targetRoom(p: ExecutePosition): number | null {
+  const targets = chartTargets(p.chart);
+  if (targets.length >= MAX_TARGETS || targets.some((t) => t.lots == null)) return null;
+  const free = heldLots(p) - targets.reduce((n, t) => n + (t.lots ?? 0), 0);
+  return free >= 1 ? free : null;
+}
+
+/** What a target of `lots` (`null`: all left) on `p` sells, if the other
+ * targets go first. `id` is its own, to leave it out of the others. */
+export function targetQty(p: ExecutePosition, lots: number | null, id?: string): number {
+  if (lots != null) return Math.min(p.qty, lots * p.lot_size);
+  const others = chartTargets(p.chart)
+    .filter((t) => t.id !== id)
+    .reduce((n, t) => n + (t.lots ?? 0), 0);
+  return Math.max(0, p.qty - others * p.lot_size);
+}
+
+/** A target line's words: "Target ≈ +₹2,400" for a lone "all left" one,
+ * as before targets had lots; "Target · 2 lots ≈ +₹1,200" otherwise. While
+ * it is past the price, what letting go sells. `count`: targets on the trade. */
+export function targetText(lots: number | null, count: number, past: boolean, approx: string, release: 'on release' | 'here'): string {
+  const what = lots == null ? 'all' : targetLotsLabel(lots);
+  if (past) return `Target · past the price, sells ${what} ${release}`;
+  return lots == null && count <= 1 ? `Target ${approx}` : `Target · ${targetLotsLabel(lots)} ${approx}`;
+}
 
 /** Which layers a chart shows (its Layers menu). */
 export interface Layers {
@@ -29,8 +70,9 @@ export const DEFAULT_LAYERS: Layers = { myTrades: true, telegramTrades: false, t
 export interface LevelActions {
   /** Levels can be set (`chart_stops` on); clearing works either way. */
   canSet: boolean;
-  move: (p: ExecutePosition, kind: LevelKind, lvl: ChartLevel) => void;
-  clear: (p: ExecutePosition, kind: LevelKind) => void;
+  /** Dragged to `lvl`: a target keeps its lots. */
+  move: (p: ExecutePosition, ref: LevelRef, lvl: ChartLevel) => void;
+  clear: (p: ExecutePosition, ref: LevelRef) => void;
   /** "+ Stop": put one where the next click lands, on this chart. */
   place: (p: ExecutePosition, kind: LevelKind, trigger: ChartLevel['trigger']) => void;
 }
@@ -70,39 +112,40 @@ function editable(p: ExecutePosition): boolean {
   return !p.halted && !p.exiting && !p.placing && p.qty > 0;
 }
 
-function levelLine(p: ExecutePosition, kind: LevelKind, lvl: ChartLevel, cx: LineContext): ChartLine {
+function levelLine(p: ExecutePosition, ref: LevelRef, lvl: ChartLevel, cx: LineContext): ChartLine {
+  const { kind } = ref;
   const color = kind === 'stop' ? C.loss : C.profit;
-  const word = kind === 'stop' ? 'Stop' : 'Target';
   const delta = deltaFor(p, cx.chainFor(p)).value;
   const draggable = cx.actions.canSet && editable(p);
+  const count = chartTargets(p.chart).length;
   const data: OrderLineData = {
     color,
     dashed: true,
     draggable,
     parts: (at) => {
       const moved = { price: at, trigger: lvl.trigger };
-      // Dropped past the price it sells the whole holding at once.
-      const past = levelCrossed(kind, moved, p.option_type, p.ltp, cx.spot[p.index] ?? null) === true;
-      const parts: LinePart[] = [
-        {
-          key: 'label',
-          text: past ? `${word} · past the price, sells all on release` : `${word} ${approxMoney(levelPnl(moved, p, cx.spot[p.index] ?? null, delta))}`,
-          color,
-          icon: draggable ? 'grip' : 'lock',
-        },
-      ];
+      const indexNow = cx.spot[p.index] ?? null;
+      // Dropped past the price it sells at once: all of it for the stop, a target's lots for a target.
+      const past = levelCrossed(kind, moved, p.option_type, p.ltp, indexNow) === true;
+      const text =
+        ref.kind === 'stop'
+          ? past
+            ? 'Stop · past the price, sells all on release'
+            : `Stop ${approxMoney(levelPnl(moved, p, indexNow, delta))}`
+          : targetText(ref.target.lots, count, past, approxMoney(levelPnl(moved, { ...p, qty: targetQty(p, ref.target.lots, ref.target.id) }, indexNow, delta)), 'on release');
+      const parts: LinePart[] = [{ key: 'label', text, color, icon: draggable ? 'grip' : 'lock' }];
       if (editable(p)) parts.push({ key: 'remove', text: '×', color });
       return parts;
     },
     axisText: (at) => price(at),
   };
   return {
-    id: `${p.id}:${kind}`,
+    id: ref.kind === 'stop' ? `${p.id}:stop` : `${p.id}:target:${ref.target.id}`,
     price: lvl.price,
     data,
     zLevel: 2,
-    onMove: (at) => cx.actions.move(p, kind, { price: at, trigger: lvl.trigger }),
-    onPart: (key) => key === 'remove' && cx.actions.clear(p, kind),
+    onMove: (at) => cx.actions.move(p, ref, { price: at, trigger: lvl.trigger }),
+    onPart: (key) => key === 'remove' && cx.actions.clear(p, ref),
   };
 }
 
@@ -121,7 +164,7 @@ function positionLine(p: ExecutePosition, at: number | { at: number }, trigger: 
         { key: 'pnl', text: p.pnl == null ? '—' : signedMoney(p.pnl), color: pnlColor },
       ];
       if (add && !p.chart?.stop) parts.push({ key: 'add-stop', text: '+ Stop', color: C.loss });
-      if (add && !p.chart?.target) parts.push({ key: 'add-target', text: '+ Target', color: C.profit });
+      if (add && targetRoom(p) != null) parts.push({ key: 'add-target', text: '+ Target', color: C.profit });
       return parts;
     },
     axisText: (value) => price(value),
@@ -156,9 +199,10 @@ export function chartLines(cx: LineContext): ChartLine[] {
         const bought = firstBuy(p, cx.fills);
         if (bought != null) out.push(positionLine(p, { at: bought }, trigger, cx));
       }
-      for (const kind of ['stop', 'target'] as const) {
-        const lvl = p.chart?.[kind];
-        if (lvl && lvl.trigger === trigger) out.push(levelLine(p, kind, lvl, cx));
+      const stop = p.chart?.stop;
+      if (stop && stop.trigger === trigger) out.push(levelLine(p, { kind: 'stop' }, stop, cx));
+      for (const target of chartTargets(p.chart)) {
+        if (target.trigger === trigger) out.push(levelLine(p, { kind: 'target', target }, target, cx));
       }
     }
   }
