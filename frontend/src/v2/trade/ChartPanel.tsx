@@ -250,7 +250,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           <button type="button" aria-label="Layers" aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <LayersIcon size={16} />
           </button>
-          <Popover open={menu === 'layers'} onClose={close} align="right" backdrop={compact}>
+          <Popover open={menu === 'layers'} onClose={close} align="right" backdrop={compact} scroll>
             <div className="px-2 pt-1 pb-1 type-caption text-fg-muted">Show on this chart</div>
             <CheckboxRow checked={layers.myTrades} title="My trades" note="Entry, stop, target · drag to move" onChange={(v) => onLayers({ ...layers, myTrades: v })} />
             <CheckboxRow checked={layers.telegramTrades} title="Telegram trades" note="Lines show on the option chart" onChange={(v) => onLayers({ ...layers, telegramTrades: v })} />

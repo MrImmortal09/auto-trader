@@ -1,12 +1,14 @@
 import { SPLIT_HANDLE, type PhoneSplit } from './phoneSplit';
 
 /** The bar between the chart and the ladder: drag it to share the height. */
-export function SplitHandle({ height, dragging, handle }: Pick<PhoneSplit, 'height' | 'dragging' | 'handle'>) {
+export function SplitHandle({ height, min, max, dragging, handle }: Pick<PhoneSplit, 'height' | 'min' | 'max' | 'dragging' | 'handle'>) {
   return (
     <div
       role="separator"
       aria-orientation="horizontal"
       aria-label="Drag to resize the chart"
+      aria-valuemin={min}
+      aria-valuemax={max}
       aria-valuenow={height}
       tabIndex={0}
       title="Drag to resize the chart"

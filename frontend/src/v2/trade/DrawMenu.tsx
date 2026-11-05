@@ -36,7 +36,7 @@ export function DrawMenu({ open, onToggle, onClose, onPick, onClear, disabled = 
       >
         <Pencil size={16} />
       </button>
-      <Popover open={open && !disabled} onClose={onClose} align="right" backdrop={compact}>
+      <Popover open={open && !disabled} onClose={onClose} align="right" backdrop={compact} scroll>
         <div className="px-2 pt-1 pb-1 type-caption text-fg-muted">Draw on this chart</div>
         {DRAW_TOOLS.map(({ tool, label }) => {
           const Icon = ICONS[tool];
