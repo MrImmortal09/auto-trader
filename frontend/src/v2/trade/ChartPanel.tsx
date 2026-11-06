@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, Layers as LayersIcon } from 'lucide-react';
+import { ChevronDown, ChevronUp, Layers as LayersIcon, Maximize2, Minimize2 } from 'lucide-react';
 import { INDEX_ORDER } from '../../lib/execute';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
@@ -54,7 +54,7 @@ function LotsStepper({ lots }: { lots: LotsPick }) {
 }
 
 /** One chart: its header (instrument, timeframe, Layers) and the chart. */
-export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, style, onStyle, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide }: {
+export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, style, onStyle, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide, fullscreen = false, onFullscreen }: {
   chartId: string;
   serverBase: string;
   sym: ChartSym;
@@ -88,6 +88,8 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   compact: boolean;
   /** Phone: folds the chart away, for more of the ladder. */
   onHide?: () => void;
+  fullscreen?: boolean;
+  onFullscreen?: (on: boolean) => void;
 }) {
   const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | null>(null);
   const [chartState, setChartState] = useState<{ loading: boolean; error: string | null; last: Bar | null }>({ loading: true, error: null, last: null });
@@ -95,6 +97,19 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   const drawApi = useRef<DrawApi | null>(null);
   const { drawing, pick: pickTool, cancel: cancelDrawing } = useDrawing(useCallback(() => drawApi.current, []));
   useChartKeymap(chartId, useCallback(() => drawApi.current, []), placing != null);
+
+  // Escape leaves full screen, but not while a level is being placed, a
+  // drawing tool is being used, or a menu or dialog is open.
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (placing != null || drawing != null || menu != null || document.querySelector('[role="dialog"]')) return;
+      onFullscreen?.(false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [fullscreen, placing, drawing, menu, onFullscreen]);
 
   // The expiry the picker lists strikes for: what was picked on this
   // chart's current instrument, else the charted option's, else the nearest.
@@ -145,7 +160,9 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
     <section
       onPointerDown={() => markChartActive(chartId)}
       onPointerEnter={() => markChartActive(chartId)}
-      className="flex min-h-0 min-w-0 flex-1 flex-col rounded-12 border border-line bg-inset"
+      className={`flex min-h-0 min-w-0 flex-1 flex-col ${
+        fullscreen ? 'rounded-none border-0 bg-canvas' : compact ? 'rounded-none border-y border-line bg-inset' : 'rounded-12 border border-line bg-inset'
+      }`}
     >
       {/* The controls on the right never shrink, so Hide chart stays on screen;
           the instrument's name and the price give way instead. */}
@@ -267,6 +284,17 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             compact={compact}
           />
         )}
+        {onFullscreen && (
+          <button
+            type="button"
+            aria-label={fullscreen ? 'Exit full screen' : 'Full screen'}
+            title={fullscreen ? 'Exit full screen' : 'Full screen'}
+            onClick={() => onFullscreen(!fullscreen)}
+            className="grid size-8 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+          >
+            {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+          </button>
+        )}
         <div className="relative shrink-0">
           <button type="button" aria-label="Layers" aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <LayersIcon size={16} />
@@ -303,13 +331,13 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             )}
           </Popover>
         </div>
-        {onHide && (
+        {onHide && !fullscreen && (
           <button type="button" aria-label="Hide chart" title="Hide chart" onClick={onHide} className="grid size-8 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <ChevronUp size={16} />
           </button>
         )}
       </header>
-      <div className="relative min-h-0 flex-1 overflow-hidden rounded-b-12">
+      <div className={`relative min-h-0 flex-1 overflow-hidden ${compact || fullscreen ? '' : 'rounded-b-12'}`}>
         {lib === 'vela' ? (
           <Suspense fallback={null}>
             <VChart
