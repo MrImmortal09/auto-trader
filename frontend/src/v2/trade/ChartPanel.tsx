@@ -7,6 +7,7 @@ import { CheckboxRow } from '../ui/CheckboxRow';
 import { Popover } from '../ui/Popover';
 import { Segment } from '../ui/Segment';
 import type { CrosshairBus } from './bus';
+import { markChartActive, useChartKeymap } from './chartKeymap';
 import { DrawBanner, DrawMenu } from './DrawMenu';
 import { useDrawing, type DrawApi } from './drawings';
 import { expiryChip, type ExpiryRow } from './expiries';
@@ -90,16 +91,28 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
 }) {
   const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | null>(null);
   const [chartState, setChartState] = useState<{ loading: boolean; error: string | null; last: Bar | null }>({ loading: true, error: null, last: null });
-  // KLineChart's drawing tools, while it draws this chart.
+  // Drawing tools (KLineChart or Vela), while it draws this chart.
   const drawApi = useRef<DrawApi | null>(null);
   const { drawing, pick: pickTool, cancel: cancelDrawing } = useDrawing(useCallback(() => drawApi.current, []));
+  useChartKeymap(chartId, useCallback(() => drawApi.current, []), placing != null);
+
   // The expiry the picker lists strikes for: what was picked on this
   // chart's current instrument, else the charted option's, else the nearest.
   const [picked, setPicked] = useState<{ on: string; expiry: string | null } | null>(null);
+  const [undoState, setUndoState] = useState({ canUndo: false, canRedo: false });
   const strikeList = useRef<HTMLDivElement>(null);
   const atmRow = useRef<HTMLDivElement>(null);
   const close = useCallback(() => setMenu(null), []);
   const onState = useCallback((s: { loading: boolean; error: string | null; last: Bar | null }) => setChartState(s), []);
+
+  useEffect(() => {
+    if (menu === 'draw') {
+      setUndoState({
+        canUndo: drawApi.current?.canUndo() ?? false,
+        canRedo: drawApi.current?.canRedo() ?? false,
+      });
+    }
+  }, [menu]);
 
   const index = sym.index;
   const symbolKey = sym.kind === 'option' ? `${sym.index}:${sym.expiry}` : sym.index;
@@ -129,7 +142,11 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   return (
     // Not clipped as a whole: its menus (the symbol picker, Layers) open over
     // whatever is below a short chart. Only the chart itself is clipped.
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col rounded-12 border border-line bg-inset">
+    <section
+      onPointerDown={() => markChartActive(chartId)}
+      onPointerEnter={() => markChartActive(chartId)}
+      className="flex min-h-0 min-w-0 flex-1 flex-col rounded-12 border border-line bg-inset"
+    >
       {/* The controls on the right never shrink, so Hide chart stays on screen;
           the instrument's name and the price give way instead. */}
       <header className={`@container flex h-10 shrink-0 items-center border-b border-line ${compact ? 'gap-1.5 pr-1 pl-3' : 'gap-2 px-3'}`}>
@@ -242,6 +259,10 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             onClose={close}
             onPick={pickTool}
             onClear={() => drawApi.current?.clear()}
+            onUndo={() => drawApi.current?.undo()}
+            onRedo={() => drawApi.current?.redo()}
+            canUndo={undoState.canUndo}
+            canRedo={undoState.canRedo}
             disabled={placing != null}
             compact={compact}
           />
@@ -311,6 +332,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               onStudies={(s) => {
                 if (s.rsi !== layers.rsi || s.cci !== layers.cci) onLayers({ ...layers, ...s });
               }}
+              drawRef={drawApi}
             />
           </Suspense>
         ) : (

@@ -8,6 +8,7 @@ import type { Chart, DeepPartial, OverlayCreate, OverlayEvent, OverlayStyle } fr
 import { readStored, writeStored } from '../../lib/execute';
 import { todayIst } from '../lib/format';
 import { C, FONT } from './chartSetup';
+import { DrawHistory } from './undoHistory';
 
 export type DrawTool = 'segment' | 'horizontalStraightLine' | 'rayLine' | 'verticalStraightLine' | 'fibonacciLine';
 
@@ -28,6 +29,12 @@ export interface DrawApi {
   cancel: () => void;
   /** Every drawing on the instrument shown, gone. */
   clear: () => void;
+  /** Undo the last drawing change (or cancel a drawing in progress). */
+  undo: () => boolean;
+  /** Redo a previously undone change. */
+  redo: () => boolean;
+  canUndo: () => boolean;
+  canRedo: () => boolean;
 }
 
 /** The tool being drawn on a chart, if any: `pick` starts one (giving up
@@ -125,9 +132,24 @@ export class KlineDrawings implements DrawApi {
   private symbol: string | null = null;
   private kept = new Map<string, Saved>();
   private pending: { id: string; done: () => void } | null = null;
+  private history = new DrawHistory<Saved[]>();
 
   constructor(chart: Chart) {
     this.chart = chart;
+  }
+
+  /** The kept list as a snapshot: a deep copy so history is immutable. */
+  private snapshot(): Saved[] {
+    return [...this.kept.values()].map((d) => ({
+      name: d.name,
+      points: d.points.map((p) => ({ t: p.t, v: p.v })),
+    }));
+  }
+
+  /** Push the current state onto the undo stack (before a change). */
+  private pushUndo() {
+    if (!this.symbol) return;
+    this.history.push(this.symbol, this.snapshot());
   }
 
   /** `symbol`'s saved drawings, drawn afresh. */
@@ -167,14 +189,63 @@ export class KlineDrawings implements DrawApi {
 
   clear() {
     this.cancel();
+    if (this.kept.size > 0) this.pushUndo();
     this.chart.removeOverlay({ groupId: GROUP });
     this.kept.clear();
+    this.save();
+  }
+
+  undo(): boolean {
+    // A drawing in progress: cancel it instead.
+    if (this.pending) {
+      this.cancel();
+      return true;
+    }
+    if (!this.symbol) return false;
+    const prev = this.history.undo(this.symbol, this.snapshot());
+    if (!prev) return false;
+    this.applySnapshot(prev);
+    return true;
+  }
+
+  redo(): boolean {
+    if (!this.symbol) return false;
+    const next = this.history.redo(this.symbol, this.snapshot());
+    if (!next) return false;
+    this.applySnapshot(next);
+    return true;
+  }
+
+  canUndo(): boolean {
+    return this.pending != null || (this.symbol != null && this.history.canUndo(this.symbol));
+  }
+
+  canRedo(): boolean {
+    return this.symbol != null && this.history.canRedo(this.symbol);
+  }
+
+  /** Replace the drawings on the chart with `snapshot` and save. */
+  private applySnapshot(snapshot: Saved[]) {
+    this.chart.removeOverlay({ groupId: GROUP });
+    this.kept = new Map();
+    for (const d of snapshot) {
+      const id = newId();
+      const points = d.points.map((p) => ({ t: p.t, v: p.v }));
+      this.kept.set(id, { name: d.name, points });
+      this.chart.createOverlay(this.overlay(id, d.name, points));
+    }
     this.save();
   }
 
   private overlay(id: string, name: DrawTool, points: Saved['points']): OverlayCreate {
     const keep = (e: OverlayEvent<unknown>) => {
       const at = e.overlay.points.flatMap((p) => (Number.isFinite(p.timestamp) && Number.isFinite(p.value) ? [{ t: p.timestamp!, v: p.value! }] : []));
+      if (at.length === 0) return;
+      const prev = this.kept.get(id);
+      if (prev && prev.points.length === at.length && prev.points.every((p, i) => p.t === at[i]?.t && p.v === at[i]?.v)) {
+        return;
+      }
+      this.pushUndo();
       this.kept.set(id, { name, points: at });
       this.save();
     };
@@ -201,6 +272,7 @@ export class KlineDrawings implements DrawApi {
           this.pending = null;
           return done();
         }
+        this.pushUndo();
         this.kept.delete(id);
         this.save();
       },

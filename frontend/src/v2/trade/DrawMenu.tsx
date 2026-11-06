@@ -1,6 +1,7 @@
-import { useEffect } from 'react';
-import { AlignVerticalSpaceAround, Minus, MoveUpRight, Pencil, SeparatorVertical, Slash, Trash2, type LucideIcon } from 'lucide-react';
+import { useEffect, useMemo } from 'react';
+import { AlignVerticalSpaceAround, Minus, MoveUpRight, Pencil, Redo2, SeparatorVertical, Slash, Trash2, Undo2, type LucideIcon } from 'lucide-react';
 import { Popover } from '../ui/Popover';
+import { isMac } from './chartKeymap';
 import { DRAW_TOOLS, type DrawTool } from './drawings';
 
 const ICONS: Record<DrawTool, LucideIcon> = {
@@ -12,17 +13,34 @@ const ICONS: Record<DrawTool, LucideIcon> = {
 };
 
 /** The Draw button beside Layers, and its menu: the tools and Clear. */
-export function DrawMenu({ open, onToggle, onClose, onPick, onClear, disabled = false, compact = false }: {
+export function DrawMenu({
+  open,
+  onToggle,
+  onClose,
+  onPick,
+  onClear,
+  onUndo,
+  onRedo,
+  canUndo = false,
+  canRedo = false,
+  disabled = false,
+  compact = false,
+}: {
   open: boolean;
   onToggle: () => void;
   onClose: () => void;
   onPick: (tool: DrawTool) => void;
   onClear: () => void;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  canUndo?: boolean;
+  canRedo?: boolean;
   /** "+ Stop" is being placed: the next tap is the stop's. */
   disabled?: boolean;
   /** Phone: no right-click to remove one drawing, only Clear. */
   compact?: boolean;
 }) {
+  const mac = useMemo(() => isMac(), []);
   return (
     <div className="relative shrink-0">
       <button
@@ -38,6 +56,31 @@ export function DrawMenu({ open, onToggle, onClose, onPick, onClear, disabled = 
       </button>
       <Popover open={open && !disabled} onClose={onClose} align="right" backdrop={compact} scroll>
         <div className="px-2 pt-1 pb-1 type-caption text-fg-muted">Draw on this chart</div>
+        {onUndo && (
+          <button
+            type="button"
+            disabled={!canUndo}
+            onClick={() => (onUndo(), onClose())}
+            className="flex h-9 w-full items-center gap-2.5 rounded-6 px-2 type-label text-fg hover:bg-raised disabled:opacity-40 disabled:hover:bg-transparent"
+          >
+            <Undo2 size={15} className="text-fg-muted" />
+            <span>Undo</span>
+            {!compact && <span className="ml-auto type-caption text-fg-muted">{mac ? '⌘Z' : 'Ctrl+Z'}</span>}
+          </button>
+        )}
+        {onRedo && (
+          <button
+            type="button"
+            disabled={!canRedo}
+            onClick={() => (onRedo(), onClose())}
+            className="flex h-9 w-full items-center gap-2.5 rounded-6 px-2 type-label text-fg hover:bg-raised disabled:opacity-40 disabled:hover:bg-transparent"
+          >
+            <Redo2 size={15} className="text-fg-muted" />
+            <span>Redo</span>
+            {!compact && <span className="ml-auto type-caption text-fg-muted">{mac ? '⇧⌘Z' : 'Ctrl+Y'}</span>}
+          </button>
+        )}
+        {(onUndo || onRedo) && <div className="my-1 h-px bg-line" />}
         {DRAW_TOOLS.map(({ tool, label }) => {
           const Icon = ICONS[tool];
           return (
