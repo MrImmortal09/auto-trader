@@ -1,15 +1,17 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import type { InputValue, SerializedDrawing, TimelineMark, Vela } from '@luxalgo/vela';
 import { VelaWorkspace } from '@luxalgo/vela/workspace';
 import { apiUrl } from '../../lib/api';
 import { readStored } from '../../lib/execute';
 import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, upsert } from './bars';
+import { editable } from './chartKeymap';
 import { C, FONT, type MarkerData } from './chartSetup';
-import { keepList, pruneExpired, VELA_DRAWINGS } from './drawings';
+import { keepList, pruneExpired, VELA_DRAWINGS, type DrawApi } from './drawings';
 import type { ChartLine, ChartProps } from './KChart';
 import { barAt, futureName, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
 import { pivotLines, pivotsByDay } from './pivots';
+import { DrawHistory } from './undoHistory';
 import { CandleProvider, PROVIDER, velaSymbol, type Feed } from './velaProvider';
 
 /** The design tokens on Vela's theme, per the handoff's table; its menus and dialogs take them too. */
@@ -57,9 +59,15 @@ const sameTf = (t: string, tf: Tf) => t === tf || t === tf.slice(0, -1);
 /** A Vela symbol, with or without its provider prefix, is `symbol`. */
 const sameSymbol = (s: string, symbol: string) => s === velaSymbol(symbol) || `${PROVIDER}:${s}` === velaSymbol(symbol);
 
-/** A text field: a key there is typing, not a shortcut. */
-function editable(t: EventTarget | null): boolean {
-  return t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement || (t instanceof HTMLElement && t.isContentEditable);
+function cloneKept(drawings: KeptDrawing[]): KeptDrawing[] {
+  return drawings.map((d) => ({
+    ...d,
+    anchors: d.anchors.map((a) => ({ ...a })),
+    style: { ...d.style },
+    text: d.text ? { ...d.text } : undefined,
+    props: d.props ? { ...d.props } : undefined,
+    showOn: d.showOn ? [...d.showOn] : undefined,
+  }));
 }
 
 /** Our drawings (order lines, VWAP, pivots), as opposed to the user's. */
@@ -121,14 +129,18 @@ const VELA_STYLE: Record<CandleStyle, string> = { candles: 'candles', bars: 'bar
  * the user do to a line is put back. Only our header picks the instrument and
  * the timeframe, and no key reaches Vela outside its text fields.
  */
-export default function VChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, rsi, cci, style, placing, onPlacingDone, bus, onState, onStyle, onStudies }: ChartProps & {
+export default function VChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, rsi, cci, style, placing, onPlacingDone, bus, onState, onStyle, onStudies, drawRef }: ChartProps & {
   /** A candle style picked in Vela's own menu. */
   onStyle?: (s: CandleStyle) => void;
   /** RSI or CCI added or closed with Vela's own menus. */
   onStudies?: (s: { rsi: boolean; cci: boolean }) => void;
+  drawRef?: RefObject<DrawApi | null>;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const chart = useRef<Vela | null>(null);
+  const history = useRef(new DrawHistory<KeptDrawing[]>());
+  const lastSaved = useRef(new Map<string, KeptDrawing[]>());
+  const apiRef = useRef<DrawApi | null>(null);
   const provider = useRef<CandleProvider | null>(null);
   const feed = useRef<Feed>({ onBar: null });
   const symbol = symbolName(sym);
@@ -320,16 +332,63 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
 
     // The user's own drawings, kept per instrument: never our lines, VWAP or
     // pivots, and only on the price pane (a study pane's id doesn't last).
+    const currentKept = (): KeptDrawing[] => {
+      const mine = ourIds(owned.current, extras.current);
+      const raw = c.drawings
+        .all()
+        .filter((d) => !mine.has(d.id) && d.paneId === PRICE_PANE)
+        .map((d) => ({
+          type: d.type,
+          paneId: d.paneId,
+          anchors: d.anchors,
+          style: d.style,
+          text: d.text,
+          locked: d.locked,
+          visible: d.visible,
+          zIndex: d.zIndex,
+          props: d.props,
+          showOn: d.showOn,
+        }));
+      return cloneKept(raw);
+    };
+
+    const applySnapshot = (snapshot: KeptDrawing[]) => {
+      const symbol = want.current.symbol;
+      const mine = ourIds(owned.current, extras.current);
+      quietly(applying, () => {
+        for (const d of c.drawings.all()) if (!mine.has(d.id)) c.drawings.remove(d.id);
+        for (const k of snapshot) {
+          const d = c.drawings.add(k.type, {
+            paneId: PRICE_PANE,
+            anchors: k.anchors,
+            style: k.style,
+            text: k.text,
+            props: k.props,
+            zIndex: k.zIndex,
+          });
+          if (!d) continue;
+          if (k.locked) c.drawings.lock(d.id, true);
+          if (k.visible === false) c.drawings.show(d.id, false);
+          if (k.showOn?.length) c.drawings.update(d.id, { showOn: k.showOn });
+        }
+      });
+      const cloned = cloneKept(snapshot);
+      lastSaved.current.set(symbol, cloned);
+      keepList(VELA_DRAWINGS + symbol, cloned);
+      pruneExpired(VELA_DRAWINGS);
+    };
+
     let saveTimer = 0;
     const saveDrawings = () => {
       saveTimer = 0;
       const symbol = want.current.symbol;
       if (userFor.current !== symbol) return;
-      const mine = ourIds(owned.current, extras.current);
-      const kept: KeptDrawing[] = c.drawings
-        .all()
-        .filter((d) => !mine.has(d.id) && d.paneId === PRICE_PANE)
-        .map((d) => ({ type: d.type, paneId: d.paneId, anchors: d.anchors, style: d.style, text: d.text, locked: d.locked, visible: d.visible, zIndex: d.zIndex, props: d.props, showOn: d.showOn }));
+      const kept = currentKept();
+      const prev = lastSaved.current.get(symbol) ?? [];
+      if (JSON.stringify(prev) !== JSON.stringify(kept)) {
+        history.current.push(symbol, prev);
+        lastSaved.current.set(symbol, kept);
+      }
       keepList(VELA_DRAWINGS + symbol, kept);
       pruneExpired(VELA_DRAWINGS);
     };
@@ -347,9 +406,10 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       const symbol = want.current.symbol;
       if (userFor.current === symbol) return;
       const mine = ourIds(owned.current, extras.current);
+      const loaded = loadList(VELA_DRAWINGS + symbol, isKeptDrawing);
       quietly(applying, () => {
         for (const d of c.drawings.all()) if (!mine.has(d.id)) c.drawings.remove(d.id);
-        for (const k of loadList(VELA_DRAWINGS + symbol, isKeptDrawing)) {
+        for (const k of loaded) {
           const d = c.drawings.add(k.type, { paneId: PRICE_PANE, anchors: k.anchors, style: k.style, text: k.text, props: k.props, zIndex: k.zIndex });
           if (!d) continue;
           if (k.locked) c.drawings.lock(d.id, true);
@@ -358,6 +418,56 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
         }
       });
       userFor.current = symbol;
+      lastSaved.current.set(symbol, cloneKept(loaded));
+    };
+
+    const undo = (): boolean => {
+      flushDrawings.current();
+      const symbol = want.current.symbol;
+      if (userFor.current !== symbol) return false;
+      const cur = currentKept();
+      const prev = history.current.undo(symbol, cur);
+      if (!prev) return false;
+      applySnapshot(prev);
+      return true;
+    };
+
+    const redo = (): boolean => {
+      flushDrawings.current();
+      const symbol = want.current.symbol;
+      if (userFor.current !== symbol) return false;
+      const cur = currentKept();
+      const next = history.current.redo(symbol, cur);
+      if (!next) return false;
+      applySnapshot(next);
+      return true;
+    };
+
+    const canUndo = (): boolean => {
+      const symbol = want.current.symbol;
+      return saveTimer !== 0 || history.current.canUndo(symbol);
+    };
+
+    const canRedo = (): boolean => {
+      const symbol = want.current.symbol;
+      return saveTimer === 0 && history.current.canRedo(symbol);
+    };
+
+    apiRef.current = {
+      start: () => {},
+      cancel: () => {},
+      clear: () => {
+        flushDrawings.current();
+        const symbol = want.current.symbol;
+        const cur = currentKept();
+        if (cur.length === 0) return;
+        history.current.push(symbol, cur);
+        applySnapshot([]);
+      },
+      undo,
+      redo,
+      canUndo,
+      canRedo,
     };
 
     // Studies added from Vela's menu, kept for this chart; RSI and CCI are the Layers menu's.
@@ -480,6 +590,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       offs.forEach((off) => off());
       flushDrawings.current();
       flushDrawings.current = () => {};
+      apiRef.current = null;
       el.removeEventListener('keydown', onKey, true);
       window.removeEventListener('pointerdown', onDown, true);
       window.removeEventListener('pointerup', onRelease, true);
@@ -505,6 +616,22 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       extras.current = { vwap: new Map(), pivots: new Map() };
     };
   }, [bus, chartId]);
+
+  useEffect(() => {
+    if (!drawRef) return;
+    drawRef.current = {
+      start: () => {},
+      cancel: () => {},
+      clear: () => apiRef.current?.clear(),
+      undo: () => apiRef.current?.undo() ?? false,
+      redo: () => apiRef.current?.redo() ?? false,
+      canUndo: () => apiRef.current?.canUndo() ?? false,
+      canRedo: () => apiRef.current?.canRedo() ?? false,
+    };
+    return () => {
+      drawRef.current = null;
+    };
+  }, [drawRef]);
 
   // Another symbol or timeframe: switched in place, from nothing. The user's
   // drawings are kept per instrument: another's come in once its bars are painted.

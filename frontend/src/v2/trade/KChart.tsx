@@ -216,6 +216,10 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       start: (tool, done) => (drawings.current ? drawings.current.start(tool, done) : done()),
       cancel: () => drawings.current?.cancel(),
       clear: () => drawings.current?.clear(),
+      undo: () => drawings.current?.undo() ?? false,
+      redo: () => drawings.current?.redo() ?? false,
+      canUndo: () => drawings.current?.canUndo() ?? false,
+      canRedo: () => drawings.current?.canRedo() ?? false,
     };
     return () => {
       drawRef.current = null;
