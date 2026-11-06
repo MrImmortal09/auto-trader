@@ -206,6 +206,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [centreAt, setCentreAt] = useState<{ key: string; strike: number } | null>(null);
   // Chains the chart pickers asked for, beyond the nearest: `INDEX:EXPIRY`.
   const [asked, setAsked] = useState<Record<string, true>>({});
+  // Which slot fills the whole screen; null when none does.
+  const [fullscreenSlot, setFullscreenSlot] = useState<number | null>(null);
   const guard = useGuard();
   const toast = useToast();
   const { canReadOwner } = useIdentity();
@@ -232,6 +234,28 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   // Each index on screen: its listed expiries, before the stream opens.
   const shownSlots = desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1);
+
+  const toggleFullscreen = useCallback((slot: number, on: boolean) => {
+    if (on) {
+      document.documentElement.requestFullscreen?.().catch(() => {});
+      setFullscreenSlot(slot);
+    } else {
+      if (document.fullscreenElement) {
+        document.exitFullscreen?.().catch(() => {});
+      }
+      setFullscreenSlot(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    const onChange = () => {
+      if (!document.fullscreenElement) setFullscreenSlot(null);
+    };
+    document.addEventListener('fullscreenchange', onChange);
+    return () => document.removeEventListener('fullscreenchange', onChange);
+  }, []);
+
+  const activeFullscreenSlot = fullscreenSlot !== null && fullscreenSlot < shownSlots.length ? fullscreenSlot : null;
   const expiryIndices = [...new Set([saved.index, ...shownSlots.map((s) => s.sym.index)])].sort();
   const expiriesPoll = usePoll(
     async () => {
@@ -268,6 +292,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     : undefined;
 
   const scalps = useMemo(() => (frame?.positions ?? []).filter((p) => p.manual).map((p) => withPending(p, pending, now)), [frame, pending, now]);
+  const activeScalps = useMemo(() => scalps.filter((p) => !p.placing), [scalps]);
   const board = frame?.board && frame.board.index === saved.index ? frame.board : null;
 
   // Each index in use: its nearest chain (deltas, tick size).
@@ -584,6 +609,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     });
 
   const charts = shownSlots.map((slot, i) => {
+    const isFullscreen = activeFullscreenSlot === i;
     const cx = {
       sym: slot.sym,
       scalps,
@@ -598,34 +624,50 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     };
     const index = slot.sym.index;
     return (
-      <ChartPanel
+      <div
         key={i}
-        chartId={`trade-${i}`}
-        serverBase={serverBase}
-        sym={slot.sym}
-        tf={slot.tf}
-        onSym={(sym) => setSlot(i, { sym })}
-        onTf={(tf) => setSlot(i, { tf })}
-        layers={slot.layers}
-        onLayers={(layers) => setSlot(i, { layers })}
-        style={slot.style}
-        onStyle={(style) => setSlot(i, { style })}
-        spot={spot}
-        change={change}
-        expiries={expiries[index]?.expiries}
-        chainAt={(expiry) => chainAt(index, expiry)}
-        onNeedChain={(expiry) => needChain(index, expiry)}
-        lines={chartLines(cx)}
-        markers={chartMarkers(cx)}
-        placing={placingAt?.slot === i ? placing : null}
-        onPlacingDone={() => setPlacingAt(null)}
-        onCancelPlacing={() => setPlacingAt(null)}
-        bus={bus}
-        lib={saved.chartLib}
-        onLib={desktop ? undefined : setLib}
-        compact={!desktop}
-        onHide={desktop ? undefined : () => showChart(false)}
-      />
+        style={!desktop && !isFullscreen ? { height: chartHeight } : undefined}
+        className={
+          isFullscreen
+            ? 'fixed inset-0 z-40 flex flex-col bg-canvas pt-safe pb-safe'
+            : desktop
+              ? 'flex min-h-0 min-w-0 flex-1 flex-col'
+              : 'flex shrink-0'
+        }
+      >
+        <ChartPanel
+          chartId={`trade-${i}`}
+          serverBase={serverBase}
+          sym={slot.sym}
+          tf={slot.tf}
+          onSym={(sym) => setSlot(i, { sym })}
+          onTf={(tf) => setSlot(i, { tf })}
+          layers={slot.layers}
+          onLayers={(layers) => setSlot(i, { layers })}
+          style={slot.style}
+          onStyle={(style) => setSlot(i, { style })}
+          spot={spot}
+          change={change}
+          expiries={expiries[index]?.expiries}
+          chainAt={(expiry) => chainAt(index, expiry)}
+          onNeedChain={(expiry) => needChain(index, expiry)}
+          lines={chartLines(cx)}
+          markers={chartMarkers(cx)}
+          placing={placingAt?.slot === i ? placing : null}
+          onPlacingDone={() => setPlacingAt(null)}
+          onCancelPlacing={() => setPlacingAt(null)}
+          bus={bus}
+          lib={saved.chartLib}
+          onLib={desktop ? undefined : setLib}
+          compact={!desktop}
+          onHide={desktop ? undefined : () => showChart(false)}
+          fullscreen={isFullscreen}
+          onFullscreen={(on) => toggleFullscreen(i, on)}
+        />
+        {isFullscreen && activeScalps.length > 0 && (
+          <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />
+        )}
+      </div>
     );
   });
 
@@ -671,10 +713,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       onRemove={clearLevel}
       onAdd={(p, kind) => {
         setSheet(false);
-        // Phone's one chart: put it on this scalp's index, and place there.
-        if (saved.slots[0].sym.index !== p.index || saved.slots[0].sym.kind !== 'index') setSlot(0, { sym: { kind: 'index', index: p.index } });
-        showChart(true);
-        startPlacing(0, p, kind, 'index');
+        const targetSlot = activeFullscreenSlot ?? 0;
+        if (saved.slots[targetSlot].sym.index !== p.index || saved.slots[targetSlot].sym.kind !== 'index') setSlot(targetSlot, { sym: { kind: 'index', index: p.index } });
+        if (!desktop) showChart(true);
+        startPlacing(targetSlot, p, kind, 'index');
       }}
       onClose={() => setSheet(false)}
       paper={account}
@@ -703,15 +745,13 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             </div>
           ) : (
             <>
-              <div style={{ height: chartHeight }} className="flex shrink-0 px-2">
-                {charts[0]}
-              </div>
+              {charts[0]}
               <SplitHandle height={chartHeight} min={splitMin} max={splitMax} dragging={splitDragging} handle={splitHandle} />
             </>
           )}
           <div className="flex min-h-0 flex-1 flex-col">{ladder}</div>
         </div>
-        <ScalpBar scalps={scalps.filter((p) => !p.placing)} h={handlers} onOpen={() => setSheet(true)} paper={account} />
+        <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />
         {sheetEl}
       </div>
     );
@@ -723,7 +763,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     { n: 3 as const, icon: Columns3, label: 'Three charts' },
   ];
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3 p-4">
+    <div className="flex h-full min-h-0 flex-col gap-2 p-2">
       {saved.barHidden ? (
         <button
           type="button"
@@ -758,8 +798,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           </button>
         </div>
       )}
-      <div ref={chartsRef} className="flex min-h-[200px] flex-1 gap-3">
-        <div className="flex min-w-0 flex-1 gap-1.5">{charts}</div>
+      <div ref={chartsRef} className="flex min-h-[200px] flex-1 gap-2">
+        <div className="flex min-w-0 flex-1 gap-1">{charts}</div>
         {saved.ladderHidden ? (
           <button
             type="button"
@@ -813,6 +853,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       {!chartStopsOn && scalps.length > 0 && (
         <p className="shrink-0 type-caption text-fg-muted">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
       )}
+      {sheetEl}
     </div>
   );
 }
