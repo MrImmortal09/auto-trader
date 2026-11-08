@@ -118,8 +118,12 @@ pub fn session_close(t_ms: i64) -> i64 {
     let dt = chrono::DateTime::from_timestamp_millis(t_ms)
         .map(|utc| utc.with_timezone(&shared_domain::ist_offset()));
     if let Some(ist) = dt {
+        use chrono::Timelike;
         if let Some(session) = shared_domain::special_session_on(ist.date_naive()) {
-            return ist_day_start(t_ms) + session.end as i64 * MINUTE_MS;
+            let minute = (ist.hour() * 60 + ist.minute()) as i64;
+            if minute >= session.start as i64 {
+                return ist_day_start(t_ms) + session.end as i64 * MINUTE_MS;
+            }
         }
     }
     ist_day_start(t_ms) + SESSION_CLOSE_MIN * MINUTE_MS
@@ -373,6 +377,28 @@ mod tests {
 
         // Session close on that Sunday is 15:30
         assert_eq!(session_close(sunday_at(14, 20)), sunday_at(15, 30));
+
+        shared_domain::set_special_sessions(vec![]);
+    }
+
+    #[test]
+    fn special_session_weekday_bars_and_close() {
+        let _guard = shared_domain::special_sessions_test_guard();
+        let weekday = chrono::NaiveDate::from_ymd_opt(2026, 10, 21).unwrap();
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: weekday,
+            start: 18 * 60,
+            end: 19 * 60 + 15,
+        }]);
+
+        // session_close(10:00 bar) is 15:30 that day, session_close(18:30 bar) is 19:15
+        assert_eq!(session_close(at(10, 0, 0, 0)), at(15, 30, 0, 0));
+        assert_eq!(session_close(at(18, 30, 0, 0)), at(19, 15, 0, 0));
+
+        // in_session true at 10:00 and 18:30, false at 16:00
+        assert!(in_session(at(10, 0, 0, 0)));
+        assert!(in_session(at(18, 30, 0, 0)));
+        assert!(!in_session(at(16, 0, 0, 0)));
 
         shared_domain::set_special_sessions(vec![]);
     }

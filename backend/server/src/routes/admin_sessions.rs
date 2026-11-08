@@ -195,8 +195,10 @@ pub async fn delete_session_handler(
         }
     }
 
+    let normalized_date = date.format("%Y-%m-%d").to_string();
+
     // Delete from SQLite FIRST
-    let deleted = match db::delete_special_session(&state.db_pool, &date_str).await {
+    let deleted = match db::delete_special_session(&state.db_pool, &normalized_date).await {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("delete special_session: {e}");
@@ -222,7 +224,7 @@ pub async fn delete_session_handler(
     list.retain(|s| s.date != date);
     shared_domain::set_special_sessions(list);
 
-    tracing::info!(date = %date_str, "Special session removed");
+    tracing::info!(date = %normalized_date, "Special session removed");
 
     send_log(
         &state.db_tx,
@@ -231,8 +233,8 @@ pub async fn delete_session_handler(
         serde_json::json!({
             "event": "SPECIAL_SESSION_REMOVED",
             "level": "INFO",
-            "message": format!("Special session removed for {date_str}"),
-            "date": date_str,
+            "message": format!("Special session removed for {normalized_date}"),
+            "date": normalized_date,
             "start": existing.map(|s| format_hhmm(s.start)),
             "end": existing.map(|s| format_hhmm(s.end)),
         }),
@@ -273,5 +275,12 @@ mod tests {
 
         let e2 = parse_hhmm("17:16").unwrap();
         assert!(e2 - s1 > 480);
+    }
+
+    #[test]
+    fn unpadded_date_parses_and_normalizes() {
+        let parsed = NaiveDate::parse_from_str("2026-11-8", "%Y-%m-%d").unwrap();
+        assert_eq!(parsed, NaiveDate::from_ymd_opt(2026, 11, 8).unwrap());
+        assert_eq!(parsed.format("%Y-%m-%d").to_string(), "2026-11-08");
     }
 }
