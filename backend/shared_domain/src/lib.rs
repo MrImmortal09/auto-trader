@@ -1391,6 +1391,53 @@ pub struct OrderRequest {
 }
 
 // ===========================================================================
+// Order timing (analytics only — see `kotak_client::orders`)
+// ===========================================================================
+
+/// One order sent to Kotak, timed on this server's clock.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderSent {
+    /// Just before the request went out, and when Kotak's answer came back.
+    pub sent_at_ms: i64,
+    pub replied_at_ms: i64,
+    /// Kotak's order number, when it took the order.
+    pub order_no: Option<String>,
+    /// Why it didn't, when it didn't.
+    pub error: Option<String>,
+    pub trading_symbol: String,
+    /// `B` / `S`.
+    pub side: String,
+    /// `MKT`, `L`, `SL`, `SL-M`.
+    pub order_type: String,
+    pub qty: i64,
+    pub price: f64,
+    pub trigger: f64,
+}
+
+/// One order update Kotak pushed, stamped with when this server received it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderUpdate {
+    pub received_at_ms: i64,
+    pub order_no: String,
+    /// `open`, `complete`, `rejected`, `cancelled`, `trigger pending`, …
+    pub status: String,
+    pub trading_symbol: Option<String>,
+    pub side: Option<String>,
+    pub qty: Option<i64>,
+    pub filled_qty: Option<i64>,
+    pub avg_price: Option<f64>,
+    pub reject_reason: Option<String>,
+    /// When Kotak received the update (`updRecvTm`), epoch nanoseconds.
+    pub kotak_received_ns: Option<i64>,
+    /// The exchange's broadcast time (`boeSec`), epoch seconds.
+    pub exchange_epoch_s: Option<i64>,
+    /// The exchange's confirmation time (`exCfmTm`), as Kotak writes it.
+    pub exchange_confirm: Option<String>,
+    /// When the order was placed (`ordDtTm`), as Kotak writes it.
+    pub order_time: Option<String>,
+}
+
+// ===========================================================================
 // Internal persistence channel
 // ===========================================================================
 
@@ -1463,6 +1510,11 @@ pub enum DbWriteMessage {
     /// A message from a monitored Telegram chat, for the v2 Desk's feed
     /// (display only — never read by the engine). Kept per chat and message
     /// id, so an edit replaces the text it was first stored with.
+    /// A timed order send, for the admin's order timing (analytics only).
+    OrderSent(OrderSent),
+    /// An order update from Kotak's push stream, merged into its order's
+    /// timing row (analytics only).
+    OrderUpdate(OrderUpdate),
     TelegramMessage {
         chat_id: i64,
         chat_title: Option<String>,

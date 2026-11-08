@@ -13,6 +13,7 @@ import { Modal } from '../ui/Modal';
 import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
 import { FeedLatency } from './FeedLatency';
+import { OrderTiming } from './OrderTiming';
 import { PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
 import { UserReport } from './UserReport';
 
@@ -364,6 +365,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
           {addForm}
         </Section>
         <FeedLatency serverBase={serverBase} desktop={desktop} />
+        <OrderTiming serverBase={serverBase} />
         <PaperPositions serverBase={serverBase} users={list} />
         <PaperTrades serverBase={serverBase} users={list} desktop={desktop} />
       </div>

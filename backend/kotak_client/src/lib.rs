@@ -7,11 +7,13 @@
 
 pub mod error;
 pub mod client;
+pub mod orders;
 pub mod totp;
 pub mod websocket;
 
 pub use error::{KotakCredentials, KotakError};
 pub use client::{KotakClient, KotakLimits, KotakOrder, KotakPosition};
+pub use orders::{subscribe_orders, OrderSent};
 pub use totp::generate_totp;
 pub use websocket::{start_market_data_stream, subscribe_ticks, PriceTick};
 
