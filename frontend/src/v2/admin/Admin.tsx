@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
-import { ChartLine, Trash2, UserPlus } from 'lucide-react';
+import { CalendarPlus, ChartLine, Trash2, UserPlus } from 'lucide-react';
 import { formatPhone, normalizePhone } from '../auth/phone';
-import { createUser, deleteUser, listUsers, patchUser } from '../lib/api';
-import { hhmm, plural, shortDate } from '../lib/format';
+import { createUser, deleteSpecialSession, deleteUser, listSpecialSessions, listUsers, patchUser, putSpecialSession } from '../lib/api';
+import { dayLabel, hhmm, plural, shortDate, todayIst } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
-import type { AdminUser } from '../lib/types';
+import type { AdminUser, SpecialSession } from '../lib/types';
 import { Row, Section } from '../settings/parts';
 import { useGuard } from '../shell/useGuard';
 import { Button } from '../ui/Button';
@@ -38,8 +38,16 @@ function reportFromUrl(): number | null {
 export function Admin({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
   const [viewing, setViewing] = useState<number | null>(reportFromUrl);
   const users = usePoll(() => listUsers(serverBase), 15_000, serverBase, viewing == null);
+  const specialSessions = usePoll(() => listSpecialSessions(serverBase), 15_000, serverBase, viewing == null);
   const guard = useGuard();
   const toast = useToast();
+  const [sessionDate, setSessionDate] = useState('');
+  const [sessionStart, setSessionStart] = useState('');
+  const [sessionEnd, setSessionEnd] = useState('');
+  const [addingSession, setAddingSession] = useState(false);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [busySessions, setBusySessions] = useState<Record<string, true>>({});
+  const [removingSession, setRemovingSession] = useState<SpecialSession | null>(null);
   const [phone, setPhone] = useState('');
   const [name, setName] = useState('');
   const [adding, setAdding] = useState(false);
@@ -74,6 +82,52 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
       setBusy((b) => {
         const next = { ...b };
         delete next[id];
+        return next;
+      });
+    }
+  }
+
+  async function addSession() {
+    if (!sessionDate || !sessionStart || !sessionEnd || sessionStart >= sessionEnd) return;
+    setAddingSession(true);
+    setSessionError(null);
+    const sent = await guard(
+      'Setting a special session needs the admin sign-in.',
+      () => putSpecialSession(serverBase, sessionDate, sessionStart, sessionEnd),
+      "Couldn't set special session",
+      'admin',
+    );
+    setAddingSession(false);
+    if (sent?.ok) {
+      toast({ tone: 'profit', title: `Saved special session for ${dayLabel(sessionDate)} ${sessionDate.slice(0, 4)}` });
+      setSessionDate('');
+      setSessionStart('');
+      setSessionEnd('');
+      setSessionError(null);
+      await specialSessions.refresh();
+    } else if (sent?.error) {
+      setSessionError(sent.error);
+    }
+  }
+
+  async function removeSession(s: SpecialSession) {
+    setRemovingSession(null);
+    setBusySessions((b) => ({ ...b, [s.date]: true }));
+    try {
+      const sent = await guard(
+        'Removing a special session needs the admin sign-in.',
+        () => deleteSpecialSession(serverBase, s.date),
+        `Couldn't remove special session for ${dayLabel(s.date)}`,
+        'admin',
+      );
+      if (sent?.ok) {
+        toast({ tone: 'neutral', title: `Removed special session for ${dayLabel(s.date)} ${s.date.slice(0, 4)}` });
+        await specialSessions.refresh();
+      }
+    } finally {
+      setBusySessions((b) => {
+        const next = { ...b };
+        delete next[s.date];
         return next;
       });
     }
@@ -192,9 +246,115 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
     </form>
   );
 
+  const today = specialSessions.data?.today ?? todayIst();
+  const sessions = specialSessions.data?.sessions ?? [];
+  const sessionRows =
+    specialSessions.data == null ? (
+      <Row title={specialSessions.error ? `Couldn't load the special sessions: ${specialSessions.error}` : 'Loading…'} />
+    ) : sessions.length === 0 ? (
+      <Row title="No upcoming special sessions" />
+    ) : (
+      sessions.map((s) => {
+        const isToday = s.date === today;
+        const isInProgress = isToday && (specialSessions.data?.active ?? false);
+        const label = `${dayLabel(s.date)} ${s.date.slice(0, 4)} · ${s.start.slice(0, 5)}–${s.end.slice(0, 5)} IST`;
+        return (
+          <Row
+            key={s.date}
+            title={
+              <span className="flex items-center gap-2">
+                <span className="truncate">{label}</span>
+                {isToday && <Chip>Today</Chip>}
+                {isInProgress && <Chip kind="live">In progress</Chip>}
+              </span>
+            }
+          >
+            <Button
+              size={size}
+              kind="quiet"
+              icon={<Trash2 size={14} />}
+              aria-label={`Remove session for ${label}`}
+              title={isInProgress ? "Can't remove while the session is in progress" : undefined}
+              disabled={isInProgress || !!busySessions[s.date]}
+              onClick={() => setRemovingSession(s)}
+            />
+          </Row>
+        );
+      })
+    );
+
+  const sessionAddForm = (
+    <form
+      className="border-t border-line p-4"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void addSession();
+      }}
+    >
+      <div className={`flex gap-2 ${large ? 'flex-col' : 'items-center'}`}>
+        <input
+          type="date"
+          min={today}
+          value={sessionDate}
+          disabled={addingSession}
+          onChange={(e) => {
+            setSessionDate(e.target.value);
+            setSessionError(null);
+          }}
+          aria-label="Session date"
+          className={`${INPUT} ${large ? 'h-11 w-full' : 'h-8 w-[160px]'} type-body tnum`}
+        />
+        <input
+          type="time"
+          value={sessionStart}
+          disabled={addingSession}
+          onChange={(e) => {
+            setSessionStart(e.target.value);
+            setSessionError(null);
+          }}
+          aria-label="Start time"
+          title="Start time (IST)"
+          className={`${INPUT} ${large ? 'h-11 w-full' : 'h-8 w-[120px]'} type-body tnum`}
+        />
+        <input
+          type="time"
+          value={sessionEnd}
+          disabled={addingSession}
+          onChange={(e) => {
+            setSessionEnd(e.target.value);
+            setSessionError(null);
+          }}
+          aria-label="End time"
+          title="End time (IST)"
+          className={`${INPUT} ${large ? 'h-11 w-full' : 'h-8 w-[120px]'} type-body tnum`}
+        />
+        <Button
+          size={size}
+          kind="profit"
+          type="submit"
+          icon={<CalendarPlus size={14} />}
+          disabled={addingSession || !sessionDate || !sessionStart || !sessionEnd || sessionStart >= sessionEnd}
+        >
+          {addingSession ? 'Adding…' : 'Add session'}
+        </Button>
+      </div>
+      <div className="mt-2 flex flex-col gap-1">
+        <p className="type-caption text-fg-muted">Same date replaces it</p>
+        {sessionError && <p className="type-caption text-loss">{sessionError}</p>}
+      </div>
+    </form>
+  );
+
   return (
     <div className={desktop ? 'px-10 pt-6 pb-24' : 'p-4'}>
       <div className={`flex flex-col gap-8 ${desktop ? 'max-w-[760px]' : ''}`}>
+        <Section
+          title="Special sessions"
+          lead="Extra trading hours on a date the market is normally shut, e.g. Muhurat trading. Everyone trades as on a normal day; new buys stop at the end. Kotak logs in 30 min before."
+        >
+          {sessionRows}
+          {sessionAddForm}
+        </Section>
         <Section
           title="Users"
           lead="Who may sign in with a phone number, as a paper trader. The admin is the server's own number (ADMIN_PHONE) and nobody else. A disabled number is signed out at once. Open a user for their P&L report: every trade, day by day."
@@ -205,6 +365,24 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
         <PaperPositions serverBase={serverBase} users={list} />
         <PaperTrades serverBase={serverBase} users={list} desktop={desktop} />
       </div>
+      {removingSession && (
+        <Modal open onClose={() => setRemovingSession(null)} label="Remove special session" width="lg:max-w-[400px]">
+          <div className="flex flex-col gap-4 p-6">
+            <h2 className="type-title text-fg">Remove {dayLabel(removingSession.date)} {removingSession.date.slice(0, 4)}?</h2>
+            <p className="type-body text-fg-muted">
+              This removes the {removingSession.start.slice(0, 5)}–{removingSession.end.slice(0, 5)} IST special trading session. The market will remain shut as normal.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button size="md" onClick={() => setRemovingSession(null)}>
+                Cancel
+              </Button>
+              <Button size="md" kind="loss" icon={<Trash2 size={14} />} onClick={() => void removeSession(removingSession)}>
+                Remove
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
       {removing && (
         <Modal open onClose={() => setRemoving(null)} label="Remove user" width="lg:max-w-[400px]">
           <div className="flex flex-col gap-4 p-6">

@@ -386,6 +386,15 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS special_sessions (
+            date TEXT PRIMARY KEY,
+            start TEXT NOT NULL,
+            end TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+
     pool
 }
 
@@ -711,6 +720,74 @@ pub async fn save_feature_flags(pool: &SqlitePool, changes: &[(&str, bool)]) -> 
         .await?;
     }
     tx.commit().await
+}
+
+/// Load upcoming special sessions from SQLite (and those within the last 7 days).
+pub async fn load_special_sessions(pool: &SqlitePool) -> Result<Vec<shared_domain::SpecialSession>, sqlx::Error> {
+    let cutoff = (shared_domain::today_ist() - chrono::Duration::days(7))
+        .format("%Y-%m-%d")
+        .to_string();
+    let rows = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT date, start, end FROM special_sessions WHERE date >= ? ORDER BY date ASC",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    let mut sessions = Vec::new();
+    for (d_str, s_str, e_str) in rows {
+        let Ok(date) = chrono::NaiveDate::parse_from_str(&d_str, "%Y-%m-%d") else {
+            tracing::warn!(date = %d_str, "Skipping malformed date in special_sessions");
+            continue;
+        };
+        let Some(start) = shared_domain::parse_hhmm(&s_str) else {
+            tracing::warn!(date = %d_str, start = %s_str, "Skipping malformed start in special_sessions");
+            continue;
+        };
+        let Some(end) = shared_domain::parse_hhmm(&e_str) else {
+            tracing::warn!(date = %d_str, end = %e_str, "Skipping malformed end in special_sessions");
+            continue;
+        };
+        sessions.push(shared_domain::SpecialSession { date, start, end });
+    }
+    Ok(sessions)
+}
+
+/// Save or replace a special session row.
+pub async fn save_special_session(
+    pool: &SqlitePool,
+    session: &shared_domain::SpecialSession,
+) -> Result<(), sqlx::Error> {
+    let now = current_ist_timestamp_string();
+    let date_str = session.date.format("%Y-%m-%d").to_string();
+    let start_str = shared_domain::format_hhmm(session.start);
+    let end_str = shared_domain::format_hhmm(session.end);
+
+    sqlx::query(
+        "INSERT INTO special_sessions (date, start, end, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(date) DO UPDATE SET
+         start = excluded.start,
+         end = excluded.end,
+         created_at = excluded.created_at",
+    )
+    .bind(&date_str)
+    .bind(&start_str)
+    .bind(&end_str)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Delete a special session by date string (YYYY-MM-DD). Returns true if a row was deleted.
+pub async fn delete_special_session(pool: &SqlitePool, date: &str) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM special_sessions WHERE date = ?")
+        .bind(date)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,6 +1253,42 @@ mod tests {
             load_feature_flags(&pool).await,
             FeatureFlags { index_options_only: false, chart_stops: true },
         );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn special_sessions_save_load_delete_and_cutoff() {
+        let db = TempDb::new("special-sessions");
+        let pool = init_db(&db.url()).await;
+        assert_eq!(load_special_sessions(&pool).await.unwrap(), vec![]);
+
+        let today = shared_domain::today_ist();
+        let session = shared_domain::SpecialSession {
+            date: today,
+            start: 14 * 60 + 20,
+            end: 15 * 60 + 30,
+        };
+        save_special_session(&pool, &session).await.unwrap();
+
+        // Also add an older one (> 7 days ago)
+        let old_date = today - chrono::Duration::days(10);
+        sqlx::query(
+            "INSERT INTO special_sessions (date, start, end, created_at) VALUES (?, '10:00', '11:00', 'x')",
+        )
+        .bind(old_date.format("%Y-%m-%d").to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Old session ignored by load_special_sessions
+        let loaded = load_special_sessions(&pool).await.unwrap();
+        assert_eq!(loaded, vec![session]);
+
+        // Delete session
+        let deleted = delete_special_session(&pool, &today.format("%Y-%m-%d").to_string()).await.unwrap();
+        assert!(deleted);
+        assert_eq!(load_special_sessions(&pool).await.unwrap(), vec![]);
+
         pool.close().await;
     }
 }

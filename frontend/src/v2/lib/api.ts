@@ -30,6 +30,7 @@ import type {
   RangeId,
   RawPosition,
   SessionUser,
+  SpecialSessionsAnswer,
   StatusAnswer,
   SystemAnswer,
   TelegramState,
@@ -234,6 +235,13 @@ export const createUser = (base: string, phone: string, name: string | null) => 
 export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) =>
   send(base, `/api/admin/users/${id}`, 'PATCH', patch);
 export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE');
+
+// Special trading sessions (e.g. Diwali Muhurat).
+export const listSpecialSessions = (base: string) => getJson<SpecialSessionsAnswer>(base, '/api/admin/special-sessions');
+export const putSpecialSession = (base: string, date: string, start: string, end: string) =>
+  send(base, `/api/admin/special-sessions/${encodeURIComponent(date)}`, 'PUT', { start, end });
+export const deleteSpecialSession = (base: string, date: string) =>
+  send(base, `/api/admin/special-sessions/${encodeURIComponent(date)}`, 'DELETE');
 
 /** Run update.sh on the server: the latest release, a restart and a health check. */
 export const updateServer = (base: string) => send(base, '/api/update_server', 'POST');

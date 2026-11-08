@@ -450,11 +450,30 @@ pub fn kotak_ready(state: &AppState) -> bool {
 }
 
 /// Manual buys are accepted 09:15–15:30 IST on a weekday — the exchange's
-/// normal session, inside the engine's own 09:15–15:40 window.
-pub fn manual_buy_window_open() -> bool {
+/// normal session, inside the engine's own 09:15–15:40 window — or throughout
+/// an active special session on its date.
+pub fn manual_buy_window_open_at(now: chrono::DateTime<chrono::FixedOffset>) -> bool {
     use chrono::Timelike;
-    let now = shared_domain::now_ist();
-    shared_domain::is_market_open() && (now.hour(), now.minute()) < (15, 30)
+    shared_domain::in_special_session_at(now)
+        || (shared_domain::is_regular_market_hours_at(now) && (now.hour(), now.minute()) < (15, 30))
+}
+
+pub fn manual_buy_window_open() -> bool {
+    manual_buy_window_open_at(shared_domain::now_ist())
+}
+
+/// Refusal message for when manual buys are closed: mentions today's special session
+/// window if one is set for today, else regular weekday hours.
+pub fn manual_buy_closed_message() -> String {
+    if let Some(session) = shared_domain::special_session_on(shared_domain::today_ist()) {
+        format!(
+            "Market is closed — today's special session runs {}–{} IST",
+            shared_domain::format_hhmm(session.start),
+            shared_domain::format_hhmm(session.end)
+        )
+    } else {
+        "Market is closed — manual buys run 09:15–15:30 IST".to_string()
+    }
 }
 
 /// Live index value and its % change on the previous close, from Kotak's feed.

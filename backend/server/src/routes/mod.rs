@@ -26,6 +26,7 @@ pub mod admin;
 pub use admin::{list_users_handler, create_user_handler, patch_user_handler, delete_user_handler};
 pub mod admin_paper;
 pub mod admin_report;
+pub mod admin_sessions;
 pub mod market;
 pub use market::{market_indicator_handler, market_live_handler, market_option_chain_handler, market_trend_handler};
 pub mod kill_switch;

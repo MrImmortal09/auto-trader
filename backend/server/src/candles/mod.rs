@@ -489,8 +489,7 @@ impl Running {
                 _ = check.tick() => {
                     let now = shared_domain::now_ist();
                     let weekday = !matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
-                    let want = weekday
-                        && bars::in_session(now.timestamp_millis())
+                    let want = ((weekday && bars::in_session(now.timestamp_millis())) || shared_domain::in_special_session_at(now))
                         && !kotak_live()
                         && !self.upstox_keys.borrow().is_empty();
                     let running = feed.as_ref().is_some_and(|f| !f.is_finished());
