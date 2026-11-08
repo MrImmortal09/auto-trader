@@ -128,8 +128,7 @@ pub async fn run(desk: Arc<PaperDesk>) {
     loop {
         tick.tick().await;
         let now = shared_domain::now_ist();
-        let trading_day = !telegram_ingester::parser::is_trading_holiday(now.date_naive())
-            || shared_domain::special_session_on(now.date_naive()).is_some();
+        let trading_day = !telegram_ingester::parser::is_trading_holiday(now.date_naive());
         step(&desk, now, trading_day, fresh).await;
     }
 }
@@ -235,6 +234,19 @@ mod tests {
         assert_eq!(decide(&session_pos, ist(sunday, (14, 30, 0)), true, Some(95.0), Some(25_050.0)), Some((95.0, all("CHART_STOP"))));
         // At/after session end: Sunday 15:30 -> None
         assert_eq!(decide(&session_pos, ist(sunday, (15, 30, 0)), true, Some(95.0), Some(25_050.0)), None);
+
+        // Special session on a weekday holiday (trading_day=false) with session 18:00–19:15
+        let weekday = (2026, 11, 4);
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: NaiveDate::from_ymd_opt(weekday.0, weekday.1, weekday.2).unwrap(),
+            start: 18 * 60,
+            end: 19 * 60 + 15,
+        }]);
+        // Outside session window: weekday holiday 10:00 -> None
+        assert_eq!(decide(&session_pos, ist(weekday, (10, 0, 0)), false, Some(95.0), Some(25_050.0)), None);
+        // Inside session window: weekday holiday 18:30 -> triggers stop
+        assert_eq!(decide(&session_pos, ist(weekday, (18, 30, 0)), false, Some(95.0), Some(25_050.0)), Some((95.0, all("CHART_STOP"))));
+
         shared_domain::set_special_sessions(vec![]);
     }
 

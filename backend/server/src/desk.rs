@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, FixedOffset, NaiveDate, Timelike};
+use chrono::{Datelike, DateTime, FixedOffset, NaiveDate, Timelike};
 use serde::Serialize;
 use shared_domain::{ChartLevels, MonitoredPosition, TradeState};
 
@@ -613,17 +613,20 @@ fn expiring(by_index: BTreeMap<String, usize>, today: NaiveDate) -> Vec<Expiring
 /// - non-trading day: "Market closed"
 pub fn market_phase(now: DateTime<FixedOffset>, trading_day: bool) -> (bool, String) {
     let minutes = now.hour() * 60 + now.minute();
+    let regular_day = trading_day && !matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
     if let Some(session) = shared_domain::special_session_on(now.date_naive()) {
-        let start_str = shared_domain::format_hhmm(session.start);
-        let end_str = shared_domain::format_hhmm(session.end);
-        if minutes < session.start {
-            (false, format!("Special session opens {start_str}"))
-        } else if minutes < session.end {
-            (true, format!("Special session · closes {end_str}"))
-        } else {
-            (false, "Market closed".to_string())
+        if (session.start..session.end).contains(&minutes) {
+            return (true, format!("Special session · closes {}", shared_domain::format_hhmm(session.end)));
         }
-    } else if !trading_day {
+        if !(regular_day && (9 * 60 + 15..15 * 60 + 30).contains(&minutes)) {
+            return if minutes < session.start {
+                (false, format!("Special session opens {}", shared_domain::format_hhmm(session.start)))
+            } else {
+                (false, "Market closed".to_string())
+            };
+        }
+    }
+    if !trading_day {
         (false, "Market closed".to_string())
     } else if minutes < 9 * 60 + 15 {
         (false, "Market opens 09:15".to_string())
@@ -893,6 +896,19 @@ mod tests {
         assert_eq!(market_phase(at(9, 15), true), (true, "Market open · closes 15:30".to_string()));
         assert_eq!(market_phase(at(15, 30), true), (false, "Market closed".to_string()));
         assert_eq!(market_phase(at(11, 0), false), (false, "Market closed".to_string()));
+
+        // Special session on a weekday (18:00–19:15)
+        let weekday = chrono::NaiveDate::from_ymd_opt(2026, 10, 21).unwrap();
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: weekday,
+            start: 18 * 60,
+            end: 19 * 60 + 15,
+        }]);
+        assert_eq!(market_phase(at(10, 0), true), (true, "Market open · closes 15:30".to_string()));
+        assert_eq!(market_phase(at(16, 0), true), (false, "Special session opens 18:00".to_string()));
+        assert_eq!(market_phase(at(18, 30), true), (true, "Special session · closes 19:15".to_string()));
+        assert_eq!(market_phase(at(19, 15), true), (false, "Market closed".to_string()));
+        assert_eq!(market_phase(at(10, 0), false), (false, "Special session opens 18:00".to_string()));
 
         // Special session on a Sunday
         let sunday = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();

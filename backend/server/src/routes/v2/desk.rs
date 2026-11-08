@@ -302,7 +302,7 @@ pub async fn status_handler(
     let now = shared_domain::now_ist();
     let today = now.date_naive();
     let day = today.format("%Y-%m-%d").to_string();
-    let trading_day = !telegram_ingester::parser::is_trading_holiday(today) || shared_domain::special_session_on(today).is_some();
+    let trading_day = !telegram_ingester::parser::is_trading_holiday(today);
     let (market_open, market) = desk::market_phase(now, trading_day);
     let latest = state.pulse.latest();
     let feed_age_secs = latest.as_ref().filter(|s| s.feed_connected).and_then(|s| s.feed_last_tick_age_secs);
