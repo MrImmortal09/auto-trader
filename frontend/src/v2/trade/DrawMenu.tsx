@@ -1,21 +1,15 @@
 import { useEffect, useMemo } from 'react';
-import { AlignVerticalSpaceAround, Minus, MoveUpRight, Pencil, Redo2, SeparatorVertical, Slash, Trash2, Undo2, type LucideIcon } from 'lucide-react';
+import { Pencil, Redo2, Trash2, Undo2 } from 'lucide-react';
 import { Popover } from '../ui/Popover';
-import { isMac } from './chartKeymap';
-import { DRAW_TOOLS, type DrawTool } from './drawings';
-
-const ICONS: Record<DrawTool, LucideIcon> = {
-  segment: Slash,
-  horizontalStraightLine: Minus,
-  rayLine: MoveUpRight,
-  verticalStraightLine: SeparatorVertical,
-  fibonacciLine: AlignVerticalSpaceAround,
-};
+import { editable, isMac } from './chartKeymap';
+import { DRAW_ICONS } from './drawIcons';
+import { DRAW_TOOLS, PHONE_TOOLS, type DrawTool } from './drawings';
 
 const ROW = 'flex h-9 w-full items-center gap-2.5 rounded-6 px-2 type-label';
 
-/** The Draw button beside Layers, and its menu: the tools and Clear. While a
- * tool is being drawn the pencil is lit and its row is the selected one. */
+/** The phone's Draw button beside Layers, and its menu: a few tools and
+ * Clear (the desktop has `DrawToolbar`). While a tool is being drawn the
+ * pencil is lit and its row is the selected one. */
 export function DrawMenu({
   open,
   onToggle,
@@ -89,8 +83,8 @@ export function DrawMenu({
           </button>
         )}
         {(onUndo || onRedo) && <div className="my-1 h-px bg-line" />}
-        {DRAW_TOOLS.map(({ tool, label }) => {
-          const Icon = ICONS[tool];
+        {DRAW_TOOLS.filter((t) => PHONE_TOOLS.includes(t.tool)).map(({ tool, label }) => {
+          const Icon = DRAW_ICONS[tool];
           const on = tool === active;
           return (
             <button key={tool} type="button" onClick={() => (onPick(tool), onClose())} className={`${ROW} ${on ? 'bg-accent-subtle text-accent' : 'text-fg hover:bg-raised'}`}>
@@ -110,21 +104,30 @@ export function DrawMenu({
   );
 }
 
-/** Over the chart while a tool is drawn: what to tap, and Cancel (or Escape).
- * The same floating pill as "Tap where the stop goes". */
-export function DrawBanner({ tool, onCancel }: { tool: DrawTool; onCancel: () => void }) {
+/** Over the chart while a tool is drawn, or the eraser is on: what to tap,
+ * Finish for a path (or Enter), and Cancel or Done (or Escape). The same
+ * floating pill as "Tap where the stop goes". */
+export function DrawBanner({ tool, onCancel, onFinish }: { tool: DrawTool | 'erase'; onCancel: () => void; onFinish?: () => void }) {
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onCancel();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel();
+      else if (e.key === 'Enter' && onFinish && !editable(e.target)) onFinish();
+    };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [onCancel]);
-  const ask = DRAW_TOOLS.find((t) => t.tool === tool)?.ask ?? 'Tap on the chart';
+  }, [onCancel, onFinish]);
+  const ask = tool === 'erase' ? 'Tap a drawing to erase it (locked ones stay)' : (DRAW_TOOLS.find((t) => t.tool === tool)?.ask ?? 'Tap on the chart');
   return (
     <div className="pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center px-2">
       <div className="pointer-events-auto flex items-center gap-3 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-md">
         <span className="type-label text-fg">{ask}</span>
+        {onFinish && (
+          <button type="button" onClick={onFinish} className="type-label text-accent hover:underline">
+            Finish
+          </button>
+        )}
         <button type="button" onClick={onCancel} className="type-label text-fg-muted hover:text-fg">
-          Cancel
+          {tool === 'erase' ? 'Done' : 'Cancel'}
         </button>
       </div>
     </div>

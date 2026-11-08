@@ -4,8 +4,8 @@ import { apiUrl } from '../../lib/api';
 import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
-import { AREA_FILL, CHART_STYLES, NO_FILL, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
-import { DRAW_PREFIX, KlineDrawings, type DrawApi } from './drawings';
+import { CHART_STYLES, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
+import { DRAW_PREFIX, KlineDrawings, useDrawPrefs, type DrawApi } from './drawings';
 import { pivotsByDay } from './pivots';
 import { drawableStudies, fitPanes, showStudies } from './studies';
 import {
@@ -23,7 +23,7 @@ import {
   type Tf,
 } from './model';
 
-const KLINE_CANDLE: Record<CandleStyle, 'candle_solid' | 'ohlc' | 'area'> = { candles: 'candle_solid', bars: 'ohlc', line: 'area', area: 'area' };
+const KLINE_CANDLE: Record<CandleStyle, 'candle_solid' | 'ohlc' | 'area'> = { candles: 'candle_solid', bars: 'ohlc', area: 'area' };
 
 /** A horizontal order line: at a price, or at the bar close at a time (where
  * the index was when a scalp was bought). */
@@ -125,6 +125,13 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   const dragging = useRef<string | null>(null);
   const vwapVersion = useRef(0);
   const pivotVersion = useRef(0);
+  // A text's or note's words being asked for, where it was placed.
+  const [asking, setAsking] = useState<Asking | null>(null);
+  // The drawing toolbar's switches (magnet, lock, hide), shared by every KLine chart.
+  const [drawPrefs] = useDrawPrefs();
+  const prefsNow = useRef(drawPrefs);
+  // The panes under the price `fitPanes` has sized: a resize keeps their heights.
+  const sizedPanes = useRef(new Set<string>());
   // The lines' prices: the price axis always takes them in, so a stop or
   // target far from the candles is still on screen.
   const linePrices = useRef<number[]>([]);
@@ -162,7 +169,14 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     chart.current = c;
     const drawn = new KlineDrawings(c);
     drawings.current = drawn;
+    drawn.setPrefs(prefsNow.current);
+    // The box sits at the point, kept inside the chart.
+    drawn.setAsk((at, initial, done) => setAsking({ x: Math.max(4, Math.min(at.x + 4, el.clientWidth - 204)), y: Math.max(4, at.y - 14), initial, done }));
+    // A double-click ends a path being drawn.
+    const onDouble = () => drawn.finish();
+    el.addEventListener('dblclick', onDouble);
     const placed = applied.current;
+    const sized = sizedPanes.current;
     c.overrideYAxis({ paneId: 'candle_pane', createRange: rangeWithLines(linePrices) });
     c.setDataLoader({
       // A few days of bars, then no more: the candle service keeps those.
@@ -206,12 +220,20 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       PIVOT_SERIES.delete(chartId);
       // A drawing under way ends with the chart.
       drawn.cancel();
+      drawn.setAsk(null);
+      el.removeEventListener('dblclick', onDouble);
       drawings.current = null;
       dispose(el);
       chart.current = null;
       placed.clear();
+      sized.clear();
     };
   }, [bus, chartId]);
+
+  useEffect(() => {
+    prefsNow.current = drawPrefs;
+    drawings.current?.setPrefs(drawPrefs);
+  }, [drawPrefs]);
 
   useEffect(() => {
     if (!drawRef) return;
@@ -223,6 +245,8 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       redo: () => drawings.current?.redo() ?? false,
       canUndo: () => drawings.current?.canUndo() ?? false,
       canRedo: () => drawings.current?.canRedo() ?? false,
+      finish: () => drawings.current?.finish(),
+      setErasing: (on) => drawings.current?.setErasing(on),
     };
     return () => {
       drawRef.current = null;
@@ -282,7 +306,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   }, [loaded, error, bars, onState]);
 
   useEffect(() => {
-    chart.current?.setStyles({ candle: { type: KLINE_CANDLE[style], area: { backgroundColor: style === 'line' ? NO_FILL : AREA_FILL } } });
+    chart.current?.setStyles({ candle: { type: KLINE_CANDLE[style] } });
   }, [style]);
 
   // The instrument's saved drawings, once its bars are in: a switch clears the chart.
@@ -308,7 +332,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     showOscillator(c, 'rsi', rsi, compact);
     showOscillator(c, 'cci', cci, compact);
     showStudies(c, studyKey ? studyKey.split(',') : [], compact);
-    fitPanes(c, hostHeight, compact);
+    fitPanes(c, hostHeight, compact, sizedPanes.current);
   }, [rsi, cci, studyKey, compact, hostHeight]);
 
   // VWAP: the option's own, or the future's moved onto the index.
@@ -477,5 +501,51 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     };
   }, [placingKey, loaded]);
 
-  return <div ref={host} className="absolute inset-0" />;
+  return (
+    <>
+      <div ref={host} className="absolute inset-0" />
+      {asking && <TextAsk key={`${asking.x},${asking.y}`} ask={asking} onDone={() => setAsking(null)} />}
+    </>
+  );
+}
+
+interface Asking {
+  x: number;
+  y: number;
+  initial: string;
+  done: (text: string | null) => void;
+}
+
+/** A text's or note's words, typed where it was placed: Enter or a click
+ * away keeps them, Escape gives up. */
+function TextAsk({ ask, onDone }: { ask: Asking; onDone: () => void }) {
+  const [value, setValue] = useState(ask.initial);
+  const said = useRef(false);
+  const end = (text: string | null) => {
+    if (said.current) return;
+    said.current = true;
+    ask.done(text);
+    onDone();
+  };
+  return (
+    <input
+      autoFocus
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') end(value);
+        else if (e.key === 'Escape') {
+          // Not full screen's Escape too.
+          e.stopPropagation();
+          end(null);
+        }
+      }}
+      onBlur={() => end(value)}
+      placeholder="Type, then Enter"
+      aria-label="Drawing text"
+      maxLength={120}
+      style={{ left: ask.x, top: ask.y }}
+      className="absolute z-20 h-7 w-[200px] rounded-6 border border-accent bg-panel px-2 type-label text-fg shadow-md outline-none"
+    />
+  );
 }

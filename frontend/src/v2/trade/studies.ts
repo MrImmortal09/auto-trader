@@ -70,18 +70,31 @@ const STYLES: DeepPartial<IndicatorStyle> = {
 
 const paneOf = (name: string) => `study_${name.toLowerCase()}_pane`;
 const PRICE_PANE = 'candle_pane';
-/** The panes under the price share at most this much of the chart. */
+/** The panes under the price take at most this much of the chart. */
 const UNDER_SHARE = 0.45;
 const PANE_MIN = 40;
 
-/** Sizes every pane under the price on `chart` (RSI, CCI and the studies'):
- * up to 100 px each (72 on a phone), less when there are several, so
- * together they never take more than `UNDER_SHARE` of a chart `height` tall. */
-export function fitPanes(chart: Chart, height: number, compact: boolean) {
+/**
+ * Sizes the panes under the price on `chart` (RSI, CCI and the studies'). A
+ * new pane gets an equal share of `UNDER_SHARE` of a chart `height` tall, up
+ * to 100 px (72 on a phone); one already sized keeps its height, dragged or
+ * not, until together they take more than that share, when all are shared
+ * out again. The share wins over `PANE_MIN`, so the price always keeps the
+ * rest. `sized` is the chart's own record of the panes it has sized.
+ */
+export function fitPanes(chart: Chart, height: number, compact: boolean, sized: Set<string>) {
   const panes = [...new Set(chart.getIndicators().map((i) => i.paneId))].filter((id) => id !== PRICE_PANE);
+  for (const id of [...sized]) if (!panes.includes(id)) sized.delete(id);
   if (panes.length === 0 || height <= 0) return;
-  const each = Math.max(PANE_MIN, Math.min(compact ? 72 : 100, Math.floor((height * UNDER_SHARE) / panes.length)));
-  for (const id of panes) chart.setPaneOptions({ id, height: each, minHeight: PANE_MIN });
+  const cap = height * UNDER_SHARE;
+  const each = Math.max(1, Math.min(compact ? 72 : 100, Math.floor(cap / panes.length)));
+  const size = (id: string) => {
+    chart.setPaneOptions({ id, height: each, minHeight: Math.min(PANE_MIN, each) });
+    sized.add(id);
+  };
+  panes.filter((id) => !sized.has(id)).forEach(size);
+  const taken = panes.reduce((sum, id) => sum + (chart.getSize(id)?.height ?? 0), 0);
+  if (taken > cap + 1) panes.forEach(size);
 }
 
 /** Shows exactly `names` of the studies on `chart`: adds what's missing,
