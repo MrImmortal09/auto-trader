@@ -301,6 +301,48 @@ export interface AdminTradesAnswer {
   realized: number;
 }
 
+/** Count, mean, median and 95th percentile of one latency, in ms. */
+export interface LatencySummary {
+  n: number;
+  mean: number;
+  p50: number;
+  p95: number;
+}
+
+export interface LatencyFigures {
+  /** Upstox's tick against the exchange's time of the trade. */
+  upstox_delay: LatencySummary | null;
+  /** Kotak's tick against the same trade's exchange time (from Upstox). */
+  kotak_delay: LatencySummary | null;
+  /** How much sooner Kotak had the price; negative when Upstox was first. */
+  kotak_lead: LatencySummary | null;
+}
+
+export type LatencyClass = 'index' | 'future' | 'position';
+
+/** How late each feed's prices arrive (`GET /api/admin/latency`). */
+export interface LatencyAnswer {
+  status: 'not_configured' | 'market_closed' | 'streaming';
+  /** The IST day the figures are for. */
+  day: string | null;
+  upstox_error: string | null;
+  /** Kotak's feed is connected and ticked in the last 10 s. */
+  kotak_streaming: boolean;
+  window_s: number;
+  classes: { class: LatencyClass; label: string; minute: LatencyFigures; day: LatencyFigures }[];
+  instruments: {
+    label: string;
+    class: LatencyClass;
+    upstox_key: string;
+    kotak_key: string;
+    upstox_age_ms: number | null;
+    kotak_age_ms: number | null;
+    minute: LatencyFigures;
+    day: LatencyFigures;
+  }[];
+  kotak_lagged: number;
+}
+
 /** One LIVE order's timing (`GET /api/admin/order-timings`). Times are Unix
  * ms on the server's clock unless named otherwise. */
 export interface OrderTimingRow {

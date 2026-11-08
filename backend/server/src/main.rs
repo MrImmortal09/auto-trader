@@ -11,6 +11,7 @@ mod candles;
 mod db;
 mod desk;
 mod execute;
+mod feed_latency;
 mod history;
 mod market_data;
 mod order_timing;
@@ -191,6 +192,8 @@ pub(crate) struct AppState {
     /// Signed-in users' own paper portfolios — see `paper`. Nothing in it
     /// reaches the owner's engine or the broker.
     pub paper: Arc<paper::PaperDesk>,
+    /// How late each feed's prices arrive — see `feed_latency`. Admin only.
+    pub feed_latency: Arc<feed_latency::FeedLatency>,
     /// How long each LIVE order took — see `order_timing`. Admin only.
     pub order_timing: Arc<order_timing::OrderTiming>,
 }
@@ -1111,13 +1114,17 @@ async fn main() {
         }
     };
     let market = Arc::new(market_data::MarketDataState::new(upstox.is_some()));
+    // How late each feed's prices arrive, for the admin (`feed_latency`):
+    // one read-only Upstox stream in market hours, and Kotak's tick tap.
+    let feed_latency = Arc::new(feed_latency::FeedLatency::new(upstox.is_some()));
     if let Some(client) = upstox.clone() {
         tokio::spawn(market_data::run_poller(
-            client,
+            client.clone(),
             Arc::clone(&market),
             write_tx.clone(),
             Arc::clone(&indicator_feed),
         ));
+        tokio::spawn(feed_latency::run(Arc::clone(&feed_latency), client, Arc::clone(&positions), Arc::clone(&ws_tx)));
     }
 
     // 9c. Kotak balance for the dashboard: hourly and after every LIVE trade,
@@ -1165,6 +1172,7 @@ async fn main() {
         limits: Arc::new(auth::ratelimit::Limiter::new()),
         whatsapp,
         paper: paper_desk,
+        feed_latency,
         order_timing,
     };
     pulse::spawn_sampler(state.clone());
@@ -1241,6 +1249,7 @@ async fn main() {
         .route("/api/admin/trades",                 get(routes::admin_paper::trades_handler))
         .route("/api/admin/positions",              get(routes::admin_paper::positions_handler))
         .route("/api/admin/users/:id/report",       get(routes::admin_report::report_handler))
+        .route("/api/admin/latency",                get(feed_latency::latency_handler))
         .route("/api/admin/order-timings",          get(order_timing::timings_handler))
         .route("/api/admin/special-sessions",       get(routes::admin_sessions::get_sessions_handler))
         .route("/api/admin/special-sessions/:date", axum::routing::put(routes::admin_sessions::put_session_handler)
