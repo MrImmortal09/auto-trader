@@ -348,6 +348,8 @@ struct FeedStatus {
 struct IndexHeadline {
     index: &'static str,
     spot: Option<f64>,
+    /// The previous session's close: the day's change in points is `spot` less this.
+    prev_close: Option<f64>,
     change_pct: Option<f64>,
 }
 
@@ -477,11 +479,13 @@ pub fn manual_buy_closed_message() -> String {
 }
 
 /// Live index value and its % change on the previous close, from Kotak's feed.
+/// The index's value on Kotak's feed, and the previous session's close when
+/// the feed has it.
 fn kotak_index(state: &AppState, index: &str) -> Option<(f64, Option<f64>)> {
     let (_, name) = shared_domain::kotak_index_feed(index)?;
     let spot = price(state, &shared_domain::index_price_key(name))?;
-    let change = price(state, &shared_domain::index_close_key(name)).map(|c| (spot - c) / c * 100.0);
-    Some((spot, change))
+    let close = price(state, &shared_domain::index_close_key(name)).filter(|c| *c > 0.0);
+    Some((spot, close))
 }
 
 async fn upstox_spot(state: &AppState, index: &str) -> Option<f64> {
@@ -686,16 +690,14 @@ pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, exp
             Some((s, _)) => Some(s),
             None => upstox_spot(state, name).await,
         };
-        // Kotak's change, else one from Upstox's previous close (NIFTY,
-        // BANKNIFTY and SENSEX): Kotak's is gone after its session ends.
-        let change_pct = match kotak.and_then(|(_, c)| c) {
+        // Kotak's previous close, else Upstox's (NIFTY, BANKNIFTY and
+        // SENSEX): Kotak's is gone after its session ends.
+        let prev_close = match kotak.and_then(|(_, c)| c) {
             Some(c) => Some(c),
-            None => match (spot, upstox_prev_close(state, name).await) {
-                (Some(s), Some(c)) => Some((s - c) / c * 100.0),
-                _ => None,
-            },
+            None => upstox_prev_close(state, name).await,
         };
-        indices.push(IndexHeadline { index: name, spot, change_pct });
+        let change_pct = spot.zip(prev_close).map(|(s, c)| (s - c) / c * 100.0);
+        indices.push(IndexHeadline { index: name, spot, prev_close, change_pct });
     }
 
     let (board, board_error) = match build_board(state, index, expiry, centre, SubPool::of(identity)).await {

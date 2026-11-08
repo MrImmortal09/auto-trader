@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChartCandlestick, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Columns2, Columns3, Square } from 'lucide-react';
-import type { ChartLevel, ChartTarget, ExecutePosition } from '../../types';
+import type { ChartLevel, ChartTarget, ExecutePosition, IndexHeadline } from '../../types';
 import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
@@ -213,9 +213,10 @@ function IndexTabs({ indices, selected, onSelect }: { indices: { index: string; 
   );
 }
 
-/** The day's move in points, from the value and the percent: "−43.95". */
-function signedPoints(spot: number, changePct: number): string {
-  const d = spot - spot / (1 + changePct / 100);
+/** The day's move in points: "−43.95". From the previous close, or worked
+ * back from the percent when the server sends none (an older one). */
+function signedPoints(spot: number, prevClose: number | null, changePct: number): string {
+  const d = prevClose != null && prevClose > 0 ? spot - prevClose : spot - spot / (1 + changePct / 100);
   const v = Math.abs(d) < 0.005 ? 0 : d;
   return `${v > 0 ? '+' : v < 0 ? MINUS : ''}${price(Math.abs(v))}`;
 }
@@ -227,7 +228,7 @@ const TICKER_POINTS = new Set(['NIFTY', 'BANKNIFTY', 'SENSEX']);
 /** One index on the desktop ticker: "NIFTY 24,986.40 −43.95 (−0.18%)", or
  * "−0.18%" alone where room is short (see `TICKER_POINTS`), the value
  * flashing as it ticks; the selected one is underlined in accent. */
-function TickerItem({ index, spot, changePct, on, onSelect }: { index: string; spot: number | null; changePct: number | null; on: boolean; onSelect: () => void }) {
+function TickerItem({ index, spot, prevClose, changePct, on, onSelect }: { index: string; spot: number | null; prevClose: number | null; changePct: number | null; on: boolean; onSelect: () => void }) {
   const flash = useTickFlash(spot, true, index);
   // All six with points need about 98rem; the three with points, the rest
   // with the percent, about 70rem (a 1440 px window with the nav rail).
@@ -246,7 +247,7 @@ function TickerItem({ index, spot, changePct, on, onSelect }: { index: string; s
       </span>
       {spot != null && changePct != null && (
         <span className={`num-small ${TONE_TEXT[toneOf(changePct)]}`}>
-          <span className={points}>{signedPoints(spot, changePct)} (</span>
+          <span className={points}>{signedPoints(spot, prevClose, changePct)} (</span>
           {signedPct(changePct)}
           <span className={points}>)</span>
         </span>
@@ -256,14 +257,43 @@ function TickerItem({ index, spot, changePct, on, onSelect }: { index: string; s
 }
 
 /** The desktop index bar: every index on one slim line, scrolling sideways
- * when the window is too narrow for all of them. */
-function IndexTicker({ indices, selected, onSelect }: { indices: { index: string; spot: number | null; change_pct: number | null }[]; selected: string; onSelect: (i: string) => void }) {
+ * when the window is too narrow for all of them — with the mouse wheel too,
+ * and always to keep the selected one in view. */
+function IndexTicker({ indices, selected, onSelect }: { indices: IndexHeadline[]; selected: string; onSelect: (i: string) => void }) {
   const by = new Map(indices.map((i) => [i.index, i]));
+  const box = useRef<HTMLDivElement>(null);
+  // On a new pick, and whenever the tabs change width (their prices arriving
+  // can push the selected one out of view).
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const keepInView = () => {
+      const tab = el.querySelector<HTMLElement>('[aria-selected="true"]');
+      if (!tab) return;
+      // This bar only: scrollIntoView could move the page around it too.
+      const left = tab.offsetLeft;
+      const right = left + tab.offsetWidth;
+      if (left < el.scrollLeft) el.scrollLeft = left;
+      else if (right > el.scrollLeft + el.clientWidth) el.scrollLeft = right - el.clientWidth;
+    };
+    keepInView();
+    const ro = new ResizeObserver(keepInView);
+    for (const tab of el.children) ro.observe(tab);
+    return () => ro.disconnect();
+  }, [selected]);
   return (
-    <div role="tablist" aria-label="Index" className="@container flex min-w-0 flex-1 items-stretch overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div
+      ref={box}
+      role="tablist"
+      aria-label="Index"
+      onWheel={(e) => {
+        if (e.deltaY !== 0 && e.deltaX === 0) e.currentTarget.scrollLeft += e.deltaY;
+      }}
+      className="@container relative flex min-w-0 flex-1 items-stretch overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+    >
       {INDEX_ORDER.map((index) => {
         const i = by.get(index);
-        return <TickerItem key={index} index={index} spot={i?.spot ?? null} changePct={i?.change_pct ?? null} on={index === selected} onSelect={() => onSelect(index)} />;
+        return <TickerItem key={index} index={index} spot={i?.spot ?? null} prevClose={i?.prev_close ?? null} changePct={i?.change_pct ?? null} on={index === selected} onSelect={() => onSelect(index)} />;
       })}
     </div>
   );
