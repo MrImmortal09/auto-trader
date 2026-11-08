@@ -15,15 +15,17 @@ export function Segment<T extends string>({
   options: { value: T; label: string; kind?: 'live' }[];
   value: T;
   onChange: (value: T) => void;
-  size?: 'sm' | 'lg';
+  /** `xs` fits a slim bar: the Trade screen's index ticker. */
+  size?: 'xs' | 'sm' | 'lg';
   /** Share the width equally (phone). */
   stretch?: boolean;
   disabled?: boolean;
   label: string;
 }) {
-  const item = size === 'lg' ? 'h-10 px-4 rounded-8 type-body-strong' : 'h-7 px-3 rounded-6 type-label';
+  const item = size === 'lg' ? 'h-10 px-4 rounded-8 type-body-strong' : size === 'xs' ? 'h-6 px-2.5 rounded-4 type-label' : 'h-7 px-3 rounded-6 type-label';
+  const track = size === 'lg' ? 'gap-1 p-1 rounded-12' : size === 'xs' ? 'gap-0.5 p-0.5 rounded-6' : 'gap-1 p-1 rounded-8';
   return (
-    <div role="tablist" aria-label={label} className={`inline-flex gap-1 border border-line bg-inset p-1 ${size === 'lg' ? 'rounded-12' : 'rounded-8'} ${stretch ? 'flex w-full' : ''}`}>
+    <div role="tablist" aria-label={label} className={`inline-flex border border-line bg-inset ${track} ${stretch ? 'flex w-full' : ''}`}>
       {options.map((o) => {
         const selected = o.value === value;
         const look = !selected

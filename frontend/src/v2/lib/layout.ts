@@ -4,11 +4,14 @@
 
 import { useSyncExternalStore } from 'react';
 import { readStored, writeStored } from '../../lib/execute';
+import { useIdentity } from '../auth/identity';
 
 /** The Trade screen's saved state (`Trade.tsx`). */
 export const TRADE_KEY = 'v2.trade';
 /** The desktop navigation rail, hidden or shown. */
 const NAV_KEY = 'v2.nav';
+/** The Trade screen's desk column taken away, per sign-in: `v2.desk.<user id>`. */
+const DESK_KEY = 'v2.desk.';
 
 /**
  * The Trade screen's layout fields: sizes and folded panes. Its picks — the
@@ -49,6 +52,47 @@ export function useNavHidden(): [boolean, () => void] {
     () => navHidden,
   );
   return [hidden, () => setNav(!navHidden)];
+}
+
+// Whether each sign-in has taken the desk column away, as read or set here.
+const deskRemovedBy = new Map<string, boolean>();
+const deskOff = (key: string) => {
+  if (!deskRemovedBy.has(key)) deskRemovedBy.set(key, readStored<{ removed?: boolean }>(key, {}).removed === true);
+  return deskRemovedBy.get(key) === true;
+};
+
+/**
+ * Whether the signed-in user has removed the Trade screen's desk column (the
+ * Owner desk, or a user's Paper portfolio) in Settings, and the setter. Each
+ * sign-in on this browser has its own; Reset layout leaves it alone.
+ */
+export function useDeskRemoved(): [boolean, (removed: boolean) => void] {
+  const { user } = useIdentity();
+  const key = `${DESK_KEY}${user?.id ?? 'none'}`;
+  const removed = useSyncExternalStore(
+    (l) => {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
+    () => deskOff(key),
+  );
+  return [
+    removed,
+    (v: boolean) => {
+      deskRemovedBy.set(key, v);
+      writeStored(key, { removed: v });
+      // Back on means shown, not back to a strip it was folded to before.
+      if (!v) {
+        const saved = readStored<Record<string, unknown> | null>(TRADE_KEY, null);
+        if (saved && 'deskHidden' in saved) {
+          const kept = { ...saved };
+          delete kept.deskHidden;
+          writeStored(TRADE_KEY, kept);
+        }
+      }
+      listeners.forEach((l) => l());
+    },
+  ];
 }
 
 /**

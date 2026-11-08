@@ -192,6 +192,9 @@ pub struct Quote {
     pub volume: f64,
     #[serde(default, deserialize_with = "num")]
     pub oi: f64,
+    /// Points from the previous session's close to `last_price`.
+    #[serde(default, deserialize_with = "num")]
+    pub net_change: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
