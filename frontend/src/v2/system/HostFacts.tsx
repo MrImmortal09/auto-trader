@@ -24,6 +24,12 @@ async function loadFacts(serverBase: string): Promise<Facts> {
   return { host, kotak, error: host ? null : "Couldn't read the host's details." };
 }
 
+/** What stands in for a card's rows: "Reading…" in the third ink, or what
+ * went wrong in loss red. */
+function Placeholder({ loading, error }: { loading: boolean; error: string | null | undefined }) {
+  return <p className={`py-2 type-body ${loading ? 'text-fg-subtle' : 'text-loss'}`}>{loading ? 'Reading…' : error}</p>;
+}
+
 /**
  * The host and the configuration checks behind it — read when the screen
  * opens and on Refresh, not streamed: they change with deploys, not by the
@@ -58,7 +64,8 @@ export function HostFacts({ serverBase }: { serverBase: string }) {
       <Card
         title="Host"
         aside={
-          <Button size="sm" kind="ghost" icon={<RefreshCw size={13} className={loading ? 'animate-spin' : ''} />} onClick={() => void refresh()} disabled={loading}>
+          // Busy is the disabled button, never a spinner.
+          <Button size="sm" kind="ghost" icon={<RefreshCw size={13} />} onClick={() => void refresh()} disabled={loading}>
             Refresh
           </Button>
         }
@@ -76,7 +83,7 @@ export function HostFacts({ serverBase }: { serverBase: string }) {
             <CountRow label="Read at" value={h.generated_at_ist.slice(11, 19)} />
           </>
         ) : (
-          <p className="py-2 type-caption text-fg-muted">{loading ? 'Reading…' : facts?.error}</p>
+          <Placeholder loading={loading} error={facts?.error} />
         )}
       </Card>
       <Card title="Kotak auto-login" note={k ? (k.auto_login_ready ? 'Ready' : 'Not ready') : undefined}>
@@ -89,7 +96,7 @@ export function HostFacts({ serverBase }: { serverBase: string }) {
             {!k.auto_login_ready && k.auto_login_reason && <p className="mt-1 type-caption text-loss">{k.auto_login_reason}</p>}
           </>
         ) : (
-          <p className="py-2 type-caption text-fg-muted">{loading ? 'Reading…' : "Couldn't read Kotak's status."}</p>
+          <Placeholder loading={loading} error="Couldn't read Kotak's status." />
         )}
       </Card>
     </>

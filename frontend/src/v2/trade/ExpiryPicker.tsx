@@ -50,7 +50,7 @@ export function ExpiryPicker({ expiries, value, onChange, size = 'sm', align = '
         aria-label={short && current ? `Expiry ${expiryLabel(current.date)}, ${daysLeftLabel(current.days_to_expiry)}` : undefined}
         disabled={all.length === 0}
         onClick={() => setOpen((o) => !o)}
-        className={`inline-flex items-center gap-1 whitespace-nowrap rounded-6 border border-line text-fg-muted hover:text-fg disabled:opacity-60 ${lg ? 'h-10 px-3 type-label' : 'h-6 px-2 type-caption'}`}
+        className={`inline-flex items-center gap-1 whitespace-nowrap rounded-6 border border-line-strong/50 text-fg-muted transition-colors duration-120 hover:text-fg disabled:opacity-50 ${lg ? 'h-10 px-3 type-label' : 'h-6 px-2 type-caption'}`}
       >
         {text}
         <ChevronDown size={lg ? 16 : 12} />
@@ -72,7 +72,7 @@ export function ExpiryPicker({ expiries, value, onChange, size = 'sm', align = '
                   onChange(i === 0 ? null : e.date);
                   close();
                 }}
-                className={`flex h-10 w-full items-center gap-2 rounded-6 px-3 text-left ${on ? 'bg-raised text-fg' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}
+                className={`flex h-10 w-full items-center gap-2 rounded-6 px-3 text-left ${on ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}
               >
                 <span className="min-w-0 flex-1 truncate type-label tnum">{label}</span>
                 {tag && <span className="type-caption">{tag}</span>}

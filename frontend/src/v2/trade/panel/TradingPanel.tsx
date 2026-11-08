@@ -5,6 +5,7 @@ import { contractLabel, expiryLabel } from '../../../lib/execute';
 import { getOrders, getPositionsRaw, type KotakOrderRow } from '../../lib/api';
 import { money, plural, price, signedMoney, signedPct, toneOf } from '../../lib/format';
 import { usePoll } from '../../lib/usePoll';
+import { useTickFlash } from '../../lib/useTickFlash';
 import type { Call, DeskAnswer, FillMark } from '../../lib/types';
 import { Button } from '../../ui/Button';
 import { Chip } from '../../ui/Chip';
@@ -39,7 +40,7 @@ function roomFor(panel: HTMLElement | null, charts: HTMLElement | null, height: 
   return Math.max(MIN_PANEL_HEIGHT, Math.floor(own + above - MIN_CHART_HEIGHT - spill));
 }
 
-/** A panel tab: its label and count, underlined while open. */
+/** A panel tab: its label and count, underlined in accent while open. */
 function PanelTab({ id, label, count, active, onSelect }: { id: TabId; label: string; count: number | null; active: boolean; onSelect: (id: TabId) => void }) {
   return (
     <button
@@ -47,11 +48,11 @@ function PanelTab({ id, label, count, active, onSelect }: { id: TabId; label: st
       role="tab"
       aria-selected={active}
       onClick={() => onSelect(id)}
-      className={`-mb-px flex h-11 shrink-0 items-center gap-2 border-b-2 px-3 type-body ${active ? 'border-fg text-fg' : 'border-transparent text-fg-muted hover:text-fg'}`}
+      className={`-mb-px flex h-11 shrink-0 items-center gap-2 border-b-2 px-3 type-body transition-colors duration-120 ${active ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}`}
     >
       {label}
       {count != null && (
-        <span className={`grid h-5 min-w-5 place-items-center rounded-full px-1.5 type-caption tnum ${active ? 'bg-fg text-canvas' : 'bg-raised text-fg-muted'}`}>{count}</span>
+        <span className={`grid h-5 min-w-5 place-items-center rounded-full px-1.5 type-caption tnum ${active ? 'bg-accent text-on-accent' : 'bg-raised text-fg-muted'}`}>{count}</span>
       )}
     </button>
   );
@@ -116,12 +117,12 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
         <div className="flex flex-col gap-0.5">
           <span className="type-label text-fg-muted">{fundsLabel}</span>
           <span className="num-medium text-fg">{funds == null ? '—' : money(funds)}</span>
-          {fundsNote && <span className="type-caption text-fg-muted tnum">{fundsNote}</span>}
+          {fundsNote && <span className="type-caption text-fg-subtle tnum">{fundsNote}</span>}
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="type-label text-fg-muted">Today</span>
           <span className={`num-medium ${TONE_TEXT[toneOf(booked)]}`}>{signedMoney(booked)}</span>
-          <span className="type-caption text-fg-muted">{todayLine}</span>
+          <span className="type-caption text-fg-subtle">{todayLine}</span>
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="type-label text-fg-muted">Open · {plural(positions.length, 'position')}</span>
@@ -141,16 +142,16 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
     <div className="flex flex-col">
       <div className="flex items-center gap-2 border-b border-line px-4 py-2.5">
         <span className="type-body-strong text-fg">{paper ? 'Paper portfolio' : 'Owner desk'}</span>
-        <Chip kind={live ? 'live' : 'profit'}>{live ? 'LIVE' : 'Paper'}</Chip>
+        <Chip kind={live ? 'live' : 'outline'}>{live ? 'LIVE' : 'Paper'}</Chip>
       </div>
       <Block label={fundsLabel}>
         <span className="num-large text-fg">{funds == null ? '—' : money(funds)}</span>
-        {fundsNote && <span className="type-caption text-fg-muted tnum">{fundsNote}</span>}
+        {fundsNote && <span className="type-caption text-fg-subtle tnum">{fundsNote}</span>}
       </Block>
-      <Block label="Today" right={closed > 0 || booked !== 0 ? <span className={`num-small ${TONE_TEXT[toneOf(booked)]}`}>{signedMoney(booked)}</span> : undefined}>
+      <Block label="Today" right={closed > 0 || booked !== 0 ? <span className={`num-medium ${TONE_TEXT[toneOf(booked)]}`}>{signedMoney(booked)}</span> : undefined}>
         <span className="type-body text-fg">{todayLine}</span>
       </Block>
-      <Block label={`Open · ${plural(positions.length, 'position')}`} right={<span className={`num-small ${TONE_TEXT[toneOf(openPnl)]}`}>{signedMoney(openPnl)}</span>}>
+      <Block label={`Open · ${plural(positions.length, 'position')}`} right={<span className={`num-medium ${TONE_TEXT[toneOf(openPnl)]}`}>{signedMoney(openPnl)}</span>}>
         {positions.map((p) => (
           <span key={p.id} className="flex items-baseline gap-2 type-caption">
             <span className="text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
@@ -158,7 +159,7 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
           </span>
         ))}
       </Block>
-      {paper && <Block label="Cash" right={<span className="num-small text-fg">{cash == null ? '—' : money(cash)}</span>} />}
+      {paper && <Block label="Cash" right={<span className="num-medium text-fg">{cash == null ? '—' : money(cash)}</span>} />}
     </div>
   );
 }
@@ -207,6 +208,9 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   const active = scalps.filter((p) => !p.placing);
   const waiting = scalps.filter((p) => p.placing);
   const openPnl = active.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
+  // The stream refreshes every 2 s, so a flash never re-triggers mid-way.
+  // A position opening or closing changes the sum without a tick.
+  const flash = useTickFlash(openPnl, true, active.map((p) => p.id).join());
   const closed = history.filter((c) => c.channel === 'Scalps');
   const shown: TabId = paper && (tab === 'waiting' || tab === 'orders') ? 'positions' : tab;
   // Orders only matter while that tab is open: Kotak's book, and the engine's
@@ -291,13 +295,16 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
     );
   };
 
-  const GRID = 'grid grid-cols-[minmax(170px,1.3fr)_110px_120px_88px_88px_minmax(110px,1fr)_minmax(110px,1fr)_150px] items-center gap-3';
+  // Measured for Inter: a contract name is at most 156 px, a level with its ×
+  // ("BANKNIFTY ≥ 57,890.00 ×") 158, the two buttons 112, and the panel at
+  // 1440 px holds 1042 of columns and gaps.
+  const GRID = 'grid grid-cols-[minmax(158px,1.3fr)_88px_120px_88px_88px_minmax(160px,1fr)_minmax(160px,1fr)_120px] items-center gap-2';
   const positions =
     active.length === 0 ? (
-      <p className="px-1 py-3 type-body text-fg-muted">No open trade. Tap Buy on the ladder to open one.</p>
+      <p className="px-1 py-3 type-body text-fg-subtle">No open trade. Tap Buy on the ladder to open one.</p>
     ) : (
       <div className="flex flex-col">
-        <div className={`${GRID} sticky top-0 border-b border-line bg-panel px-1 py-2 type-caption text-fg-muted`}>
+        <div className={`${GRID} sticky top-0 border-b border-line bg-panel px-1 py-2 type-eyebrow text-fg-muted`}>
           <span>Symbol</span>
           <span className="text-right">Qty</span>
           <span className="text-right">Open P&L</span>
@@ -315,7 +322,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
             <div key={p.id} className={`${GRID} border-b border-line px-1 py-2.5`}>
               <span className="flex min-w-0 flex-col">
                 <span className="truncate type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
-                <span className="truncate type-caption text-fg-muted">
+                <span className="truncate type-caption text-fg-subtle">
                   {p.expiry ? expiryLabel(p.expiry) : 'Scalp'}
                   {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
                 </span>
@@ -333,10 +340,10 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
               <span>{stopCell(p, locked)}</span>
               <span>{targetCell(p, locked)}</span>
               <span className="flex justify-end gap-2">
-                <Button pointerOnly kind="ghost" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)} title={`Sell ${p.lot_size} at market`}>
+                <Button pointerOnly kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)} title={`Sell ${p.lot_size} at market`}>
                   −1 lot
                 </Button>
-                <Button pointerOnly kind="loss-outline" disabled={locked} onClick={() => h.onExit(p)} title={`Sell all ${p.qty} at market`}>
+                <Button pointerOnly kind="loss" disabled={locked} onClick={() => h.onExit(p)} title={`Sell all ${p.qty} at market`}>
                   Close
                 </Button>
               </span>
@@ -348,19 +355,19 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
 
   const waitingRows =
     waiting.length === 0 ? (
-      <p className="px-1 py-3 type-body text-fg-muted">No buy waiting. A tap on the ladder shows here until its order is sent.</p>
+      <p className="px-1 py-3 type-body text-fg-subtle">No buy waiting. A tap on the ladder shows here until its order is sent.</p>
     ) : (
       <ul className="flex flex-col">
         {waiting.map((p) => (
-          <li key={p.id} className="flex items-center gap-3 border-b border-line px-1 py-2.5">
+          <li key={p.id} className="flex items-center gap-3 border-b border-line px-1 py-2">
             <span className="min-w-0 flex-1 type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
             <span className="type-caption text-fg">{p.halted ? 'Halted by the engine — see System' : 'Buying at market…'}</span>
             {mode === 'LIVE' ? (
               // In LIVE the row can't be dropped safely while the engine may be mid-send:
               // the engine abandons a buy it couldn't send within 15 s.
-              <span className="type-caption text-fg-muted">Dropped by the engine if not sent in 15 s</span>
+              <span className="type-caption text-fg-subtle">Dropped by the engine if not sent in 15 s</span>
             ) : (
-              <Button pointerOnly kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
+              <Button pointerOnly kind="neutral" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
                 Cancel
               </Button>
             )}
@@ -411,7 +418,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   const bookNote = book.data?.error ?? (book.data?.fetched_at ? `Kotak's order book as of ${book.data.fetched_at}` : null);
   const orders =
     kotakOrders.length === 0 && sending.length === 0 ? (
-      <p className="px-1 py-3 type-body text-fg-muted">
+      <p className="px-1 py-3 type-body text-fg-subtle">
         {book.data || raw.data
           ? (book.data?.error ??
             (mode === 'LIVE'
@@ -429,15 +436,15 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
               <li key={o.key} className={`${ORDER_GRID} border-b border-line px-1 py-2.5`}>
                 <span className="min-w-0 truncate type-body-strong text-fg">{o.contract}</span>
                 <span className="col-span-4 type-caption tnum text-fg">{o.what} · not in Kotak's book yet</span>
-                <span className="truncate text-right type-caption tnum text-fg-muted">#{o.id}</span>
+                <span className="truncate text-right type-mono text-fg-subtle">#{o.id}</span>
               </li>
             ))}
             {working.map(orderRow)}
-            {working.length + sending.length === 0 && <li className="px-1 py-2.5 type-caption text-fg-muted">Nothing working at Kotak right now.</li>}
+            {working.length + sending.length === 0 && <li className="px-1 py-2.5 type-caption text-fg-subtle">Nothing working at Kotak right now.</li>}
           </>,
         )}
         {done.length > 0 && orderGroup('Filled, rejected or cancelled', done.length, done.map(orderRow))}
-        {bookNote && <p className={`px-1 type-caption ${book.data?.error ? 'text-loss' : 'text-fg-muted'}`}>{bookNote}</p>}
+        {bookNote && <p className={`px-1 type-caption ${book.data?.error ? 'text-loss' : 'text-fg-subtle'}`}>{bookNote}</p>}
       </div>
     );
 
@@ -453,12 +460,14 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
         </div>
       ) : (
         <span className="flex h-11 items-center gap-2 px-3 type-body-strong text-fg">
-          Trading <span className="type-caption text-fg-muted tnum">{plural(active.length, 'open position')}</span>
+          Trading <span className="type-caption text-fg-subtle tnum">{plural(active.length, 'open position')}</span>
         </span>
       )}
       <span className="flex-1" />
       <span className="type-label text-fg-muted">Open</span>
-      <span className={`num-medium ${TONE_TEXT[toneOf(openPnl)]}`}>{signedMoney(openPnl)}</span>
+      <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium ${TONE_TEXT[toneOf(openPnl)]} ${flash.className}`}>
+        {signedMoney(openPnl)}
+      </span>
       <HoldButton size="sm" disabled={active.length === 0 || h.exitAllBusy} onFire={h.onExitAll}>
         {h.exitAllBusy ? 'Exiting…' : 'Hold to exit all'}
       </HoldButton>

@@ -35,7 +35,7 @@ export function Popover({ open, onClose, align = 'left', backdrop = false, scrol
     <>
       {/* Inside the anchor, so the outside-press check above leaves it to this click. */}
       {backdrop && <div aria-hidden className="fixed inset-0 z-20" onClick={onClose} />}
-      <div ref={box} className={`absolute top-full z-30 mt-1 min-w-[260px] animate-fade-in rounded-12 border border-line bg-panel p-2 shadow-lg ${scroll ? 'max-h-[70dvh] overflow-y-auto' : ''} ${align === 'right' ? 'right-0' : 'left-0'}`}>
+      <div ref={box} className={`absolute top-full z-30 mt-1 min-w-[260px] animate-fade-in rounded-12 border border-line bg-panel p-2 shadow-md ${scroll ? 'max-h-[70dvh] overflow-y-auto' : ''} ${align === 'right' ? 'right-0' : 'left-0'}`}>
         {children}
       </div>
     </>

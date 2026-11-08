@@ -9,10 +9,13 @@ import { ago, count, ms, outcomeWords, rate } from './units';
 /** What the engine did with a signal, when it counts as applied. */
 const APPLIED = ['accepted', 'edit_applied', 'duplicate_revised', 'sl_updated', 'exit_applied'];
 
-/** Outcomes with how many, longest first, each with a bar. */
+/** A table's column head: an eyebrow over the hairline. */
+const TH = 'py-2 type-eyebrow text-fg-muted';
+
+/** Outcomes with how many, longest first, each with a bar in the indicator blue. */
 function OutcomeList({ rows, empty }: { rows: [string, number][]; empty: string }) {
   const shown = rows.filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
-  if (shown.length === 0) return <p className="py-1.5 type-caption text-fg-muted">{empty}</p>;
+  if (shown.length === 0) return <p className="py-1.5 type-body text-fg-subtle">{empty}</p>;
   const top = Math.max(...shown.map(([, v]) => v));
   return (
     <ul className="flex flex-col gap-1.5">
@@ -82,7 +85,7 @@ function StateRow({ name, level, state, detail }: { name: string; level: Level; 
       <HealthDot level={level} className="mt-1.5" />
       <div className="min-w-0 flex-1">
         <div className="type-body-strong text-fg">{name}</div>
-        {detail && <div className="type-caption text-fg-muted">{detail}</div>}
+        {detail && <div className="type-caption text-fg-subtle tnum">{detail}</div>}
       </div>
       <span className="shrink-0 type-body text-fg">{state}</span>
     </div>
@@ -139,28 +142,28 @@ export function PositionsCard({ s, compact }: { s: TelemetrySample; compact: boo
   return (
     <Card title="Tracked positions" note={c ? `${c.waiting} waiting · ${c.active} open · ${c.target1} past T1 · ${c.closed} closed` : undefined}>
       {rows == null ? (
-        <p className="py-2 type-caption text-fg-muted">The engine was busy at the last sample; the table refreshes with the next.</p>
+        <p className="py-2 type-body text-fg-subtle">The engine was busy at the last sample; the table refreshes with the next.</p>
       ) : rows.length === 0 ? (
-        <p className="py-2 type-caption text-fg-muted">Nothing tracked.</p>
+        <p className="py-2 type-body text-fg-subtle">Nothing tracked.</p>
       ) : (
         <div className="-mx-4 overflow-x-auto px-4">
           <table className={`w-full ${compact ? 'min-w-[560px]' : ''}`}>
             <thead>
-              <tr className="border-b border-line type-caption text-fg-muted">
-                <th className="py-2 text-left font-normal">Contract</th>
-                <th className="py-2 text-left font-normal">State</th>
-                <th className="py-2 text-right font-normal">Qty</th>
-                <th className="py-2 text-right font-normal">Avg</th>
-                <th className="py-2 text-right font-normal">Stop</th>
-                <th className="py-2 text-right font-normal">LTP</th>
-                <th className="py-2 text-right font-normal">P&amp;L</th>
-                <th className="py-2 text-right font-normal">Price age</th>
+              <tr className="border-b border-line">
+                <th className={`${TH} text-left`}>Contract</th>
+                <th className={`${TH} text-left`}>State</th>
+                <th className={`${TH} text-right`}>Qty</th>
+                <th className={`${TH} text-right`}>Avg</th>
+                <th className={`${TH} text-right`}>Stop</th>
+                <th className={`${TH} text-right`}>LTP</th>
+                <th className={`${TH} text-right`}>P&amp;L</th>
+                <th className={`${TH} text-right`}>Price age</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((p) => (
                 <tr key={p.id} className="border-b border-line last:border-0">
-                  <td className="py-2 type-body text-fg">
+                  <td className="py-2 type-body-strong text-fg">
                     {[p.instrument, p.strike, p.option_type].filter((x) => x != null && x !== '').join(' ')}
                     {p.halted && <span className="ml-2 type-label text-loss">Halted</span>}
                   </td>
@@ -172,7 +175,7 @@ export function PositionsCard({ s, compact }: { s: TelemetrySample; compact: boo
                   <td className={`py-2 text-right num-medium ${p.mtm == null ? 'text-fg' : p.mtm < 0 ? 'text-loss' : p.mtm > 0 ? 'text-profit' : 'text-fg'}`}>
                     {p.mtm == null ? '—' : signedMoney(p.mtm)}
                   </td>
-                  <td className="py-2 text-right num-medium text-fg-muted">{p.ltp_age_secs == null ? '—' : ago(p.ltp_age_secs)}</td>
+                  <td className="py-2 text-right num-medium text-fg-subtle">{p.ltp_age_secs == null ? '—' : ago(p.ltp_age_secs)}</td>
                 </tr>
               ))}
             </tbody>
@@ -188,21 +191,21 @@ export function EndpointCard({ title, rows, keyLabel, errorLabel }: { title: str
   return (
     <Card title={title} note="p95 over 30 s">
       {rows.length === 0 ? (
-        <p className="py-2 type-caption text-fg-muted">No calls yet.</p>
+        <p className="py-2 type-body text-fg-subtle">No calls yet.</p>
       ) : (
         <table className="w-full table-fixed">
           <thead>
-            <tr className="border-b border-line type-caption text-fg-muted">
-              <th className="py-2 text-left font-normal">{keyLabel}</th>
-              <th className="w-[70px] py-2 text-right font-normal">Calls</th>
-              <th className="w-[70px] py-2 text-right font-normal">{errorLabel}</th>
-              <th className="w-[80px] py-2 text-right font-normal">p95</th>
+            <tr className="border-b border-line">
+              <th className={`${TH} text-left`}>{keyLabel}</th>
+              <th className={`${TH} w-[70px] text-right`}>Calls</th>
+              <th className={`${TH} w-[70px] text-right`}>{errorLabel}</th>
+              <th className={`${TH} w-[80px] text-right`}>p95</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((r) => (
               <tr key={r.endpoint} className="border-b border-line last:border-0">
-                <td className="break-all py-2 pr-3 font-mono text-[12px] text-fg">{r.endpoint}</td>
+                <td className="break-all py-2 pr-3 type-mono text-fg">{r.endpoint}</td>
                 <td className="py-2 text-right num-medium text-fg">{count(r.total)}</td>
                 <td className={`py-2 text-right num-medium ${r.errors > 0 ? 'text-loss' : 'text-fg'}`}>{count(r.errors)}</td>
                 <td className="py-2 text-right num-medium text-fg">{ms(r.p95_ms)}</td>

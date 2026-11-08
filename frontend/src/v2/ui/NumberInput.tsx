@@ -1,14 +1,17 @@
 import { useState, type KeyboardEvent } from 'react';
 
-// Figma "Input": a well with the value and its unit (%, ×, ₹). Edits are
-// kept here until Enter or leaving the field; only a number actually typed,
-// valid and different, is committed. Escape puts the saved value back.
+// Figma "Input": an inset well with the value and its unit (%, ×, ₹). Edits
+// are kept here until Enter or leaving the field; only a number actually
+// typed, valid and different, is committed, and once the commit says it went
+// through (`onCommit` returns or resolves `true`) the well flashes accent for
+// a moment to say it saved. Escape puts the saved value back.
 
 const GROUPED = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 });
 
 export function NumberInput({ value, onCommit, unit, min, max, decimals = 0, grouped = false, size = 'md', label, disabled = false, width = 'w-[120px]' }: {
   value: number;
-  onCommit: (n: number) => void;
+  /** `true` (or a promise of it) once the value is stored: only then does the well flash "saved". */
+  onCommit: (n: number) => boolean | void | Promise<boolean | void>;
   unit?: string;
   min: number;
   max: number;
@@ -25,13 +28,21 @@ export function NumberInput({ value, onCommit, unit, min, max, decimals = 0, gro
   const [draft, setDraft] = useState<string | null>(null);
   // Typed into since focus. Focusing and leaving alone never saves.
   const [typed, setTyped] = useState(false);
+  // Commits so far: keying the well on it restarts the "saved" flash.
+  const [saves, setSaves] = useState(0);
   const shown = grouped ? GROUPED.format(value) : value.toFixed(decimals);
   const text = draft ?? shown;
   const parsed = draft == null ? value : Number(draft.replace(/,/g, '').trim());
   const valid = draft == null || (draft.trim() !== '' && Number.isFinite(parsed) && parsed >= min && parsed <= max);
 
   function commit() {
-    if (draft != null && typed && valid && parsed !== value) onCommit(parsed);
+    if (draft != null && typed && valid && parsed !== value) {
+      // A refused or failed save (no write access, offline) must not look saved.
+      void Promise.resolve(onCommit(parsed)).then(
+        (ok) => ok === true && setSaves((n) => n + 1),
+        () => undefined,
+      );
+    }
     setDraft(null);
     setTyped(false);
   }
@@ -48,9 +59,10 @@ export function NumberInput({ value, onCommit, unit, min, max, decimals = 0, gro
   return (
     <div className="flex flex-col items-end gap-1">
       <label
-        className={`flex items-center gap-2 rounded-6 border bg-inset px-3 transition-colors focus-within:border-line-strong ${
-          size === 'lg' ? 'h-11' : 'h-9'
-        } ${valid ? 'border-line' : 'border-loss'} ${disabled ? 'opacity-50' : ''} ${width}`}
+        key={saves}
+        className={`flex items-center gap-2 border bg-inset px-3 transition-colors duration-120 focus-within:border-accent has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-accent has-[:focus-visible]:outline-offset-2 ${
+          size === 'lg' ? 'h-11 rounded-8' : 'h-9 rounded-6'
+        } ${valid ? 'border-line' : 'border-loss'} ${disabled ? 'opacity-50' : ''} ${saves > 0 ? 'animate-saved' : ''} ${width}`}
       >
         <input
           type="text"
@@ -67,9 +79,9 @@ export function NumberInput({ value, onCommit, unit, min, max, decimals = 0, gro
           }}
           onBlur={commit}
           onKeyDown={onKey}
-          className="min-w-0 flex-1 bg-transparent num-medium text-fg outline-none"
+          className="min-w-0 flex-1 bg-transparent num-medium text-fg outline-none placeholder:text-fg-subtle"
         />
-        {unit && <span className="shrink-0 type-caption text-fg-muted">{unit}</span>}
+        {unit && <span className="shrink-0 type-caption text-fg-subtle">{unit}</span>}
       </label>
       {!valid && (
         <span className="type-caption text-loss">

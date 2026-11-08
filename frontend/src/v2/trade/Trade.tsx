@@ -36,6 +36,7 @@ import {
 import { money, price, signedPct, toneOf, todayIst } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { ChainAnswer, ExpiriesAnswer } from '../lib/types';
+import { useTickFlash } from '../lib/useTickFlash';
 import { useGuard } from '../shell/useGuard';
 import { Segment } from '../ui/Segment';
 import { useToast } from '../ui/toast';
@@ -154,30 +155,37 @@ function withPending(p: ExecutePosition, pending: Record<string, Pending>, now: 
   return { ...p, chart: { stop, targets } };
 }
 
-/** Figma "Index tab": the index, its value and the day's change. */
+/** Figma "Index tab": the index, its value (flashing its tint as it ticks)
+ * and the day's change. A white tile; the selected one is outlined and
+ * tinted in accent. */
+function IndexTab({ index, spot, changePct, on, onSelect }: { index: string; spot: number | null; changePct: number | null; on: boolean; onSelect: () => void }) {
+  const flash = useTickFlash(spot, true, index);
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={on}
+      onClick={onSelect}
+      className={`flex min-w-[124px] shrink-0 flex-col rounded-8 border px-3 py-2 text-left transition-colors duration-120 ${on ? 'border-accent bg-accent-subtle' : 'border-line bg-panel hover:bg-raised/40'}`}
+    >
+      <span className="type-caption text-fg-muted">{index}</span>
+      <span className="flex items-baseline gap-1.5">
+        <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium text-fg ${flash.className}`}>
+          {spot == null ? '—' : price(spot)}
+        </span>
+        {changePct != null && <span className={`num-small ${TONE_TEXT[toneOf(changePct)]}`}>{signedPct(changePct)}</span>}
+      </span>
+    </button>
+  );
+}
+
 function IndexTabs({ indices, selected, onSelect }: { indices: { index: string; spot: number | null; change_pct: number | null }[]; selected: string; onSelect: (i: string) => void }) {
   const by = new Map(indices.map((i) => [i.index, i]));
   return (
     <div role="tablist" aria-label="Index" className="flex min-w-0 gap-2 overflow-x-auto">
       {INDEX_ORDER.map((index) => {
         const i = by.get(index);
-        const on = index === selected;
-        return (
-          <button
-            key={index}
-            type="button"
-            role="tab"
-            aria-selected={on}
-            onClick={() => onSelect(index)}
-            className={`flex min-w-[124px] shrink-0 flex-col rounded-8 border px-3 py-2 text-left ${on ? 'border-line-strong bg-raised' : 'border-line hover:bg-raised/50'}`}
-          >
-            <span className="type-caption text-fg-muted">{index}</span>
-            <span className="flex items-baseline gap-1.5">
-              <span className="num-medium text-fg">{i?.spot == null ? '—' : price(i.spot)}</span>
-              {i?.change_pct != null && <span className={`num-small ${TONE_TEXT[toneOf(i.change_pct)]}`}>{signedPct(i.change_pct)}</span>}
-            </span>
-          </button>
-        );
+        return <IndexTab key={index} index={index} spot={i?.spot ?? null} changePct={i?.change_pct ?? null} on={index === selected} onSelect={() => onSelect(index)} />;
       })}
     </div>
   );
@@ -539,7 +547,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           : past
             ? 'Stop · past the price, sells all here'
             : `Stop ${approxMoney(levelPnl(lvl, p, indexNow, delta))}`;
-        return [{ key: 'label', text, color }];
+        return [{ key: 'label', text, color, filled: past }];
       },
       axisText: (at) => price(at),
     };
@@ -691,7 +699,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       header={desktop ? undefined : expiryPicker('lg', true)}
     />
   ) : (
-    <p className="px-4 py-6 type-body text-fg-muted">{frame?.board_error ?? (frame ? 'No option chain yet — it loads after the Kotak login.' : 'Connecting…')}</p>
+    <p className="px-4 py-6 type-body text-fg-subtle">{frame?.board_error ?? (frame ? 'No option chain yet — it loads after the Kotak login.' : 'Connecting…')}</p>
   );
 
   const sheetEl = sheet && (
@@ -734,10 +742,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         <div ref={splitBox} className="flex min-h-0 flex-1 flex-col">
           {chartHidden ? (
             <div className="shrink-0 px-2 pb-3">
-              <button type="button" onClick={() => showChart(true)} className="flex h-10 w-full items-center gap-2 rounded-12 border border-line bg-inset px-3 text-left">
+              <button type="button" onClick={() => showChart(true)} className="flex h-10 w-full items-center gap-2 rounded-12 border border-line bg-panel px-3 text-left">
                 <ChartCandlestick size={16} className="text-fg-muted" />
                 <span className="type-label text-fg">Show chart</span>
-                <span className="min-w-0 flex-1 truncate type-caption text-fg-muted">
+                <span className="min-w-0 flex-1 truncate type-caption text-fg-subtle">
                   {symbolLabel(saved.slots[0].sym)} · {saved.slots[0].tf}
                 </span>
                 <ChevronDown size={16} className="text-fg-muted" />
@@ -780,9 +788,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           <span className="flex-1" />
           <Segment label="Chart library" size="sm" value={saved.chartLib} onChange={setLib} options={CHART_LIBS} />
           <span className="type-label text-fg-muted">Charts</span>
-          <div role="tablist" aria-label="Charts" className="flex gap-1 rounded-8 bg-inset p-1">
+          <div role="tablist" aria-label="Charts" className="flex gap-1 rounded-8 border border-line bg-inset p-1">
             {layouts.map(({ n, icon: Icon, label }) => (
-              <button key={n} type="button" role="tab" aria-selected={saved.layout === n} aria-label={label} onClick={() => save((s) => ({ ...s, layout: n }))} className={`grid size-7 place-items-center rounded-6 ${saved.layout === n ? 'bg-raised text-fg' : 'text-fg-muted hover:text-fg'}`}>
+              <button key={n} type="button" role="tab" aria-selected={saved.layout === n} aria-label={label} onClick={() => save((s) => ({ ...s, layout: n }))} className={`grid size-7 place-items-center rounded-6 transition-colors duration-120 ${saved.layout === n ? 'bg-panel text-accent shadow-sm' : 'text-fg-muted hover:text-fg'}`}>
                 <Icon size={16} />
               </button>
             ))}
@@ -851,7 +859,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         paper={account}
       />
       {!chartStopsOn && scalps.length > 0 && (
-        <p className="shrink-0 type-caption text-fg-muted">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
+        <p className="shrink-0 type-caption text-fg-subtle">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
       )}
       {sheetEl}
     </div>

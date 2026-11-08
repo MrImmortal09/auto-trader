@@ -14,11 +14,11 @@ import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
 import { FeedLatency } from './FeedLatency';
 import { OrderTiming } from './OrderTiming';
-import { PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
+import { Note, PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
 import { StoredData } from './StoredData';
 import { UserReport } from './UserReport';
 
-const INPUT = 'rounded-6 border border-line bg-inset px-2.5 text-fg outline-none placeholder:text-fg-muted focus:border-line-strong disabled:opacity-50';
+const INPUT = 'rounded-6 border border-line bg-inset px-2.5 text-fg transition-colors duration-120 placeholder:text-fg-subtle focus:border-accent disabled:opacity-50';
 
 /** "Last signed in 26 Oct 15:44", or "Never signed in". */
 function lastLogin(u: AdminUser): string {
@@ -169,7 +169,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
   const list = users.data ?? [];
   const rows =
     users.data == null ? (
-      <Row title={users.error ? `Couldn't load the users: ${users.error}` : 'Loading…'} />
+      <Note tone={users.error ? 'loss' : 'subtle'}>{users.error ? `Couldn't load the users: ${users.error}` : 'Loading…'}</Note>
     ) : (
       list.map((u) => {
         const isAdmin = u.role === 'admin';
@@ -186,13 +186,13 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
                     {who}
                   </button>
                 )}
-                {isAdmin && <Chip kind="live">Admin</Chip>}
+                {isAdmin && <Chip kind="accent">Admin</Chip>}
                 {!u.enabled && <Chip kind="loss">Disabled</Chip>}
               </span>
             }
             caption={
               <>
-                <div>{`+91 ${formatPhone(u.phone)} · ${lastLogin(u)} · added ${shortDate(u.created_at.slice(0, 10))}`}</div>
+                <div className="text-fg-subtle tnum">{`+91 ${formatPhone(u.phone)} · ${lastLogin(u)} · added ${shortDate(u.created_at.slice(0, 10))}`}</div>
                 {u.paper && <PaperLine p={u.paper} />}
               </>
             }
@@ -229,7 +229,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
       }}
     >
       <span className="relative flex items-center">
-        <span className="pointer-events-none absolute left-2.5 type-caption text-fg-muted">+91</span>
+        <span className="pointer-events-none absolute left-2.5 type-caption text-fg-subtle">+91</span>
         <input
           type="tel"
           inputMode="numeric"
@@ -239,11 +239,11 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
           value={phone}
           disabled={adding}
           onChange={(e) => setPhone(e.target.value.replace(/[^\d\s+-]/g, ''))}
-          className={`${INPUT} ${large ? 'h-11 w-full' : 'h-8 w-[160px]'} pl-9 num-small tracking-[0.06em]`}
+          className={`${INPUT} ${large ? 'h-11 w-full' : 'h-8 w-[172px]'} pl-9 num-small tracking-[0.06em]`}
         />
       </span>
       <input type="text" aria-label="Name" placeholder="Name (optional)" maxLength={60} value={name} disabled={adding} onChange={(e) => setName(e.target.value)} className={`${INPUT} ${large ? 'h-11 w-full' : 'h-8 flex-1'} type-body`} />
-      <Button size={size} kind="profit" type="submit" icon={<UserPlus size={14} />} disabled={adding || phone.replace(/\D/g, '').length < 10}>
+      <Button size={size} kind="accent" type="submit" icon={<UserPlus size={14} />} disabled={adding || phone.replace(/\D/g, '').length < 10}>
         {adding ? 'Adding…' : 'Add'}
       </Button>
     </form>
@@ -268,7 +268,8 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
               <span className="flex items-center gap-2">
                 <span className="truncate">{label}</span>
                 {isToday && <Chip>Today</Chip>}
-                {isInProgress && <Chip kind="live">In progress</Chip>}
+                {/* Marigold means real money (LIVE) only. */}
+                {isInProgress && <Chip kind="accent">In progress</Chip>}
               </span>
             }
           >
