@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, Layers as LayersIcon, Maximize2, Minimize2 } from 'lucide-react';
+import { ChartSpline, ChevronDown, ChevronUp, Layers as LayersIcon, Maximize2, Minimize2 } from 'lucide-react';
 import { INDEX_ORDER } from '../../lib/execute';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
@@ -10,11 +10,13 @@ import { Segment } from '../ui/Segment';
 import type { CrosshairBus } from './bus';
 import { markChartActive, useChartKeymap } from './chartKeymap';
 import { DrawBanner, DrawMenu } from './DrawMenu';
-import { useDrawing, type DrawApi } from './drawings';
+import { DrawToolbar } from './DrawToolbar';
+import { useDrawing, useDrawPrefs, type DrawApi, type DrawTool } from './drawings';
 import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type Placing } from './KChart';
 import type { Layers } from './lines';
 import { CANDLE_STYLES, CHART_LIBS, sameSym, symbolLabel, symbolName, type Bar, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { drawableStudies, STUDIES } from './studies';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 const TFS: Tf[] = ['1m', '5m', '15m'];
@@ -92,25 +94,39 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   fullscreen?: boolean;
   onFullscreen?: (on: boolean) => void;
 }) {
-  const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | null>(null);
+  const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | 'studies' | null>(null);
   const [chartState, setChartState] = useState<{ loading: boolean; error: string | null; last: Bar | null }>({ loading: true, error: null, last: null });
   // Drawing tools (KLineChart or Vela), while it draws this chart.
   const drawApi = useRef<DrawApi | null>(null);
   const { drawing, pick: pickTool, cancel: cancelDrawing } = useDrawing(useCallback(() => drawApi.current, []));
+  // The desktop KLine chart's toolbar: its eraser, and the switches every
+  // KLine chart shares (magnet, lock, hide).
+  const toolbar = lib !== 'vela' && !compact;
+  const [erasing, setErasing] = useState(false);
+  const [drawPrefs, setDrawPrefs] = useDrawPrefs();
+  useEffect(() => {
+    drawApi.current?.setErasing?.(erasing);
+  }, [erasing]);
+  // A tool picked while drawings are hidden shows them again.
+  const pickDesktop = (tool: DrawTool) => {
+    setErasing(false);
+    if (drawPrefs.hidden) setDrawPrefs({ hidden: false });
+    pickTool(tool);
+  };
   useChartKeymap(chartId, useCallback(() => drawApi.current, []), placing != null);
 
   // Escape leaves full screen, but not while a level is being placed, a
-  // drawing tool is being used, or a menu or dialog is open.
+  // drawing tool or the eraser is being used, or a menu or dialog is open.
   useEffect(() => {
     if (!fullscreen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      if (placing != null || drawing != null || menu != null || document.querySelector('[role="dialog"]')) return;
+      if (placing != null || drawing != null || erasing || menu != null || document.querySelector('[role="dialog"]')) return;
       onFullscreen?.(false);
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [fullscreen, placing, drawing, menu, onFullscreen]);
+  }, [fullscreen, placing, drawing, erasing, menu, onFullscreen]);
 
   // The expiry the picker lists strikes for: what was picked on this
   // chart's current instrument, else the charted option's, else the nearest.
@@ -156,6 +172,42 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
     const row = atmRow.current;
     if (box && row) box.scrollTop = row.offsetTop - box.clientHeight / 2 + row.offsetHeight / 2;
   }, [menu, chain, atm]);
+
+  // KLineChart's indicators (Vela has its own menu): over the price, then each
+  // in a pane under it, RSI and CCI being the Layers menu's two.
+  const setStudy = (name: string, on: boolean) =>
+    onLayers({ ...layers, studies: STUDIES.filter((s) => (s.name === name ? on : layers.studies.includes(s.name))).map((s) => s.name) });
+  const studyRow = (s: (typeof STUDIES)[number]) => {
+    const noVolume = s.volume === true && sym.kind === 'index';
+    return (
+      <CheckboxRow
+        key={s.name}
+        checked={layers.studies.includes(s.name)}
+        // Picked on an option's chart, it can still be taken off here.
+        disabled={noVolume && !layers.studies.includes(s.name)}
+        title={s.title}
+        note={noVolume ? 'Needs volume: an index has none, chart an option' : s.note}
+        onChange={(v) => setStudy(s.name, v)}
+      />
+    );
+  };
+  // In the Layers menu (phone), which has its own RSI and CCI rows.
+  const studyList = (oscillators: boolean) => (
+    <>
+      <div className="px-2 pt-1 pb-1 type-caption text-fg-muted">Over the price</div>
+      {STUDIES.filter((s) => s.over).map(studyRow)}
+      <div className="px-2 pt-3 pb-1 type-caption text-fg-muted">Under the price, each in its own pane</div>
+      {oscillators && (
+        <>
+          <CheckboxRow checked={layers.rsi} title="RSI · Relative strength" note="14 bars, lines at 70 and 30" onChange={(v) => onLayers({ ...layers, rsi: v })} />
+          <CheckboxRow checked={layers.cci} title="CCI · Commodity channel" note="20 bars, lines at +100 and −100" onChange={(v) => onLayers({ ...layers, cci: v })} />
+        </>
+      )}
+      {STUDIES.filter((s) => !s.over).map(studyRow)}
+    </>
+  );
+  // What the chart draws: a volume study isn't, on an index.
+  const studyCount = drawableStudies(layers.studies, sym.kind === 'index').length + (layers.rsi ? 1 : 0) + (layers.cci ? 1 : 0);
 
   return (
     // Not clipped as a whole: its menus (the symbol picker, Layers) open over
@@ -272,7 +324,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             ))}
           </div>
         )}
-        {lib !== 'vela' && (
+        {lib !== 'vela' && compact && (
           <DrawMenu
             open={menu === 'draw'}
             onToggle={() => setMenu(menu === 'draw' ? null : 'draw')}
@@ -298,6 +350,24 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           >
             {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
           </button>
+        )}
+        {lib !== 'vela' && !compact && (
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              aria-label="Indicators"
+              title="Indicators"
+              aria-expanded={menu === 'studies'}
+              onClick={() => setMenu(menu === 'studies' ? null : 'studies')}
+              className={`flex h-8 items-center gap-1 rounded-6 px-1.5 hover:bg-raised hover:text-fg ${studyCount > 0 ? 'text-accent' : 'text-fg-muted'}`}
+            >
+              <ChartSpline size={16} />
+              {studyCount > 0 && <span className="num-small">{studyCount}</span>}
+            </button>
+            <Popover open={menu === 'studies'} onClose={close} align="right" scroll>
+              {studyList(true)}
+            </Popover>
+          </div>
         )}
         <div className="relative shrink-0">
           <button type="button" aria-label="Layers" aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
@@ -333,6 +403,13 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                 <Segment label="Chart library" size="sm" value={lib} onChange={onLib} options={CHART_LIBS} />
               </div>
             )}
+            {lib !== 'vela' && compact && (
+              <>
+                <div className="mx-2 mt-3 border-t border-line" />
+                <div className="px-2 pt-3 pb-1 type-label text-fg">Indicators</div>
+                {studyList(false)}
+              </>
+            )}
           </Popover>
         </div>
         {onHide && !fullscreen && (
@@ -342,69 +419,97 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
         )}
       </header>
       <div className="relative min-h-0 flex-1 overflow-hidden">
-        {lib === 'vela' ? (
-          <Suspense fallback={null}>
-            <VChart
-              chartId={chartId}
-              serverBase={serverBase}
-              sym={sym}
-              tf={tf}
-              lines={lines}
-              markers={markers}
-              vwap={layers.vwap}
-              pivots={layers.pivots}
-              rsi={layers.rsi}
-              cci={layers.cci}
-              style={style}
-              placing={placing}
-              onPlacingDone={onPlacingDone}
-              bus={bus}
-              onState={onState}
-              onStyle={onStyle}
-              onStudies={(s) => {
-                if (s.rsi !== layers.rsi || s.cci !== layers.cci) onLayers({ ...layers, ...s });
+        <div className="absolute inset-0 flex">
+          {toolbar && (
+            <DrawToolbar
+              active={drawing}
+              erasing={erasing}
+              prefs={drawPrefs}
+              onPick={pickDesktop}
+              onCursor={() => {
+                cancelDrawing();
+                setErasing(false);
               }}
-              drawRef={drawApi}
+              onErase={() => {
+                cancelDrawing();
+                setErasing((on) => !on);
+              }}
+              onPrefs={setDrawPrefs}
+              onUndo={() => drawApi.current?.undo()}
+              onRedo={() => drawApi.current?.redo()}
+              onClear={() => drawApi.current?.clear()}
+              disabled={placing != null}
             />
-          </Suspense>
-        ) : (
-          <KChart
-            chartId={chartId}
-            serverBase={serverBase}
-            sym={sym}
-            tf={tf}
-            lines={lines}
-            markers={markers}
-            vwap={layers.vwap}
-            pivots={layers.pivots}
-            rsi={layers.rsi}
-            cci={layers.cci}
-            style={style}
-            placing={placing}
-            onPlacingDone={onPlacingDone}
-            bus={bus}
-            onState={onState}
-            compact={compact}
-            drawRef={drawApi}
-          />
-        )}
-        {drawing && !placing && lib !== 'vela' && <DrawBanner tool={drawing} onCancel={cancelDrawing} />}
-        {placing && (
-          <div className="pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center">
-            <div className="pointer-events-auto flex items-center gap-3 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-md">
-              <span className="type-label text-fg">Tap where the {placing.what} goes</span>
-              {placing.lots && <LotsStepper lots={placing.lots} />}
-              <button type="button" onClick={onCancelPlacing} className="type-label text-fg-muted hover:text-fg">
-                Cancel
-              </button>
-            </div>
+          )}
+          <div className="relative min-w-0 flex-1">
+            {lib === 'vela' ? (
+              <Suspense fallback={null}>
+                <VChart
+                  chartId={chartId}
+                  serverBase={serverBase}
+                  sym={sym}
+                  tf={tf}
+                  lines={lines}
+                  markers={markers}
+                  vwap={layers.vwap}
+                  pivots={layers.pivots}
+                  rsi={layers.rsi}
+                  cci={layers.cci}
+                  style={style}
+                  placing={placing}
+                  onPlacingDone={onPlacingDone}
+                  bus={bus}
+                  onState={onState}
+                  onStyle={onStyle}
+                  onStudies={(s) => {
+                    if (s.rsi !== layers.rsi || s.cci !== layers.cci) onLayers({ ...layers, ...s });
+                  }}
+                  drawRef={drawApi}
+                />
+              </Suspense>
+            ) : (
+              <KChart
+                chartId={chartId}
+                serverBase={serverBase}
+                sym={sym}
+                tf={tf}
+                lines={lines}
+                markers={markers}
+                vwap={layers.vwap}
+                pivots={layers.pivots}
+                rsi={layers.rsi}
+                cci={layers.cci}
+                studies={layers.studies}
+                style={style}
+                placing={placing}
+                onPlacingDone={onPlacingDone}
+                bus={bus}
+                onState={onState}
+                compact={compact}
+                drawRef={drawApi}
+              />
+            )}
+            {(drawing || erasing) && !placing && lib !== 'vela' && (
+              <DrawBanner tool={drawing ?? 'erase'} onCancel={drawing ? cancelDrawing : () => setErasing(false)} onFinish={drawing === 'v2Path' ? () => drawApi.current?.finish?.() : undefined} />
+            )}
+            {placing && (
+              <div className="pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center">
+                <div className="pointer-events-auto flex items-center gap-3 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-md">
+                  <span className="type-label text-fg">Tap where the {placing.what} goes</span>
+                  {placing.lots && <LotsStepper lots={placing.lots} />}
+                  <button type="button" onClick={onCancelPlacing} className="type-label text-fg-muted hover:text-fg">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+            {(chartState.loading || chartState.error) && (
+              <div className="pointer-events-none absolute inset-0 grid place-items-center">
+                <span className={`rounded-8 bg-panel/90 px-3 py-1.5 type-caption ${chartState.error ? 'text-loss' : 'text-fg-subtle'}`}>{chartState.error ?? 'Loading bars…'}</span>
+              </div>
+            )}
           </div>
-        )}
-        {(chartState.loading || chartState.error) && (
-          <div className="pointer-events-none absolute inset-0 grid place-items-center">
-            <span className={`rounded-8 bg-panel/90 px-3 py-1.5 type-caption ${chartState.error ? 'text-loss' : 'text-fg-subtle'}`}>{chartState.error ?? 'Loading bars…'}</span>
-          </div>
-        )}
+        </div>
       </div>
     </section>
   );

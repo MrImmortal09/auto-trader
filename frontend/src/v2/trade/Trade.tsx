@@ -55,6 +55,7 @@ import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, 
 import { usePhoneSplit } from './phoneSplit';
 import { SplitHandle } from './SplitHandle';
 import { TradingPanel } from './panel/TradingPanel';
+import { knownStudies } from './studies';
 import { PositionSheet, ScalpBar, type PaperAccount, type PositionHandlers } from './Positions';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -115,7 +116,7 @@ function loadSaved(): Saved {
     if (!s?.sym) return d;
     const sym = s.sym.kind === 'option' && s.sym.expiry < today ? { kind: 'index' as const, index: s.sym.index } : s.sym;
     const style: CandleStyle = s.style === 'bars' || s.style === 'area' ? s.style : 'candles';
-    return { sym, tf: s.tf ?? '5m', layers: { ...DEFAULT_LAYERS, ...s.layers }, style };
+    return { sym, tf: s.tf ?? '5m', layers: { ...DEFAULT_LAYERS, ...s.layers, studies: knownStudies(s.layers?.studies) }, style };
   });
   const expiry = Object.fromEntries(Object.entries(saved.expiry ?? {}).filter(([index, date]) => INDEX_ORDER.includes(index) && typeof date === 'string' && date >= today));
   return {
