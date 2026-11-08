@@ -1,4 +1,4 @@
-use shared_domain::{current_ist_timestamp_string, DbWriteMessage, MonitoredPosition};
+use shared_domain::{current_ist_timestamp_string, ArchivedCandle, DbWriteMessage, MonitoredPosition};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use shared_domain::{telemetry, FeatureFlags, TradingConfig};
 use std::str::FromStr;
@@ -252,6 +252,25 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             source TEXT NOT NULL,
             PRIMARY KEY (symbol, t)
         )",
+    ).execute(&pool).await.unwrap();
+
+    // The permanent 1-minute archive (see `candles::archive`): the indices and
+    // every listed future on them, with volume and OI, never pruned, so a past
+    // day's VWAP and pivots can be rebuilt after Upstox stops serving the
+    // contract. About 170 MB a year (Upstox sends a row for every minute,
+    // traded or not). New table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS candle_archive (
+            symbol TEXT NOT NULL,
+            t INTEGER NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL,
+            oi REAL NOT NULL,
+            PRIMARY KEY (symbol, t)
+        ) WITHOUT ROWID",
     ).execute(&pool).await.unwrap();
 
     // Upstox option-chain analytics (see `market_data.rs`). New table, so this
@@ -857,6 +876,12 @@ pub async fn db_writer(
                     telemetry::db_write_error("candle");
                 }
             }
+            DbWriteMessage::ArchiveCandles { symbol, candles } => {
+                if let Err(e) = write_archived_candles(&pool, &symbol, &candles).await {
+                    tracing::error!(symbol, error = %e, "DB candle archive insert");
+                    telemetry::db_write_error("candle_archive");
+                }
+            }
             DbWriteMessage::TelegramMessage { chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, instrument, strike, side, edited } => {
                 // An edit keeps the first-seen send time and title, and
                 // replaces the text and how it was routed.
@@ -914,6 +939,33 @@ pub async fn prune_candles(pool: &SqlitePool, before: i64) {
 /// [`prune_candles`] for a spawned task.
 pub async fn prune_candles_owned(pool: SqlitePool, before: i64) {
     prune_candles(&pool, before).await;
+}
+
+/// One symbol's archived candles in one transaction; a stored minute is
+/// replaced by the newer answer for it.
+async fn write_archived_candles(pool: &SqlitePool, symbol: &str, candles: &[ArchivedCandle]) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    for c in candles {
+        sqlx::query(
+            "INSERT INTO candle_archive (symbol, t, open, high, low, close, volume, oi)
+             VALUES (?,?,?,?,?,?,?,?)
+             ON CONFLICT(symbol, t) DO UPDATE SET
+               open = excluded.open, high = excluded.high, low = excluded.low,
+               close = excluded.close, volume = excluded.volume, oi = excluded.oi",
+        )
+        .bind(symbol).bind(c.t).bind(c.open).bind(c.high).bind(c.low).bind(c.close).bind(c.volume).bind(c.oi)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+/// Unix ms of the newest archived minute of `symbol`, if any.
+pub async fn last_archived_minute(pool: &SqlitePool, symbol: &str) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT MAX(t) FROM candle_archive WHERE symbol = ?")
+        .bind(symbol)
+        .fetch_one(pool)
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1200,45 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row, (Some(-1001), Some("Alpha Calls".into()), Some("CE".into()), Some(25_000.0), Some("27962".into())));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn archived_candles_keep_their_volume_and_a_newer_answer_replaces_a_minute() {
+        let db = TempDb::new("candle-archive");
+        let pool = init_db(&db.url()).await;
+        assert_eq!(last_archived_minute(&pool, "NIFTY:FUT:2026-11-24").await.unwrap(), None);
+
+        let candle = |t: i64, close: f64, volume: f64| ArchivedCandle {
+            t, open: 25_000.0, high: 25_010.0, low: 24_990.0, close, volume, oi: 1_500_000.0,
+        };
+        let (tx, rx) = mpsc::channel(4);
+        let writer = tokio::spawn(db_writer(rx, pool.clone(), Arc::new(BalanceCache::new())));
+        tx.send(DbWriteMessage::ArchiveCandles {
+            symbol: "NIFTY:FUT:2026-11-24".into(),
+            candles: vec![candle(60_000, 25_005.0, 1_200.0), candle(120_000, 25_007.0, 800.0)],
+        }).await.unwrap();
+        // The next sweep fetches the same day again: a minute is replaced,
+        // never doubled.
+        tx.send(DbWriteMessage::ArchiveCandles {
+            symbol: "NIFTY:FUT:2026-11-24".into(),
+            candles: vec![candle(120_000, 25_008.0, 950.0)],
+        }).await.unwrap();
+        tx.send(DbWriteMessage::ArchiveCandles { symbol: "NIFTY".into(), candles: vec![candle(180_000, 24_950.0, 0.0)] })
+            .await
+            .unwrap();
+        drop(tx);
+        writer.await.unwrap();
+
+        let rows: Vec<(i64, f64, f64, f64)> = sqlx::query_as(
+            "SELECT t, close, volume, oi FROM candle_archive WHERE symbol = 'NIFTY:FUT:2026-11-24' ORDER BY t",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, [(60_000, 25_005.0, 1_200.0, 1_500_000.0), (120_000, 25_008.0, 950.0, 1_500_000.0)]);
+        assert_eq!(last_archived_minute(&pool, "NIFTY:FUT:2026-11-24").await.unwrap(), Some(120_000));
+        assert_eq!(last_archived_minute(&pool, "NIFTY").await.unwrap(), Some(180_000));
         pool.close().await;
     }
 

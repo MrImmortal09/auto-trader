@@ -465,6 +465,25 @@ impl UpstoxClient {
         .map_err(|e| UpstoxError::Decode(e.to_string()))?
     }
 
+    /// Every future on the `wanted` underlyings in an instruments file — the
+    /// near, next and far months — stream-filtered the same way as
+    /// [`Self::nearest_index_futures`].
+    pub async fn index_futures(&self, instruments_url: &str, wanted: &[&str]) -> Result<Vec<Derivative>, UpstoxError> {
+        let gz = self.download_instruments(instruments_url).await?;
+        let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
+
+        tokio::task::spawn_blocking(move || {
+            let reader = BufReader::new(flate2::read::GzDecoder::new(&gz[..]));
+            let mut de = serde_json::Deserializer::from_reader(reader);
+            let rows = FutFilter { wanted: &wanted }
+                .deserialize(&mut de)
+                .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))?;
+            Ok(rows.iter().filter_map(to_derivative).collect())
+        })
+        .await
+        .map_err(|e| UpstoxError::Decode(e.to_string()))?
+    }
+
     /// The gzipped bytes of an instruments file (a few MB; the rows are
     /// decompressed and filtered as a stream by the callers).
     async fn download_instruments(&self, instruments_url: &str) -> Result<bytes::Bytes, UpstoxError> {

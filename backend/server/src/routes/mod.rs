@@ -24,6 +24,7 @@ pub mod auth_phone;
 pub use auth_phone::{otp_request_handler, otp_verify_handler, me_handler};
 pub mod admin;
 pub use admin::{list_users_handler, create_user_handler, patch_user_handler, delete_user_handler};
+pub mod admin_data;
 pub mod admin_paper;
 pub mod admin_report;
 pub mod market;

@@ -983,11 +983,14 @@ async fn main() {
     let market = Arc::new(market_data::MarketDataState::new(upstox.is_some()));
     if let Some(client) = upstox.clone() {
         tokio::spawn(market_data::run_poller(
-            client,
+            client.clone(),
             Arc::clone(&market),
             write_tx.clone(),
             Arc::clone(&indicator_feed),
         ));
+        // The permanent 1-minute archive of the indices and their futures,
+        // swept after each day's close (see `candles::archive`).
+        tokio::spawn(candles::archive::run(client, pool.clone(), write_tx.clone()));
     }
 
     // 9c. Kotak balance for the dashboard: hourly and after every LIVE trade,
@@ -1110,6 +1113,7 @@ async fn main() {
         .route("/api/admin/trades",                 get(routes::admin_paper::trades_handler))
         .route("/api/admin/positions",              get(routes::admin_paper::positions_handler))
         .route("/api/admin/users/:id/report",       get(routes::admin_report::report_handler))
+        .route("/api/admin/data",                   get(routes::admin_data::data_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))

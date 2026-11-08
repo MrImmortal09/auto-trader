@@ -1462,6 +1462,22 @@ pub struct OrderRequest {
 // Internal persistence channel
 // ===========================================================================
 
+/// One finished 1-minute candle for the permanent archive (see
+/// [`DbWriteMessage::ArchiveCandles`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArchivedCandle {
+    /// Unix ms of the minute's start.
+    pub t: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    /// Traded in the minute; 0 for an index, which has none.
+    pub volume: f64,
+    /// Open interest at the minute; 0 for an index.
+    pub oi: f64,
+}
+
 /// Message sent over the `mpsc` channel to the dedicated SQLite writer task.
 ///
 /// Defined here (not in `server`) so both `trading_engine` and `server` can
@@ -1527,6 +1543,14 @@ pub enum DbWriteMessage {
         close: f64,
         volume: Option<f64>,
         source: &'static str,
+    },
+    /// Finished 1-minute candles for the permanent archive, all one symbol's,
+    /// written in one transaction (analytics only — from Upstox, never read
+    /// by the engine). Upstox's latest answer for a minute replaces any
+    /// stored one.
+    ArchiveCandles {
+        symbol: String,
+        candles: Vec<ArchivedCandle>,
     },
     /// A message from a monitored Telegram chat, for the v2 Desk's feed
     /// (display only — never read by the engine). Kept per chat and message

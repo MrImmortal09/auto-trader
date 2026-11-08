@@ -5,11 +5,68 @@
 //! ```text
 //! UPSTOX_ANALYTICS_TOKEN=... cargo run -p upstox_client --bin upstox_probe
 //! ```
+//!
+//! With `archive`, it checks only what the candle archive fetches instead
+//! (and opens no feed): every listed index future, and 1-minute candles with
+//! volume across the archive's backfill window.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use upstox_client::{UpstoxClient, NSE_INSTRUMENTS_URL};
+use chrono::NaiveDate;
+use upstox_client::{Candle, UpstoxClient, BSE_INSTRUMENTS_URL, NSE_INSTRUMENTS_URL};
+
+/// The candle archive's backfill: 92 days, in 28-day requests.
+async fn archive_check(client: &UpstoxClient, today: NaiveDate) {
+    let summary = |c: &[Candle]| {
+        let day = |ms: i64| {
+            chrono::DateTime::from_timestamp_millis(ms).map(|t| t.with_timezone(&shared_domain::ist_offset()).date_naive())
+        };
+        let volume: f64 = c.iter().map(|c| c.volume).sum();
+        let with_volume = c.iter().filter(|c| c.volume > 0.0).count();
+        format!(
+            "{} candles, {:?}..{:?}, {with_volume} with volume, total {volume}, last oi {:?}",
+            c.len(),
+            c.first().and_then(|c| day(c.start_ms)),
+            c.last().and_then(|c| day(c.start_ms)),
+            c.last().map(|c| c.oi),
+        )
+    };
+    let mut keys = vec![("NIFTY index".to_string(), "NSE_INDEX|Nifty 50".to_string())];
+    for (url, wanted) in [
+        (NSE_INSTRUMENTS_URL, &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"][..]),
+        (BSE_INSTRUMENTS_URL, &["SENSEX", "BANKEX"][..]),
+    ] {
+        let mut futures = client.index_futures(url, wanted).await.expect("instruments");
+        futures.sort_by(|a, b| (&a.underlying, a.expiry).cmp(&(&b.underlying, b.expiry)));
+        for f in &futures {
+            println!("future {} {} {}", f.underlying, f.expiry, f.instrument_key);
+        }
+        for name in ["NIFTY", "SENSEX"] {
+            if let Some(far) = futures.iter().filter(|f| f.underlying == name).max_by_key(|f| f.expiry) {
+                keys.push((format!("{name} future {}", far.expiry), far.instrument_key.clone()));
+            }
+        }
+    }
+    let mut from = today - chrono::Days::new(92);
+    while from < today {
+        let to = (from + chrono::Days::new(27)).min(today - chrono::Days::new(1));
+        for (name, key) in &keys {
+            match client.historical_candles(key, 1, from, to).await {
+                Ok(c) => println!("historical 1m {name} {from}..{to}: {}", summary(&c)),
+                Err(e) => println!("historical 1m {name} {from}..{to}: {e}"),
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        from = to + chrono::Days::new(1);
+    }
+    for (name, key) in &keys {
+        match client.intraday_candles(key, 1).await {
+            Ok(c) => println!("intraday 1m {name} (today {today}): {}", summary(&c)),
+            Err(e) => println!("intraday 1m {name}: {e}"),
+        }
+    }
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -17,6 +74,10 @@ async fn main() {
     let client = UpstoxClient::new(token.trim()).expect("build client");
     let today = shared_domain::today_ist();
     let index = "NSE_INDEX|Nifty 50";
+    if std::env::args().nth(1).as_deref() == Some("archive") {
+        archive_check(&client, today).await;
+        return;
+    }
 
     match client.intraday_candles(index, 1).await {
         Ok(c) => println!("intraday 1m {index}: {} candles, first {:?}, last {:?}", c.len(), c.first(), c.last()),

@@ -287,6 +287,44 @@ export interface AdminTradesAnswer {
   realized: number;
 }
 
+/** What the server's database keeps (`GET /api/admin/data`). */
+export interface StoredData {
+  /** The database file, its write-ahead log aside. */
+  db_bytes: number;
+  tables: StoredTable[];
+  /** Indices first, each followed by its futures by expiry. */
+  archive: ArchivedSymbol[];
+  /** Upstox is configured, so the daily archive sweep runs. */
+  archiving: boolean;
+}
+
+export interface StoredTable {
+  table: string;
+  label: string;
+  what: string;
+  /** "Forever", "30 days", "Today". */
+  kept: string;
+  rows: number;
+  /** IST `YYYY-MM-DD HH:MM:SS` of the oldest and newest row. */
+  first: string | null;
+  last: string | null;
+}
+
+/** One index or future in the candle archive. */
+export interface ArchivedSymbol {
+  /** `NIFTY`, or `NIFTY:FUT:2026-11-24`. */
+  symbol: string;
+  index: string;
+  /** A future's expiry; null for the index. */
+  expiry: string | null;
+  first_day: string;
+  last_day: string;
+  days: number;
+  candles: number;
+  /** Candles that traded; an index never does. */
+  with_volume: number;
+}
+
 /** One open paper position (`GET /api/admin/positions`). */
 export interface AdminPosition {
   user_id: number;

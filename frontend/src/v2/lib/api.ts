@@ -31,6 +31,7 @@ import type {
   RawPosition,
   SessionUser,
   StatusAnswer,
+  StoredData,
   SystemAnswer,
   TelegramState,
   TrendAnswer,
@@ -223,6 +224,8 @@ export function getAdminTrades(base: string, user: number | null, from: string |
   return getJson<AdminTradesAnswer>(base, `/api/admin/trades${q.size ? `?${q}` : ''}`);
 }
 export const getAdminPositions = (base: string) => getJson<AdminPosition[]>(base, '/api/admin/positions');
+/** What the database keeps, and the candle archive's coverage. */
+export const getStoredData = (base: string) => getJson<StoredData>(base, '/api/admin/data');
 /** One user's paper P&L over the IST days `from`..`to` (from their first fill without `from`). */
 export function getUserReport(base: string, user: number, from: string | null, to: string) {
   const q = new URLSearchParams({ to });

@@ -13,6 +13,7 @@ import { Modal } from '../ui/Modal';
 import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
 import { PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
+import { StoredData } from './StoredData';
 import { UserReport } from './UserReport';
 
 const INPUT = 'rounded-6 border border-line bg-inset px-2.5 text-fg outline-none placeholder:text-fg-muted focus:border-line-strong disabled:opacity-50';
@@ -204,6 +205,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
         </Section>
         <PaperPositions serverBase={serverBase} users={list} />
         <PaperTrades serverBase={serverBase} users={list} desktop={desktop} />
+        <StoredData serverBase={serverBase} />
       </div>
       {removing && (
         <Modal open onClose={() => setRemoving(null)} label="Remove user" width="lg:max-w-[400px]">
