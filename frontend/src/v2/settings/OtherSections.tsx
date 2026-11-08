@@ -7,7 +7,6 @@ import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
 import { Row, Section } from './parts';
 import { uptimeText } from './summary';
-import { UpdateServer } from './UpdateServer';
 import type { SettingsState } from './useSettings';
 
 /** Trade: how its orders go, which is fixed. */
@@ -22,12 +21,14 @@ export function TradeNotes({ flags, id, title }: { flags: Flags | null; id?: str
   );
 }
 
+/** The GitHub Actions workflow that deploys the server. */
+const DEPLOY_WORKFLOW = 'https://github.com/MrImmortal09/auto-trader/actions/workflows/deploy.yml';
+
 /** Server and data: what's running, the paper wallet and the P&L charges. */
-export function ServerData({ serverBase, settings, system, onRestarted, id, title, large = false }: {
+export function ServerData({ serverBase, settings, system, id, title, large = false }: {
   serverBase: string;
   settings: SettingsState;
   system: SystemAnswer | null;
-  onRestarted: () => void;
   id?: string;
   title?: string;
   large?: boolean;
@@ -62,8 +63,10 @@ export function ServerData({ serverBase, settings, system, onRestarted, id, titl
       <Row title="Brokerage per order" caption="A flat charge per order in the P&L figures. What Kotak charges doesn't change.">
         <NumberInput label="Brokerage per order" value={cfg.brokerage_per_order} min={0} max={1000} grouped unit="₹" size={size} onCommit={(n) => void save(() => ({ brokerage_per_order: n }), `Brokerage ₹${n} an order`)} />
       </Row>
-      <Row title="Update the server" caption="The latest release from GitHub. It restarts in about a minute, and goes back to this one if the new one fails.">
-        <UpdateServer serverBase={serverBase} size={size} onRestarted={onRestarted} />
+      <Row title="Updates" caption="Every merge to main is released and deployed by GitHub Actions: the server restarts on the new release (about 30 s), and goes back to this one if the new one fails. Run it again, or an older release, from the deploy workflow.">
+        <a href={DEPLOY_WORKFLOW} target="_blank" rel="noreferrer" className="inline-flex h-7 shrink-0 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">
+          Deploys
+        </a>
       </Row>
       <Row title="Clear the database" caption="In the old design, which asks first.">
         <a href="/v1/settings" className="inline-flex h-7 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">

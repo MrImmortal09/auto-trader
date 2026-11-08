@@ -1,6 +1,7 @@
 name: Build and Release Server Binary
 
-# Only run build and release on commits pushed to main
+# Build and release on every commit pushed to main, then deploy it to the VM
+# (deploy.yml).
 on:
   push:
     branches:
@@ -12,6 +13,9 @@ permissions:
 jobs:
   release-server:
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      asset_name: ${{ steps.version.outputs.asset_name }}
 
     env:
       CARGO_TERM_COLOR: always
@@ -71,3 +75,12 @@ jobs:
           make_latest: true
           files: |
             dist/${{ steps.version.outputs.asset_name }}
+
+  # Every release goes live straight away, at any time of day (see deploy.yml).
+  deploy:
+    needs: release-server
+    uses: ./.github/workflows/deploy.yml
+    with:
+      release_tag: ${{ needs.release-server.outputs.release_tag }}
+      asset_name: ${{ needs.release-server.outputs.asset_name }}
+    secrets: inherit

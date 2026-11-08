@@ -161,7 +161,6 @@ mod tests {
         (POST, "/api/settings/clear_database", Access::Admin),
         (GET, "/api/wallet/balance", Access::Admin),
         (POST, "/api/wallet/balance", Access::Admin),
-        (POST, "/api/update_server", Access::Admin),
         (POST, "/api/auth/kotak", Access::Admin),
         (GET, "/api/auth/kotak", Access::Admin),
         (POST, "/api/auth/kotak/auto-login", Access::Admin),

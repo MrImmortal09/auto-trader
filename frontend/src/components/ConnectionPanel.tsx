@@ -22,7 +22,6 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
     kotak_connected: false,
     scrip_loaded_at: null,
   });
-  const [isUpdating, setIsUpdating] = useState(false);
 
   useEffect(() => {
     if (!serverBase) return;
@@ -74,45 +73,6 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
     }
   };
 
-  const handleUpdate = async () => {
-    if (!hasWriteAccess) {
-      openUnlockModal('Updating server requires Write Access');
-      return;
-    }
-    if (!confirm('Are you sure you want to update the server? This will download the latest release, disconnect everything, and restart the server.')) return;
-    setIsUpdating(true);
-    // The server kills itself (via tmux C-c) before it can flush the HTTP
-    // response, so fetch() almost always rejects with a network error. That
-    // is NOT a failure — it means the update script started successfully.
-    // Only treat an explicit HTTP 500 body as a real error.
-    let explicitError: string | null = null;
-    try {
-      const res = await apiFetch(serverBase, '/api/update_server', { method: 'POST' });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        explicitError = body?.error ?? `HTTP ${res.status}`;
-      }
-    } catch {
-      // Network error = server died mid-response = update is running. Fall through.
-    }
-
-    if (explicitError) {
-      alert(`Failed to trigger update: ${explicitError}`);
-      setIsUpdating(false);
-      return;
-    }
-
-    // Poll /api/health until the new server comes back up, then reload.
-    const pollTimer = setInterval(async () => {
-      try {
-        const res = await apiFetch(serverBase, '/api/health');
-        if (res.ok) {
-          clearInterval(pollTimer);
-          window.location.reload();
-        }
-      } catch (e) {}
-    }, 2000);
-  };
 
   // The backend formats this in IST, so compare against today *in IST* rather
   // than the viewer's local date — the dashboard can be open from any timezone
@@ -175,21 +135,21 @@ export function ConnectionPanel({ serverBase, onServerBaseChange }: {
           </div>
         </div>
         <div className="flex gap-2 w-full sm:w-auto justify-end">
-          {/* Update Server */}
-          <button
-            onClick={handleUpdate}
-            disabled={isUpdating}
-            className={`btn-sm transition-colors shadow-sm ${isUpdating ? 'bg-primary/50 text-on-primary cursor-wait' : 'bg-primary hover:bg-primary/90 text-on-primary font-medium'}`}
-            title="Download latest binary and restart"
+          {/* Updates are deployed by GitHub Actions on every merge to main. */}
+          <a
+            href="https://github.com/MrImmortal09/auto-trader/actions/workflows/deploy.yml"
+            target="_blank"
+            rel="noreferrer"
+            className="btn-sm transition-colors shadow-sm bg-primary hover:bg-primary/90 text-on-primary font-medium"
+            title="Every merge to main is deployed by GitHub Actions; run it again or roll back from here"
           >
-            {isUpdating ? 'Updating...' : 'Update Server'}
-          </button>
+            Deploys
+          </a>
 
           {/* Hard reset (restarts server) — kept for emergencies */}
           <button
             id="btn-reset-all-connections"
             onClick={handleReset}
-            disabled={isUpdating}
             className="btn-sm bg-error-container hover:bg-error text-on-error-container hover:text-on-error border border-error/30 transition-colors disabled:opacity-50 font-medium"
             title="Full reset — restarts the server process"
           >

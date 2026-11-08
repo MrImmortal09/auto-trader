@@ -1,0 +1,227 @@
+name: Deploy server
+
+# Deploys a server release to the VM over SSH, in place of the old
+# backend/server/update.sh: syncs ~/auto-trader to the release's commit (the
+# Kotak bridge is plain JS read at spawn), installs that release's binary,
+# restarts it in tmux pane 0:0, health-checks it, and rolls back — binary and
+# source — if it doesn't come up.
+#
+# Runs after every release (release-server.yml calls it), at any time of day:
+# a restart leaves the engine down for about 10-30 s, open positions included.
+# Run it by hand from the Actions tab to deploy again, or to go back to an
+# older release (give its tag).
+#
+# Secrets: ORACLE_VM_HOST, ORACLE_VM_USER, ORACLE_VM_SSH_KEY (a key used only
+# for deploys) and ORACLE_VM_FINGERPRINT (the VM's SSH host key, SHA256:…).
+#
+# The server must run from ~/auto-trader/backend: it finds ../frontend/dist
+# and ../kotak-bridge relative to its working directory.
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      asset_name:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release to deploy (e.g. server-v0.1.160). Empty deploys the latest.
+        required: false
+        type: string
+
+# One deploy at a time, in order; a queued one is never cancelled.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ inputs.asset_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          fi
+          if [ -z "$ASSET" ]; then
+            ASSET=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -E '^server-.*-x86_64-unknown-linux-gnu$' | head -n1 || true)
+          fi
+          if [ -z "$TAG" ] || [ -z "$ASSET" ]; then
+            echo "::error::Could not resolve the release (tag '$TAG', asset '$ASSET')"
+            exit 1
+          fi
+          # Only names a release would have: they end up in a shell on the VM.
+          [[ "$TAG" =~ ^server-v[0-9.]+$ ]] || { echo "::error::Unexpected tag '$TAG'"; exit 1; }
+          [[ "$ASSET" =~ ^server-[0-9.]+-x86_64-unknown-linux-gnu$ ]] || { echo "::error::Unexpected asset '$ASSET'"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "Deploying $TAG ($ASSET)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy on the VM
+        uses: appleboy/ssh-action@v1
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          ASSET: ${{ steps.release.outputs.asset }}
+          REPO_SLUG: ${{ github.repository }}
+        with:
+          host: ${{ secrets.ORACLE_VM_HOST }}
+          username: ${{ secrets.ORACLE_VM_USER }}
+          key: ${{ secrets.ORACLE_VM_SSH_KEY }}
+          fingerprint: ${{ secrets.ORACLE_VM_FINGERPRINT }}
+          envs: TAG,ASSET,REPO_SLUG
+          command_timeout: 10m
+          script: |
+            set -uo pipefail
+            REPO="$HOME/auto-trader"
+            BACKEND="$REPO/backend"
+            PANE="0:0"
+            HEALTH="http://127.0.0.1:8080/api/health"
+            VERSION_URL="http://127.0.0.1:8080/api/version"
+            BACKUP="$BACKEND/.server_prev"
+            exec > >(tee -a /tmp/deploy.log) 2>&1
+            echo "[$(date '+%F %T')] ===== Deploy $TAG ($ASSET) ====="
+
+            # Processes are found by name or exact command line, never with
+            # `pkill -f <pattern>`: this script runs as `bash -c "<script>"`,
+            # so its own command line holds every pattern written here.
+            server_pids() { pgrep '^server-[0-9]' || true; }
+            bridge_pids() {
+              for pid in $(pgrep -x node; pgrep -x bash); do
+                case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
+                  "node index.js "|"bash -c node index.js ") echo "$pid" ;;
+                esac
+              done
+            }
+            stop_server() {
+              tmux send-keys -t "$PANE" C-c 2>/dev/null || true
+              for _ in 1 2 3 4 5; do
+                [ -z "$(server_pids)" ] && break
+                sleep 1
+              done
+              local pids
+              pids="$(server_pids) $(bridge_pids)"
+              if [ -n "${pids// /}" ]; then kill $pids 2>/dev/null || true; fi
+              sleep 1
+            }
+            start_server() {
+              tmux send-keys -t "$PANE" "cd $BACKEND && ./$1" C-m
+            }
+            # Up, and reporting the version it should (`$1`, e.g. 0.1.163), so
+            # an old process still holding the port never passes for the new one.
+            healthy() {
+              for i in $(seq 1 15); do
+                sleep 2
+                if curl -sf "$HEALTH" >/dev/null 2>&1; then
+                  running=$(curl -sf "$VERSION_URL" 2>/dev/null | grep -o '"version":"[^"]*"' | cut -d '"' -f 4)
+                  if [ "$running" = "$1" ]; then return 0; fi
+                  echo "  ...up, but reports version '$running', not '$1' ($i/15)"
+                else
+                  echo "  ...not up yet ($i/15)"
+                fi
+              done
+              return 1
+            }
+            version_of() { basename "$1" | sed -E 's/^server-([0-9.]+)-.*/\1/'; }
+
+            # 1. Everything slow or fragile happens before the server stops.
+            TMP_BIN="/tmp/$ASSET"
+            # RELEASES_BASE is only ever set by deploy-test.yml.
+            RELEASES="${RELEASES_BASE:-https://github.com/$REPO_SLUG/releases/download}"
+            if ! curl -fsSL "$RELEASES/$TAG/$ASSET" -o "$TMP_BIN"; then
+              echo "FATAL: download failed; the running server is untouched"
+              exit 1
+            fi
+            chmod +x "$TMP_BIN"
+
+            # 2. What is running now: the binary behind the live process.
+            CURRENT_BIN=""
+            for pid in $(server_pids); do
+              CURRENT_BIN=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+              [ -n "$CURRENT_BIN" ] && break
+            done
+            if [ -z "$CURRENT_BIN" ]; then
+              CURRENT_BIN=$(ls -t "$BACKEND"/server-*-x86_64-unknown-linux-gnu 2>/dev/null | head -n1 || true)
+            fi
+            echo "Running now: ${CURRENT_BIN:-nothing}"
+            if [ "$CURRENT_BIN" = "$BACKEND/$ASSET" ] && [ -n "$(server_pids)" ]; then
+              echo "Already running $ASSET; nothing to do."
+              rm -f "$TMP_BIN"
+              exit 0
+            fi
+
+            # 3. The source follows the release (the bridge is read at spawn);
+            #    remember where it was for a rollback.
+            cd "$REPO" || { echo "FATAL: no $REPO"; exit 1; }
+            PREV_HEAD=$(git rev-parse HEAD 2>/dev/null || true)
+            if ! git fetch origin --tags --prune --force; then
+              echo "FATAL: git fetch failed; the running server is untouched"
+              exit 1
+            fi
+            if ! git reset --hard "refs/tags/$TAG"; then
+              echo "FATAL: git reset to $TAG failed; the running server is untouched"
+              [ -n "$PREV_HEAD" ] && git reset --hard "$PREV_HEAD"
+              exit 1
+            fi
+            echo "Source now at $(git rev-parse --short HEAD)"
+
+            # 4. Back up the live binary, then the downtime: stop, swap, start.
+            if [ -n "$CURRENT_BIN" ] && [ -f "$CURRENT_BIN" ]; then cp "$CURRENT_BIN" "$BACKUP"; fi
+            echo "Stopping the server..."
+            stop_server
+            mv "$TMP_BIN" "$BACKEND/$ASSET"
+            chmod +x "$BACKEND/$ASSET"
+            echo "Starting $ASSET in tmux $PANE..."
+            start_server "$ASSET"
+
+            # 5. Healthy: prune. Not: put the previous binary and source back.
+            if healthy "$(version_of "$ASSET")"; then
+              for f in "$BACKEND"/server-*-x86_64-unknown-linux-gnu; do
+                [ "$f" = "$BACKEND/$ASSET" ] && continue
+                [ "$f" = "$CURRENT_BIN" ] && continue
+                rm -f "$f"
+              done
+              echo "[$(date '+%F %T')] ===== Deployed $TAG ====="
+              exit 0
+            fi
+
+            echo "FATAL: $ASSET failed its health check after 30 s"
+            if [ -n "$CURRENT_BIN" ] && [ -f "$BACKUP" ]; then
+              echo "Rolling back to $(basename "$CURRENT_BIN")"
+              stop_server
+              [ -n "$PREV_HEAD" ] && git -C "$REPO" reset --hard "$PREV_HEAD"
+              cp "$BACKUP" "$CURRENT_BIN"
+              chmod +x "$CURRENT_BIN"
+              start_server "$(basename "$CURRENT_BIN")"
+              if healthy "$(version_of "$CURRENT_BIN")"; then
+                echo "Rolled back: $(basename "$CURRENT_BIN") is up again. Check the account."
+              else
+                echo "Rollback did not come up either. Manual intervention needed NOW: the account may be unattended."
+              fi
+            else
+              echo "No previous binary to roll back to. Manual intervention needed NOW: the account may be unattended."
+            fi
+            echo "[$(date '+%F %T')] ===== Deploy of $TAG FAILED ====="
+            exit 1
+
+      - name: Summary
+        if: success()
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          echo "Live on the VM: ${TAG#server-v} (GET /api/version agrees)" >> "$GITHUB_STEP_SUMMARY"
