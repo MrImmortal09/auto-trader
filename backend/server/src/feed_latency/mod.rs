@@ -165,6 +165,16 @@ fn position_watches(positions: &[MonitoredPosition]) -> Vec<Watch> {
         .collect()
 }
 
+/// What to watch: the indices, the near futures, then each held contract that
+/// isn't one of those already (a held near-month future is watched once).
+fn watch_set(futures: &[Watch], held: Vec<Watch>) -> Vec<Watch> {
+    let mut out = index_watches();
+    out.extend(futures.iter().cloned());
+    let mut keys: HashSet<String> = out.iter().map(|w| w.upstox_key.clone()).collect();
+    out.extend(held.into_iter().filter(|w| keys.insert(w.upstox_key.clone())));
+    out
+}
+
 /// The three measurements, in the order the panel shows them.
 #[derive(Debug, Default)]
 struct Measures {
@@ -354,8 +364,15 @@ impl FeedLatency {
         st.record(i, recv_ms, samples);
     }
 
+    /// The Upstox stream dropped: the resubscribe snapshot after it reconnects
+    /// is each instrument's last trade, not a delay, so each matcher starts
+    /// its Upstox side over.
     fn upstox_failed(&self, error: String) {
-        self.state().upstox_error = Some(error);
+        let mut st = self.state();
+        st.upstox_error = Some(error);
+        for x in st.instruments.iter_mut() {
+            x.matcher.reset_upstox();
+        }
     }
 
     fn kotak_lagged(&self, n: u64) {
@@ -453,8 +470,23 @@ pub async fn run(
         tracing::info!("Feed latency: measuring");
 
         let (keys_tx, keys_rx) = watch::channel(BTreeSet::<String>::new());
-        let (tick_tx, mut tick_rx) = mpsc::channel::<LtpTick>(4096);
-        let stream = tokio::spawn(stream_with_backoff(client.clone(), keys_rx, tick_tx, Arc::clone(&me)));
+        let (raw_tx, mut raw_rx) = mpsc::channel::<LtpTick>(4096);
+        let (tick_tx, mut tick_rx) = mpsc::channel::<(LtpTick, i64)>(4096);
+        let stream = tokio::spawn(stream_with_backoff(client.clone(), keys_rx, raw_tx, Arc::clone(&me)));
+        // Each Upstox tick is stamped the moment it leaves the stream, not when
+        // this loop gets to it: time the loop spends elsewhere must not count
+        // as Upstox's delay (Kotak's ticks are stamped at their tap too).
+        let relay = tokio::spawn(async move {
+            while let Some(tick) = raw_rx.recv().await {
+                if tick_tx.send((tick, now_ms())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // The futures lookup downloads Upstox's instruments files: it runs in
+        // its own task so this loop never waits on the network.
+        let (lookup_tx, mut lookup_rx) = mpsc::channel::<Result<Vec<Watch>, String>>(1);
+        let mut lookup_running = false;
         let mut kotak_rx = kotak_client::subscribe_ticks();
         let mut kotak_channel: Option<mpsc::UnboundedSender<String>> = None;
         let mut kotak_sent: HashSet<String> = HashSet::new();
@@ -466,22 +498,21 @@ pub async fn run(
                     if !shared_domain::is_market_open() {
                         break;
                     }
-                    if futures.as_ref().is_none_or(|(day, _)| *day != today) && tokio::time::Instant::now() >= futures_retry_at {
-                        match near_futures(&client, today).await {
-                            Ok(list) => futures = Some((today, list)),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Feed latency: Upstox futures lookup failed — indices and held contracts only for now");
-                                futures_retry_at = tokio::time::Instant::now() + FUTURES_RETRY;
-                            }
-                        }
+                    if !lookup_running
+                        && futures.as_ref().is_none_or(|(day, _)| *day != today)
+                        && tokio::time::Instant::now() >= futures_retry_at
+                    {
+                        lookup_running = true;
+                        let (client, tx) = (client.clone(), lookup_tx.clone());
+                        tokio::spawn(async move {
+                            let _ = tx.send(near_futures(&client, today).await.map_err(|e| e.to_string())).await;
+                        });
                     }
-                    let mut watches = index_watches();
-                    if let Some((day, list)) = &futures {
-                        if *day == today {
-                            watches.extend(list.iter().cloned());
-                        }
-                    }
-                    watches.extend(position_watches(&positions.read().await));
+                    let todays_futures: &[Watch] = match &futures {
+                        Some((day, list)) if *day == today => list,
+                        _ => &[],
+                    };
+                    let watches = watch_set(todays_futures, position_watches(&positions.read().await));
                     me.set_watches(&watches);
                     let keys: BTreeSet<String> = watches.iter().map(|w| w.upstox_key.clone()).collect();
                     keys_tx.send_if_modified(|current| {
@@ -504,7 +535,17 @@ pub async fn run(
                         }
                     }
                 }
-                Some(tick) = tick_rx.recv() => me.on_upstox(&tick, now_ms()),
+                Some(found) = lookup_rx.recv() => {
+                    lookup_running = false;
+                    match found {
+                        Ok(list) => futures = Some((today, list)),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Feed latency: Upstox futures lookup failed — indices and held contracts only for now");
+                            futures_retry_at = tokio::time::Instant::now() + FUTURES_RETRY;
+                        }
+                    }
+                }
+                Some((tick, recv_ms)) = tick_rx.recv() => me.on_upstox(&tick, recv_ms),
                 tick = kotak_rx.recv() => match tick {
                     Ok(t) => me.on_kotak(&t.key, t.ltp, t.at_ms),
                     Err(broadcast::error::RecvError::Lagged(n)) => me.kotak_lagged(n),
@@ -515,6 +556,7 @@ pub async fn run(
 
         drop(keys_tx);
         stream.abort();
+        relay.abort();
         me.close_day();
         tracing::info!("Feed latency: market closed, stopped");
     }
@@ -589,6 +631,19 @@ mod tests {
         assert_eq!(nearest_futures(&list, &["NIFTY"], date(11, 24))[0].upstox_key, "NSE_FO|61471");
         let after = nearest_futures(&list, &["NIFTY"], date(11, 25));
         assert_eq!((after[0].label.as_str(), after[0].upstox_key.as_str()), ("NIFTY DEC FUT", "NSE_FO|58875"));
+    }
+
+    #[test]
+    fn a_held_near_month_future_is_watched_once() {
+        let nov = future_watch("NIFTY", NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(), "NSE_FO|61471").unwrap();
+        let held_future = Watch { label: "NIFTY".into(), class: Class::Position, upstox_key: "NSE_FO|61471".into(), kotak_key: "nse_fo|61471".into(), kotak_subscribe: None };
+        let held_option = Watch { label: "NIFTY 25000 CE".into(), class: Class::Position, upstox_key: "NSE_FO|47155".into(), kotak_key: "nse_fo|47155".into(), kotak_subscribe: None };
+        let watches = watch_set(std::slice::from_ref(&nov), vec![held_future, held_option.clone()]);
+        let keys: Vec<&str> = watches.iter().map(|w| w.upstox_key.as_str()).collect();
+        assert_eq!(keys.iter().filter(|k| **k == "NSE_FO|61471").count(), 1);
+        assert_eq!(watches.iter().find(|w| w.upstox_key == "NSE_FO|61471").unwrap().class, Class::Future);
+        assert_eq!(watches.last(), Some(&held_option));
+        assert_eq!(watches.len(), INDEX_NAMES.len() + 2);
     }
 
     #[test]

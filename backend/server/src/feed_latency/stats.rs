@@ -116,6 +116,13 @@ impl Matcher {
         out
     }
 
+    /// The Upstox stream dropped: its first tick after reconnecting is a
+    /// snapshot of the last trade again, so it only sets where prices start.
+    pub fn reset_upstox(&mut self) {
+        self.last_upstox_ltp = None;
+        self.upstox.clear();
+    }
+
     /// A Kotak tick received at `recv_ms`.
     pub fn kotak(&mut self, ltp: f64, recv_ms: i64) -> Vec<Sample> {
         keep(self.kotak_samples(ltp, recv_ms))
@@ -254,6 +261,17 @@ mod tests {
         assert!(m.upstox(100.0, 0, 11_000).is_empty(), "no trade time");
         // A reconnect's snapshot of a trade a minute old is no delay.
         assert!(m.upstox(100.5, 20_000, 80_000).is_empty());
+    }
+
+    #[test]
+    fn after_a_reconnect_the_first_upstox_tick_is_a_snapshot_again() {
+        let mut m = Matcher::default();
+        m.upstox(100.0, 1_000, 1_100);
+        assert_eq!(m.upstox(101.0, 2_000, 2_150), [Sample::UpstoxDelay(150.0)]);
+        m.reset_upstox();
+        // The resubscribe snapshot: a trade from 20 s ago, new to the matcher.
+        assert!(m.upstox(102.0, 3_000, 23_000).is_empty());
+        assert_eq!(m.upstox(103.0, 24_000, 24_120), [Sample::UpstoxDelay(120.0)]);
     }
 
     #[test]
