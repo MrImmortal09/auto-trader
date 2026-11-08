@@ -793,12 +793,29 @@ const ENTRY_RETRY_THROTTLE: Duration = Duration::from_secs(5);
 /// retried well before it matters.
 const UNCERTAIN_ENTRY_GRACE: Duration = Duration::from_secs(20);
 
-/// True at/after 15:39 IST, for the remainder of the day.
+/// True at/after the entry cutoff IST, for the remainder of the day:
+/// - on a date with a special session:
+///   - Saturday/Sunday: minute >= session.end
+///   - weekday: minute >= max(15:39, session.end)
+/// - other dates: minute >= 15:39
+pub fn is_entry_cutoff_passed_at(now: chrono::DateTime<chrono::FixedOffset>) -> bool {
+    use chrono::{Datelike, Timelike};
+    let minute = now.hour() * 60 + now.minute();
+    let regular_cutoff = NO_ENTRY_HOUR * 60 + NO_ENTRY_MINUTE;
+    if let Some(session) = shared_domain::special_session_on(now.date_naive()) {
+        let is_weekend = matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        if is_weekend {
+            minute >= session.end
+        } else {
+            minute >= std::cmp::max(regular_cutoff, session.end)
+        }
+    } else {
+        minute >= regular_cutoff
+    }
+}
+
 pub fn is_entry_cutoff_passed() -> bool {
-    use chrono::Timelike;
-    let now = shared_domain::now_ist();
-    let (h, m) = (now.hour(), now.minute());
-    h > NO_ENTRY_HOUR || (h == NO_ENTRY_HOUR && m >= NO_ENTRY_MINUTE)
+    is_entry_cutoff_passed_at(shared_domain::now_ist())
 }
 
 /// Why a `WaitingForEntry` position should be abandoned rather than left to
@@ -5217,6 +5234,63 @@ pub async fn start_position_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ist_time(y: i32, m: u32, d: u32, hr: u32, min: u32) -> chrono::DateTime<chrono::FixedOffset> {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(hr, min, 0)
+            .unwrap()
+            .and_local_timezone(shared_domain::ist_offset())
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn entry_cutoff_with_and_without_special_session() {
+        let _guard = shared_domain::special_sessions_test_guard();
+        use shared_domain::{set_special_sessions, SpecialSession};
+
+        // 1. Weekend with session (Sunday 2026-11-08, 14:20–15:30)
+        let sunday = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        set_special_sessions(vec![SpecialSession {
+            date: sunday,
+            start: 14 * 60 + 20,
+            end: 15 * 60 + 30,
+        }]);
+        assert!(!is_entry_cutoff_passed_at(ist_time(2026, 11, 8, 14, 25)));
+        assert!(!is_entry_cutoff_passed_at(ist_time(2026, 11, 8, 15, 29)));
+        assert!(is_entry_cutoff_passed_at(ist_time(2026, 11, 8, 15, 30)));
+        assert!(is_entry_cutoff_passed_at(ist_time(2026, 11, 8, 16, 0)));
+
+        // 2. Weekday with session ending before 15:39 (Wednesday 2026-11-04, 14:20–15:30)
+        let wednesday = chrono::NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
+        set_special_sessions(vec![SpecialSession {
+            date: wednesday,
+            start: 14 * 60 + 20,
+            end: 15 * 60 + 30,
+        }]);
+        // max(15:39, 15:30) = 15:39
+        assert!(!is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 15, 35)));
+        assert!(!is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 15, 38)));
+        assert!(is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 15, 39)));
+
+        // 3. Weekday with session ending after 15:39 (Wednesday 2026-11-04, 18:00–19:15)
+        set_special_sessions(vec![SpecialSession {
+            date: wednesday,
+            start: 18 * 60,
+            end: 19 * 60 + 15,
+        }]);
+        // max(15:39, 19:15) = 19:15
+        assert!(!is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 15, 40)));
+        assert!(!is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 18, 30)));
+        assert!(!is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 19, 14)));
+        assert!(is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 19, 15)));
+
+        // 4. Regular date with no session
+        set_special_sessions(vec![]);
+        assert!(!is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 15, 38)));
+        assert!(is_entry_cutoff_passed_at(ist_time(2026, 11, 4, 15, 39)));
+    }
 
     fn position_created_at(created_at: &str) -> MonitoredPosition {
         MonitoredPosition {

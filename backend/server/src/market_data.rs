@@ -195,13 +195,26 @@ const POLL_END_MINUTE: u32 = 15 * 60 + 31;
 /// download and parse do not land on top of the 09:15 open on the small VM.
 const FUTURES_REFRESH_START_MINUTE: u32 = 9 * 60;
 
-/// True on a weekday when the IST minute-of-day is within `start..=end`.
+/// True on a weekday when the IST minute-of-day is within `start..=end`,
+/// or on a special session date from 15 min before START (for futures refresh)
+/// or START (for quotes) through END+1.
 fn weekday_minute_between(start: u32, end: u32) -> bool {
     let now = shared_domain::now_ist();
+    let m = now.hour() * 60 + now.minute();
+    if let Some(session) = shared_domain::special_session_on(now.date_naive()) {
+        let session_start = if start == FUTURES_REFRESH_START_MINUTE {
+            session.start.saturating_sub(15)
+        } else {
+            session.start
+        };
+        let session_end = session.end + 1;
+        if (session_start..=session_end).contains(&m) {
+            return true;
+        }
+    }
     if matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
         return false;
     }
-    let m = now.hour() * 60 + now.minute();
     (start..=end).contains(&m)
 }
 

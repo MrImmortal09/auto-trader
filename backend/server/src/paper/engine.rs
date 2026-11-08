@@ -70,7 +70,14 @@ pub fn decide(
         }
         return None;
     }
-    if !(trading_day && t >= at(9, 15, 0) && t < close) {
+    let in_window = if shared_domain::special_session_on(now.date_naive()).is_some() {
+        use chrono::Datelike;
+        let is_weekend = matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        shared_domain::in_special_session_at(now) || (trading_day && !is_weekend && t >= at(9, 15, 0) && t < close)
+    } else {
+        trading_day && t >= at(9, 15, 0) && t < close
+    };
+    if !in_window {
         return None;
     }
     let hit = shared_domain::chart_hit(Some(&pos.option_type), &pos.chart, premium, index, pos.lots())?;
@@ -190,6 +197,7 @@ mod tests {
 
     #[test]
     fn chart_levels_sell_only_in_market_hours_and_only_on_a_fresh_premium() {
+        let _guard = shared_domain::special_sessions_test_guard();
         let stop = ChartLevel { price: 25_060.0, trigger: LevelTrigger::Index };
         let target = ChartLevel { price: 140.0, trigger: LevelTrigger::Premium };
         let target = ChartTarget { id: "t".into(), price: target.price, trigger: target.trigger, lots: None };
@@ -210,6 +218,36 @@ mod tests {
         // Closed market, or a holiday.
         assert_eq!(decide(&later, ist((2026, 10, 27), (9, 14, 0)), true, Some(95.0), Some(25_000.0)), None);
         assert_eq!(decide(&later, open, false, Some(95.0), Some(25_000.0)), None);
+
+        // Special session on a Sunday (2026-11-08 14:20–15:30)
+        let sunday = (2026, 11, 8);
+        let mut session_pos = later.clone();
+        session_pos.expiry = NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: NaiveDate::from_ymd_opt(2026, 11, 8).unwrap(),
+            start: 14 * 60 + 20,
+            end: 15 * 60 + 30,
+        }]);
+        // Outside session window: Sunday 10:00 -> None
+        assert_eq!(decide(&session_pos, ist(sunday, (10, 0, 0)), true, Some(95.0), Some(25_050.0)), None);
+        // Inside session window: Sunday 14:30 -> triggers stop
+        assert_eq!(decide(&session_pos, ist(sunday, (14, 30, 0)), true, Some(95.0), Some(25_050.0)), Some((95.0, all("CHART_STOP"))));
+        // At/after session end: Sunday 15:30 -> None
+        assert_eq!(decide(&session_pos, ist(sunday, (15, 30, 0)), true, Some(95.0), Some(25_050.0)), None);
+
+        // Special session on a weekday holiday (trading_day=false) with session 18:00–19:15
+        let weekday = (2026, 11, 4);
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: NaiveDate::from_ymd_opt(weekday.0, weekday.1, weekday.2).unwrap(),
+            start: 18 * 60,
+            end: 19 * 60 + 15,
+        }]);
+        // Outside session window: weekday holiday 10:00 -> None
+        assert_eq!(decide(&session_pos, ist(weekday, (10, 0, 0)), false, Some(95.0), Some(25_050.0)), None);
+        // Inside session window: weekday holiday 18:30 -> triggers stop
+        assert_eq!(decide(&session_pos, ist(weekday, (18, 30, 0)), false, Some(95.0), Some(25_050.0)), Some((95.0, all("CHART_STOP"))));
+
+        shared_domain::set_special_sessions(vec![]);
     }
 
     #[tokio::test]

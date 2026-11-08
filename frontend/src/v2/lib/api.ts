@@ -9,6 +9,8 @@ import type { TradingConfig } from '../../types';
 import type { Bar, Tf } from '../trade/model';
 import type {
   AdminPosition,
+  LatencyAnswer,
+  OrderTimingAnswer,
   AdminTradesAnswer,
   AdminUser,
   ChainAnswer,
@@ -30,6 +32,7 @@ import type {
   RangeId,
   RawPosition,
   SessionUser,
+  SpecialSessionsAnswer,
   StatusAnswer,
   StoredData,
   SystemAnswer,
@@ -224,6 +227,11 @@ export function getAdminTrades(base: string, user: number | null, from: string |
   return getJson<AdminTradesAnswer>(base, `/api/admin/trades${q.size ? `?${q}` : ''}`);
 }
 export const getAdminPositions = (base: string) => getJson<AdminPosition[]>(base, '/api/admin/positions');
+/** How late each feed's prices arrive: the last minute and the day. */
+export const getLatency = (base: string) => getJson<LatencyAnswer>(base, '/api/admin/latency');
+/** How long each LIVE order took on `day` (IST `YYYY-MM-DD`; today without it). */
+export const getOrderTimings = (base: string, day?: string) =>
+  getJson<OrderTimingAnswer>(base, `/api/admin/order-timings${day ? `?day=${day}` : ''}`);
 /** What the database keeps, and the candle archive's coverage. */
 export const getStoredData = (base: string) => getJson<StoredData>(base, '/api/admin/data');
 /** One user's paper P&L over the IST days `from`..`to` (from their first fill without `from`). */
@@ -237,6 +245,13 @@ export const createUser = (base: string, phone: string, name: string | null) => 
 export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) =>
   send(base, `/api/admin/users/${id}`, 'PATCH', patch);
 export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE');
+
+// Special trading sessions (e.g. Diwali Muhurat).
+export const listSpecialSessions = (base: string) => getJson<SpecialSessionsAnswer>(base, '/api/admin/special-sessions');
+export const putSpecialSession = (base: string, date: string, start: string, end: string) =>
+  send(base, `/api/admin/special-sessions/${encodeURIComponent(date)}`, 'PUT', { start, end });
+export const deleteSpecialSession = (base: string, date: string) =>
+  send(base, `/api/admin/special-sessions/${encodeURIComponent(date)}`, 'DELETE');
 
 /** Run update.sh on the server: the latest release, a restart and a health check. */
 export const updateServer = (base: string) => send(base, '/api/update_server', 'POST');

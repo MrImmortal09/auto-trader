@@ -101,7 +101,7 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
         return refuse(StatusCode::CONFLICT, "Kill switch is active — trading is halted");
     }
     if !execute::manual_buy_window_open() || trading_engine::is_entry_cutoff_passed() {
-        return refuse(StatusCode::CONFLICT, "Market is closed — manual buys run 09:15–15:30 IST");
+        return refuse(StatusCode::CONFLICT, execute::manual_buy_closed_message());
     }
     if !execute::feed_fresh() {
         return refuse(StatusCode::CONFLICT, "Price feed is stale — not buying blind");

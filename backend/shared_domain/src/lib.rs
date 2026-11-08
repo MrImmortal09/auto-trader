@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod entry_gate;
+pub mod special_session;
 pub mod telemetry;
+
+pub use special_session::*;
 
 /// Underlying index names this app treats as "index" options (vs. stock
 /// options, which fall back to `TradingConfig::other_lots`). Matched against
@@ -70,31 +73,6 @@ pub const MARKET_CLOSE_MINUTE: u32 = 40;
 pub const EXPIRY_SQUAREOFF_HOUR: u32 = 15;
 pub const EXPIRY_SQUAREOFF_MINUTE: u32 = 38;
 
-pub fn is_market_open() -> bool {
-    use chrono::Timelike;
-    use chrono::Datelike;
-    let now = now_ist();
-
-    // Check if it is a weekday
-    let weekday = now.weekday();
-    if weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun {
-        return false;
-    }
-
-    let h = now.hour();
-    let m = now.minute();
-
-    // Market hours are 09:15 to 15:40 IST (close is exclusive — sharp cutoff)
-    if h < MARKET_OPEN_HOUR || (h == MARKET_OPEN_HOUR && m < MARKET_OPEN_MINUTE) {
-        return false;
-    }
-    if h > MARKET_CLOSE_HOUR || (h == MARKET_CLOSE_HOUR && m >= MARKET_CLOSE_MINUTE) {
-        return false;
-    }
-
-    true
-}
-
 /// Today's market close instant (15:40:00 IST), regardless of weekday.
 pub fn today_market_close_ist() -> DateTime<FixedOffset> {
     now_ist()
@@ -104,52 +82,6 @@ pub fn today_market_close_ist() -> DateTime<FixedOffset> {
         .and_local_timezone(ist_offset())
         .single()
         .expect("IST close time is unambiguous")
-}
-
-/// The next market open instant (09:15:00 IST) strictly in the future,
-/// skipping weekends. If today is a weekday and it's before 09:15, returns
-/// today's open; otherwise returns the next weekday's open.
-pub fn next_market_open_ist() -> DateTime<FixedOffset> {
-    use chrono::Datelike;
-    let now = now_ist();
-    let mut date = now.date_naive();
-
-    let today_open = date
-        .and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)
-        .expect("valid open time")
-        .and_local_timezone(ist_offset())
-        .single()
-        .expect("IST open time is unambiguous");
-
-    let is_weekday = date.weekday() != chrono::Weekday::Sat && date.weekday() != chrono::Weekday::Sun;
-    if is_weekday && now < today_open {
-        return today_open;
-    }
-
-    // Advance to the next weekday
-    loop {
-        date += ChronoDuration::days(1);
-        if date.weekday() != chrono::Weekday::Sat && date.weekday() != chrono::Weekday::Sun {
-            break;
-        }
-    }
-
-    date
-        .and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)
-        .expect("valid open time")
-        .and_local_timezone(ist_offset())
-        .single()
-        .expect("IST open time is unambiguous")
-}
-
-/// Duration to sleep until the next market open. Zero if the market is open right now.
-pub fn duration_until_market_open() -> std::time::Duration {
-    if is_market_open() {
-        return std::time::Duration::ZERO;
-    }
-    let now = now_ist();
-    let next_open = next_market_open_ist();
-    (next_open - now).to_std().unwrap_or(std::time::Duration::ZERO)
 }
 
 /// Duration to sleep until today's 15:40:00 IST market close. `None` if that
@@ -1459,6 +1391,53 @@ pub struct OrderRequest {
 }
 
 // ===========================================================================
+// Order timing (analytics only — see `kotak_client::orders`)
+// ===========================================================================
+
+/// One order sent to Kotak, timed on this server's clock.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderSent {
+    /// Just before the request went out, and when Kotak's answer came back.
+    pub sent_at_ms: i64,
+    pub replied_at_ms: i64,
+    /// Kotak's order number, when it took the order.
+    pub order_no: Option<String>,
+    /// Why it didn't, when it didn't.
+    pub error: Option<String>,
+    pub trading_symbol: String,
+    /// `B` / `S`.
+    pub side: String,
+    /// `MKT`, `L`, `SL`, `SL-M`.
+    pub order_type: String,
+    pub qty: i64,
+    pub price: f64,
+    pub trigger: f64,
+}
+
+/// One order update Kotak pushed, stamped with when this server received it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderUpdate {
+    pub received_at_ms: i64,
+    pub order_no: String,
+    /// `open`, `complete`, `rejected`, `cancelled`, `trigger pending`, …
+    pub status: String,
+    pub trading_symbol: Option<String>,
+    pub side: Option<String>,
+    pub qty: Option<i64>,
+    pub filled_qty: Option<i64>,
+    pub avg_price: Option<f64>,
+    pub reject_reason: Option<String>,
+    /// When Kotak received the update (`updRecvTm`), epoch nanoseconds.
+    pub kotak_received_ns: Option<i64>,
+    /// The exchange's broadcast time (`boeSec`), epoch seconds.
+    pub exchange_epoch_s: Option<i64>,
+    /// The exchange's confirmation time (`exCfmTm`), as Kotak writes it.
+    pub exchange_confirm: Option<String>,
+    /// When the order was placed (`ordDtTm`), as Kotak writes it.
+    pub order_time: Option<String>,
+}
+
+// ===========================================================================
 // Internal persistence channel
 // ===========================================================================
 
@@ -1555,6 +1534,11 @@ pub enum DbWriteMessage {
     /// A message from a monitored Telegram chat, for the v2 Desk's feed
     /// (display only — never read by the engine). Kept per chat and message
     /// id, so an edit replaces the text it was first stored with.
+    /// A timed order send, for the admin's order timing (analytics only).
+    OrderSent(OrderSent),
+    /// An order update from Kotak's push stream, merged into its order's
+    /// timing row (analytics only).
+    OrderUpdate(OrderUpdate),
     TelegramMessage {
         chat_id: i64,
         chat_title: Option<String>,
