@@ -126,10 +126,18 @@ jobs:
             # Processes are found by name or exact command line, never with
             # `pkill -f <pattern>`: the SSH command line holds this whole script.
             server_pids() { pgrep '^server-[0-9]' || true; }
+            # The Kotak bridge: `node index.js` (the server starts it with
+            # `bash -lc`) running in our kotak-bridge folder, and nothing else
+            # called index.js. Not by name: Node names itself MainThread.
             bridge_pids() {
-              for pid in $(pgrep -x node; pgrep -x bash); do
-                case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
-                  "node index.js "|"bash -c node index.js ") echo "$pid" ;;
+              local f pid
+              for f in /proc/[0-9]*/cmdline; do
+                pid=${f#/proc/}
+                pid=${pid%/cmdline}
+                case "$(tr '\0' ' ' < "$f" 2>/dev/null)" in
+                  "node index.js "|"bash -c node index.js "|"bash -lc node index.js ")
+                    if [ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" = "$REPO/kotak-bridge" ]; then echo "$pid"; fi
+                    ;;
                 esac
               done
             }
