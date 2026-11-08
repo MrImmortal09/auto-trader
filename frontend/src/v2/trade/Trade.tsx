@@ -37,7 +37,9 @@ import { money, price, signedPct, toneOf, todayIst } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { ChainAnswer, ExpiriesAnswer } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
+import { TRADE_KEY } from '../lib/layout';
 import { useGuard } from '../shell/useGuard';
+import { ResizeHandle } from '../ui/ResizeHandle';
 import { Segment } from '../ui/Segment';
 import { useToast } from '../ui/toast';
 import { C, type OrderLineData } from './chartSetup';
@@ -49,6 +51,7 @@ import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
 import { approxMoney, CHART_LIBS, istClock, levelCrossed, levelPnl, optionOf, sameSym, symbolLabel, toTick, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
+import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
 import { SplitHandle } from './SplitHandle';
 import { TradingPanel } from './panel/TradingPanel';
@@ -84,13 +87,23 @@ interface Saved {
   barHidden: boolean;
   /** Desktop: the options ladder folded away, the charts taking its width. */
   ladderHidden: boolean;
+  /** Desktop: the options ladder's width, in px. */
+  ladderWidth: number;
+  /** Desktop: how two or three charts share their row, as fractions adding
+   * up to 1; missing means equal. */
+  chartShares: Partial<Record<'2' | '3', number[]>>;
+  /** Desktop: the trading panel's desk column (the owner's desk, or a user's
+   * portfolio): its width, in px. */
+  deskWidth: number;
+  /** Desktop: that column folded away. */
+  deskHidden: boolean;
 }
 
-const STORE_KEY = 'v2.trade';
+const STORE_KEY = TRADE_KEY;
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false };
 
 /** The saved layout, with any option that has since expired back on its
  * index, and any chosen expiry that has passed back to the nearest. */
@@ -118,6 +131,15 @@ function loadSaved(): Saved {
     panelHeight: clampPanelHeight(typeof saved.panelHeight === 'number' ? saved.panelHeight : DEFAULT_PANEL_HEIGHT),
     barHidden: saved.barHidden === true,
     ladderHidden: saved.ladderHidden === true,
+    ladderWidth: savedWidth(saved.ladderWidth, MIN_LADDER_WIDTH, MAX_LADDER_WIDTH, DEFAULT_LADDER_WIDTH),
+    chartShares: Object.fromEntries(
+      (['2', '3'] as const).flatMap((n) => {
+        const shares = savedShares(saved.chartShares?.[n], Number(n));
+        return shares ? [[n, shares]] : [];
+      }),
+    ),
+    deskWidth: savedWidth(saved.deskWidth, MIN_DESK_WIDTH, MAX_DESK_WIDTH, DEFAULT_DESK_WIDTH),
+    deskHidden: saved.deskHidden === true,
   };
 }
 
@@ -234,6 +256,13 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // Desktop: the charts row, which the trading panel grows up into.
   const chartsRef = useRef<HTMLDivElement>(null);
   const setPanelHeight = useCallback((panelHeight: number) => save((s) => ({ ...s, panelHeight })), [save]);
+  // Desktop: the charts' own row, and the widths under a drag (kept here
+  // until the pointer lifts, then saved once).
+  const chartsBox = useRef<HTMLDivElement>(null);
+  const rowWidth = useWidth(chartsRef, desktop);
+  const chartsWidth = useWidth(chartsBox, desktop);
+  const [sharesDrag, setSharesDrag] = useState<number[] | null>(null);
+  const [ladderDrag, setLadderDrag] = useState<number | null>(null);
   // Phone: the chart and the ladder share the screen; a handle drags the split.
   const { attach: splitBox, height: chartHeight, min: splitMin, max: splitMax, dragging: splitDragging, handle: splitHandle } = usePhoneSplit(
     saved.phoneChartHeight,
@@ -616,6 +645,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       return { ...s, expiry };
     });
 
+  // How the shown charts share their row (desktop), as dragged or saved.
+  const sharesKey = String(shownSlots.length) as '2' | '3';
+  const shares = shownSlots.length < 2 ? [1] : (sharesDrag ?? saved.chartShares[sharesKey] ?? equalShares(shownSlots.length));
   const charts = shownSlots.map((slot, i) => {
     const isFullscreen = activeFullscreenSlot === i;
     const cx = {
@@ -634,12 +666,12 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     return (
       <div
         key={i}
-        style={!desktop && !isFullscreen ? { height: chartHeight } : undefined}
+        style={isFullscreen ? undefined : desktop ? { flex: `${shares[i] ?? 1} 1 0%` } : { height: chartHeight }}
         className={
           isFullscreen
             ? 'fixed inset-0 z-40 flex flex-col bg-canvas pt-safe pb-safe'
             : desktop
-              ? 'flex min-h-0 min-w-0 flex-1 flex-col'
+              ? 'flex min-h-0 min-w-0 flex-col'
               : 'flex shrink-0'
         }
       >
@@ -765,6 +797,39 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     );
   }
 
+  // The ladder never squeezes a chart under its least width.
+  const ladderWidth = ladderDrag ?? saved.ladderWidth;
+  const ladderMax = Math.max(MIN_LADDER_WIDTH, Math.min(MAX_LADDER_WIDTH, Math.round(rowWidth - 8 - shownSlots.length * (MIN_CHART_WIDTH + 4))));
+  // The edge between chart `i` and chart `i + 1`; the width they share stays theirs.
+  const chartHandle = (i: number) => {
+    const space = chartsWidth - (shownSlots.length - 1) * 4;
+    const pair = (shares[i] + shares[i + 1]) * space;
+    return (
+      <ResizeHandle
+        key={`edge-${i}`}
+        label="Resize the charts"
+        grows="right"
+        value={shares[i] * space}
+        min={MIN_CHART_WIDTH}
+        max={Math.max(MIN_CHART_WIDTH, pair - MIN_CHART_WIDTH)}
+        onChange={(px) => space > 0 && setSharesDrag(withLeftShare(shares, i, px / space))}
+        onCommit={(px) => {
+          setSharesDrag(null);
+          if (space > 0) save((s) => ({ ...s, chartShares: { ...s.chartShares, [sharesKey]: withLeftShare(shares, i, px / space) } }));
+        }}
+        onReset={() => {
+          setSharesDrag(null);
+          save((s) => {
+            const chartShares = { ...s.chartShares };
+            delete chartShares[sharesKey];
+            return { ...s, chartShares };
+          });
+        }}
+        className="w-1"
+      />
+    );
+  };
+
   const layouts = [
     { n: 1 as const, icon: Square, label: 'One chart' },
     { n: 2 as const, icon: Columns2, label: 'Two charts' },
@@ -806,20 +871,40 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           </button>
         </div>
       )}
-      <div ref={chartsRef} className="flex min-h-[200px] flex-1 gap-2">
-        <div className="flex min-w-0 flex-1 gap-1">{charts}</div>
+      <div ref={chartsRef} className="flex min-h-[200px] flex-1">
+        <div ref={chartsBox} className="flex min-w-0 flex-1">
+          {charts.flatMap((chart, i) => (i === 0 ? [chart] : [chartHandle(i - 1), chart]))}
+        </div>
         {saved.ladderHidden ? (
           <button
             type="button"
             onClick={() => save((s) => ({ ...s, ladderHidden: false }))}
             aria-label={`Show the ${saved.index} options`}
             title={`Show the ${saved.index} options`}
-            className="-mx-1 flex w-5 shrink-0 items-center justify-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+            className="ml-1 flex w-5 shrink-0 items-center justify-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
           >
             <ChevronLeft size={14} />
           </button>
         ) : (
-          <aside className="flex w-[380px] shrink-0 flex-col rounded-12 border border-line bg-panel py-3">
+          <>
+          <ResizeHandle
+            label={`Resize the ${saved.index} options`}
+            grows="left"
+            value={ladderWidth}
+            min={MIN_LADDER_WIDTH}
+            max={ladderMax}
+            onChange={setLadderDrag}
+            onCommit={(w) => {
+              setLadderDrag(null);
+              save((s) => ({ ...s, ladderWidth: w }));
+            }}
+            onReset={() => {
+              setLadderDrag(null);
+              save((s) => ({ ...s, ladderWidth: DEFAULT_LADDER_WIDTH }));
+            }}
+            className="w-2"
+          />
+          <aside style={{ width: ladderWidth }} className="flex shrink-0 flex-col rounded-12 border border-line bg-panel py-3">
             <div className="flex items-center gap-2 px-3 pb-3">
               <h2 className="type-title text-fg">{saved.index} options</h2>
               <span className="ml-auto">{expiryPicker('sm')}</span>
@@ -836,6 +921,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             {ladder}
             {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
           </aside>
+          </>
         )}
       </div>
       <TradingPanel
@@ -854,6 +940,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         onToggle={() => save((s) => ({ ...s, panelOpen: !s.panelOpen }))}
         height={saved.panelHeight}
         onHeight={setPanelHeight}
+        deskWidth={saved.deskWidth}
+        onDeskWidth={(deskWidth) => save((s) => ({ ...s, deskWidth }))}
+        deskHidden={saved.deskHidden}
+        onDeskHidden={(deskHidden) => save((s) => ({ ...s, deskHidden }))}
         chartsRef={chartsRef}
         layout={saved.barHidden ? 'bar hidden' : 'bar shown'}
         paper={account}

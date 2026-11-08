@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp } from 'lucide-react';
 import type { ExecutePosition } from '../../../types';
 import { contractLabel, expiryLabel } from '../../../lib/execute';
 import { getOrders, getPositionsRaw, type KotakOrderRow } from '../../lib/api';
@@ -10,12 +10,14 @@ import type { Call, DeskAnswer, FillMark } from '../../lib/types';
 import { Button } from '../../ui/Button';
 import { Chip } from '../../ui/Chip';
 import { HoldButton } from '../../ui/HoldButton';
+import { ResizeHandle } from '../../ui/ResizeHandle';
 import { chartTargets, targetLotsLabel } from '../../../lib/format';
 import { targetRoom, type LevelKind, type LevelRef } from '../lines';
 import type { PaperAccount, PositionHandlers } from '../Positions';
 import { busyNote, levelWords } from '../words';
 import { activityEvents, type EngineError } from './activity';
 import { MIN_CHART_HEIGHT, MIN_PANEL_HEIGHT } from './height';
+import { DEFAULT_DESK_WIDTH, MAX_DESK_WIDTH, MIN_DESK_WIDTH, MIN_PANEL_BODY, useWidth } from '../paneSizes';
 import { ActivityList, HistoryList, PaperActivityList } from './lists';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -78,13 +80,15 @@ function Block({ label, right, children }: { label: ReactNode; right?: ReactNode
  * ₹10,00,000 they started with; the owner's desk shows its funds — Kotak's
  * in LIVE, the paper wallet otherwise.
  */
-export function AccountColumn({ mode, desk, positions, paper, vertical }: {
+export function AccountColumn({ mode, desk, positions, paper, vertical, onHide }: {
   mode: string;
   desk: DeskAnswer | null;
   /** The open positions (not a buy still being placed). */
   positions: ExecutePosition[];
   paper?: PaperAccount;
   vertical: boolean;
+  /** Folds the column away, where it can be (the desktop trading panel). */
+  onHide?: () => void;
 }) {
   const live = !paper && mode === 'LIVE';
   const cash = desk?.wallet.balance ?? null;
@@ -143,6 +147,17 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
       <div className="flex items-center gap-2 border-b border-line px-4 py-2.5">
         <span className="type-body-strong text-fg">{paper ? 'Paper portfolio' : 'Owner desk'}</span>
         <Chip kind={live ? 'live' : 'outline'}>{live ? 'LIVE' : 'Paper'}</Chip>
+        {onHide && (
+          <button
+            type="button"
+            onClick={onHide}
+            aria-label={`Hide the ${paper ? 'portfolio' : 'owner desk'}`}
+            title={`Hide the ${paper ? 'portfolio' : 'owner desk'}`}
+            className="ml-auto grid size-6 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+          >
+            <ChevronLeft size={14} />
+          </button>
+        )}
       </div>
       <Block label={fundsLabel}>
         <span className="num-large text-fg">{funds == null ? '—' : money(funds)}</span>
@@ -172,7 +187,7 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
  * Exit all is held. Its top edge drags to resize it — up into the charts,
  * never past the bottom of the window — and the chevron folds it.
  */
-export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, chartsRef, layout, paper }: {
+export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, deskWidth, onDeskWidth, deskHidden, onDeskHidden, chartsRef, layout, paper }: {
   serverBase: string;
   mode: string;
   desk: DeskAnswer | null;
@@ -192,6 +207,12 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   /** Height while open, in px. */
   height: number;
   onHeight: (h: number) => void;
+  /** The left column (the owner's desk, or a user's portfolio): its width,
+   * and whether it is folded away. */
+  deskWidth: number;
+  onDeskWidth: (w: number) => void;
+  deskHidden: boolean;
+  onDeskHidden: (hidden: boolean) => void;
   /** The charts above, which give the panel its room. */
   chartsRef: RefObject<HTMLElement | null>;
   /** Changes whenever the screen above changes shape (the index bar shown
@@ -205,6 +226,11 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   const [dragged, setDragged] = useState<number | null>(null);
   const drag = useRef<{ y: number; h: number; max: number } | null>(null);
   const sectionRef = useRef<HTMLElement>(null);
+  // The desk column's width under a drag; the tabs beside it keep their room.
+  const [deskDrag, setDeskDrag] = useState<number | null>(null);
+  const panelWidth = useWidth(sectionRef, open);
+  const deskMax = Math.max(MIN_DESK_WIDTH, Math.min(MAX_DESK_WIDTH, Math.round(panelWidth - MIN_PANEL_BODY)));
+  const deskName = paper ? 'portfolio' : 'owner desk';
   const active = scalps.filter((p) => !p.placing);
   const waiting = scalps.filter((p) => p.placing);
   const openPnl = active.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
@@ -497,9 +523,40 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
       >
         <span className="mt-1 h-1 w-12 rounded-full bg-line-strong group-hover:bg-fg-muted" />
       </div>
-      <aside className="w-[260px] shrink-0 overflow-y-auto border-r border-line">
-        <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical />
-      </aside>
+      {deskHidden ? (
+        <button
+          type="button"
+          onClick={() => onDeskHidden(false)}
+          aria-label={`Show the ${deskName}`}
+          title={`Show the ${deskName}`}
+          className="flex w-6 shrink-0 items-center justify-center border-r border-line text-fg-muted hover:bg-raised hover:text-fg"
+        >
+          <ChevronRight size={14} />
+        </button>
+      ) : (
+        <>
+          <aside style={{ width: Math.min(deskDrag ?? deskWidth, deskMax) }} className="shrink-0 overflow-y-auto border-r border-line">
+            <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical onHide={() => onDeskHidden(true)} />
+          </aside>
+          <ResizeHandle
+            label={`Resize the ${deskName}`}
+            grows="right"
+            value={Math.min(deskDrag ?? deskWidth, deskMax)}
+            min={MIN_DESK_WIDTH}
+            max={deskMax}
+            onChange={setDeskDrag}
+            onCommit={(w) => {
+              setDeskDrag(null);
+              onDeskWidth(w);
+            }}
+            onReset={() => {
+              setDeskDrag(null);
+              onDeskWidth(DEFAULT_DESK_WIDTH);
+            }}
+            className="z-10 -mr-1 -ml-1 w-2"
+          />
+        </>
+      )}
       <div className="flex min-w-0 flex-1 flex-col">
         {header}
         <div className="min-h-0 flex-1 overflow-y-auto px-3">
