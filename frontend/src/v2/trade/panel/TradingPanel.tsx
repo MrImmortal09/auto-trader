@@ -187,7 +187,7 @@ export function AccountColumn({ mode, desk, positions, paper, vertical, onHide }
  * Exit all is held. Its top edge drags to resize it — up into the charts,
  * never past the bottom of the window — and the chevron folds it.
  */
-export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, deskWidth, onDeskWidth, deskHidden, onDeskHidden, chartsRef, layout, paper }: {
+export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, deskWidth, onDeskWidth, deskHidden, onDeskHidden, deskRemoved, chartsRef, layout, paper }: {
   serverBase: string;
   mode: string;
   desk: DeskAnswer | null;
@@ -212,6 +212,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   deskWidth: number;
   onDeskWidth: (w: number) => void;
   deskHidden: boolean;
+  /** Taken away in Settings: no column, no strip, no edge. */
+  deskRemoved: boolean;
   onDeskHidden: (hidden: boolean) => void;
   /** The charts above, which give the panel its room. */
   chartsRef: RefObject<HTMLElement | null>;
@@ -504,11 +506,11 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   );
 
   if (!open) {
-    return <section className="flex shrink-0 flex-col rounded-12 border border-line bg-panel">{header}</section>;
+    return <section className="flex shrink-0 flex-col border-t border-line bg-panel">{header}</section>;
   }
 
   return (
-    <section ref={sectionRef} style={{ height: dragged ?? height }} className="relative flex shrink-0 overflow-hidden rounded-12 border border-line bg-panel">
+    <section ref={sectionRef} style={{ height: dragged ?? height }} className="relative flex shrink-0 overflow-hidden border-t border-line bg-panel">
       {/* The top edge: drag to make the panel taller or shorter. */}
       <div
         role="separator"
@@ -521,21 +523,21 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
         title="Drag to resize"
         className="group absolute inset-x-0 top-0 z-10 flex h-3 cursor-row-resize touch-none justify-center"
       >
-        <span className="mt-1 h-1 w-12 rounded-full bg-line-strong group-hover:bg-fg-muted" />
+        <span className="mt-1 h-1 w-10 rounded-full bg-line transition-colors duration-120 group-hover:bg-line-strong" />
       </div>
-      {deskHidden ? (
+      {deskRemoved ? null : deskHidden ? (
         <button
           type="button"
           onClick={() => onDeskHidden(false)}
           aria-label={`Show the ${deskName}`}
           title={`Show the ${deskName}`}
-          className="flex w-6 shrink-0 items-center justify-center border-r border-line text-fg-muted hover:bg-raised hover:text-fg"
+          className="flex w-5 shrink-0 items-center justify-center border-r border-line text-fg-muted hover:bg-raised hover:text-fg"
         >
           <ChevronRight size={14} />
         </button>
       ) : (
         <>
-          <aside style={{ width: Math.min(deskDrag ?? deskWidth, deskMax) }} className="shrink-0 overflow-y-auto border-r border-line">
+          <aside style={{ width: Math.min(deskDrag ?? deskWidth, deskMax) }} className="shrink-0 overflow-y-auto">
             <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical onHide={() => onDeskHidden(true)} />
           </aside>
           <ResizeHandle
@@ -553,7 +555,6 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
               setDeskDrag(null);
               onDeskWidth(DEFAULT_DESK_WIDTH);
             }}
-            className="z-10 -mr-1 -ml-1 w-2"
           />
         </>
       )}

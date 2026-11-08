@@ -558,6 +558,15 @@ export interface ExecutePosition {
   chart?: ChartLevels;
 }
 
+/** One index at the top of the Trade screen. */
+export interface IndexHeadline {
+  index: string;
+  spot: number | null;
+  /** The previous session's close; absent from a server older than this field. */
+  prev_close?: number | null;
+  change_pct: number | null;
+}
+
 export interface ExecuteFrame {
   /** Unix ms. */
   ts: number;
@@ -567,7 +576,7 @@ export interface ExecuteFrame {
   market_open: boolean;
   feed: { connected: boolean; last_tick_age_ms: number | null };
   kotak_ready: boolean;
-  indices: { index: string; spot: number | null; change_pct: number | null }[];
+  indices: IndexHeadline[];
   board: ExecuteBoard | null;
   board_error: string | null;
   positions: ExecutePosition[];

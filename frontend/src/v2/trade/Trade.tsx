@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChartCandlestick, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Columns2, Columns3, Square } from 'lucide-react';
-import type { ChartLevel, ChartTarget, ExecutePosition } from '../../types';
+import type { ChartLevel, ChartTarget, ExecutePosition, IndexHeadline } from '../../types';
 import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
@@ -33,11 +33,11 @@ import {
   type PaperFill,
   type Sent,
 } from '../lib/api';
-import { money, price, signedPct, toneOf, todayIst } from '../lib/format';
+import { MINUS, money, price, signedPct, toneOf, todayIst } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { ChainAnswer, ExpiriesAnswer } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
-import { TRADE_KEY } from '../lib/layout';
+import { TRADE_KEY, useDeskRemoved } from '../lib/layout';
 import { useGuard } from '../shell/useGuard';
 import { ResizeHandle } from '../ui/ResizeHandle';
 import { Segment } from '../ui/Segment';
@@ -214,6 +214,92 @@ function IndexTabs({ indices, selected, onSelect }: { indices: { index: string; 
   );
 }
 
+/** The day's move in points: "−43.95". From the previous close, or worked
+ * back from the percent when the server sends none (an older one). */
+function signedPoints(spot: number, prevClose: number | null, changePct: number): string {
+  const d = prevClose != null && prevClose > 0 ? spot - prevClose : spot - spot / (1 + changePct / 100);
+  const v = Math.abs(d) < 0.005 ? 0 : d;
+  return `${v > 0 ? '+' : v < 0 ? MINUS : ''}${price(Math.abs(v))}`;
+}
+
+/** The indices the ticker gives the day's points as well as the percent
+ * whenever the bar has room for them; the others only on a wide window. */
+const TICKER_POINTS = new Set(['NIFTY', 'BANKNIFTY', 'SENSEX']);
+
+/** One index on the desktop ticker: "NIFTY 24,986.40 −43.95 (−0.18%)", or
+ * "−0.18%" alone where room is short (see `TICKER_POINTS`), the value
+ * flashing as it ticks; the selected one is underlined in accent. */
+function TickerItem({ index, spot, prevClose, changePct, on, onSelect }: { index: string; spot: number | null; prevClose: number | null; changePct: number | null; on: boolean; onSelect: () => void }) {
+  const flash = useTickFlash(spot, true, index);
+  // All six with points need about 98rem; the three with points, the rest
+  // with the percent, about 70rem (a 1440 px window with the nav rail).
+  const points = TICKER_POINTS.has(index) ? 'hidden @[70rem]:inline' : 'hidden @[98rem]:inline';
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={on}
+      onClick={onSelect}
+      className={`relative flex shrink-0 items-center gap-1.5 px-3 whitespace-nowrap transition-colors duration-120 hover:bg-raised/40 ${on ? 'after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:bg-accent' : ''}`}
+    >
+      <span className={`type-label ${on ? 'text-fg' : 'text-fg-muted'}`}>{index}</span>
+      <span key={flash.key} className={`-mx-0.5 rounded-4 px-0.5 num-small text-fg ${flash.className}`}>
+        {spot == null ? '—' : price(spot)}
+      </span>
+      {spot != null && changePct != null && (
+        <span className={`num-small ${TONE_TEXT[toneOf(changePct)]}`}>
+          <span className={points}>{signedPoints(spot, prevClose, changePct)} (</span>
+          {signedPct(changePct)}
+          <span className={points}>)</span>
+        </span>
+      )}
+    </button>
+  );
+}
+
+/** The desktop index bar: every index on one slim line, scrolling sideways
+ * when the window is too narrow for all of them — with the mouse wheel too,
+ * and always to keep the selected one in view. */
+function IndexTicker({ indices, selected, onSelect }: { indices: IndexHeadline[]; selected: string; onSelect: (i: string) => void }) {
+  const by = new Map(indices.map((i) => [i.index, i]));
+  const box = useRef<HTMLDivElement>(null);
+  // On a new pick, and whenever the tabs change width (their prices arriving
+  // can push the selected one out of view).
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const keepInView = () => {
+      const tab = el.querySelector<HTMLElement>('[aria-selected="true"]');
+      if (!tab) return;
+      // This bar only: scrollIntoView could move the page around it too.
+      const left = tab.offsetLeft;
+      const right = left + tab.offsetWidth;
+      if (left < el.scrollLeft) el.scrollLeft = left;
+      else if (right > el.scrollLeft + el.clientWidth) el.scrollLeft = right - el.clientWidth;
+    };
+    keepInView();
+    const ro = new ResizeObserver(keepInView);
+    for (const tab of el.children) ro.observe(tab);
+    return () => ro.disconnect();
+  }, [selected]);
+  return (
+    <div
+      ref={box}
+      role="tablist"
+      aria-label="Index"
+      onWheel={(e) => {
+        if (e.deltaY !== 0 && e.deltaX === 0) e.currentTarget.scrollLeft += e.deltaY;
+      }}
+      className="@container relative flex min-w-0 flex-1 items-stretch overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+    >
+      {INDEX_ORDER.map((index) => {
+        const i = by.get(index);
+        return <TickerItem key={index} index={index} spot={i?.spot ?? null} prevClose={i?.prev_close ?? null} changePct={i?.change_pct ?? null} on={index === selected} onSelect={() => onSelect(index)} />;
+      })}
+    </div>
+  );
+}
+
 /** `NIFTY:2026-11-03`: how a chain other than an index's nearest is keyed. */
 const chainKeyOf = (index: string, expiry: string) => `${index}:${expiry}`;
 
@@ -256,6 +342,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   }, []);
   // Desktop: the charts row, which the trading panel grows up into.
   const chartsRef = useRef<HTMLDivElement>(null);
+  // The desk column, unless this sign-in took it away in Settings.
+  const [deskRemoved] = useDeskRemoved();
   const setPanelHeight = useCallback((panelHeight: number) => save((s) => ({ ...s, panelHeight })), [save]);
   // Desktop: the charts' own row, and the widths under a drag (kept here
   // until the pointer lifts, then saved once).
@@ -631,8 +719,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   function selectIndex(index: string) {
     save((s) => {
       const next = { ...s, index };
-      // On phone the one chart follows the tabs, unless it shows this index's option.
-      if (!desktop && s.slots[0].sym.index !== index) next.slots = s.slots.map((slot, n) => (n === 0 ? { ...slot, sym: { kind: 'index', index } } : slot));
+      // The first chart follows the pick, unless a chart on screen already
+      // shows this index or one of its options (the phone shows one chart).
+      const shown = s.slots.slice(0, desktop ? s.layout : 1);
+      if (!shown.some((slot) => slot.sym.index === index)) next.slots = s.slots.map((slot, n) => (n === 0 ? { ...slot, sym: { kind: 'index', index } } : slot));
       return next;
     });
   }
@@ -800,10 +890,11 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   // The ladder never squeezes a chart under its least width.
   const ladderWidth = ladderDrag ?? saved.ladderWidth;
-  const ladderMax = Math.max(MIN_LADDER_WIDTH, Math.min(MAX_LADDER_WIDTH, Math.round(rowWidth - 8 - shownSlots.length * (MIN_CHART_WIDTH + 4))));
+  // Each edge (the ladder's and those between charts) takes 1 px.
+  const ladderMax = Math.max(MIN_LADDER_WIDTH, Math.min(MAX_LADDER_WIDTH, Math.round(rowWidth - shownSlots.length * (MIN_CHART_WIDTH + 1))));
   // The edge between chart `i` and chart `i + 1`; the width they share stays theirs.
   const chartHandle = (i: number) => {
-    const space = chartsWidth - (shownSlots.length - 1) * 4;
+    const space = chartsWidth - (shownSlots.length - 1);
     const pair = (shares[i] + shares[i + 1]) * space;
     return (
       <ResizeHandle
@@ -826,7 +917,6 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             return { ...s, chartShares };
           });
         }}
-        className="w-1"
       />
     );
   };
@@ -836,40 +926,41 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     { n: 2 as const, icon: Columns2, label: 'Two charts' },
     { n: 3 as const, icon: Columns3, label: 'Three charts' },
   ];
+  // Edge to edge: no gutters, the panes meet at 1 px lines, the charts get the room.
   return (
-    <div className="flex h-full min-h-0 flex-col gap-2 p-2">
+    <div className="flex h-full min-h-0 flex-col bg-panel">
       {saved.barHidden ? (
         <button
           type="button"
           onClick={() => save((s) => ({ ...s, barHidden: false }))}
           aria-label="Show the index bar"
           title="Show the index bar"
-          className="-mt-2 -mb-1 flex h-4 shrink-0 items-center justify-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+          className="flex h-3 shrink-0 items-center justify-center border-b border-line text-fg-muted hover:bg-raised hover:text-fg"
         >
-          <ChevronDown size={14} />
+          <ChevronDown size={12} />
         </button>
       ) : (
-        <div className="flex shrink-0 items-center gap-3">
-          <IndexTabs indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
-          <span className="flex-1" />
-          <Segment label="Chart library" size="sm" value={saved.chartLib} onChange={setLib} options={CHART_LIBS} />
-          <span className="type-label text-fg-muted">Charts</span>
-          <div role="tablist" aria-label="Charts" className="flex gap-1 rounded-8 border border-line bg-inset p-1">
-            {layouts.map(({ n, icon: Icon, label }) => (
-              <button key={n} type="button" role="tab" aria-selected={saved.layout === n} aria-label={label} onClick={() => save((s) => ({ ...s, layout: n }))} className={`grid size-7 place-items-center rounded-6 transition-colors duration-120 ${saved.layout === n ? 'bg-panel text-accent shadow-sm' : 'text-fg-muted hover:text-fg'}`}>
-                <Icon size={16} />
-              </button>
-            ))}
+        <div className="flex h-9 shrink-0 items-stretch border-b border-line">
+          <IndexTicker indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
+          <div className="flex shrink-0 items-center gap-2 border-l border-line pr-1 pl-2">
+            <Segment label="Chart library" size="xs" value={saved.chartLib} onChange={setLib} options={CHART_LIBS} />
+            <div role="tablist" aria-label="Charts" className="flex gap-0.5 rounded-6 border border-line bg-inset p-0.5">
+              {layouts.map(({ n, icon: Icon, label }) => (
+                <button key={n} type="button" role="tab" aria-selected={saved.layout === n} aria-label={label} title={label} onClick={() => save((s) => ({ ...s, layout: n }))} className={`grid size-6 place-items-center rounded-4 transition-colors duration-120 ${saved.layout === n ? 'bg-panel text-accent shadow-sm' : 'text-fg-muted hover:text-fg'}`}>
+                  <Icon size={14} />
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => save((s) => ({ ...s, barHidden: true }))}
+              aria-label="Hide the index bar"
+              title="Hide the index bar"
+              className="grid size-7 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+            >
+              <ChevronUp size={14} />
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => save((s) => ({ ...s, barHidden: true }))}
-            aria-label="Hide the index bar"
-            title="Hide the index bar"
-            className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
-          >
-            <ChevronUp size={16} />
-          </button>
         </div>
       )}
       <div ref={chartsRef} className="flex min-h-[200px] flex-1">
@@ -882,46 +973,47 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             onClick={() => save((s) => ({ ...s, ladderHidden: false }))}
             aria-label={`Show the ${saved.index} options`}
             title={`Show the ${saved.index} options`}
-            className="ml-1 flex w-5 shrink-0 items-center justify-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+            className="flex w-5 shrink-0 items-center justify-center border-l border-line text-fg-muted hover:bg-raised hover:text-fg"
           >
             <ChevronLeft size={14} />
           </button>
         ) : (
           <>
-          <ResizeHandle
-            label={`Resize the ${saved.index} options`}
-            grows="left"
-            value={ladderWidth}
-            min={MIN_LADDER_WIDTH}
-            max={ladderMax}
-            onChange={setLadderDrag}
-            onCommit={(w) => {
-              setLadderDrag(null);
-              save((s) => ({ ...s, ladderWidth: w }));
-            }}
-            onReset={() => {
-              setLadderDrag(null);
-              save((s) => ({ ...s, ladderWidth: DEFAULT_LADDER_WIDTH }));
-            }}
-            className="w-2"
-          />
-          <aside style={{ width: ladderWidth }} className="flex shrink-0 flex-col rounded-12 border border-line bg-panel py-3">
-            <div className="flex items-center gap-2 px-3 pb-3">
-              <h2 className="type-title text-fg">{saved.index} options</h2>
-              <span className="ml-auto">{expiryPicker('sm')}</span>
-              <button
-                type="button"
-                onClick={() => save((s) => ({ ...s, ladderHidden: true }))}
-                aria-label={`Hide the ${saved.index} options`}
-                title={`Hide the ${saved.index} options`}
-                className="grid size-7 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
-              >
-                <ChevronRight size={16} />
-              </button>
-            </div>
-            {ladder}
-            {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
-          </aside>
+            <ResizeHandle
+              label={`Resize the ${saved.index} options`}
+              grows="left"
+              value={ladderWidth}
+              min={MIN_LADDER_WIDTH}
+              max={ladderMax}
+              onChange={setLadderDrag}
+              onCommit={(w) => {
+                setLadderDrag(null);
+                save((s) => ({ ...s, ladderWidth: w }));
+              }}
+              onReset={() => {
+                setLadderDrag(null);
+                save((s) => ({ ...s, ladderWidth: DEFAULT_LADDER_WIDTH }));
+              }}
+            />
+            <aside style={{ width: ladderWidth }} className="flex shrink-0 flex-col">
+              <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line pr-1 pl-3">
+                <h2 className="type-body-strong text-fg">{saved.index} options</h2>
+                <span className="ml-auto">{expiryPicker('sm')}</span>
+                <button
+                  type="button"
+                  onClick={() => save((s) => ({ ...s, ladderHidden: true }))}
+                  aria-label={`Hide the ${saved.index} options`}
+                  title={`Hide the ${saved.index} options`}
+                  className="grid size-8 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+                >
+                  <ChevronRight size={16} />
+                </button>
+              </div>
+              <div className="flex min-h-0 flex-1 flex-col pt-2 pb-2">
+                {ladder}
+                {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
+              </div>
+            </aside>
           </>
         )}
       </div>
@@ -945,12 +1037,13 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         onDeskWidth={(deskWidth) => save((s) => ({ ...s, deskWidth }))}
         deskHidden={saved.deskHidden}
         onDeskHidden={(deskHidden) => save((s) => ({ ...s, deskHidden }))}
+        deskRemoved={deskRemoved}
         chartsRef={chartsRef}
         layout={saved.barHidden ? 'bar hidden' : 'bar shown'}
         paper={account}
       />
       {!chartStopsOn && scalps.length > 0 && (
-        <p className="shrink-0 type-caption text-fg-subtle">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
+        <p className="shrink-0 border-t border-line px-3 py-1 type-caption text-fg-subtle">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
       )}
       {sheetEl}
     </div>

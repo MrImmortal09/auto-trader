@@ -216,7 +216,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
       onPointerDown={() => markChartActive(chartId)}
       onPointerEnter={() => markChartActive(chartId)}
       className={`flex min-h-0 min-w-0 flex-1 flex-col ${
-        fullscreen ? 'rounded-none border-0 bg-canvas' : compact ? 'rounded-none border-y border-line bg-panel' : 'rounded-12 border border-line bg-panel'
+        fullscreen ? 'bg-canvas' : compact ? 'border-y border-line bg-panel' : 'bg-panel'
       }`}
     >
       {/* The controls on the right never shrink, so Hide chart stays on screen;
@@ -418,7 +418,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           </button>
         )}
       </header>
-      <div className={`relative min-h-0 flex-1 overflow-hidden ${compact || fullscreen ? '' : 'rounded-b-12'}`}>
+      <div className="relative min-h-0 flex-1 overflow-hidden">
         <div className="absolute inset-0 flex">
           {toolbar && (
             <DrawToolbar
