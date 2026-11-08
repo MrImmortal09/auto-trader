@@ -92,13 +92,13 @@ export function KillSwitchDialog({ serverBase, mode, onClose, onDone }: {
         {desk.data && (
           <div className="rounded-12 bg-inset px-4 py-1">
             {open.length === 0 ? (
-              <div className="py-3 type-body text-fg-muted">Nothing is open.</div>
+              <div className="py-3 type-body text-fg-subtle">Nothing is open.</div>
             ) : (
               <>
                 {open.map((p) => (
                   <div key={p.id} className="flex items-center gap-2 py-2.5">
                     <span className="type-body-strong text-fg">{p.contract}</span>
-                    <span className="type-caption text-fg-muted tnum">{p.qty} qty</span>
+                    <span className="type-caption text-fg-subtle tnum">{p.qty} qty</span>
                     <span className={`ml-auto num-medium ${TONE_TEXT[toneOf(p.pnl)]}`}>{p.pnl == null ? '—' : signedMoney(p.pnl)}</span>
                   </div>
                 ))}
@@ -111,7 +111,7 @@ export function KillSwitchDialog({ serverBase, mode, onClose, onDone }: {
           </div>
         )}
 
-        <p className={`type-caption ${mode === 'LIVE' ? 'text-live' : 'text-fg-muted'}`}>
+        <p className={`type-caption ${mode === 'LIVE' ? 'text-live-ink' : 'text-fg-subtle'}`}>
           {mode === 'LIVE'
             ? 'LIVE: every open position is sold on Kotak at market, with real money.'
             : 'Paper mode: only paper positions are affected.'}

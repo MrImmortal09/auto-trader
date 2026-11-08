@@ -4,6 +4,7 @@ import { money, plural, signedMoney, toneOf } from '../lib/format';
 import { useIsWide } from '../lib/hooks';
 import { usePoll } from '../lib/usePoll';
 import type { DeskAnswer, DeskPosition, Stopped } from '../lib/types';
+import { useTickFlash } from '../lib/useTickFlash';
 import { useGuard } from '../shell/useGuard';
 import { Segment } from '../ui/Segment';
 import { Stat } from '../ui/Stat';
@@ -17,7 +18,7 @@ function Section({ title, count, children }: { title: string; count: number; chi
     <section className="flex flex-col">
       <h2 className="mb-1 flex items-baseline gap-2 type-title text-fg">
         {title}
-        <span className="type-caption text-fg-muted tnum">{count}</span>
+        <span className="type-caption text-fg-subtle tnum">{count}</span>
       </h2>
       {children}
     </section>
@@ -25,7 +26,7 @@ function Section({ title, count, children }: { title: string; count: number; chi
 }
 
 function Empty({ children }: { children: ReactNode }) {
-  return <p className="py-2 type-body text-fg-muted">{children}</p>;
+  return <p className="py-2 type-body text-fg-subtle">{children}</p>;
 }
 
 /** `record` less `key`. */
@@ -104,11 +105,13 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped, paper = f
 
   const d = desk.data;
   const k = d?.kpis;
+  // The hero flashes its tint when the net ticks up or down.
+  const flash = useTickFlash(k?.net);
 
   const kpis = d && k && (
     desktop ? (
-      <div className="flex flex-wrap items-end gap-x-10 gap-y-4 border-b border-line pb-5">
-        <Stat label="Net today" value={signedMoney(k.net)} size="hero" tone={toneOf(k.net)} />
+      <div className="flex flex-wrap items-end gap-x-8 gap-y-4 border-b border-line pb-5">
+        <Stat label="Net today" value={signedMoney(k.net)} size="hero" tone={toneOf(k.net)} flash={flash} />
         <Stat label="Booked" value={signedMoney(k.booked)} tone={toneOf(k.booked)} />
         <Stat label="Open" value={signedMoney(k.open)} tone={toneOf(k.open)} />
         <Stat label={paper ? 'Trades today' : 'Calls today'} value={k.calls} />
@@ -120,7 +123,7 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped, paper = f
       </div>
     ) : (
       <div className="flex flex-col gap-3">
-        <Stat label="Net today" value={signedMoney(k.net)} size="hero" tone={toneOf(k.net)} />
+        <Stat label="Net today" value={signedMoney(k.net)} size="hero" tone={toneOf(k.net)} flash={flash} />
         <div className="grid grid-cols-3 gap-3">
           <Stat label="Booked" value={signedMoney(k.booked)} size="medium" tone={toneOf(k.booked)} />
           <Stat label="Open" value={signedMoney(k.open)} size="medium" tone={toneOf(k.open)} />
@@ -185,7 +188,7 @@ export function DeskToday({ serverBase, desktop, rangeSwitch, stopped, paper = f
   );
 
   const loading = !d && (
-    <p className={`type-body ${desk.error ? 'text-loss' : 'text-fg-muted'}`}>{desk.error ? `Couldn't load the desk: ${desk.error}` : 'Loading…'}</p>
+    <p className={`type-body ${desk.error ? 'text-loss' : 'text-fg-subtle'}`}>{desk.error ? `Couldn't load the desk: ${desk.error}` : 'Loading…'}</p>
   );
   const feedPane = <TelegramFeed feed={feed.data} error={feed.error} showTitle={desktop} />;
   const paneSwitch = (

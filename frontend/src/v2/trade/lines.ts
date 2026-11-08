@@ -133,7 +133,7 @@ function levelLine(p: ExecutePosition, ref: LevelRef, lvl: ChartLevel, cx: LineC
             ? 'Stop · past the price, sells all on release'
             : `Stop ${approxMoney(levelPnl(moved, p, indexNow, delta))}`
           : targetText(ref.target.lots, count, past, approxMoney(levelPnl(moved, { ...p, qty: targetQty(p, ref.target.lots, ref.target.id) }, indexNow, delta)), 'on release');
-      const parts: LinePart[] = [{ key: 'label', text, color, icon: draggable ? 'grip' : 'lock' }];
+      const parts: LinePart[] = [{ key: 'label', text, color, filled: past, icon: draggable ? 'grip' : 'lock' }];
       if (editable(p)) parts.push({ key: 'remove', text: '×', color });
       return parts;
     },

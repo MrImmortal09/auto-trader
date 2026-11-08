@@ -6,7 +6,7 @@ import { readStored } from '../../lib/execute';
 import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, upsert } from './bars';
 import { editable } from './chartKeymap';
-import { C, FONT, type MarkerData } from './chartSetup';
+import { C, FONT, PIVOT_ORANGE, type MarkerData } from './chartSetup';
 import { keepList, pruneExpired, VELA_DRAWINGS, type DrawApi } from './drawings';
 import type { ChartLine, ChartProps } from './KChart';
 import { barAt, futureName, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
@@ -14,13 +14,14 @@ import { pivotLines, pivotsByDay } from './pivots';
 import { DrawHistory } from './undoHistory';
 import { CandleProvider, PROVIDER, velaSymbol, type Feed } from './velaProvider';
 
-/** The design tokens on Vela's theme, per the handoff's table; its menus and dialogs take them too. */
-const THEME = { background: C.canvas, textColor: C.muted, gridColor: C.grid, borderColor: C.line, upColor: C.profit, downColor: C.loss, fontFamily: FONT };
-/** Pivots in TradingView's orange, as on the KLineChart page. */
-const PIVOT = '#fb8c00';
+/** The design tokens on Vela's theme: white, the subtle ink for the axes,
+ * the candle pair, as the KLineChart page draws; its menus and dialogs take them too. */
+const THEME = { background: C.canvas, textColor: C.subtle, gridColor: C.grid, borderColor: C.line, upColor: C.up, downColor: C.down, fontFamily: FONT };
+/** The pivot orange, as on the KLineChart page; the names are in the muted ink. */
+const PIVOT = PIVOT_ORANGE;
 /** A drag reports every move; the level is sent once the line has rested this long. */
 const MOVE_SETTLE_MS = 300;
-const MARK_COLOR: Record<MarkerData['kind'], string> = { B: C.profit, E: C.muted, T: C.profit, S: C.loss, call: C.indicator };
+const MARK_COLOR: Record<MarkerData['kind'], string> = { B: C.profit, E: C.fg, T: C.profit, S: C.loss, call: C.indicator };
 /** Vela's price pane: where every order line belongs. */
 const PRICE_PANE = 'price';
 /** RSI and CCI as Vela names them: the Layers menu owns them. */
@@ -100,7 +101,7 @@ const WORD_PARTS = new Set(['label', 'pnl']);
 
 /** A pivot's name, on its line. */
 function pivotText(value: string): Text {
-  return { value, color: PIVOT, size: 'tiny', hAlign: 'center', vAlign: 'top', side: 'above' };
+  return { value, color: C.muted, size: 'tiny', hAlign: 'center', vAlign: 'top', side: 'above' };
 }
 
 /** Where a line's anchor (its label and handle) sits: a fifth of the way

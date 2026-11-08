@@ -82,17 +82,17 @@ export function TrafficCards({ s, history, height = 150 }: { s: TelemetrySample 
     <>
       <Card title="Price feed" note="ticks a second" aside={<span className="num-medium text-fg">{rate(s?.feed_ticks_per_sec)}</span>}>
         <MetricChart points={series(history, (p) => p.feed_ticks_per_sec)} height={height} format={tick} value={(v) => `${rate(v)} ticks/s`} label="Price-feed ticks a second" />
-        <p className="mt-2 type-caption text-fg-muted">
+        <p className="mt-2 type-caption text-fg-subtle tnum">
           {s ? `${count(s.feed_ticks_total)} ticks · ${count(s.feed_bridge_restarts_total)} bridge restarts since the server started` : ' '}
         </p>
       </Card>
       <Card title="Kotak REST" note="p95 over 30 s" aside={<span className="num-medium text-fg">{ms(s?.kotak_p95_ms)}</span>}>
         <MetricChart points={series(history, (p) => p.kotak_p95_ms)} height={height} format={tick} value={ms} label="Kotak REST p95" atLeast={100} />
-        <p className="mt-2 type-caption text-fg-muted">{s ? `${count(s.kotak_requests_total)} calls · ${count(s.kotak_errors_total)} not 2xx` : ' '}</p>
+        <p className="mt-2 type-caption text-fg-subtle tnum">{s ? `${count(s.kotak_requests_total)} calls · ${count(s.kotak_errors_total)} not 2xx` : ' '}</p>
       </Card>
       <Card title="Dashboard API" note="requests a second" aside={<span className="num-medium text-fg">{rate(s?.http_req_per_sec)}</span>}>
         <MetricChart points={series(history, (p) => p.http_req_per_sec)} height={height} format={tick} value={(v) => `${rate(v)} req/s`} label="Dashboard API requests a second" />
-        <p className="mt-2 type-caption text-fg-muted">
+        <p className="mt-2 type-caption text-fg-subtle tnum">
           {s ? `p95 ${ms(s.http_p95_ms)} · ${count(s.http_in_flight)} in flight · ${s.http_5xx_pct ?? 0}% 5xx · ${s.http_4xx_pct ?? 0}% 4xx` : ' '}
         </p>
       </Card>

@@ -7,8 +7,15 @@ import type { MarkTone, RailMark, RailSpec } from './rail';
 const TICK: Record<MarkTone, string> = { loss: 'bg-loss', profit: 'bg-profit', muted: 'bg-fg-muted' };
 const TEXT: Record<MarkTone, string> = { loss: 'text-loss', profit: 'text-profit', muted: 'text-fg-muted' };
 
-/** Roughly how wide a caption is: 11 px Anek Latin, digits condensed. */
-const textWidth = (s: string) => s.length * 6 + 4;
+/** What the rail sits on. The price marker's ring, and the hollow marker's
+ * fill, take the same colour so the dot looks punched out of the surface:
+ * the page on a desktop row, white inside a card or a sheet. */
+export type RailSurface = 'canvas' | 'panel';
+const RING: Record<RailSurface, string> = { canvas: 'ring-canvas', panel: 'ring-panel' };
+const HOLLOW: Record<RailSurface, string> = { canvas: 'bg-canvas', panel: 'bg-panel' };
+
+/** Roughly how wide a caption is: 11 px Inter, tabular digits. */
+const textWidth = (s: string) => s.length * 7 + 4;
 
 /** Where a label goes, kept inside the rail: centred on its point, or held
  * against an end. */
@@ -18,7 +25,7 @@ function labelBox(cx: number, w: number, width: number): { left: number; style: 
   return { left: cx - w / 2, style: { left: cx, transform: 'translateX(-50%)' } };
 }
 
-export function PositionRail({ spec }: { spec: RailSpec }) {
+export function PositionRail({ spec, surface = 'canvas' }: { spec: RailSpec; surface?: RailSurface }) {
   const box = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
 
@@ -34,7 +41,7 @@ export function PositionRail({ spec }: { spec: RailSpec }) {
     return (
       <div className="relative h-[46px] w-full">
         <div className="absolute inset-x-0 top-[23px] border-t-2 border-dashed border-line" />
-        <div className="absolute inset-x-0 top-[29px] truncate text-center type-caption text-fg-muted">{spec.empty}</div>
+        <div className="absolute inset-x-0 top-[29px] truncate text-center type-caption text-fg-subtle">{spec.empty}</div>
       </div>
     );
   }
@@ -92,7 +99,7 @@ export function PositionRail({ spec }: { spec: RailSpec }) {
         ))}
       {marker && (
         <span
-          className={`absolute top-[18px] size-3 -translate-x-1/2 rounded-full ${marker.hollow ? 'border-2 border-fg bg-canvas' : 'bg-fg ring-2 ring-canvas'}`}
+          className={`absolute top-[18px] size-3 -translate-x-1/2 rounded-full ${marker.hollow ? `border-2 border-fg ${HOLLOW[surface]}` : `bg-fg ring-2 ${RING[surface]}`}`}
           style={{ left: `${pct(marker.at)}%` }}
         />
       )}

@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react';
 import { useServerBase } from '../lib/hooks';
 import { ServerDialog } from '../settings/dialogs';
+import { Mark } from '../shell/Mark';
 import { useIdentity } from './identity';
 import { SignInForm } from './SignInSheet';
 
@@ -23,20 +24,18 @@ function SignInPage() {
     <div className="flex min-h-dvh flex-col items-center justify-center bg-canvas px-4 py-10 text-fg">
       <div className="flex w-full max-w-[400px] flex-col gap-6">
         <div className="flex items-center gap-3">
-          <div aria-hidden className="grid size-10 place-items-center rounded-8 bg-raised type-label font-semibold text-fg">
-            AT
-          </div>
+          <Mark />
           <div>
             <h1 className="type-title text-fg">Auto Trader</h1>
-            <p className="type-caption text-fg-muted">For invited numbers only.</p>
+            <p className="type-caption text-fg-subtle">For invited numbers only.</p>
           </div>
         </div>
-        <div className="rounded-16 border border-line bg-panel">
+        <div className="rounded-16 border border-line bg-panel shadow-lg">
           <SignInForm reason={signInReason} />
         </div>
-        <p className="type-caption text-fg-muted">
+        <p className="type-caption text-fg-subtle">
           Server {server} ·{' '}
-          <button type="button" className="text-fg underline-offset-2 hover:underline" onClick={() => setServerOpen(true)}>
+          <button type="button" className="text-accent underline-offset-2 transition-colors duration-120 hover:text-accent-strong hover:underline" onClick={() => setServerOpen(true)}>
             Change
           </button>
         </p>

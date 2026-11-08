@@ -28,7 +28,12 @@ interface ManualInputs {
 
 const EMPTY_MANUAL: ManualInputs = { stop_loss: '', target: '', avg_buy_price: '' };
 
-const FIELD = 'h-9 w-full rounded-6 border border-line bg-inset px-2.5 num-medium text-fg outline-none focus:border-line-strong';
+// An inset well; its border turns accent while it has focus.
+const FIELD = 'h-9 w-full rounded-6 border border-line bg-inset px-2.5 num-medium text-fg transition-colors duration-120 placeholder:text-fg-subtle focus:border-accent';
+
+// An option: a choice, not a buy, so the selected one is blue.
+const OPTION = 'h-8 rounded-6 px-3 type-button transition-colors duration-120';
+const OPTION_LOOK = { selected: 'bg-accent text-on-accent', idle: 'bg-raised text-fg-muted hover:text-fg' } as const;
 
 export function SyncWithKotak({ serverBase, onSynced }: { serverBase: string; onSynced: () => void }) {
   const guard = useGuard();
@@ -115,7 +120,7 @@ export function SyncWithKotak({ serverBase, onSynced }: { serverBase: string; on
 
   return (
     <>
-      <Button size="md" onClick={openPreview} disabled={loading} icon={<RefreshCw size={14} className={loading ? 'animate-spin' : ''} />}>
+      <Button size="md" onClick={openPreview} disabled={loading} icon={<RefreshCw size={14} />}>
         {loading ? 'Checking Kotak…' : 'Sync with Kotak'}
       </Button>
 
@@ -136,21 +141,21 @@ export function SyncWithKotak({ serverBase, onSynced }: { serverBase: string; on
           <div className="flex items-start justify-between gap-4 border-b border-line px-6 py-4">
             <div>
               <h2 className="type-title text-fg">Sync with Kotak</h2>
-              <p className="mt-0.5 type-caption text-fg-muted">Live comparison against the broker — nothing changes until you apply.</p>
+              <p className="mt-0.5 type-caption text-fg-subtle">Live comparison against the broker — nothing changes until you apply.</p>
             </div>
-            <button type="button" aria-label="Close" onClick={() => setFindings(null)} disabled={applying} className="text-fg-muted hover:text-fg">
+            <button type="button" aria-label="Close" onClick={() => setFindings(null)} disabled={applying} className="text-fg-muted transition-colors duration-120 hover:text-fg">
               <X size={18} />
             </button>
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-6 py-4">
             {error && <div className="rounded-8 bg-loss-subtle px-3.5 py-2.5 type-caption text-loss">{error}</div>}
-            {findings.length === 0 && <p className="py-6 text-center type-body text-fg-muted">Nothing tracked right now — nothing to compare.</p>}
+            {findings.length === 0 && <p className="py-6 text-center type-body text-fg-subtle">Nothing tracked right now — nothing to compare.</p>}
             {actionable.map((f) => {
               const key = keyOf(f);
               const selectedKind = selections[key];
               return (
-                <div key={key} className="rounded-12 bg-inset p-4">
+                <div key={key} className="rounded-12 border border-line bg-panel p-4">
                   <p className="mb-3 type-body text-fg">{f.message}</p>
                   <div className="flex flex-wrap gap-2">
                     {f.options.map((o) => {
@@ -162,7 +167,7 @@ export function SyncWithKotak({ serverBase, onSynced }: { serverBase: string; on
                           type="button"
                           aria-pressed={selected}
                           onClick={() => (kind === 'AdoptManual' ? selectManualEntry(key) : setSelections((s) => ({ ...s, [key]: kind })))}
-                          className={`h-8 rounded-6 px-3 type-button transition-colors ${selected ? 'bg-profit text-on-accent' : 'bg-raised text-fg-muted hover:text-fg'}`}
+                          className={`${OPTION} ${selected ? OPTION_LOOK.selected : OPTION_LOOK.idle}`}
                         >
                           {o.label}
                           {o.recommended ? ' (recommended)' : ''}
@@ -193,7 +198,7 @@ export function SyncWithKotak({ serverBase, onSynced }: { serverBase: string; on
                           className={FIELD}
                         />
                       </label>
-                      <p className="col-span-full type-caption text-fg-muted">
+                      <p className="col-span-full type-caption text-fg-subtle">
                         Buy price is this lot&apos;s actual entry — leave it blank to use the broker&apos;s
                         {f.broker_avg_price > 0 ? ` same-day average (₹${f.broker_avg_price.toFixed(2)})` : ' same-day average'}, which blends every fill of the symbol. If
                         dynamic targeting is on, the runner extends past target 1 like any other position — no target 2 needed.
@@ -208,7 +213,7 @@ export function SyncWithKotak({ serverBase, onSynced }: { serverBase: string; on
               <div className="flex flex-col gap-1.5 border-t border-line pt-3">
                 <div className="type-label text-fg-muted">No action available</div>
                 {informational.map((f) => (
-                  <p key={keyOf(f)} className="type-caption text-fg-muted">
+                  <p key={keyOf(f)} className="type-caption text-fg-subtle">
                     {f.message}
                   </p>
                 ))}
@@ -220,7 +225,7 @@ export function SyncWithKotak({ serverBase, onSynced }: { serverBase: string; on
             <Button size="md" onClick={() => setFindings(null)} disabled={applying}>
               Cancel
             </Button>
-            <Button size="md" kind="profit" onClick={applySelections} disabled={applying || actionable.length === 0}>
+            <Button size="md" kind="accent" onClick={applySelections} disabled={applying || actionable.length === 0}>
               {applying ? 'Applying…' : 'Apply selected'}
             </Button>
           </div>

@@ -16,7 +16,7 @@ export function Exits({ settings, id, title, large = false }: { settings: Settin
   return (
     <Section id={id} title={title}>
       <Row title="Target 1" caption={dynamic ? 'Share sold when target 1 is hit. With dynamic targets on, target 1 sells one lot instead.' : 'Share sold when target 1 is hit'}>
-        <NumberInput label="Target 1" value={cfg.target_1_exit_pct} min={0} max={100} unit="%" size={size} onCommit={(n) => void save(() => ({ target_1_exit_pct: n }), `Target 1 sells ${n}%`)} />
+        <NumberInput label="Target 1" value={cfg.target_1_exit_pct} min={0} max={100} unit="%" size={size} onCommit={(n) => save(() => ({ target_1_exit_pct: n }), `Target 1 sells ${n}%`)} />
       </Row>
       <Row title="Dynamic targets" caption="Keep a lot running after T1 and move the stop up">
         <Toggle label="Dynamic targets" checked={dynamic} onChange={(on) => void save(() => ({ dynamic_targeting: on }), `Dynamic targets ${on ? 'on' : 'off'}`)} />
@@ -31,7 +31,7 @@ export function Exits({ settings, id, title, large = false }: { settings: Settin
           unit="×"
           size={size}
           disabled={!dynamic}
-          onCommit={(n) => void save(() => ({ dynamic_targeting_trail_factor: n }), `Trail factor ${n}`)}
+          onCommit={(n) => save(() => ({ dynamic_targeting_trail_factor: n }), `Trail factor ${n}`)}
         />
       </Row>
       <Row indent title="Extension factor" caption="Next target distance, as a share of entry to T1">
@@ -44,7 +44,7 @@ export function Exits({ settings, id, title, large = false }: { settings: Settin
           unit="×"
           size={size}
           disabled={!dynamic}
-          onCommit={(n) => void save(() => ({ dynamic_targeting_extension_factor: n }), `Extension factor ${n}`)}
+          onCommit={(n) => save(() => ({ dynamic_targeting_extension_factor: n }), `Extension factor ${n}`)}
         />
       </Row>
       <Row indent title="Single-lot positions too" caption="Ride targets instead of exiting at T1">
@@ -67,7 +67,7 @@ export function Exits({ settings, id, title, large = false }: { settings: Settin
           unit="%"
           size={size}
           disabled={!protect}
-          onCommit={(n) => void save(() => ({ pre_t1_trail_arm_pct: n }), `Arm at ${n}%`)}
+          onCommit={(n) => save(() => ({ pre_t1_trail_arm_pct: n }), `Arm at ${n}%`)}
         />
       </Row>
     </Section>

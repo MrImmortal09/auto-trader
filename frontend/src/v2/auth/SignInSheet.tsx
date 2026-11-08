@@ -19,7 +19,7 @@ export function SignInSheet() {
   return signInOpen ? <SignInForm reason={signInReason} onClose={closeSignIn} /> : null;
 }
 
-const INPUT = 'h-12 w-full rounded-8 border border-line bg-inset px-3 text-fg outline-none focus:border-line-strong disabled:opacity-50';
+const INPUT = 'h-12 w-full rounded-8 border border-line bg-inset px-3 text-fg transition-colors duration-120 focus:border-accent disabled:opacity-50';
 
 function mmss(secs: number): string {
   return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
@@ -123,7 +123,7 @@ export function SignInForm({ reason, onClose }: { reason: string | null; onClose
         <label className="flex flex-col gap-1.5">
           <span className="type-label text-fg-muted">Mobile number</span>
           <span className="relative flex items-center">
-            <span className="pointer-events-none absolute left-3 type-body text-fg-muted">+91</span>
+            <span className="pointer-events-none absolute left-3 type-body text-fg-subtle">+91</span>
             <input
               type="tel"
               inputMode="numeric"
@@ -142,11 +142,11 @@ export function SignInForm({ reason, onClose }: { reason: string | null; onClose
             />
           </span>
         </label>
-        {locked ? <p className="type-caption text-loss tnum">{lockedFor > 3600 ? error : `Too many attempts. Try again in ${mmss(lockedFor)}.`}</p> : error && <p className="type-caption text-loss">{error}</p>}
+        {locked ? <p className="type-caption text-loss tnum">{lockedFor > 3600 ? error : `Too many attempts. Try again in ${mmss(lockedFor)}.`}</p> : error && <p className="type-caption text-loss tnum">{error}</p>}
         <div className="flex items-center gap-2">
           <span className="flex-1" />
           {cancel}
-          <Button size="md" kind="profit" type="submit" disabled={busy || locked || typed.replace(/\D/g, '').length < 10}>
+          <Button size="md" kind="accent" type="submit" disabled={busy || locked || typed.replace(/\D/g, '').length < 10}>
             {busy ? 'Sending…' : 'Send code'}
           </Button>
         </div>
@@ -164,7 +164,7 @@ export function SignInForm({ reason, onClose }: { reason: string | null; onClose
           {note ?? `Sent on WhatsApp to +91 ${phone ? formatPhone(phone) : ''}.`}{' '}
           <button
             type="button"
-            className="text-fg underline-offset-2 hover:underline"
+            className="text-accent underline-offset-2 transition-colors duration-120 hover:text-accent-strong hover:underline"
             onClick={() => {
               setStep('phone');
               setError(null);
@@ -192,14 +192,14 @@ export function SignInForm({ reason, onClose }: { reason: string | null; onClose
           }}
           className={`${INPUT} text-center num-large tracking-[0.6em]`}
         />
-        {locked ? <p className="type-caption text-loss tnum">{lockedFor > 3600 ? error : `Too many attempts. Try again in ${mmss(lockedFor)}.`}</p> : error && <p className="type-caption text-loss">{error}</p>}
+        {locked ? <p className="type-caption text-loss tnum">{lockedFor > 3600 ? error : `Too many attempts. Try again in ${mmss(lockedFor)}.`}</p> : error && <p className="type-caption text-loss tnum">{error}</p>}
         <div className="flex items-center gap-2">
           <Button size="sm" kind="quiet" disabled={busy || locked || resendIn > 0} onClick={() => phone && void sendCode(phone)}>
             {resendIn > 0 ? `Send again in ${resendIn}s` : 'Send again'}
           </Button>
           <span className="flex-1" />
           {cancel}
-          <Button size="md" kind="profit" type="submit" disabled={busy || locked || code.length !== 6}>
+          <Button size="md" kind="accent" type="submit" disabled={busy || locked || code.length !== 6}>
             {busy ? 'Checking…' : 'Sign in'}
           </Button>
         </div>

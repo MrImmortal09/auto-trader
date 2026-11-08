@@ -35,7 +35,7 @@ function DeskGuest() {
     <div className="flex h-full flex-col items-center justify-center gap-3 px-6 py-16 text-center">
       <h2 className="type-title text-fg">Your paper desk</h2>
       <p className="max-w-[360px] type-body text-fg-muted">Sign in to see your positions, today's P&L and your trade history. Charts and the ladder are open to everyone.</p>
-      <Button size="lg" kind="profit" icon={<LogIn size={16} />} onClick={() => openSignIn('Sign in to see your paper desk.')}>
+      <Button size="lg" kind="accent" icon={<LogIn size={16} />} onClick={() => openSignIn('Sign in to see your paper desk.')}>
         Sign in
       </Button>
     </div>

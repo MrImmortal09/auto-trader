@@ -60,7 +60,7 @@ export function LiveDialog({ serverBase, onConfirm, onClose }: {
           {c && consequences(c).map((line) => <p key={line}>{line}</p>)}
         </div>
         {c ? (
-          <div className="rounded-12 bg-inset px-4 py-1">
+          <div className="rounded-12 border border-live-ink/30 bg-live-subtle px-4 py-1">
             {rows.map(([k, v]) => (
               <div key={k} className="flex items-start gap-4 py-2.5">
                 <span className="shrink-0 type-body-strong text-fg">{k}</span>
@@ -69,14 +69,14 @@ export function LiveDialog({ serverBase, onConfirm, onClose }: {
             ))}
           </div>
         ) : (
-          <p className="type-body text-fg-muted">{check.error ?? 'Checking Kotak and what is open…'}</p>
+          <p className={`type-body ${check.error ? 'text-loss' : 'text-fg-subtle'}`}>{check.error ?? 'Checking Kotak and what is open…'}</p>
         )}
         {blocked && <p className="type-caption text-loss">{blocked}</p>}
         <div className="flex flex-col gap-1.5">
           <label htmlFor="live-confirm" className="type-label text-fg-muted">
             Type {WORD} to confirm
           </label>
-          <div className="flex h-11 items-center gap-2 rounded-6 border border-line bg-inset px-3 focus-within:border-line-strong">
+          <div className="flex h-11 items-center gap-2 rounded-6 border border-line bg-inset px-3 transition-colors duration-120 focus-within:border-accent has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-accent has-[:focus-visible]:outline-offset-2">
             <input
               id="live-confirm"
               data-autofocus
@@ -89,7 +89,7 @@ export function LiveDialog({ serverBase, onConfirm, onClose }: {
             />
             {matched && <Check size={16} className="shrink-0 text-fg" aria-label="Matches" />}
           </div>
-          <span className="type-caption text-fg-muted">Capital letters, exactly as shown</span>
+          <span className="type-caption text-fg-subtle">Capital letters, exactly as shown</span>
         </div>
         <div className={desktop ? 'flex justify-end gap-2' : 'flex flex-col-reverse gap-3'}>
           <Button size={desktop ? 'md' : 'lg'} onClick={onClose} disabled={sending} className={desktop ? '' : 'w-full'}>

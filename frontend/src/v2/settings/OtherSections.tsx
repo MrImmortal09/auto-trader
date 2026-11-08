@@ -5,7 +5,7 @@ import { useGuard } from '../shell/useGuard';
 import { NumberInput } from '../ui/NumberInput';
 import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
-import { Row, Section } from './parts';
+import { LINK_BUTTON, LINK_BUTTON_LG, Row, Section } from './parts';
 import { uptimeText } from './summary';
 import type { SettingsState } from './useSettings';
 
@@ -46,10 +46,11 @@ export function ServerData({ serverBase, settings, system, id, title, large = fa
         .join(' · ')
     : '…';
 
-  async function setBalance(n: number) {
+  async function setBalance(n: number): Promise<boolean> {
     const sent = await guard('Changing the paper wallet needs write access.', () => setWalletBalance(serverBase, n), "Couldn't set the paper wallet");
     if (sent?.ok) toast({ tone: 'neutral', title: 'Saved', body: `Paper wallet ₹${n.toLocaleString('en-IN')}` });
     await wallet.refresh();
+    return sent?.ok === true;
   }
 
   return (
@@ -57,19 +58,19 @@ export function ServerData({ serverBase, settings, system, id, title, large = fa
       <Row title="Server" caption={running} />
       <Row title="Paper wallet" caption={paper ? 'Paper buys, sells and charges settle against it.' : 'Not used in LIVE.'}>
         {wallet.data && (
-          <NumberInput label="Paper wallet" value={wallet.data.balance} min={0} max={1_000_000_000} grouped unit="₹" size={size} width="w-[150px]" disabled={!paper} onCommit={(n) => void setBalance(n)} />
+          <NumberInput label="Paper wallet" value={wallet.data.balance} min={0} max={1_000_000_000} grouped unit="₹" size={size} width="w-[150px]" disabled={!paper} onCommit={(n) => setBalance(n)} />
         )}
       </Row>
       <Row title="Brokerage per order" caption="A flat charge per order in the P&L figures. What Kotak charges doesn't change.">
-        <NumberInput label="Brokerage per order" value={cfg.brokerage_per_order} min={0} max={1000} grouped unit="₹" size={size} onCommit={(n) => void save(() => ({ brokerage_per_order: n }), `Brokerage ₹${n} an order`)} />
+        <NumberInput label="Brokerage per order" value={cfg.brokerage_per_order} min={0} max={1000} grouped unit="₹" size={size} onCommit={(n) => save(() => ({ brokerage_per_order: n }), `Brokerage ₹${n} an order`)} />
       </Row>
       <Row title="Updates" caption="Every merge to main is released and deployed by GitHub Actions: the server restarts on the new release (about 30 s), and goes back to this one if the new one fails. Run it again, or an older release, from the deploy workflow.">
-        <a href={DEPLOY_WORKFLOW} target="_blank" rel="noreferrer" className="inline-flex h-7 shrink-0 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">
+        <a href={DEPLOY_WORKFLOW} target="_blank" rel="noreferrer" className={`shrink-0 ${large ? LINK_BUTTON_LG : LINK_BUTTON}`}>
           Deploys
         </a>
       </Row>
       <Row title="Clear the database" caption="In the old design, which asks first.">
-        <a href="/v1/settings" className="inline-flex h-7 items-center rounded-6 bg-raised px-2.5 type-button text-fg hover:bg-line">
+        <a href="/v1/settings" className={large ? LINK_BUTTON_LG : LINK_BUTTON}>
           Open
         </a>
       </Row>
