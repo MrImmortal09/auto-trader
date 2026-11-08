@@ -15,6 +15,9 @@ const clamp = (v: number, min: number, max: number) => Math.round(Math.max(min, 
  *
  * `onChange` follows the pointer; `onCommit` gets the value to keep once the
  * drag ends, so a drag saves once, not on every move.
+ *
+ * It is the 1 px line between two flat panes, takes 1 px of the row, and is
+ * grabbed 4 px either side of it.
  */
 export function ResizeHandle({ label, value, min, max, grows, onChange, onCommit, onReset, className = '' }: {
   label: string;
@@ -77,9 +80,14 @@ export function ResizeHandle({ label, value, min, max, grows, onChange, onCommit
       onPointerCancel={onUp}
       onDoubleClick={onReset}
       onKeyDown={onKey}
-      className={`group relative flex shrink-0 cursor-col-resize touch-none select-none items-center justify-center rounded-full outline-none focus-visible:bg-accent-subtle ${className}`}
+      className={`group relative z-10 w-px shrink-0 cursor-col-resize touch-none select-none bg-line outline-none ${className}`}
     >
-      <span className={`h-10 w-1 rounded-full transition-colors duration-120 ${dragging ? 'bg-accent' : 'bg-transparent group-hover:bg-line-strong group-focus-visible:bg-accent'}`} />
+      {/* The grip, 4 px either side of the line, and what shows on hover or drag. */}
+      <span aria-hidden className="absolute inset-y-0 -right-1 -left-1" />
+      <span
+        aria-hidden
+        className={`pointer-events-none absolute inset-y-0 left-1/2 w-[3px] -translate-x-1/2 transition-colors duration-120 ${dragging ? 'bg-accent' : 'bg-transparent group-hover:bg-line-strong group-focus-visible:bg-accent'}`}
+      />
     </div>
   );
 }
