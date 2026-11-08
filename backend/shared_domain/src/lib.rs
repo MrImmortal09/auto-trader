@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod entry_gate;
+pub mod special_session;
 pub mod telemetry;
+
+pub use special_session::*;
 
 /// Underlying index names this app treats as "index" options (vs. stock
 /// options, which fall back to `TradingConfig::other_lots`). Matched against
@@ -70,31 +73,6 @@ pub const MARKET_CLOSE_MINUTE: u32 = 40;
 pub const EXPIRY_SQUAREOFF_HOUR: u32 = 15;
 pub const EXPIRY_SQUAREOFF_MINUTE: u32 = 38;
 
-pub fn is_market_open() -> bool {
-    use chrono::Timelike;
-    use chrono::Datelike;
-    let now = now_ist();
-
-    // Check if it is a weekday
-    let weekday = now.weekday();
-    if weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun {
-        return false;
-    }
-
-    let h = now.hour();
-    let m = now.minute();
-
-    // Market hours are 09:15 to 15:40 IST (close is exclusive — sharp cutoff)
-    if h < MARKET_OPEN_HOUR || (h == MARKET_OPEN_HOUR && m < MARKET_OPEN_MINUTE) {
-        return false;
-    }
-    if h > MARKET_CLOSE_HOUR || (h == MARKET_CLOSE_HOUR && m >= MARKET_CLOSE_MINUTE) {
-        return false;
-    }
-
-    true
-}
-
 /// Today's market close instant (15:40:00 IST), regardless of weekday.
 pub fn today_market_close_ist() -> DateTime<FixedOffset> {
     now_ist()
@@ -104,52 +82,6 @@ pub fn today_market_close_ist() -> DateTime<FixedOffset> {
         .and_local_timezone(ist_offset())
         .single()
         .expect("IST close time is unambiguous")
-}
-
-/// The next market open instant (09:15:00 IST) strictly in the future,
-/// skipping weekends. If today is a weekday and it's before 09:15, returns
-/// today's open; otherwise returns the next weekday's open.
-pub fn next_market_open_ist() -> DateTime<FixedOffset> {
-    use chrono::Datelike;
-    let now = now_ist();
-    let mut date = now.date_naive();
-
-    let today_open = date
-        .and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)
-        .expect("valid open time")
-        .and_local_timezone(ist_offset())
-        .single()
-        .expect("IST open time is unambiguous");
-
-    let is_weekday = date.weekday() != chrono::Weekday::Sat && date.weekday() != chrono::Weekday::Sun;
-    if is_weekday && now < today_open {
-        return today_open;
-    }
-
-    // Advance to the next weekday
-    loop {
-        date += ChronoDuration::days(1);
-        if date.weekday() != chrono::Weekday::Sat && date.weekday() != chrono::Weekday::Sun {
-            break;
-        }
-    }
-
-    date
-        .and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)
-        .expect("valid open time")
-        .and_local_timezone(ist_offset())
-        .single()
-        .expect("IST open time is unambiguous")
-}
-
-/// Duration to sleep until the next market open. Zero if the market is open right now.
-pub fn duration_until_market_open() -> std::time::Duration {
-    if is_market_open() {
-        return std::time::Duration::ZERO;
-    }
-    let now = now_ist();
-    let next_open = next_market_open_ist();
-    (next_open - now).to_std().unwrap_or(std::time::Duration::ZERO)
 }
 
 /// Duration to sleep until today's 15:40:00 IST market close. `None` if that

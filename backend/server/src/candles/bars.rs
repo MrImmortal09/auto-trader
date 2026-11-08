@@ -90,8 +90,21 @@ fn ist_minute_of_day(t_ms: i64) -> i64 {
     (t_ms + IST_OFFSET_MS).rem_euclid(DAY_MS) / MINUTE_MS
 }
 
-/// Whether `t_ms` falls inside the 09:15–15:30 IST session of its day.
+/// Whether `t_ms` falls inside the trading session of its day (regular 09:15–15:30 IST
+/// on weekdays, or an active special session window on a session date).
 pub fn in_session(t_ms: i64) -> bool {
+    let dt = chrono::DateTime::from_timestamp_millis(t_ms)
+        .map(|utc| utc.with_timezone(&shared_domain::ist_offset()));
+    if let Some(ist) = dt {
+        use chrono::{Datelike, Timelike};
+        let minute = (ist.hour() * 60 + ist.minute()) as i64;
+        if let Some(session) = shared_domain::special_session_on(ist.date_naive()) {
+            let is_weekend = matches!(ist.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+            let in_special = minute >= session.start as i64 && minute < session.end as i64;
+            let in_regular = !is_weekend && (SESSION_OPEN_MIN..SESSION_CLOSE_MIN).contains(&minute);
+            return in_special || in_regular;
+        }
+    }
     (SESSION_OPEN_MIN..SESSION_CLOSE_MIN).contains(&ist_minute_of_day(t_ms))
 }
 
@@ -100,8 +113,15 @@ pub fn ist_day_start(t_ms: i64) -> i64 {
     t_ms - (t_ms + IST_OFFSET_MS).rem_euclid(DAY_MS)
 }
 
-/// Unix ms of 15:30 IST, the session's end, on `t_ms`'s IST day.
+/// Unix ms of the session's end on `t_ms`'s IST day (15:30 IST regular, or session end).
 pub fn session_close(t_ms: i64) -> i64 {
+    let dt = chrono::DateTime::from_timestamp_millis(t_ms)
+        .map(|utc| utc.with_timezone(&shared_domain::ist_offset()));
+    if let Some(ist) = dt {
+        if let Some(session) = shared_domain::special_session_on(ist.date_naive()) {
+            return ist_day_start(t_ms) + session.end as i64 * MINUTE_MS;
+        }
+    }
     ist_day_start(t_ms) + SESSION_CLOSE_MIN * MINUTE_MS
 }
 
@@ -319,5 +339,41 @@ mod tests {
         assert_eq!(session_close(at(9, 15, 0, 0)), at(15, 30, 0, 0));
         assert_eq!(Tf::parse("5M"), Some(Tf::M5));
         assert_eq!(Tf::parse("30m"), None);
+    }
+
+    #[test]
+    fn special_session_bars_built_inside_window_only() {
+        let _guard = shared_domain::special_sessions_test_guard();
+        let sunday_at = |h: i64, m: i64| {
+            let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 8)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(shared_domain::ist_offset())
+                .unwrap()
+                .timestamp_millis();
+            day + (h * 60 + m) * 60 * 1000
+        };
+
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap(),
+            start: 14 * 60 + 20,
+            end: 15 * 60 + 30,
+        }]);
+
+        // Sunday outside session: 10:00, 14:19, 15:30 -> not in_session
+        assert!(!in_session(sunday_at(10, 0)));
+        assert!(!in_session(sunday_at(14, 19)));
+        assert!(!in_session(sunday_at(15, 30)));
+
+        // Sunday inside session: 14:20, 15:00, 15:29 -> in_session
+        assert!(in_session(sunday_at(14, 20)));
+        assert!(in_session(sunday_at(15, 0)));
+        assert!(in_session(sunday_at(15, 29)));
+
+        // Session close on that Sunday is 15:30
+        assert_eq!(session_close(sunday_at(14, 20)), sunday_at(15, 30));
+
+        shared_domain::set_special_sessions(vec![]);
     }
 }

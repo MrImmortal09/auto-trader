@@ -601,18 +601,36 @@ fn expiring(by_index: BTreeMap<String, usize>, today: NaiveDate) -> Vec<Expiring
         .collect()
 }
 
-/// Whether the market is open, and the status bar's line about it: open
-/// 09:15–15:30 IST on a trading day.
-pub fn market_phase(now: DateTime<FixedOffset>, trading_day: bool) -> (bool, &'static str) {
+/// Whether the market is open, and the status bar's line about it:
+/// - on a special session date:
+///   - before START: "Special session opens HH:MM"
+///   - between START and END: "Special session · closes HH:MM"
+///   - after END: "Market closed"
+/// - on other trading days:
+///   - before 09:15: "Market opens 09:15"
+///   - 09:15–15:30: "Market open · closes 15:30"
+///   - after 15:30: "Market closed"
+/// - non-trading day: "Market closed"
+pub fn market_phase(now: DateTime<FixedOffset>, trading_day: bool) -> (bool, String) {
     let minutes = now.hour() * 60 + now.minute();
-    if !trading_day {
-        (false, "Market closed")
+    if let Some(session) = shared_domain::special_session_on(now.date_naive()) {
+        let start_str = shared_domain::format_hhmm(session.start);
+        let end_str = shared_domain::format_hhmm(session.end);
+        if minutes < session.start {
+            (false, format!("Special session opens {start_str}"))
+        } else if minutes < session.end {
+            (true, format!("Special session · closes {end_str}"))
+        } else {
+            (false, "Market closed".to_string())
+        }
+    } else if !trading_day {
+        (false, "Market closed".to_string())
     } else if minutes < 9 * 60 + 15 {
-        (false, "Market opens 09:15")
+        (false, "Market opens 09:15".to_string())
     } else if minutes < 15 * 60 + 30 {
-        (true, "Market open · closes 15:30")
+        (true, "Market open · closes 15:30".to_string())
     } else {
-        (false, "Market closed")
+        (false, "Market closed".to_string())
     }
 }
 
@@ -862,6 +880,7 @@ mod tests {
 
     #[test]
     fn the_market_line_follows_the_clock() {
+        let _guard = shared_domain::special_sessions_test_guard();
         let at = |h, m| {
             chrono::NaiveDate::from_ymd_opt(2026, 10, 21)
                 .unwrap()
@@ -870,11 +889,41 @@ mod tests {
                 .and_local_timezone(shared_domain::ist_offset())
                 .unwrap()
         };
-        assert_eq!(market_phase(at(9, 0), true), (false, "Market opens 09:15"));
-        assert_eq!(market_phase(at(9, 15), true), (true, "Market open · closes 15:30"));
-        assert_eq!(market_phase(at(15, 30), true), (false, "Market closed"));
-        assert_eq!(market_phase(at(11, 0), false), (false, "Market closed"));
+        assert_eq!(market_phase(at(9, 0), true), (false, "Market opens 09:15".to_string()));
+        assert_eq!(market_phase(at(9, 15), true), (true, "Market open · closes 15:30".to_string()));
+        assert_eq!(market_phase(at(15, 30), true), (false, "Market closed".to_string()));
+        assert_eq!(market_phase(at(11, 0), false), (false, "Market closed".to_string()));
+
+        // Special session on a Sunday
+        let sunday = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: sunday,
+            start: 14 * 60 + 20,
+            end: 15 * 60 + 30,
+        }]);
+        let sunday_at = |h, m| {
+            sunday
+                .and_hms_opt(h, m, 0)
+                .unwrap()
+                .and_local_timezone(shared_domain::ist_offset())
+                .single()
+                .unwrap()
+        };
+        assert_eq!(
+            market_phase(sunday_at(10, 0), true),
+            (false, "Special session opens 14:20".to_string())
+        );
+        assert_eq!(
+            market_phase(sunday_at(14, 20), true),
+            (true, "Special session · closes 15:30".to_string())
+        );
+        assert_eq!(
+            market_phase(sunday_at(15, 30), true),
+            (false, "Market closed".to_string())
+        );
+        shared_domain::set_special_sessions(vec![]);
         let stopped = stopped_from_log(r#"{"event":"KILL_SWITCH_ENGAGED","liquidated_positions":3,"abandoned_entries":1}"#, "2026-10-21 11:52:07");
         assert_eq!(stopped, Stopped { at: Some("11:52".into()), positions_exited: 3, entries_cancelled: 1 });
+        shared_domain::set_special_sessions(vec![]);
     }
 }

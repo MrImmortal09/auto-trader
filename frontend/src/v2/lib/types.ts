@@ -241,6 +241,20 @@ export interface AdminUser {
   paper: AdminPaper | null;
 }
 
+/** One special trading session (e.g. Diwali Muhurat). Times are IST `HH:MM`. */
+export interface SpecialSession {
+  date: string;
+  start: string;
+  end: string;
+}
+
+/** `GET /api/admin/special-sessions` */
+export interface SpecialSessionsAnswer {
+  sessions: SpecialSession[];
+  today: string;
+  active: boolean;
+}
+
 /** A user's paper portfolio at a glance, on the Admin page. */
 export interface AdminPaper {
   balance: number;
