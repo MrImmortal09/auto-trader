@@ -3,6 +3,7 @@ import { ChevronDown, CircleAlert } from 'lucide-react';
 import { AccountChip, AccountRow } from '../auth/AccountChip';
 import { signedMoney, toneOf } from '../lib/format';
 import { useIstClock } from '../lib/hooks';
+import { useNavHidden } from '../lib/layout';
 import type { Health, HealthSet, Level, Mode, Role, StatusAnswer } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
 import { Button } from '../ui/Button';
@@ -57,10 +58,22 @@ export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
   // Paper and LIVE are different figures, not a tick.
   const flash = useTickFlash(status?.day_pnl, true, status?.mode);
   const ownerView = role === 'admin';
+  const [navHidden, toggleNav] = useNavHidden();
+  const navAction = navHidden ? 'Show the navigation' : 'Hide the navigation';
   return (
     <header className={`flex h-10 shrink-0 items-center gap-4 border-b border-line px-4 ${barLook(status?.mode)}`}>
       <div className="flex min-w-0 flex-1 items-center gap-3">
-        <ModeChip mode={status?.mode} />
+        {/* The mode chip also folds the navigation rail away, for room. */}
+        <button
+          type="button"
+          onClick={toggleNav}
+          aria-pressed={navHidden}
+          aria-label={`${status?.mode === 'LIVE' ? 'LIVE' : 'Paper'} mode: ${navAction.toLowerCase()}`}
+          title={navAction}
+          className="shrink-0 rounded-4 outline-none transition-opacity duration-120 hover:opacity-80 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        >
+          <ModeChip mode={status?.mode} />
+        </button>
         <span className="num-small text-fg">{clock} IST</span>
         <span className="truncate type-caption text-fg-subtle">{status?.market ?? ''}</span>
       </div>

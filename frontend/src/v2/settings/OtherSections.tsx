@@ -4,6 +4,8 @@ import type { Flags, SystemAnswer } from '../lib/types';
 import { useGuard } from '../shell/useGuard';
 import { NumberInput } from '../ui/NumberInput';
 import { Toggle } from '../ui/Toggle';
+import { resetLayout } from '../lib/layout';
+import { Button } from '../ui/Button';
 import { useToast } from '../ui/toast';
 import { LINK_BUTTON, LINK_BUTTON_LG, Row, Section } from './parts';
 import { uptimeText } from './summary';
@@ -11,8 +13,19 @@ import type { SettingsState } from './useSettings';
 
 /** Trade: how its orders go, which is fixed. */
 export function TradeNotes({ flags, id, title }: { flags: Flags | null; id?: string; title?: string }) {
+  const toast = useToast();
   return (
     <Section id={id} title={title}>
+      <Row title="Layout" caption="Every pane on the Trade screen back to its first size and shown again, and the navigation rail back. Your charts, drawings, lots and expiries stay.">
+        <Button
+          onClick={() => {
+            resetLayout();
+            toast({ tone: 'neutral', title: 'Layout reset', body: 'The Trade screen opens at its first sizes, with every pane shown.' });
+          }}
+        >
+          Reset layout
+        </Button>
+      </Row>
       <Row title="One-tap buy" caption="A tap on the ladder buys at market, with no confirm. Any strike of any listed expiry; lots per tap are set on the Trade screen." />
       <Row title="Hold to exit all" caption="Holding Exit all for a second sells every manual trade at market. Telegram positions are left alone." />
       <Row title="Pointer only" caption="No key on the keyboard ever sends an order." />
