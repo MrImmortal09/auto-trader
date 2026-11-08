@@ -134,7 +134,7 @@ jobs:
               for f in /proc/[0-9]*/cmdline; do
                 pid=${f#/proc/}
                 pid=${pid%/cmdline}
-                case "$(tr '\0' ' ' < "$f" 2>/dev/null)" in
+                case "$(tr '\0' ' ' 2>/dev/null < "$f")" in
                   "node index.js "|"bash -c node index.js "|"bash -lc node index.js ")
                     if [ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" = "$REPO/kotak-bridge" ]; then echo "$pid"; fi
                     ;;
@@ -149,10 +149,13 @@ jobs:
               done
               [ -z "$(server_pids)" ]
             }
+            # Every tmux call closes fd 9 (the deploy lock): a tmux server it
+            # starts would otherwise hold the lock, and every later deploy wait.
+            tmux_() { tmux "$@" 9>&-; }
             # Ctrl-C in its pane, then SIGTERM, then SIGKILL; then its bridge,
             # and the port free for the next one.
             stop_server() {
-              tmux send-keys -t "$PANE" C-c 2>/dev/null || true
+              tmux_ send-keys -t "$PANE" C-c 2>/dev/null || true
               if ! gone_within 10; then
                 say "Still running after Ctrl-C; sending SIGTERM"
                 kill -TERM $(server_pids) 2>/dev/null || true
@@ -177,16 +180,16 @@ jobs:
               say "WARNING: port $PORT is still in use"
             }
             ensure_pane() {
-              if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+              if ! tmux_ has-session -t "$SESSION" 2>/dev/null; then
                 say "tmux session $SESSION is missing; creating it"
-                tmux new-session -d -s "$SESSION"
+                tmux_ new-session -d -s "$SESSION"
               fi
             }
             start_server() {
               ensure_pane
               # Clear anything half-typed in the pane before the command.
-              tmux send-keys -t "$PANE" C-u
-              tmux send-keys -t "$PANE" "cd $BACKEND && ./$1" C-m
+              tmux_ send-keys -t "$PANE" C-u
+              tmux_ send-keys -t "$PANE" "cd $BACKEND && ./$1" C-m
             }
             # `server-0.1.163-x86_64-unknown-linux-gnu` -> `0.1.163`; empty
             # for any other name.
