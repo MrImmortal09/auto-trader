@@ -37,7 +37,7 @@ import { MINUS, money, price, signedPct, toneOf, todayIst } from '../lib/format'
 import { usePoll } from '../lib/usePoll';
 import type { ChainAnswer, ExpiriesAnswer } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
-import { TRADE_KEY } from '../lib/layout';
+import { TRADE_KEY, useDeskRemoved } from '../lib/layout';
 import { useGuard } from '../shell/useGuard';
 import { ResizeHandle } from '../ui/ResizeHandle';
 import { Segment } from '../ui/Segment';
@@ -220,11 +220,18 @@ function signedPoints(spot: number, changePct: number): string {
   return `${v > 0 ? '+' : v < 0 ? MINUS : ''}${price(Math.abs(v))}`;
 }
 
-/** One index on the desktop ticker: "NIFTY 24,986.40 −0.18%", with the
- * points ("−43.95 (−0.18%)") when the bar is wide enough, the value flashing
- * as it ticks; the selected one is underlined in accent. */
+/** The indices the ticker gives the day's points as well as the percent
+ * whenever the bar has room for them; the others only on a wide window. */
+const TICKER_POINTS = new Set(['NIFTY', 'BANKNIFTY', 'SENSEX']);
+
+/** One index on the desktop ticker: "NIFTY 24,986.40 −43.95 (−0.18%)", or
+ * "−0.18%" alone where room is short (see `TICKER_POINTS`), the value
+ * flashing as it ticks; the selected one is underlined in accent. */
 function TickerItem({ index, spot, changePct, on, onSelect }: { index: string; spot: number | null; changePct: number | null; on: boolean; onSelect: () => void }) {
   const flash = useTickFlash(spot, true, index);
+  // All six with points need about 98rem; the three with points, the rest
+  // with the percent, about 70rem (a 1440 px window with the nav rail).
+  const points = TICKER_POINTS.has(index) ? 'hidden @[70rem]:inline' : 'hidden @[98rem]:inline';
   return (
     <button
       type="button"
@@ -237,12 +244,11 @@ function TickerItem({ index, spot, changePct, on, onSelect }: { index: string; s
       <span key={flash.key} className={`-mx-0.5 rounded-4 px-0.5 num-small text-fg ${flash.className}`}>
         {spot == null ? '—' : price(spot)}
       </span>
-      {/* The points too only when all six fit with them (a wide window). */}
       {spot != null && changePct != null && (
         <span className={`num-small ${TONE_TEXT[toneOf(changePct)]}`}>
-          <span className="hidden @[98rem]:inline">{signedPoints(spot, changePct)} (</span>
+          <span className={points}>{signedPoints(spot, changePct)} (</span>
           {signedPct(changePct)}
-          <span className="hidden @[98rem]:inline">)</span>
+          <span className={points}>)</span>
         </span>
       )}
     </button>
@@ -305,6 +311,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   }, []);
   // Desktop: the charts row, which the trading panel grows up into.
   const chartsRef = useRef<HTMLDivElement>(null);
+  // The desk column, unless this sign-in took it away in Settings.
+  const [deskRemoved] = useDeskRemoved();
   const setPanelHeight = useCallback((panelHeight: number) => save((s) => ({ ...s, panelHeight })), [save]);
   // Desktop: the charts' own row, and the widths under a drag (kept here
   // until the pointer lifts, then saved once).
@@ -998,6 +1006,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         onDeskWidth={(deskWidth) => save((s) => ({ ...s, deskWidth }))}
         deskHidden={saved.deskHidden}
         onDeskHidden={(deskHidden) => save((s) => ({ ...s, deskHidden }))}
+        deskRemoved={deskRemoved}
         chartsRef={chartsRef}
         layout={saved.barHidden ? 'bar hidden' : 'bar shown'}
         paper={account}

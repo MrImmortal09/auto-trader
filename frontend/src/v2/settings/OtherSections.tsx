@@ -4,7 +4,8 @@ import type { Flags, SystemAnswer } from '../lib/types';
 import { useGuard } from '../shell/useGuard';
 import { NumberInput } from '../ui/NumberInput';
 import { Toggle } from '../ui/Toggle';
-import { resetLayout } from '../lib/layout';
+import { useIdentity } from '../auth/identity';
+import { resetLayout, useDeskRemoved } from '../lib/layout';
 import { Button } from '../ui/Button';
 import { useToast } from '../ui/toast';
 import { LINK_BUTTON, LINK_BUTTON_LG, Row, Section } from './parts';
@@ -14,9 +15,18 @@ import type { SettingsState } from './useSettings';
 /** Trade: how its orders go, which is fixed. */
 export function TradeNotes({ flags, id, title }: { flags: Flags | null; id?: string; title?: string }) {
   const toast = useToast();
+  const { canReadOwner } = useIdentity();
+  const [deskRemoved, setDeskRemoved] = useDeskRemoved();
+  const deskName = canReadOwner ? 'Owner desk' : 'Paper portfolio';
   return (
     <Section id={id} title={title}>
-      <Row title="Layout" caption="Every pane on the Trade screen back to its first size and shown again, and the navigation rail back. Your charts, drawings, lots and expiries stay.">
+      <Row
+        title={deskName}
+        caption={`The column beside the positions on the desktop Trade screen. Off takes it away completely, with no strip to bring it back; only for you, on this browser.`}
+      >
+        <Toggle checked={!deskRemoved} onChange={(on) => setDeskRemoved(!on)} label={`Show the ${deskName} on the Trade screen`} />
+      </Row>
+      <Row title="Layout" caption={`Every pane on the Trade screen back to its first size and shown again, and the navigation rail back. Your charts, drawings, lots and expiries stay, and so does the ${deskName} switch above.`}>
         <Button
           onClick={() => {
             resetLayout();

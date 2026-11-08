@@ -187,7 +187,7 @@ export function AccountColumn({ mode, desk, positions, paper, vertical, onHide }
  * Exit all is held. Its top edge drags to resize it — up into the charts,
  * never past the bottom of the window — and the chevron folds it.
  */
-export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, deskWidth, onDeskWidth, deskHidden, onDeskHidden, chartsRef, layout, paper }: {
+export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, deskWidth, onDeskWidth, deskHidden, onDeskHidden, deskRemoved, chartsRef, layout, paper }: {
   serverBase: string;
   mode: string;
   desk: DeskAnswer | null;
@@ -212,6 +212,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   deskWidth: number;
   onDeskWidth: (w: number) => void;
   deskHidden: boolean;
+  /** Taken away in Settings: no column, no strip, no edge. */
+  deskRemoved: boolean;
   onDeskHidden: (hidden: boolean) => void;
   /** The charts above, which give the panel its room. */
   chartsRef: RefObject<HTMLElement | null>;
@@ -523,7 +525,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
       >
         <span className="mt-1 h-1 w-10 rounded-full bg-line transition-colors duration-120 group-hover:bg-line-strong" />
       </div>
-      {deskHidden ? (
+      {deskRemoved ? null : deskHidden ? (
         <button
           type="button"
           onClick={() => onDeskHidden(false)}

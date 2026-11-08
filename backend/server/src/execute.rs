@@ -488,6 +488,10 @@ async fn upstox_spot(state: &AppState, index: &str) -> Option<f64> {
     state.market.indices.read().await.get(index).and_then(|l| l.spot).filter(|s| *s > 0.0)
 }
 
+async fn upstox_prev_close(state: &AppState, index: &str) -> Option<f64> {
+    state.market.indices.read().await.get(index).and_then(|l| l.prev_close).filter(|c| *c > 0.0)
+}
+
 /// Spot from put-call parity on whatever strikes have both prices: at the
 /// strike where call and put are closest, `K + CE − PE`.
 fn parity_spot(state: &AppState, strikes: &[ChainStrike]) -> Option<f64> {
@@ -677,9 +681,19 @@ pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, exp
 
     let mut indices = Vec::with_capacity(INDEX_NAMES.len());
     for &name in INDEX_NAMES {
-        let (spot, change_pct) = match kotak_index(state, name) {
-            Some((s, c)) => (Some(s), c),
-            None => (upstox_spot(state, name).await, None),
+        let kotak = kotak_index(state, name);
+        let spot = match kotak {
+            Some((s, _)) => Some(s),
+            None => upstox_spot(state, name).await,
+        };
+        // Kotak's change, else one from Upstox's previous close (NIFTY,
+        // BANKNIFTY and SENSEX): Kotak's is gone after its session ends.
+        let change_pct = match kotak.and_then(|(_, c)| c) {
+            Some(c) => Some(c),
+            None => match (spot, upstox_prev_close(state, name).await) {
+                (Some(s), Some(c)) => Some((s - c) / c * 100.0),
+                _ => None,
+            },
         };
         indices.push(IndexHeadline { index: name, spot, change_pct });
     }
