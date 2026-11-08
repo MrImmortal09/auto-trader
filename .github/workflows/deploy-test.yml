@@ -1,0 +1,36 @@
+name: Deploy script test
+
+# deploy.yml restarts the live server on every merge, so its VM script is
+# tested on a pull request before it can run against the real VM: a good
+# release, the same release again, and a release that must roll back
+# (.github/deploy-test/run.sh).
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/deploy.yml
+      - .github/deploy-test/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+
+      - name: Build the stand-in server
+        run: rustc --edition 2021 -O .github/deploy-test/fake_server.rs -o "$RUNNER_TEMP/fake-server"
+
+      - name: Run the deploy script against a simulated VM
+        run: bash .github/deploy-test/run.sh "$RUNNER_TEMP/fake-server"
+
+      - name: Deploy log
+        if: always()
+        run: cat /tmp/deploy.log || true

@@ -253,9 +253,6 @@ export const putSpecialSession = (base: string, date: string, start: string, end
 export const deleteSpecialSession = (base: string, date: string) =>
   send(base, `/api/admin/special-sessions/${encodeURIComponent(date)}`, 'DELETE');
 
-/** Run update.sh on the server: the latest release, a restart and a health check. */
-export const updateServer = (base: string) => send(base, '/api/update_server', 'POST');
-
 // ── A user's own paper portfolio (`/api/v2/me/*`) ─────────────────────── //
 // Fills are booked at once at the live price: an answer is the fill.
 
