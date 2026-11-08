@@ -62,9 +62,11 @@ export interface Layers {
   /** RSI (14) and CCI (20), each in a pane under the candles. */
   rsi: boolean;
   cci: boolean;
+  /** KLineChart's other indicators picked for this chart, by name (`studies.ts`). */
+  studies: string[];
 }
 
-export const DEFAULT_LAYERS: Layers = { myTrades: true, telegramTrades: false, telegramCalls: false, vwap: true, pivots: true, rsi: false, cci: false };
+export const DEFAULT_LAYERS: Layers = { myTrades: true, telegramTrades: false, telegramCalls: false, vwap: true, pivots: true, rsi: false, cci: false, studies: [] };
 
 /** What the screen can do to a scalp's levels from a chart. */
 export interface LevelActions {

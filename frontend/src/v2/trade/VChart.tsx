@@ -29,7 +29,7 @@ const NATIVE = { rsi: 'rsi', cci: 'commodity-channel-index' } as const;
 /** Studies added from Vela's Indicators menu, kept per chart slot. */
 const STUDIES = 'v2.studies.v.';
 /** The candle styles the Layers menu knows. */
-const OUR_STYLES = new Set<string>(['candles', 'bars', 'area']);
+const OUR_STYLES = new Set<string>(['candles', 'bars', 'line', 'area']);
 
 type Text = NonNullable<SerializedDrawing['text']>;
 /** A user's drawing as kept: all but its id. */
@@ -116,7 +116,7 @@ interface Keyed<T> {
   value: T;
 }
 
-const VELA_STYLE: Record<CandleStyle, string> = { candles: 'candles', bars: 'bars', area: 'area' };
+const VELA_STYLE: Record<CandleStyle, string> = { candles: 'candles', bars: 'bars', line: 'line', area: 'area' };
 
 /**
  * One chart in Vela's own app (its workspace, one chart): `sym` at `tf`, the

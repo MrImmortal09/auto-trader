@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, Layers as LayersIcon, Maximize2, Minimize2 } from 'lucide-react';
+import { ChartSpline, ChevronDown, ChevronUp, Layers as LayersIcon, Maximize2, Minimize2 } from 'lucide-react';
 import { INDEX_ORDER } from '../../lib/execute';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
@@ -15,6 +15,7 @@ import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type Placing } from './KChart';
 import type { Layers } from './lines';
 import { CANDLE_STYLES, CHART_LIBS, sameSym, symbolLabel, symbolName, type Bar, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { STUDIES } from './studies';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 const TFS: Tf[] = ['1m', '5m', '15m'];
@@ -92,7 +93,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   fullscreen?: boolean;
   onFullscreen?: (on: boolean) => void;
 }) {
-  const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | null>(null);
+  const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | 'studies' | null>(null);
   const [chartState, setChartState] = useState<{ loading: boolean; error: string | null; last: Bar | null }>({ loading: true, error: null, last: null });
   // Drawing tools (KLineChart or Vela), while it draws this chart.
   const drawApi = useRef<DrawApi | null>(null);
@@ -156,6 +157,40 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
     const row = atmRow.current;
     if (box && row) box.scrollTop = row.offsetTop - box.clientHeight / 2 + row.offsetHeight / 2;
   }, [menu, chain, atm]);
+
+  // KLineChart's indicators (Vela has its own menu): over the price, then each
+  // in a pane under it, RSI and CCI being the Layers menu's two.
+  const setStudy = (name: string, on: boolean) =>
+    onLayers({ ...layers, studies: STUDIES.filter((s) => (s.name === name ? on : layers.studies.includes(s.name))).map((s) => s.name) });
+  const studyRow = (s: (typeof STUDIES)[number]) => {
+    const noVolume = s.volume === true && sym.kind === 'index';
+    return (
+      <CheckboxRow
+        key={s.name}
+        checked={layers.studies.includes(s.name)}
+        disabled={noVolume}
+        title={s.title}
+        note={noVolume ? 'Needs volume: an index has none, chart an option' : s.note}
+        onChange={(v) => setStudy(s.name, v)}
+      />
+    );
+  };
+  // In the Layers menu (phone), which has its own RSI and CCI rows.
+  const studyList = (oscillators: boolean) => (
+    <>
+      <div className="px-2 pt-1 pb-1 type-caption text-fg-muted">Over the price</div>
+      {STUDIES.filter((s) => s.over).map(studyRow)}
+      <div className="px-2 pt-3 pb-1 type-caption text-fg-muted">Under the price, each in its own pane</div>
+      {oscillators && (
+        <>
+          <CheckboxRow checked={layers.rsi} title="RSI · Relative strength" note="14 bars, lines at 70 and 30" onChange={(v) => onLayers({ ...layers, rsi: v })} />
+          <CheckboxRow checked={layers.cci} title="CCI · Commodity channel" note="20 bars, lines at +100 and −100" onChange={(v) => onLayers({ ...layers, cci: v })} />
+        </>
+      )}
+      {STUDIES.filter((s) => !s.over).map(studyRow)}
+    </>
+  );
+  const studyCount = layers.studies.length + (layers.rsi ? 1 : 0) + (layers.cci ? 1 : 0);
 
   return (
     // Not clipped as a whole: its menus (the symbol picker, Layers) open over
@@ -299,6 +334,24 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
           </button>
         )}
+        {lib !== 'vela' && !compact && (
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              aria-label="Indicators"
+              title="Indicators"
+              aria-expanded={menu === 'studies'}
+              onClick={() => setMenu(menu === 'studies' ? null : 'studies')}
+              className={`flex h-8 items-center gap-1 rounded-6 px-1.5 hover:bg-raised hover:text-fg ${studyCount > 0 ? 'text-accent' : 'text-fg-muted'}`}
+            >
+              <ChartSpline size={16} />
+              {studyCount > 0 && <span className="num-small">{studyCount}</span>}
+            </button>
+            <Popover open={menu === 'studies'} onClose={close} align="right" scroll>
+              {studyList(true)}
+            </Popover>
+          </div>
+        )}
         <div className="relative shrink-0">
           <button type="button" aria-label="Layers" aria-expanded={menu === 'layers'} onClick={() => setMenu(menu === 'layers' ? null : 'layers')} className="grid size-8 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
             <LayersIcon size={16} />
@@ -324,14 +377,21 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             <CheckboxRow checked={layers.rsi} title="RSI" note="14 bars, lines at 70 and 30" onChange={(v) => onLayers({ ...layers, rsi: v })} />
             <CheckboxRow checked={layers.cci} title="CCI" note="20 bars, lines at +100 and −100" onChange={(v) => onLayers({ ...layers, cci: v })} />
             <div className="flex items-center justify-between gap-3 px-2 pt-3 pb-1">
-              <span className="type-label text-fg">Candle style</span>
-              <Segment label="Candle style" size="sm" value={style} onChange={onStyle} options={CANDLE_STYLES} />
+              <span className="whitespace-nowrap type-label text-fg">Chart type</span>
+              <Segment label="Chart type" size="sm" value={style} onChange={onStyle} options={CANDLE_STYLES} />
             </div>
             {onLib && (
               <div className="flex items-center justify-between gap-3 px-2 pt-1 pb-1">
                 <span className="type-label text-fg">Chart library</span>
                 <Segment label="Chart library" size="sm" value={lib} onChange={onLib} options={CHART_LIBS} />
               </div>
+            )}
+            {lib !== 'vela' && compact && (
+              <>
+                <div className="mx-2 mt-3 border-t border-line" />
+                <div className="px-2 pt-3 pb-1 type-label text-fg">Indicators</div>
+                {studyList(false)}
+              </>
             )}
           </Popover>
         </div>
@@ -379,6 +439,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             pivots={layers.pivots}
             rsi={layers.rsi}
             cci={layers.cci}
+            studies={layers.studies}
             style={style}
             placing={placing}
             onPlacingDone={onPlacingDone}

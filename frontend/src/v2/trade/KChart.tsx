@@ -4,9 +4,10 @@ import { apiUrl } from '../../lib/api';
 import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
-import { CHART_STYLES, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
+import { AREA_FILL, CHART_STYLES, NO_FILL, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
 import { DRAW_PREFIX, KlineDrawings, type DrawApi } from './drawings';
 import { pivotsByDay } from './pivots';
+import { drawableStudies, fitPanes, showStudies } from './studies';
 import {
   barAt,
   countdown,
@@ -22,7 +23,7 @@ import {
   type Tf,
 } from './model';
 
-const KLINE_CANDLE: Record<CandleStyle, 'candle_solid' | 'ohlc' | 'area'> = { candles: 'candle_solid', bars: 'ohlc', area: 'area' };
+const KLINE_CANDLE: Record<CandleStyle, 'candle_solid' | 'ohlc' | 'area'> = { candles: 'candle_solid', bars: 'ohlc', line: 'area', area: 'area' };
 
 /** A horizontal order line: at a price, or at the bar close at a time (where
  * the index was when a scalp was bought). */
@@ -99,7 +100,9 @@ export interface ChartProps {
  * VWAP is its future's, moved onto the index by the basis. The user's own
  * drawings are kept per instrument (see `drawings.ts`).
  */
-export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, rsi, cci, style, placing, onPlacingDone, bus, onState, compact = false, drawRef }: ChartProps & {
+export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, rsi, cci, studies, style, placing, onPlacingDone, bus, onState, compact = false, drawRef }: ChartProps & {
+  /** KLineChart's other indicators picked for this chart (`studies.ts`). */
+  studies: string[];
   /** Phone: shorter RSI and CCI panes. */
   compact?: boolean;
   /** Set to this chart's drawing tools while it is up, for the Draw menu. */
@@ -279,7 +282,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   }, [loaded, error, bars, onState]);
 
   useEffect(() => {
-    chart.current?.setStyles({ candle: { type: KLINE_CANDLE[style] } });
+    chart.current?.setStyles({ candle: { type: KLINE_CANDLE[style], area: { backgroundColor: style === 'line' ? NO_FILL : AREA_FILL } } });
   }, [style]);
 
   // The instrument's saved drawings, once its bars are in: a switch clears the chart.
@@ -287,13 +290,26 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     if (loaded) drawings.current?.show(symbol);
   }, [loaded, symbol, tf]);
 
-  // RSI and CCI: KLineChart's own, each in its pane.
+  // RSI and CCI (the Layers menu's) and the Indicators menu's picks, those
+  // built from volume only on an option; then the panes under the price
+  // share at most part of the chart, so the price keeps the room.
+  const studyKey = drawableStudies(studies, sym.kind === 'index').join(',');
+  const [hostHeight, setHostHeight] = useState(0);
+  useLayoutEffect(() => {
+    const el = host.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setHostHeight(Math.round(el.getBoundingClientRect().height)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   useEffect(() => {
-    if (chart.current) showOscillator(chart.current, 'rsi', rsi, compact);
-  }, [rsi, compact]);
-  useEffect(() => {
-    if (chart.current) showOscillator(chart.current, 'cci', cci, compact);
-  }, [cci, compact]);
+    const c = chart.current;
+    if (!c) return;
+    showOscillator(c, 'rsi', rsi, compact);
+    showOscillator(c, 'cci', cci, compact);
+    showStudies(c, studyKey ? studyKey.split(',') : [], compact);
+    fitPanes(c, hostHeight, compact);
+  }, [rsi, cci, studyKey, compact, hostHeight]);
 
   // VWAP: the option's own, or the future's moved onto the index.
   useEffect(() => {

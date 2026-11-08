@@ -13,6 +13,10 @@ export { C, FONT };
 
 const IN = new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+/** The Area style's fill; the Line style is the same line with none. */
+export const AREA_FILL = alpha(C.up, 0.1);
+export const NO_FILL = 'rgba(0, 0, 0, 0)';
+
 // The chart draws on white: a recessive horizontal grid, solid candles in the
 // candle pair (a hue family apart from the money greens and reds), dark tags
 // with white text for the last price and the crosshair, as TradingView light.
@@ -56,7 +60,7 @@ export const CHART_STYLES: DeepPartial<Styles> = {
       lineColor: C.up,
       smooth: false,
       value: 'close',
-      backgroundColor: alpha(C.up, 0.1),
+      backgroundColor: AREA_FILL,
       point: { show: true, color: C.up, radius: 4, rippleColor: C.up, rippleRadius: 4, animation: false, animationDuration: 0 },
     },
   },
