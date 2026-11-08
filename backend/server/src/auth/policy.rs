@@ -188,6 +188,7 @@ mod tests {
         (GET, "/api/admin/trades", Access::Admin),
         (GET, "/api/admin/positions", Access::Admin),
         (GET, "/api/admin/users/3/report", Access::Admin),
+        (GET, "/api/admin/order-timings", Access::Admin),
         (GET, "/api/admin/special-sessions", Access::Admin),
         (PUT, "/api/admin/special-sessions/2026-11-08", Access::Admin),
         (DELETE, "/api/admin/special-sessions/2026-11-08", Access::Admin),

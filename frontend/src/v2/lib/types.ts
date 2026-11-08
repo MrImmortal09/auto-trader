@@ -301,6 +301,56 @@ export interface AdminTradesAnswer {
   realized: number;
 }
 
+/** One LIVE order's timing (`GET /api/admin/order-timings`). Times are Unix
+ * ms on the server's clock unless named otherwise. */
+export interface OrderTimingRow {
+  order_no: string | null;
+  trading_symbol: string | null;
+  /** `B` / `S`. */
+  side: string | null;
+  /** `MKT`, `L`, `SL`, `SL-M`. */
+  order_type: string | null;
+  qty: number | null;
+  price: number | null;
+  trigger_price: number | null;
+  sent_at_ms: number | null;
+  /** When Kotak answered the send. */
+  replied_at_ms: number | null;
+  /** Why Kotak refused the send. */
+  error: string | null;
+  /** From the push stream: `open`, `complete`, `rejected`, `cancelled`, … */
+  status: string | null;
+  filled_qty: number | null;
+  avg_price: number | null;
+  reject_reason: string | null;
+  first_update_ms: number | null;
+  accepted_at_ms: number | null;
+  first_fill_ms: number | null;
+  filled_at_ms: number | null;
+  /** Kotak's own receive time of the latest update, epoch ns. */
+  kotak_received_ns: number | null;
+  /** The exchange's broadcast time, epoch seconds. */
+  exchange_epoch_s: number | null;
+  /** The exchange's confirmation time, as Kotak writes it. */
+  exchange_confirm: string | null;
+  order_time: string | null;
+}
+
+export interface OrderTimingAnswer {
+  day: string;
+  push: {
+    /** `KOTAK_ORDER_STREAM=on` on the server. */
+    enabled: boolean;
+    connected: boolean;
+    style: 'json' | 'raw' | null;
+    last_event_ms: number | null;
+    error: string | null;
+    updates: number;
+  };
+  /** Newest first. */
+  orders: OrderTimingRow[];
+}
+
 /** One open paper position (`GET /api/admin/positions`). */
 export interface AdminPosition {
   user_id: number;

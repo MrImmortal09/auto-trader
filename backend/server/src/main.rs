@@ -13,6 +13,7 @@ mod desk;
 mod execute;
 mod history;
 mod market_data;
+mod order_timing;
 mod orders;
 mod paper;
 mod pulse;
@@ -48,6 +49,29 @@ pub(crate) fn resolve_auth_secret() -> Option<String> {
 /// limits with the owner). It needs the server's own `.env` and database, so
 /// it is exactly as safe as a shell on the VM. It only reads the database:
 /// the running server needn't stop.
+/// `server order-feed-probe [seconds]`: try Kotak's order push stream with the
+/// session saved in the database and print what it sends — see
+/// `order_timing::probe`. Opens the database read-only; the running server
+/// needn't stop.
+async fn order_feed_probe() -> i32 {
+    let seconds = std::env::args().nth(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://trades.db".into());
+    let opts = match <sqlx::sqlite::SqliteConnectOptions as std::str::FromStr>::from_str(&db_url) {
+        Ok(opts) => opts.read_only(true),
+        Err(e) => {
+            eprintln!("Invalid DATABASE_URL {db_url}: {e}");
+            return 1;
+        }
+    };
+    match SqlitePool::connect_with(opts).await {
+        Ok(pool) => order_timing::probe(&pool, seconds).await,
+        Err(e) => {
+            eprintln!("Can't open {db_url}: {e}");
+            1
+        }
+    }
+}
+
 async fn print_admin_token() -> i32 {
     let (Some(secret), Some(phone)) = (resolve_auth_secret(), auth::admin_phone()) else {
         eprintln!("admin-token needs AUTH_SECRET and ADMIN_PHONE — run it from the server's directory, beside its .env");
@@ -167,6 +191,8 @@ pub(crate) struct AppState {
     /// Signed-in users' own paper portfolios — see `paper`. Nothing in it
     /// reaches the owner's engine or the broker.
     pub paper: Arc<paper::PaperDesk>,
+    /// How long each LIVE order took — see `order_timing`. Admin only.
+    pub order_timing: Arc<order_timing::OrderTiming>,
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +776,9 @@ async fn main() {
     if std::env::args().nth(1).as_deref() == Some("admin-token") {
         std::process::exit(print_admin_token().await);
     }
+    if std::env::args().nth(1).as_deref() == Some("order-feed-probe") {
+        std::process::exit(order_feed_probe().await);
+    }
 
     // 1. Tracing — timestamps in IST (UTC+5:30) so server logs are readable
     let ist_timer = tracing_subscriber::fmt::time::OffsetTime::new(
@@ -847,6 +876,16 @@ async fn main() {
     }
 
     let kotak_client_opt = Arc::new(tokio::sync::Mutex::new(None));
+    // Order timing (analytics only, see `order_timing`): every send is
+    // recorded from here on — before the monitor can place one — and Kotak's
+    // order push stream runs only with KOTAK_ORDER_STREAM=on.
+    let order_timing = Arc::new(order_timing::OrderTiming::new(order_timing::push_enabled()));
+    tokio::spawn(order_timing::run_recorder(write_tx.clone()));
+    if order_timing::push_enabled() {
+        tokio::spawn(order_timing::run_push_stream(Arc::clone(&order_timing), Arc::clone(&kotak_client_opt), write_tx.clone()));
+    } else {
+        tracing::info!("KOTAK_ORDER_STREAM not on — order fill times come from the send only (try `server order-feed-probe` first)");
+    }
     let ws_task = Arc::new(tokio::sync::Mutex::new(None));
     let ws_tx = Arc::new(tokio::sync::Mutex::new(None));
     // Serializes full Kotak login attempts end-to-end — see
@@ -1126,6 +1165,7 @@ async fn main() {
         limits: Arc::new(auth::ratelimit::Limiter::new()),
         whatsapp,
         paper: paper_desk,
+        order_timing,
     };
     pulse::spawn_sampler(state.clone());
     // Users' paper positions: chart levels and the expiry square-off, and
@@ -1201,6 +1241,7 @@ async fn main() {
         .route("/api/admin/trades",                 get(routes::admin_paper::trades_handler))
         .route("/api/admin/positions",              get(routes::admin_paper::positions_handler))
         .route("/api/admin/users/:id/report",       get(routes::admin_report::report_handler))
+        .route("/api/admin/order-timings",          get(order_timing::timings_handler))
         .route("/api/admin/special-sessions",       get(routes::admin_sessions::get_sessions_handler))
         .route("/api/admin/special-sessions/:date", axum::routing::put(routes::admin_sessions::put_session_handler)
                                                    .delete(routes::admin_sessions::delete_session_handler))

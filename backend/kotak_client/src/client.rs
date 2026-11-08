@@ -568,7 +568,19 @@ impl KotakClient {
     /// Place a live order via `POST {baseUrl}/quick/order/rule/ms/place`.
     ///
     /// The `OrderRequest` is serialised as the `jData` URL-encoded form field.
+    /// The call is timed for the admin's order timing (`orders::subscribe_orders`):
+    /// a copy only, made after the answer is in, that never changes it.
     pub async fn place_live_order(
+        &self,
+        order: &OrderRequest,
+    ) -> Result<ExecutionResult, KotakError> {
+        let sent_at_ms = crate::orders::send_clock();
+        let result = self.place_live_order_inner(order).await;
+        crate::orders::publish_order(order, sent_at_ms, result.as_ref().map(|r| r.order_id.as_str()).map_err(|e| e.to_string()));
+        result
+    }
+
+    async fn place_live_order_inner(
         &self,
         order: &OrderRequest,
     ) -> Result<ExecutionResult, KotakError> {

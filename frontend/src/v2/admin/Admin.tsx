@@ -12,6 +12,7 @@ import { Chip } from '../ui/Chip';
 import { Modal } from '../ui/Modal';
 import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
+import { OrderTiming } from './OrderTiming';
 import { PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
 import { UserReport } from './UserReport';
 
@@ -362,6 +363,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
           {rows}
           {addForm}
         </Section>
+        <OrderTiming serverBase={serverBase} />
         <PaperPositions serverBase={serverBase} users={list} />
         <PaperTrades serverBase={serverBase} users={list} desktop={desktop} />
       </div>
