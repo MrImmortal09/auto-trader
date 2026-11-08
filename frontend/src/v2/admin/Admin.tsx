@@ -15,6 +15,7 @@ import { useToast } from '../ui/toast';
 import { FeedLatency } from './FeedLatency';
 import { OrderTiming } from './OrderTiming';
 import { PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
+import { StoredData } from './StoredData';
 import { UserReport } from './UserReport';
 
 const INPUT = 'rounded-6 border border-line bg-inset px-2.5 text-fg outline-none placeholder:text-fg-muted focus:border-line-strong disabled:opacity-50';
@@ -368,6 +369,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
         <OrderTiming serverBase={serverBase} />
         <PaperPositions serverBase={serverBase} users={list} />
         <PaperTrades serverBase={serverBase} users={list} desktop={desktop} />
+        <StoredData serverBase={serverBase} />
       </div>
       {removingSession && (
         <Modal open onClose={() => setRemovingSession(null)} label="Remove special session" width="lg:max-w-[400px]">

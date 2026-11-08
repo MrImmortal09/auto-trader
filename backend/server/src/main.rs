@@ -1124,6 +1124,9 @@ async fn main() {
             write_tx.clone(),
             Arc::clone(&indicator_feed),
         ));
+        // The permanent 1-minute archive of the indices and their futures,
+        // swept after each day's close (see `candles::archive`).
+        tokio::spawn(candles::archive::run(client.clone(), pool.clone(), write_tx.clone()));
         tokio::spawn(feed_latency::run(Arc::clone(&feed_latency), client, Arc::clone(&positions), Arc::clone(&ws_tx)));
     }
 
@@ -1254,6 +1257,7 @@ async fn main() {
         .route("/api/admin/special-sessions",       get(routes::admin_sessions::get_sessions_handler))
         .route("/api/admin/special-sessions/:date", axum::routing::put(routes::admin_sessions::put_session_handler)
                                                    .delete(routes::admin_sessions::delete_session_handler))
+        .route("/api/admin/data",                   get(routes::admin_data::data_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))

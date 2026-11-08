@@ -193,6 +193,7 @@ mod tests {
         (GET, "/api/admin/special-sessions", Access::Admin),
         (PUT, "/api/admin/special-sessions/2026-11-08", Access::Admin),
         (DELETE, "/api/admin/special-sessions/2026-11-08", Access::Admin),
+        (GET, "/api/admin/data", Access::Admin),
         (GET, "/api/admin/credentials", Access::Admin),
         (PUT, "/api/admin/credentials", Access::Admin),
         (GET, "/api/v2/flags", Access::SignedIn),

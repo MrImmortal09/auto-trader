@@ -34,6 +34,7 @@ import type {
   SessionUser,
   SpecialSessionsAnswer,
   StatusAnswer,
+  StoredData,
   SystemAnswer,
   TelegramState,
   TrendAnswer,
@@ -231,6 +232,8 @@ export const getLatency = (base: string) => getJson<LatencyAnswer>(base, '/api/a
 /** How long each LIVE order took on `day` (IST `YYYY-MM-DD`; today without it). */
 export const getOrderTimings = (base: string, day?: string) =>
   getJson<OrderTimingAnswer>(base, `/api/admin/order-timings${day ? `?day=${day}` : ''}`);
+/** What the database keeps, and the candle archive's coverage. */
+export const getStoredData = (base: string) => getJson<StoredData>(base, '/api/admin/data');
 /** One user's paper P&L over the IST days `from`..`to` (from their first fill without `from`). */
 export function getUserReport(base: string, user: number, from: string | null, to: string) {
   const q = new URLSearchParams({ to });
