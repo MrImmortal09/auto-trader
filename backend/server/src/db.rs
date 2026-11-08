@@ -878,7 +878,9 @@ pub async fn db_writer(
             }
             DbWriteMessage::ArchiveCandles { symbol, candles } => {
                 if let Err(e) = write_archived_candles(&pool, &symbol, &candles).await {
-                    tracing::error!(symbol, error = %e, "DB candle archive insert");
+                    // A later batch that lands moves the symbol's last archived
+                    // minute past these, so the next sweep won't refetch them.
+                    tracing::error!(symbol, candles = candles.len(), first_t = candles.first().map(|c| c.t), error = %e, "DB candle archive insert failed — these minutes stay missing from the archive");
                     telemetry::db_write_error("candle_archive");
                 }
             }

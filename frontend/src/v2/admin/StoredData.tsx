@@ -3,6 +3,7 @@ import { dateRange, indexName, plural, shortDate } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { ArchivedSymbol, StoredTable } from '../lib/types';
 import { Row, Section } from '../settings/parts';
+import { Button } from '../ui/Button';
 
 /** "23,250" — Indian grouping. */
 const count = (n: number) => n.toLocaleString('en-IN');
@@ -50,8 +51,9 @@ function archiveLine(s: ArchivedSymbol): string {
  * archive's coverage, index by index. Read-only.
  */
 export function StoredData({ serverBase }: { serverBase: string }) {
-  // Counting the archive reads all of it: once a minute is plenty.
-  const data = usePoll(() => getStoredData(serverBase), 60_000, serverBase);
+  // Counting reads every row of tables that grow forever: once on opening,
+  // then every 10 minutes, or on Refresh.
+  const data = usePoll(() => getStoredData(serverBase), 600_000, serverBase);
   const d = data.data;
   const pending = <Row title={data.error ? `Couldn't read the database: ${data.error}` : 'Loading…'} />;
 
@@ -65,6 +67,11 @@ export function StoredData({ serverBase }: { serverBase: string }) {
         lead={`What the server's database keeps${d ? ` (${size(d.db_bytes)})` : ''}, and for how long. Clearing the database from v1's log panel empties the owner's trades and the logs.`}
       >
         {d == null ? pending : d.tables.map((t) => <TableRow key={t.table} t={t} />)}
+        {d != null && (
+          <Row title="Counted on opening, then every 10 minutes" caption="Counting reads every row, so it isn't done more often.">
+            <Button onClick={() => void data.refresh()}>Refresh</Button>
+          </Row>
+        )}
       </Section>
       <Section
         title="Candle archive"

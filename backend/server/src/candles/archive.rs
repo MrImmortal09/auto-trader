@@ -13,7 +13,8 @@
 //! startup only outside 09:00–15:50 on a weekday.
 //!
 //! Each sweep fetches, per symbol, from its last archived day (fetched again,
-//! in case a sweep was cut short) to the last finished day. A symbol never
+//! in case a sweep was cut short) to the last finished day. A request that fails
+//! ends that symbol's sweep, so the next one starts again from where it stopped. A symbol never
 //! archived goes back [`BACKFILL_DAYS`], or to its listing if that is later.
 
 use std::time::Duration;
@@ -106,8 +107,13 @@ async fn sweep(client: &UpstoxClient, pool: &SqlitePool, db_tx: &mpsc::Sender<Db
                     return;
                 }
                 Err(e) => {
+                    // Stop this symbol here: a later request that succeeded
+                    // would move its last archived minute past the failed
+                    // range, and no sweep would fetch that range again —
+                    // after a future expires, nobody can.
                     failed += 1;
-                    tracing::warn!(symbol, ?request, error = %e, "Candle archive: Upstox candle request failed");
+                    tracing::warn!(symbol, ?request, error = %e, "Candle archive: Upstox candle request failed — the rest of this symbol waits for the next sweep");
+                    break;
                 }
             }
         }
