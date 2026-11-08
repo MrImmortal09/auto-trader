@@ -9,6 +9,8 @@ import type { TradingConfig } from '../../types';
 import type { Bar, Tf } from '../trade/model';
 import type {
   AdminPosition,
+  LatencyAnswer,
+  OrderTimingAnswer,
   AdminTradesAnswer,
   AdminUser,
   ChainAnswer,
@@ -32,6 +34,7 @@ import type {
   SessionUser,
   SpecialSessionsAnswer,
   StatusAnswer,
+  StoredData,
   SystemAnswer,
   TelegramState,
   TrendAnswer,
@@ -224,6 +227,13 @@ export function getAdminTrades(base: string, user: number | null, from: string |
   return getJson<AdminTradesAnswer>(base, `/api/admin/trades${q.size ? `?${q}` : ''}`);
 }
 export const getAdminPositions = (base: string) => getJson<AdminPosition[]>(base, '/api/admin/positions');
+/** How late each feed's prices arrive: the last minute and the day. */
+export const getLatency = (base: string) => getJson<LatencyAnswer>(base, '/api/admin/latency');
+/** How long each LIVE order took on `day` (IST `YYYY-MM-DD`; today without it). */
+export const getOrderTimings = (base: string, day?: string) =>
+  getJson<OrderTimingAnswer>(base, `/api/admin/order-timings${day ? `?day=${day}` : ''}`);
+/** What the database keeps, and the candle archive's coverage. */
+export const getStoredData = (base: string) => getJson<StoredData>(base, '/api/admin/data');
 /** One user's paper P&L over the IST days `from`..`to` (from their first fill without `from`). */
 export function getUserReport(base: string, user: number, from: string | null, to: string) {
   const q = new URLSearchParams({ to });

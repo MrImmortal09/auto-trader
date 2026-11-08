@@ -538,7 +538,10 @@ impl DbWriteMessage {
             DbWriteMessage::PositionsSnapshot { .. } => "positions_snapshot",
             DbWriteMessage::OiSnapshot { .. } => "oi_snapshot",
             DbWriteMessage::CandleMinute { .. } => "candle",
+            DbWriteMessage::ArchiveCandles { .. } => "candle_archive",
             DbWriteMessage::TelegramMessage { .. } => "telegram_message",
+            DbWriteMessage::OrderSent(_) => "order_sent",
+            DbWriteMessage::OrderUpdate(_) => "order_update",
         }
     }
 }

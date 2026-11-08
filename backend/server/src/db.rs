@@ -1,4 +1,4 @@
-use shared_domain::{current_ist_timestamp_string, DbWriteMessage, MonitoredPosition};
+use shared_domain::{current_ist_timestamp_string, ArchivedCandle, DbWriteMessage, MonitoredPosition};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use shared_domain::{telemetry, FeatureFlags, TradingConfig};
 use std::str::FromStr;
@@ -252,6 +252,62 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             source TEXT NOT NULL,
             PRIMARY KEY (symbol, t)
         )",
+    ).execute(&pool).await.unwrap();
+
+    // How long each LIVE order took (see `order_timing`): one row per order,
+    // the send and Kotak's reply from the send tap, the rest from Kotak's push
+    // stream, merged by order number whichever lands first. A send Kotak
+    // refused has no number and gets a row of its own. Analytics only; kept,
+    // like the trades. New table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS order_timings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_no TEXT UNIQUE,
+            day TEXT NOT NULL,
+            trading_symbol TEXT,
+            side TEXT,
+            order_type TEXT,
+            qty INTEGER,
+            price REAL,
+            trigger_price REAL,
+            sent_at_ms INTEGER,
+            replied_at_ms INTEGER,
+            error TEXT,
+            status TEXT,
+            filled_qty INTEGER,
+            avg_price REAL,
+            reject_reason TEXT,
+            first_update_ms INTEGER,
+            accepted_at_ms INTEGER,
+            first_fill_ms INTEGER,
+            filled_at_ms INTEGER,
+            kotak_received_ns INTEGER,
+            exchange_epoch_s INTEGER,
+            exchange_confirm TEXT,
+            order_time TEXT,
+            updated_ms INTEGER
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_order_timings_day ON order_timings (day)")
+        .execute(&pool).await.unwrap();
+
+    // The permanent 1-minute archive (see `candles::archive`): the indices and
+    // every listed future on them, with volume and OI, never pruned, so a past
+    // day's VWAP and pivots can be rebuilt after Upstox stops serving the
+    // contract. About 170 MB a year (Upstox sends a row for every minute,
+    // traded or not). New table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS candle_archive (
+            symbol TEXT NOT NULL,
+            t INTEGER NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL,
+            oi REAL NOT NULL,
+            PRIMARY KEY (symbol, t)
+        ) WITHOUT ROWID",
     ).execute(&pool).await.unwrap();
 
     // Upstox option-chain analytics (see `market_data.rs`). New table, so this
@@ -934,6 +990,26 @@ pub async fn db_writer(
                     telemetry::db_write_error("candle");
                 }
             }
+            DbWriteMessage::OrderSent(sent) => {
+                if let Err(e) = write_order_sent(&pool, &sent).await {
+                    tracing::error!(order_no = ?sent.order_no, error = %e, "DB order timing insert");
+                    telemetry::db_write_error("order_sent");
+                }
+            }
+            DbWriteMessage::OrderUpdate(update) => {
+                if let Err(e) = write_order_update(&pool, &update).await {
+                    tracing::error!(order_no = %update.order_no, error = %e, "DB order update insert");
+                    telemetry::db_write_error("order_update");
+                }
+            }
+            DbWriteMessage::ArchiveCandles { symbol, candles } => {
+                if let Err(e) = write_archived_candles(&pool, &symbol, &candles).await {
+                    // A later batch that lands moves the symbol's last archived
+                    // minute past these, so the next sweep won't refetch them.
+                    tracing::error!(symbol, candles = candles.len(), first_t = candles.first().map(|c| c.t), error = %e, "DB candle archive insert failed — these minutes stay missing from the archive");
+                    telemetry::db_write_error("candle_archive");
+                }
+            }
             DbWriteMessage::TelegramMessage { chat_id, chat_title, msg_id, sent_at, text, kind, reply_to, value, instrument, strike, side, edited } => {
                 // An edit keeps the first-seen send time and title, and
                 // replaces the text and how it was routed.
@@ -991,6 +1067,148 @@ pub async fn prune_candles(pool: &SqlitePool, before: i64) {
 /// [`prune_candles`] for a spawned task.
 pub async fn prune_candles_owned(pool: SqlitePool, before: i64) {
     prune_candles(&pool, before).await;
+}
+
+/// One symbol's archived candles in one transaction; a stored minute is
+/// replaced by the newer answer for it.
+async fn write_archived_candles(pool: &SqlitePool, symbol: &str, candles: &[ArchivedCandle]) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    for c in candles {
+        sqlx::query(
+            "INSERT INTO candle_archive (symbol, t, open, high, low, close, volume, oi)
+             VALUES (?,?,?,?,?,?,?,?)
+             ON CONFLICT(symbol, t) DO UPDATE SET
+               open = excluded.open, high = excluded.high, low = excluded.low,
+               close = excluded.close, volume = excluded.volume, oi = excluded.oi",
+        )
+        .bind(symbol).bind(c.t).bind(c.open).bind(c.high).bind(c.low).bind(c.close).bind(c.volume).bind(c.oi)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+/// Unix ms of the newest archived minute of `symbol`, if any.
+pub async fn last_archived_minute(pool: &SqlitePool, symbol: &str) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT MAX(t) FROM candle_archive WHERE symbol = ?")
+        .bind(symbol)
+        .fetch_one(pool)
+        .await
+}
+
+// ---------------------------------------------------------------------------
+// Order timings (see `order_timing`)
+// ---------------------------------------------------------------------------
+
+/// The IST day of a Unix-ms instant, `YYYY-MM-DD`.
+fn ist_day_of(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.with_timezone(&shared_domain::ist_offset()).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// A send: its row, or the send fields on the row its updates already made.
+async fn write_order_sent(pool: &SqlitePool, s: &shared_domain::OrderSent) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO order_timings (order_no, day, trading_symbol, side, order_type, qty, price, trigger_price, sent_at_ms, replied_at_ms, error)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(order_no) DO UPDATE SET
+           day = excluded.day, trading_symbol = excluded.trading_symbol, side = excluded.side,
+           order_type = excluded.order_type, qty = excluded.qty, price = excluded.price,
+           trigger_price = excluded.trigger_price, sent_at_ms = excluded.sent_at_ms,
+           replied_at_ms = excluded.replied_at_ms, error = excluded.error",
+    )
+    .bind(&s.order_no).bind(ist_day_of(s.sent_at_ms)).bind(&s.trading_symbol).bind(&s.side).bind(&s.order_type)
+    .bind(s.qty).bind(s.price).bind(s.trigger).bind(s.sent_at_ms).bind(s.replied_at_ms).bind(&s.error)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Kotak's status words that mean the exchange holds the order.
+fn is_accepted(status: &str) -> bool {
+    matches!(status, "open" | "trigger pending" | "complete" | "partially filled")
+}
+
+/// An update: the latest status, quantity and price, and the first time each
+/// stage was seen (accepted, first fill, filled), kept from the first update
+/// that showed it.
+async fn write_order_update(pool: &SqlitePool, u: &shared_domain::OrderUpdate) -> Result<(), sqlx::Error> {
+    let at = u.received_at_ms;
+    let accepted = is_accepted(&u.status).then_some(at);
+    let first_fill = u.filled_qty.filter(|q| *q > 0).map(|_| at);
+    let filled = (u.status == "complete").then_some(at);
+    sqlx::query(
+        "INSERT INTO order_timings (order_no, day, trading_symbol, side, qty, status, filled_qty, avg_price, reject_reason,
+                                    first_update_ms, accepted_at_ms, first_fill_ms, filled_at_ms,
+                                    kotak_received_ns, exchange_epoch_s, exchange_confirm, order_time, updated_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(order_no) DO UPDATE SET
+           trading_symbol = COALESCE(order_timings.trading_symbol, excluded.trading_symbol),
+           side = COALESCE(order_timings.side, excluded.side),
+           qty = COALESCE(order_timings.qty, excluded.qty),
+           status = excluded.status,
+           filled_qty = COALESCE(excluded.filled_qty, order_timings.filled_qty),
+           avg_price = COALESCE(excluded.avg_price, order_timings.avg_price),
+           reject_reason = COALESCE(excluded.reject_reason, order_timings.reject_reason),
+           first_update_ms = COALESCE(order_timings.first_update_ms, excluded.first_update_ms),
+           accepted_at_ms = COALESCE(order_timings.accepted_at_ms, excluded.accepted_at_ms),
+           first_fill_ms = COALESCE(order_timings.first_fill_ms, excluded.first_fill_ms),
+           filled_at_ms = COALESCE(order_timings.filled_at_ms, excluded.filled_at_ms),
+           kotak_received_ns = COALESCE(excluded.kotak_received_ns, order_timings.kotak_received_ns),
+           exchange_epoch_s = COALESCE(excluded.exchange_epoch_s, order_timings.exchange_epoch_s),
+           exchange_confirm = COALESCE(excluded.exchange_confirm, order_timings.exchange_confirm),
+           order_time = COALESCE(order_timings.order_time, excluded.order_time),
+           updated_ms = excluded.updated_ms",
+    )
+    .bind(&u.order_no).bind(ist_day_of(at)).bind(&u.trading_symbol).bind(&u.side).bind(u.qty)
+    .bind(&u.status).bind(u.filled_qty).bind(u.avg_price).bind(&u.reject_reason)
+    .bind(at).bind(accepted).bind(first_fill).bind(filled)
+    .bind(u.kotak_received_ns).bind(u.exchange_epoch_s).bind(&u.exchange_confirm).bind(&u.order_time).bind(at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// One order's timing row, as the admin's Order timing section reads it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow, serde::Serialize)]
+pub struct OrderTimingRow {
+    pub order_no: Option<String>,
+    pub trading_symbol: Option<String>,
+    pub side: Option<String>,
+    pub order_type: Option<String>,
+    pub qty: Option<i64>,
+    pub price: Option<f64>,
+    pub trigger_price: Option<f64>,
+    pub sent_at_ms: Option<i64>,
+    pub replied_at_ms: Option<i64>,
+    pub error: Option<String>,
+    pub status: Option<String>,
+    pub filled_qty: Option<i64>,
+    pub avg_price: Option<f64>,
+    pub reject_reason: Option<String>,
+    pub first_update_ms: Option<i64>,
+    pub accepted_at_ms: Option<i64>,
+    pub first_fill_ms: Option<i64>,
+    pub filled_at_ms: Option<i64>,
+    pub kotak_received_ns: Option<i64>,
+    pub exchange_epoch_s: Option<i64>,
+    pub exchange_confirm: Option<String>,
+    pub order_time: Option<String>,
+}
+
+/// The day's orders, newest first.
+pub async fn load_order_timings(pool: &SqlitePool, day: &str) -> Result<Vec<OrderTimingRow>, sqlx::Error> {
+    sqlx::query_as::<_, OrderTimingRow>(
+        "SELECT order_no, trading_symbol, side, order_type, qty, price, trigger_price, sent_at_ms, replied_at_ms, error,
+                status, filled_qty, avg_price, reject_reason, first_update_ms, accepted_at_ms, first_fill_ms, filled_at_ms,
+                kotak_received_ns, exchange_epoch_s, exchange_confirm, order_time
+         FROM order_timings WHERE day = ?
+         ORDER BY COALESCE(sent_at_ms, first_update_ms) DESC, id DESC",
+    )
+    .bind(day)
+    .fetch_all(pool)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,6 +1447,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archived_candles_keep_their_volume_and_a_newer_answer_replaces_a_minute() {
+        let db = TempDb::new("candle-archive");
+        let pool = init_db(&db.url()).await;
+        assert_eq!(last_archived_minute(&pool, "NIFTY:FUT:2026-11-24").await.unwrap(), None);
+
+        let candle = |t: i64, close: f64, volume: f64| ArchivedCandle {
+            t, open: 25_000.0, high: 25_010.0, low: 24_990.0, close, volume, oi: 1_500_000.0,
+        };
+        let (tx, rx) = mpsc::channel(4);
+        let writer = tokio::spawn(db_writer(rx, pool.clone(), Arc::new(BalanceCache::new())));
+        tx.send(DbWriteMessage::ArchiveCandles {
+            symbol: "NIFTY:FUT:2026-11-24".into(),
+            candles: vec![candle(60_000, 25_005.0, 1_200.0), candle(120_000, 25_007.0, 800.0)],
+        }).await.unwrap();
+        // The next sweep fetches the same day again: a minute is replaced,
+        // never doubled.
+        tx.send(DbWriteMessage::ArchiveCandles {
+            symbol: "NIFTY:FUT:2026-11-24".into(),
+            candles: vec![candle(120_000, 25_008.0, 950.0)],
+        }).await.unwrap();
+        tx.send(DbWriteMessage::ArchiveCandles { symbol: "NIFTY".into(), candles: vec![candle(180_000, 24_950.0, 0.0)] })
+            .await
+            .unwrap();
+        drop(tx);
+        writer.await.unwrap();
+
+        let rows: Vec<(i64, f64, f64, f64)> = sqlx::query_as(
+            "SELECT t, close, volume, oi FROM candle_archive WHERE symbol = 'NIFTY:FUT:2026-11-24' ORDER BY t",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, [(60_000, 25_005.0, 1_200.0, 1_500_000.0), (120_000, 25_008.0, 950.0, 1_500_000.0)]);
+        assert_eq!(last_archived_minute(&pool, "NIFTY:FUT:2026-11-24").await.unwrap(), Some(120_000));
+        assert_eq!(last_archived_minute(&pool, "NIFTY").await.unwrap(), Some(180_000));
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn feature_flags_start_off_and_survive_a_restart_and_a_settings_save() {
         let db = TempDb::new("flags");
         let pool = init_db(&db.url()).await;
@@ -1289,6 +1546,84 @@ mod tests {
         assert!(deleted);
         assert_eq!(load_special_sessions(&pool).await.unwrap(), vec![]);
 
+        pool.close().await;
+    }
+}
+
+#[cfg(test)]
+mod order_timing_tests {
+    use super::test_support::TempDb;
+    use super::*;
+    use shared_domain::{OrderSent, OrderUpdate};
+
+    /// 2026-11-09 10:15:30 IST.
+    const T0: i64 = 1_794_199_530_000;
+
+    fn sent(order_no: Option<&str>, at: i64, error: Option<&str>) -> OrderSent {
+        OrderSent {
+            sent_at_ms: at,
+            replied_at_ms: at + 180,
+            order_no: order_no.map(str::to_string),
+            error: error.map(str::to_string),
+            trading_symbol: "NIFTY26N2425000CE".into(),
+            side: "B".into(),
+            order_type: "MKT".into(),
+            qty: 75,
+            price: 0.0,
+            trigger: 0.0,
+        }
+    }
+
+    fn update(order_no: &str, at: i64, status: &str, filled: i64, avg: Option<f64>) -> OrderUpdate {
+        OrderUpdate {
+            received_at_ms: at,
+            order_no: order_no.into(),
+            status: status.into(),
+            filled_qty: Some(filled),
+            avg_price: avg,
+            exchange_epoch_s: Some(at / 1000),
+            ..OrderUpdate::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_and_pushed_updates_merge_by_order_number_whichever_lands_first() {
+        let db = TempDb::new("order-timings");
+        let pool = init_db(&db.url()).await;
+        let (tx, rx) = mpsc::channel(16);
+        let writer = tokio::spawn(db_writer(rx, pool.clone(), Arc::new(BalanceCache::new())));
+        for msg in [
+            // Order 1: the send is recorded first, then open, a part fill, the rest.
+            DbWriteMessage::OrderSent(sent(Some("1"), T0, None)),
+            DbWriteMessage::OrderUpdate(update("1", T0 + 150, "open", 0, None)),
+            DbWriteMessage::OrderUpdate(update("1", T0 + 300, "open", 25, Some(120.0))),
+            DbWriteMessage::OrderUpdate(update("1", T0 + 420, "complete", 75, Some(120.5))),
+            // Order 2: Kotak's push beats the send tap to the writer.
+            DbWriteMessage::OrderUpdate(update("2", T0 + 5_250, "complete", 75, Some(99.0))),
+            DbWriteMessage::OrderSent(sent(Some("2"), T0 + 5_000, None)),
+            // A send Kotak refused: no number, a row of its own.
+            DbWriteMessage::OrderSent(sent(None, T0 + 9_000, Some("RMS: margin exceeds"))),
+        ] {
+            tx.send(msg).await.unwrap();
+        }
+        drop(tx);
+        writer.await.unwrap();
+
+        let rows = load_order_timings(&pool, "2026-11-09").await.unwrap();
+        assert_eq!(rows.len(), 3);
+        // Newest first.
+        assert_eq!((rows[0].order_no.as_deref(), rows[0].error.as_deref()), (None, Some("RMS: margin exceeds")));
+
+        let two = &rows[1];
+        assert_eq!((two.sent_at_ms, two.replied_at_ms, two.filled_at_ms), (Some(T0 + 5_000), Some(T0 + 5_180), Some(T0 + 5_250)));
+        assert_eq!((two.trading_symbol.as_deref(), two.status.as_deref(), two.avg_price), (Some("NIFTY26N2425000CE"), Some("complete"), Some(99.0)));
+
+        let one = &rows[2];
+        assert_eq!((one.sent_at_ms, one.replied_at_ms), (Some(T0), Some(T0 + 180)));
+        assert_eq!((one.first_update_ms, one.accepted_at_ms, one.first_fill_ms, one.filled_at_ms), (Some(T0 + 150), Some(T0 + 150), Some(T0 + 300), Some(T0 + 420)));
+        assert_eq!((one.status.as_deref(), one.filled_qty, one.avg_price, one.qty), (Some("complete"), Some(75), Some(120.5), Some(75)));
+        assert_eq!(one.exchange_epoch_s, Some((T0 + 420) / 1000));
+        assert!(load_order_timings(&pool, "2026-11-08").await.unwrap().is_empty());
         pool.close().await;
     }
 }
