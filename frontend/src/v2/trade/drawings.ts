@@ -113,7 +113,7 @@ export function useDrawing(api: () => DrawApi | null) {
 export interface DrawPrefs {
   /** New and moved points snap to the nearest open, high, low or close. */
   magnet: boolean;
-  /** Drawings can't be moved or erased. */
+  /** Drawings can't be moved, erased or right-clicked away. */
   locked: boolean;
   /** Drawings are off the chart (still kept). */
   hidden: boolean;
@@ -125,6 +125,9 @@ let prefs: DrawPrefs = (() => {
   const s = readStored<Partial<DrawPrefs>>(PREFS_KEY, {});
   return { magnet: s.magnet === true, locked: s.locked === true, hidden: s.hidden === true };
 })();
+
+/** All three off: the phone's charts, which have no toolbar to switch them back. */
+export const NO_DRAW_PREFS: DrawPrefs = { magnet: false, locked: false, hidden: false };
 
 /** The toolbar's magnet, lock and hide, kept in this browser, and a setter. */
 export function useDrawPrefs(): [DrawPrefs, (change: Partial<DrawPrefs>) => void] {
@@ -226,6 +229,19 @@ const newId = () => `${DRAW_PREFIX}${Date.now().toString(36)}-${(made++).toStrin
  * `done(null)` when given up. */
 export type AskText = (at: { x: number; y: number }, initial: string, done: (text: string | null) => void) => void;
 
+/** `points` as kept, each once: a point repeated straight after itself (a
+ * double-click's second tap) goes. */
+function distinct(points: { timestamp?: number; value?: number }[]): Saved['points'] {
+  const at: Saved['points'] = [];
+  for (const q of points) {
+    if (!Number.isFinite(q.timestamp) || !Number.isFinite(q.value)) continue;
+    const last = at[at.length - 1];
+    if (last && last.t === q.timestamp && last.v === q.value) continue;
+    at.push({ t: q.timestamp!, v: q.value! });
+  }
+  return at;
+}
+
 const copy = (d: Saved): Saved => ({ name: d.name, points: d.points.map((p) => ({ t: p.t, v: p.v })), ...(d.text !== undefined ? { text: d.text } : {}) });
 
 /** One KLineChart's drawings: drawn from storage for the instrument shown, and
@@ -313,25 +329,26 @@ export class KlineDrawings implements DrawApi {
     p.done();
   }
 
-  /** A path ends at the points tapped: the one following the pointer, and a
-   * double-click's second tap on the same spot, aren't among them. */
+  /**
+   * Ends a path being drawn at the points tapped so far (Enter, or Finish).
+   * The one following the pointer isn't among them. KLineChart keeps a
+   * drawing in progress apart from finished ones, and only its own events
+   * move it across, so the one in progress goes and a finished path with
+   * those points takes its place. (A double-click is KLineChart's own way to
+   * end it, through `onDrawEnd`.)
+   */
   finish() {
     const p = this.pending;
     if (!p || p.tool !== 'v2Path') return;
     const o = this.chart.getOverlays({ id: p.id })[0];
-    const tapped = (o?.points ?? []).slice(0, Math.max(0, (o?.currentStep ?? 1) - 1));
-    const at: Saved['points'] = [];
-    for (const q of tapped) {
-      if (!Number.isFinite(q.timestamp) || !Number.isFinite(q.value)) continue;
-      const last = at[at.length - 1];
-      if (last && last.t === q.timestamp && last.v === q.value) continue;
-      at.push({ t: q.timestamp!, v: q.value! });
-    }
+    const at = distinct((o?.points ?? []).slice(0, Math.max(0, (o?.currentStep ?? 1) - 1)));
     if (at.length < 2) return this.cancel();
     this.pending = null;
-    this.chart.overrideOverlay({ id: p.id, points: at.map((q) => ({ timestamp: q.t, value: q.v })), lock: this.prefs.locked });
+    this.chart.removeOverlay({ id: p.id });
+    const d: Saved = { name: 'v2Path', points: at };
+    this.chart.createOverlay(this.overlay(p.id, d));
     this.pushUndo();
-    this.kept.set(p.id, { name: 'v2Path', points: at });
+    this.kept.set(p.id, d);
     this.save();
     p.done();
   }
@@ -462,7 +479,18 @@ export class KlineDrawings implements DrawApi {
         if (this.pending?.id !== id) return;
         const { done } = this.pending;
         this.pending = null;
-        if (name === RULER) {
+        if (name === 'v2Path') {
+          // Ended by a double-click: its two taps landed on the same spot.
+          const at = distinct(e.overlay.points);
+          if (at.length < 2) {
+            this.chart.removeOverlay({ id });
+            return done();
+          }
+          this.chart.overrideOverlay({ id, points: at.map((q) => ({ timestamp: q.t, value: q.v })) });
+          this.pushUndo();
+          this.kept.set(id, { name, points: at });
+          this.save();
+        } else if (name === RULER) {
           this.ruler = id;
         } else if (WORDED.has(name)) {
           this.askWords(id, { name, points: pointsOf(e) }, true);
@@ -474,17 +502,17 @@ export class KlineDrawings implements DrawApi {
       },
       onPressedMoveEnd: (e) => keep(e),
       onClick: () => {
-        if (this.erasing && this.pending == null) {
-          if (id === this.ruler) this.dropRuler();
-          else if (this.kept.has(id)) this.remove(id);
-        }
+        if (!this.erasing || this.pending != null) return;
+        if (id === this.ruler) this.dropRuler();
+        // KLineChart's lock only stops a drag: a locked drawing isn't erased either.
+        else if (this.kept.has(id) && !this.prefs.locked) this.remove(id);
       },
       onDoubleClick: () => {
         const kept = this.kept.get(id);
         if (kept && WORDED.has(name) && this.pending == null && !this.erasing) this.askWords(id, kept, false);
       },
-      // KLineChart removes it once this returns.
-      onRightClick: () => {
+      // KLineChart removes it once this returns, unless told not to.
+      onRightClick: (e) => {
         if (this.pending?.id === id) {
           const { done } = this.pending;
           this.pending = null;
@@ -494,6 +522,7 @@ export class KlineDrawings implements DrawApi {
           this.ruler = null;
           return;
         }
+        if (this.prefs.locked) return e.preventDefault?.();
         this.pushUndo();
         this.kept.delete(id);
         this.save();

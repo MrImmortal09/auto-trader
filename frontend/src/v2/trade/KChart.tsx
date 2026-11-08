@@ -5,7 +5,7 @@ import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
 import { CHART_STYLES, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
-import { DRAW_PREFIX, KlineDrawings, useDrawPrefs, type DrawApi } from './drawings';
+import { DRAW_PREFIX, KlineDrawings, NO_DRAW_PREFS, useDrawPrefs, type DrawApi } from './drawings';
 import { pivotsByDay } from './pivots';
 import { drawableStudies, fitPanes, showStudies } from './studies';
 import {
@@ -127,8 +127,10 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   const pivotVersion = useRef(0);
   // A text's or note's words being asked for, where it was placed.
   const [asking, setAsking] = useState<Asking | null>(null);
-  // The drawing toolbar's switches (magnet, lock, hide), shared by every KLine chart.
-  const [drawPrefs] = useDrawPrefs();
+  // The drawing toolbar's switches (magnet, lock, hide), shared by every
+  // desktop KLine chart. The phone has no toolbar to switch them back, so none.
+  const [sharedPrefs] = useDrawPrefs();
+  const drawPrefs = compact ? NO_DRAW_PREFS : sharedPrefs;
   const prefsNow = useRef(drawPrefs);
   // The panes under the price `fitPanes` has sized: a resize keeps their heights.
   const sizedPanes = useRef(new Set<string>());
@@ -172,9 +174,6 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     drawn.setPrefs(prefsNow.current);
     // The box sits at the point, kept inside the chart.
     drawn.setAsk((at, initial, done) => setAsking({ x: Math.max(4, Math.min(at.x + 4, el.clientWidth - 204)), y: Math.max(4, at.y - 14), initial, done }));
-    // A double-click ends a path being drawn.
-    const onDouble = () => drawn.finish();
-    el.addEventListener('dblclick', onDouble);
     const placed = applied.current;
     const sized = sizedPanes.current;
     c.overrideYAxis({ paneId: 'candle_pane', createRange: rangeWithLines(linePrices) });
@@ -221,7 +220,6 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       // A drawing under way ends with the chart.
       drawn.cancel();
       drawn.setAsk(null);
-      el.removeEventListener('dblclick', onDouble);
       drawings.current = null;
       dispose(el);
       chart.current = null;
