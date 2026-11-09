@@ -29,10 +29,12 @@ const SUBSCRIBE_HALF: usize = 7;
 /// Ladder scrips subscribed per day at most, everyone's together. Subscriptions
 /// are never withdrawn, and the feed's own cap (200 on the retired HSM feed;
 /// unknown on the native one) must keep room for positions' contracts, whose
-/// stops depend on their ticks. Past the budget a row shows no price, and the
-/// buy route refuses a contract with no recent price: it fails toward not
+/// stops depend on their ticks: 180 leaves 20 of those 200. At 120 the open's
+/// first few ladders used it all within seconds (2026-11-09), leaving BANKNIFTY
+/// and SENSEX without prices all day. Past the budget a row shows no price, and
+/// the buy route refuses a contract with no recent price: it fails toward not
 /// trading.
-const MAX_LADDER_SCRIPS: usize = 120;
+const MAX_LADDER_SCRIPS: usize = 180;
 /// How much of that total signed-in users' streams may take, together. The
 /// owner's and the admin's streams may use the whole total, so paper users
 /// cost the owner at most this many strikes a day and the feed never carries
