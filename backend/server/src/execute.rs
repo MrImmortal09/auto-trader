@@ -6,11 +6,12 @@
 //!
 //! Everything here reads in-memory state only (scrip master, the shared price
 //! map, positions, telemetry). It never calls Kotak; the only thing it sends
-//! anywhere is feed subscriptions through the market-data bridge.
+//! anywhere is feed subscriptions (and their release) through the
+//! market-data bridge.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::Serialize;
@@ -22,26 +23,37 @@ use crate::auth::Identity;
 use crate::paper::PaperPosition;
 use crate::AppState;
 
-/// Strikes subscribed and streamed each side of ATM. The screen shows ±5 of
-/// them; the spare two each side let it hold its rows still while the user's
-/// finger is on the ladder, and give a re-centred ladder prices at once.
-const SUBSCRIBE_HALF: usize = 7;
-/// Ladder scrips subscribed per day at most, everyone's together. Subscriptions
-/// are never withdrawn, and the feed's own cap (200 on the retired HSM feed;
-/// unknown on the native one) must keep room for positions' contracts, whose
-/// stops depend on their ticks: 180 leaves 20 of those 200. At 120 the open's
-/// first few ladders used it all within seconds (2026-11-09), leaving BANKNIFTY
-/// and SENSEX without prices all day. Past the budget a row shows no price, and
-/// the buy route refuses a contract with no recent price: it fails toward not
-/// trading.
-const MAX_LADDER_SCRIPS: usize = 180;
-/// How much of that total signed-in users' streams may take, together. The
-/// owner's and the admin's streams may use the whole total, so paper users
-/// cost the owner at most this many strikes a day and the feed never carries
-/// more than before. One window is 15 strikes × CE/PE = 30 keys.
-const MAX_PUBLIC_LADDER_SCRIPS: usize = 30;
+/// Strikes streamed each side of the strike the screen is centred on (ATM
+/// unless it scrolled). The screen shows ±5 of them; the spare two each side
+/// let it hold its rows still while the user's finger is on the ladder.
+const ROWS_HALF: usize = 7;
+/// Strikes kept on the feed each side of ATM for every index ladder someone
+/// signed in has open: ATM−7..ATM+7, calls and puts (30 contracts). Only
+/// those get prices; a strike scrolled to past them shows none. A strike that
+/// leaves every band (spot moved, or the ladder closed) is unsubscribed once
+/// no ladder has wanted it for [`BAND_GRACE`], unless a position holds it.
+const BAND_HALF: usize = 7;
+/// How long a band strike no ladder wants stays on the feed: spot wobbling
+/// across a strike doesn't churn the feed, and a ladder reopened within it
+/// has its prices at once.
+const BAND_GRACE: Duration = Duration::from_secs(30);
+/// How often band strikes nobody wants are looked for.
+const BAND_SWEEP_EVERY: Duration = Duration::from_secs(5);
+/// Band strikes on the feed at once at most, everyone's together: six full
+/// bands. The feed's own cap (200 on the retired HSM feed; 3000 in Kotak's
+/// reference client for the native one) must keep room for positions'
+/// contracts, whose stops depend on their ticks. Past it a strike shows no
+/// price, and the buy route refuses a contract with no recent price: it
+/// fails toward not trading.
+const MAX_BAND_SCRIPS: usize = 180;
+/// Signed-in users' ladders add strikes only while the total is under this
+/// (two bands), so the owner always has room for four more of their own.
+const MAX_PUBLIC_BAND_SCRIPS: usize = 60;
+/// The "band full" warning is logged at most this often: every open ladder
+/// asks four times a second.
+const BAND_WARN_EVERY: Duration = Duration::from_secs(60);
 
-/// Whose daily subscription budget a stream draws on.
+/// Whose share of the band budget a stream draws on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubPool {
     /// The admin: the owner's desk.
@@ -65,8 +77,8 @@ impl SubPool {
 
     fn budget(self) -> usize {
         match self {
-            SubPool::Owner => MAX_LADDER_SCRIPS,
-            SubPool::Public => MAX_PUBLIC_LADDER_SCRIPS,
+            SubPool::Owner => MAX_BAND_SCRIPS,
+            SubPool::Public => MAX_PUBLIC_BAND_SCRIPS,
             SubPool::None => 0,
         }
     }
@@ -109,15 +121,14 @@ struct Subscriptions {
     /// The bridge channel these were sent on. A re-login starts a fresh
     /// bridge with a fresh channel, which knows none of them.
     channel: Option<mpsc::UnboundedSender<String>>,
-    /// The IST day they were sent on: the feed drops ladder subscriptions at
+    /// The IST day they were sent on: the feed drops band subscriptions at
     /// each day's close, so a new day starts from none.
     day: Option<NaiveDate>,
-    /// Every ladder scrip sent today, whichever pool paid for it.
-    sent: HashSet<String>,
-    /// How much of each pool's budget is spent.
-    owner_used: usize,
-    public_used: usize,
+    /// Every band strike on the feed, with when a ladder last wanted it.
+    band: HashMap<String, Instant>,
     indices_sent: bool,
+    /// When the "band full" warning was last logged.
+    warned_at: Option<Instant>,
 }
 
 /// An engine error from the log stream, kept briefly for the Execute screen.
@@ -249,15 +260,16 @@ impl ExecuteBoard {
         Some((index.to_string(), chain, record))
     }
 
-    /// Make sure the feed streams every index's spot value and `keys`, paid
-    /// for out of `pool`'s budget. Subscriptions are never withdrawn: open
-    /// positions share the feed.
+    /// Make sure the feed streams every index's spot value and `keys` (a
+    /// band, nearest ATM first), paid for out of `pool`'s share, and note
+    /// that a ladder wants them now.
     async fn ensure_subscribed(&self, state: &AppState, keys: &[String], pool: SubPool) {
         if pool == SubPool::None {
             return;
         }
         let Some(tx) = state.ws_tx.lock().await.clone() else { return };
         let today = shared_domain::today_ist();
+        let now = Instant::now();
         let mut subs = self.subs.lock().await;
         if !subs.channel.as_ref().is_some_and(|c| c.same_channel(&tx)) || subs.day != Some(today) {
             *subs = Subscriptions { channel: Some(tx.clone()), day: Some(today), ..Default::default() };
@@ -271,39 +283,113 @@ impl ExecuteBoard {
             let msg = serde_json::json!({ "action": "subscribe_indices", "indices": indices.join(",") });
             subs.indices_sent = tx.send(msg.to_string()).is_ok();
         }
-        let wanted: Vec<&String> = keys.iter().filter(|k| !subs.sent.contains(*k)).collect();
+        let mut wanted = Vec::new();
+        for key in keys {
+            match subs.band.get_mut(key) {
+                Some(at) => *at = now,
+                None => wanted.push(key.clone()),
+            }
+        }
         if wanted.is_empty() {
             return;
         }
-        let used = match pool {
-            SubPool::Owner => subs.owner_used,
-            SubPool::Public | SubPool::None => subs.public_used,
-        };
-        // The pool's own share, inside what is left of the day's total.
-        let room = pool.budget().saturating_sub(used).min(MAX_LADDER_SCRIPS.saturating_sub(subs.sent.len()));
-        if wanted.len() > room {
+        let room = pool.budget().saturating_sub(subs.band.len());
+        if wanted.len() > room && subs.warned_at.map_or(true, |t| now.duration_since(t) >= BAND_WARN_EVERY) {
+            subs.warned_at = Some(now);
             tracing::warn!(
-                "Ladder subscription budget reached ({pool:?}): {used} of {} scrips (total {} of {MAX_LADDER_SCRIPS}) subscribed today, {} more asked for; the rest show no price until tomorrow",
+                "Ladder band full ({pool:?}): {} of {} strikes on the feed, {} more asked for; they show no price until a band frees",
+                subs.band.len(),
                 pool.budget(),
-                subs.sent.len(),
                 wanted.len()
             );
         }
-        let fresh: Vec<String> = wanted.into_iter().take(room).cloned().collect();
-        if fresh.is_empty() {
+        wanted.truncate(room);
+        if wanted.is_empty() {
             return;
         }
-        // `ladder`: the feed drops these at the day's close (unlike a
-        // position's own subscription), so they never pile up across days.
-        let msg = serde_json::json!({ "action": "subscribe", "scrips": fresh.join("&"), "ladder": true });
+        // `band`: released once no ladder wants them, and dropped by the feed
+        // at the day's close (unlike a position's own subscription).
+        let msg = serde_json::json!({ "action": "subscribe", "scrips": wanted.join("&"), "band": true });
         if tx.send(msg.to_string()).is_ok() {
-            match pool {
-                SubPool::Owner => subs.owner_used += fresh.len(),
-                SubPool::Public | SubPool::None => subs.public_used += fresh.len(),
+            for key in wanted {
+                subs.band.insert(key, now);
             }
-            subs.sent.extend(fresh);
         }
     }
+
+    /// Every [`BAND_SWEEP_EVERY`], take off the feed the band strikes no
+    /// ladder has wanted for [`BAND_GRACE`].
+    pub fn spawn_band_release(state: AppState) {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(BAND_SWEEP_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                state.execute.release_unwanted(&state).await;
+            }
+        });
+    }
+
+    /// Unsubscribe the band strikes no ladder wants any more — never one a
+    /// position holds, the owner's or a user's, whatever the bands say. (The
+    /// market-data stream checks again, against what positions and charts
+    /// subscribed.)
+    async fn release_unwanted(&self, state: &AppState) {
+        // Read before the subscriptions lock is taken, which nothing holds
+        // while waiting on these.
+        let mut held: HashSet<String> = state
+            .positions
+            .read()
+            .await
+            .iter()
+            .filter(|p| !matches!(p.state, TradeState::Closed))
+            .filter_map(|p| p.ws_scrip_key.clone())
+            .collect();
+        held.extend(state.paper.feed_keys().await.0);
+        let Some(tx) = state.ws_tx.lock().await.clone() else { return };
+        let mut subs = self.subs.lock().await;
+        // A fresh bridge or a new day: the next ladder frame starts over.
+        if !subs.channel.as_ref().is_some_and(|c| c.same_channel(&tx)) || subs.day != Some(shared_domain::today_ist()) {
+            return;
+        }
+        let stale = unwanted_band_keys(&subs.band, &held, Instant::now());
+        if stale.is_empty() {
+            return;
+        }
+        let msg = serde_json::json!({ "action": "unsubscribe", "scrips": stale.join("&"), "band": true });
+        if tx.send(msg.to_string()).is_ok() {
+            for key in &stale {
+                subs.band.remove(key);
+            }
+            tracing::info!("Ladder band: released {} strikes no ladder wants ({} left on the feed)", stale.len(), subs.band.len());
+        }
+    }
+}
+
+/// The band strikes no ladder has wanted for [`BAND_GRACE`] by `now`, leaving
+/// out any in `held` (positions' contracts), sorted.
+fn unwanted_band_keys(band: &HashMap<String, Instant>, held: &HashSet<String>, now: Instant) -> Vec<String> {
+    let mut keys: Vec<String> = band
+        .iter()
+        .filter(|(key, at)| now.duration_since(**at) >= BAND_GRACE && !held.contains(*key))
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The feed keys of the strikes within `half` of `atm`, calls and puts,
+/// nearest ATM first, so a band cut short by the budget keeps the strikes
+/// that matter most.
+fn band_keys(strikes: &[ChainStrike], atm: usize, half: usize) -> Vec<String> {
+    let mut picked: Vec<usize> = window(strikes.len(), atm, half).collect();
+    picked.sort_by_key(|i| i.abs_diff(atm));
+    picked
+        .into_iter()
+        .flat_map(|i| [strikes[i].ce.as_ref(), strikes[i].pe.as_ref()])
+        .flatten()
+        .map(ScripRecord::ws_key)
+        .collect()
 }
 
 /// The index `record` is an option of, if it is one the Execute screen may
@@ -527,8 +613,8 @@ fn window(len: usize, atm: usize, half: usize) -> std::ops::Range<usize> {
 }
 
 /// The board for `index`: its `expiry`'s chain (the nearest when `None`; an
-/// unlisted one is an error), with the window subscribed (out of `pool`'s
-/// budget) and streamed around `centre` (ATM when `None`).
+/// unlisted one is an error), with the band around ATM subscribed (out of
+/// `pool`'s share) and the rows streamed around `centre` (ATM when `None`).
 async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>, pool: SubPool) -> Result<Board, String> {
     if state.scrip_store.read().await.is_none() {
         return Err("Scrip Master not loaded yet — connect Kotak first".to_string());
@@ -562,16 +648,11 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
     // Without any spot yet, centre on the middle of the chain so prices start
     // flowing; parity takes over as soon as they do.
     let atm = spot.and_then(|s| atm_index(&chain.strikes, s)).unwrap_or(chain.strikes.len() / 2);
-    // The screen may have scrolled away from ATM: its window is what gets prices.
+    // Only the band around ATM is on the feed, wherever the screen scrolled.
+    state.execute.ensure_subscribed(state, &band_keys(&chain.strikes, atm, BAND_HALF), pool).await;
+    // The screen may have scrolled away from ATM: its rows are streamed there.
     let centre = centre.and_then(|c| atm_index(&chain.strikes, c)).unwrap_or(atm);
-    let range = window(chain.strikes.len(), centre, SUBSCRIBE_HALF);
-    let keys: Vec<String> = chain.strikes[range.clone()]
-        .iter()
-        .flat_map(|s| [s.ce.as_ref(), s.pe.as_ref()])
-        .flatten()
-        .map(ScripRecord::ws_key)
-        .collect();
-    state.execute.ensure_subscribed(state, &keys, pool).await;
+    let range = window(chain.strikes.len(), centre, ROWS_HALF);
 
     let quote = |r: &Option<ScripRecord>| {
         r.as_ref().map(|r| {
@@ -583,10 +664,10 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
             }
         })
     };
-    // The whole subscribed window goes out: v1 shows ATM ± 5 of it and v2
-    // merges it into the full strike list, and while a finger is on the
-    // ladder it holds its rows still — the spare strikes keep their prices
-    // live meanwhile.
+    // The whole window goes out: v1 shows ATM ± 5 of it and v2 merges it
+    // into the full strike list, and while a finger is on the ladder it
+    // holds its rows still — the spare strikes keep their prices live
+    // meanwhile.
     let rows: Vec<Row> = chain.strikes[range]
         .iter()
         .map(|s| Row { strike: s.strike, ce: quote(&s.ce), pe: quote(&s.pe) })
@@ -801,9 +882,57 @@ mod tests {
         assert_eq!(SubPool::of(&Identity::User { user_id: 2 }), SubPool::Public);
         assert_eq!(SubPool::of(&Identity::Anonymous), SubPool::None);
         assert_eq!(SubPool::None.budget(), 0);
-        // The public share sits inside the one total: the feed never carries more than before.
-        assert!(SubPool::Public.budget() < SubPool::Owner.budget());
-        assert_eq!(SubPool::Owner.budget(), MAX_LADDER_SCRIPS);
+        // The public share sits inside the one total, leaving the owner four bands.
+        assert!(SubPool::Public.budget() + 4 * (2 * BAND_HALF + 1) * 2 <= SubPool::Owner.budget());
+        assert_eq!(SubPool::Owner.budget(), MAX_BAND_SCRIPS);
+    }
+
+    fn priced(k: f64, token: u32) -> ChainStrike {
+        let leg = |opt: &str, tok: u32| ScripRecord {
+            instrument_token: tok.to_string(),
+            exchange_segment_code: "nse_fo".to_string(),
+            option_type: opt.to_string(),
+            ..record("NIFTY", "X", "nse_fo", k * 100.0, opt, (2026, 11, 10))
+        };
+        ChainStrike { strike: k, ce: Some(leg("CE", token)), pe: Some(leg("PE", token + 1)) }
+    }
+
+    #[test]
+    fn the_band_is_atm_plus_minus_seven_nearest_first() {
+        let chain: Vec<ChainStrike> = (0..60).map(|i| priced(24000.0 + 50.0 * i as f64, 1000 + 2 * i)).collect();
+        let atm = atm_index(&chain, 25010.0).unwrap();
+        assert_eq!(chain[atm].strike, 25000.0);
+        let keys = band_keys(&chain, atm, BAND_HALF);
+        assert_eq!(keys.len(), 30);
+        // ATM's call and put first, then one strike below and above, and on.
+        assert_eq!(&keys[..2], [chain[atm].ce.as_ref().unwrap().ws_key(), chain[atm].pe.as_ref().unwrap().ws_key()]);
+        assert_eq!(keys[2], chain[atm - 1].ce.as_ref().unwrap().ws_key());
+        assert_eq!(keys[4], chain[atm + 1].ce.as_ref().unwrap().ws_key());
+        assert!(keys.contains(&chain[atm - 7].pe.as_ref().unwrap().ws_key()));
+        assert!(keys.contains(&chain[atm + 7].ce.as_ref().unwrap().ws_key()));
+        assert!(!keys.contains(&chain[atm + 8].ce.as_ref().unwrap().ws_key()));
+        assert!(!keys.contains(&chain[atm - 8].pe.as_ref().unwrap().ws_key()));
+        // Near the chain's end it clamps.
+        assert_eq!(band_keys(&chain, 2, BAND_HALF).len(), 2 * 10);
+    }
+
+    #[test]
+    fn only_unwanted_band_strikes_no_position_holds_are_released() {
+        let now = Instant::now();
+        let Some(old) = now.checked_sub(BAND_GRACE + Duration::from_secs(1)) else { return };
+        let fresh = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        let band: HashMap<String, Instant> = [
+            ("nse_fo|1", old),
+            ("nse_fo|2", old),
+            ("nse_fo|3", fresh),
+            ("nse_fo|4", old),
+        ]
+        .into_iter()
+        .map(|(k, at)| (k.to_string(), at))
+        .collect();
+        let held: HashSet<String> = ["nse_fo|2".to_string()].into();
+        assert_eq!(unwanted_band_keys(&band, &held, now), ["nse_fo|1", "nse_fo|4"]);
+        assert!(unwanted_band_keys(&band, &held, fresh).len() <= 2);
     }
 
     #[test]

@@ -1184,6 +1184,8 @@ async fn main() {
     tokio::spawn(paper::engine::run(Arc::clone(&state.paper)));
     paper::feed::spawn_keeper(Arc::clone(&state.paper), Arc::clone(&state.ws_tx));
     state.execute.spawn_error_watch(&state.log_tx);
+    // Ladder strikes that left every ATM band come off the feed.
+    execute::ExecuteBoard::spawn_band_release(state.clone());
     // Reconnect Telegram from the last Start, so a restart or an update needs
     // no login code. Nothing missed while down is replayed.
     tokio::spawn(routes::resume_saved_telegram(state.clone()));

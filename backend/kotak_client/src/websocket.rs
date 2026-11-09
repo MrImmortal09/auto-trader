@@ -57,21 +57,26 @@ fn resolve_bridge_dir() -> Option<PathBuf> {
 struct Subscribed {
     /// Positions' contracts — kept for as long as this stream runs.
     scrips: std::collections::HashSet<String>,
-    /// The Execute screen's option ladders (`"ladder": true`) — dropped at
-    /// each day's close, so they never pile up across days.
+    /// Contracts charts and the latency probe stream (`"ladder": true`) —
+    /// dropped at each day's close, so they never pile up across days.
     ladder: std::collections::HashSet<String>,
+    /// The Execute screen's ATM bands (`"band": true`) — released by the
+    /// screen once a strike leaves every band, and dropped at the close.
+    band: std::collections::HashSet<String>,
     /// Index spot values by name (`nse_cm|Nifty 50`).
     indices: std::collections::HashSet<String>,
 }
 
 impl Subscribed {
     fn len(&self) -> usize {
-        self.scrips.union(&self.ladder).count() + self.indices.len()
+        self.all_scrips().len() + self.indices.len()
     }
 
-    /// Every scrip to stream: positions' and the ladders'.
+    /// Every scrip to stream: positions', charts' and the ladders' bands.
     fn all_scrips(&self) -> Vec<String> {
-        self.scrips.union(&self.ladder).cloned().collect()
+        let mut all: std::collections::HashSet<&String> = self.scrips.union(&self.ladder).collect();
+        all.extend(&self.band);
+        all.into_iter().cloned().collect()
     }
 }
 
@@ -82,6 +87,8 @@ fn remember_subscriptions(msg: &str, subs: &mut Subscribed) {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(msg) else { return };
     let (field, set) = match parsed.get("action").and_then(|v| v.as_str()) {
         Some("subscribe_indices") => ("indices", &mut subs.indices),
+        Some("unsubscribe") => return,
+        _ if parsed.get("band").and_then(|v| v.as_bool()) == Some(true) => ("scrips", &mut subs.band),
         _ if parsed.get("ladder").and_then(|v| v.as_bool()) == Some(true) => ("scrips", &mut subs.ladder),
         _ => ("scrips", &mut subs.scrips),
     };
@@ -93,6 +100,30 @@ fn remember_subscriptions(msg: &str, subs: &mut Subscribed) {
             }
         }
     }
+}
+
+/// For an `unsubscribe` of band strikes (`{"action": "unsubscribe", "scrips":
+/// "nse_fo|1&nse_fo|2", "band": true}`): forget them as band strikes and give
+/// back the ones nothing else streams — only those may leave the feed. A
+/// position's contract, or one a chart streams, stays even when a band asked
+/// for it too. `None` for any other message.
+fn release_band(msg: &str, subs: &mut Subscribed) -> Option<Vec<String>> {
+    let parsed = serde_json::from_str::<serde_json::Value>(msg).ok()?;
+    if parsed.get("action").and_then(|v| v.as_str()) != Some("unsubscribe") {
+        return None;
+    }
+    // Only a band's own strikes are ever released.
+    if parsed.get("band").and_then(|v| v.as_bool()) != Some(true) {
+        return Some(Vec::new());
+    }
+    let mut released = Vec::new();
+    for item in parsed.get("scrips").and_then(|v| v.as_str()).unwrap_or("").split(|c| c == ',' || c == '&') {
+        let item = item.trim();
+        if subs.band.remove(item) && !subs.scrips.contains(item) && !subs.ladder.contains(item) {
+            released.push(item.to_string());
+        }
+    }
+    Some(released)
 }
 
 /// Kotak's production market-feed endpoint, used when the login response
@@ -150,7 +181,9 @@ pub async fn start_market_data_stream(
                     _ = &mut sleep => {}
                     msg_opt = rx.recv() => {
                         if let Some(msg) = msg_opt {
-                            remember_subscriptions(&msg, &mut subs);
+                            if release_band(&msg, &mut subs).is_none() {
+                                remember_subscriptions(&msg, &mut subs);
+                            }
                         } else {
                             return; // rx closed
                         }
@@ -271,9 +304,22 @@ pub async fn start_market_data_stream(
             msg_opt = rx.recv() => {
                 match msg_opt {
                     Some(msg) => {
-                        remember_subscriptions(&msg, &mut subs);
-                        if let Some(stdin) = current_stdin.as_mut() {
-                            let mut payload = msg.clone();
+                        let payload = match release_band(&msg, &mut subs) {
+                            Some(released) if released.is_empty() => None,
+                            Some(released) => {
+                                // Forgotten, so a strike off the feed shows no price
+                                // rather than its last one.
+                                for key in &released {
+                                    prices.remove(key);
+                                }
+                                Some(serde_json::json!({ "action": "unsubscribe", "scrips": released.join("&") }).to_string())
+                            }
+                            None => {
+                                remember_subscriptions(&msg, &mut subs);
+                                Some(msg)
+                            }
+                        };
+                        if let (Some(mut payload), Some(stdin)) = (payload, current_stdin.as_mut()) {
                             if !payload.ends_with('\n') { payload.push('\n'); }
                             if let Err(e) = stdin.write_all(payload.as_bytes()).await {
                                 error!("Failed to write to Node bridge stdin: {}", e);
@@ -322,6 +368,7 @@ pub async fn start_market_data_stream(
                 // Ladders are re-requested by the Execute screen tomorrow,
                 // around tomorrow's prices.
                 subs.ladder.clear();
+                subs.band.clear();
                 for index in subs.indices.iter() {
                     let name = index.split_once('|').map_or(index.as_str(), |(_, n)| n);
                     prices.remove(&shared_domain::index_price_key(name));
@@ -355,6 +402,32 @@ mod subscription_tests {
         let mut all = subs.all_scrips();
         all.sort();
         assert_eq!(all, ["nse_fo|1", "nse_fo|2"]);
+    }
+
+    #[test]
+    fn a_band_releases_only_strikes_nothing_else_streams() {
+        let mut subs = Subscribed::default();
+        remember_subscriptions(r#"{"action":"subscribe","scrips":"nse_fo|1"}"#, &mut subs);
+        remember_subscriptions(r#"{"action":"subscribe","scrips":"nse_fo|2","ladder":true}"#, &mut subs);
+        remember_subscriptions(r#"{"action":"subscribe","scrips":"nse_fo|1&nse_fo|2&nse_fo|3&nse_fo|4","band":true}"#, &mut subs);
+        assert_eq!(subs.len(), 4);
+
+        // A position's (1) and a chart's (2) contract stay on the feed.
+        let released = release_band(r#"{"action":"unsubscribe","scrips":"nse_fo|1&nse_fo|2&nse_fo|3","band":true}"#, &mut subs);
+        assert_eq!(released, Some(vec!["nse_fo|3".to_string()]));
+        let mut all = subs.all_scrips();
+        all.sort();
+        assert_eq!(all, ["nse_fo|1", "nse_fo|2", "nse_fo|4"]);
+
+        // Released twice, or never a band's: nothing more leaves.
+        assert_eq!(release_band(r#"{"action":"unsubscribe","scrips":"nse_fo|3","band":true}"#, &mut subs), Some(vec![]));
+        // An unsubscribe that isn't a band's never takes anything off.
+        assert_eq!(release_band(r#"{"action":"unsubscribe","scrips":"nse_fo|1&nse_fo|4"}"#, &mut subs), Some(vec![]));
+        assert_eq!(subs.all_scrips().len(), 3);
+        // Anything else isn't a release at all.
+        assert_eq!(release_band(r#"{"action":"subscribe","scrips":"nse_fo|9"}"#, &mut subs), None);
+        remember_subscriptions(r#"{"action":"unsubscribe","scrips":"nse_fo|9","band":true}"#, &mut subs);
+        assert!(!subs.all_scrips().contains(&"nse_fo|9".to_string()));
     }
 
     #[test]
