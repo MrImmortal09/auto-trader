@@ -122,13 +122,13 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
     };
     // The feed being alive says nothing about this contract: its own price
     // must be recent too, or the user is looking at a price that's gone.
-    if execute::contract_age_secs(&ws_key).is_none_or(|age| age > execute::MAX_BUY_PRICE_AGE_SECS) {
+    if execute::contract_age_secs(&ws_key).is_none_or(|age| age > execute::buy_max_age_secs(execute::SubPool::Owner)) {
         return refuse(
             StatusCode::CONFLICT,
             format!(
                 "{}'s price hasn't updated in over {:.0} min — not buying blind",
                 record.trading_symbol,
-                execute::MAX_BUY_PRICE_AGE_SECS / 60.0
+                execute::buy_max_age_secs(execute::SubPool::Owner) / 60.0
             ),
         );
     }

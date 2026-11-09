@@ -93,11 +93,20 @@ pub const MAX_FEED_AGE_SECS: f64 = 5.0;
 /// about once a second.
 pub const MAX_CONTRACT_AGE_SECS: f64 = 10.0;
 /// A contract whose own price hasn't ticked for this long isn't bought by
-/// hand (the owner's desk and the users' paper desk). Illiquid options trade
-/// minutes apart, so this is far longer than [`MAX_CONTRACT_AGE_SECS`] — the
-/// owner's call. The buy goes in at market, so the fill may be well away
-/// from the price on screen.
+/// hand on the owner's desk. Illiquid options trade minutes apart, so this is
+/// far longer than [`MAX_CONTRACT_AGE_SECS`] — the owner's call. The buy goes
+/// in at market, so the fill may be well away from the price on screen. A
+/// paper desk fills at the price it reads, where a stale one would be free
+/// P&L, so it keeps [`MAX_CONTRACT_AGE_SECS`].
 pub const MAX_BUY_PRICE_AGE_SECS: f64 = 300.0;
+
+/// How old a contract's price may be for a buy from `pool`'s desk.
+pub fn buy_max_age_secs(pool: SubPool) -> f64 {
+    match pool {
+        SubPool::Owner => MAX_BUY_PRICE_AGE_SECS,
+        SubPool::Public | SubPool::None => MAX_CONTRACT_AGE_SECS,
+    }
+}
 /// Engine errors are kept this long, so a failed tap can say why.
 const RECENT_ERROR_MS: i64 = 60_000;
 
@@ -467,6 +476,9 @@ struct Board {
     /// or around the strike the stream was asked to centre on.
     window: Window,
     rows: Vec<Row>,
+    /// A contract price older than this (ms) can't be bought from this
+    /// board: 5 min on the owner's desk, 10 s on a paper desk.
+    buy_max_age_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -695,6 +707,7 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
         atm: spot.map(|_| chain.strikes[atm].strike),
         window,
         rows,
+        buy_max_age_ms: (buy_max_age_secs(pool) * 1000.0) as u64,
     })
 }
 
@@ -892,6 +905,15 @@ mod tests {
         // The public share sits inside the one total, leaving the owner four bands.
         assert!(SubPool::Public.budget() + 4 * (2 * BAND_HALF + 1) * 2 <= SubPool::Owner.budget());
         assert_eq!(SubPool::Owner.budget(), MAX_BAND_SCRIPS);
+    }
+
+    #[test]
+    fn only_the_owners_desk_buys_on_an_old_price() {
+        assert_eq!(buy_max_age_secs(SubPool::Owner), MAX_BUY_PRICE_AGE_SECS);
+        // A paper fill takes the price it reads: an old one would be free P&L.
+        assert_eq!(buy_max_age_secs(SubPool::Public), MAX_CONTRACT_AGE_SECS);
+        assert_eq!(buy_max_age_secs(SubPool::None), MAX_CONTRACT_AGE_SECS);
+        assert!(MAX_CONTRACT_AGE_SECS < MAX_BUY_PRICE_AGE_SECS);
     }
 
     fn priced(k: f64, token: u32) -> ChainStrike {

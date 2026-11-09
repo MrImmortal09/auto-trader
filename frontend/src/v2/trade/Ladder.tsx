@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import type { ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
-import { CONTRACT_STALE_MS, expiryLabel } from '../../lib/execute';
+import { buyMaxAgeMs, expiryLabel, fmtAgeLimit } from '../../lib/execute';
 import { level, price, signedMoney } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
@@ -8,10 +8,10 @@ import { Button } from '../ui/Button';
 import { LotsStepper } from '../ui/LotsStepper';
 
 /** Why one side of a row can't be bought now, or null. */
-function quoteBlocked(q: ExecuteQuote | null, blocked: string | null): string | null {
+function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: number): string | null {
   if (blocked) return blocked;
   if (!q || q.ltp == null) return 'No price for this contract yet';
-  if (q.age_ms != null && q.age_ms > CONTRACT_STALE_MS) return "This contract's price hasn't updated in 5 min";
+  if (q.age_ms != null && q.age_ms > maxAgeMs) return `This contract's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}`;
   return null;
 }
 
@@ -174,7 +174,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
   const side = (q: ExecuteQuote | null, strike: number, kind: 'CE' | 'PE', itm: boolean, near: boolean) => {
     const label = `${board.index} ${strike} ${kind} (${expiryLabel(board.expiry)})`;
     const position = q ? held.get(q.sym) : undefined;
-    const why = quoteBlocked(q, blocked);
+    const why = quoteBlocked(q, blocked, buyMaxAgeMs(board));
     const busy = q ? !!sending[q.sym] : false;
     const button = (
       <Button
