@@ -2,7 +2,7 @@
 // Execute screen helpers — formatting, per-viewer preferences, buy guards.
 // ---------------------------------------------------------------------------
 
-import type { ExecuteFrame } from '../types';
+import type { ExecuteBoard, ExecuteFrame } from '../types';
 
 /** Index tabs — weekly-expiry indices first; keys 1–6 follow this order. */
 export const INDEX_ORDER = ['NIFTY', 'BANKNIFTY', 'SENSEX', 'FINNIFTY', 'MIDCPNIFTY', 'BANKEX'];
@@ -15,8 +15,20 @@ export const VISIBLE_HALF = 5;
 export const FEED_STALE_MS = 5_000;
 /** Above this the feed badge turns amber. */
 export const FEED_SLOW_MS = 2_000;
-/** A strike whose own price is older than this can't be bought (server: 10 s). */
+/** A strike whose own price is older than this can't be bought, when the
+ * board doesn't say (a paper desk's limit on the server). */
 export const CONTRACT_STALE_MS = 10_000;
+
+/** How old a contract's price may be for a buy from `board`: the server's
+ * own limit for this desk (5 min on the owner's, for illiquid options). */
+export function buyMaxAgeMs(board: ExecuteBoard): number {
+  return board.buy_max_age_ms ?? CONTRACT_STALE_MS;
+}
+
+/** A price-age limit for a message: `10 s`, `5 min`. */
+export function fmtAgeLimit(ms: number): string {
+  return ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : `${Math.round(ms / 1000)} s`;
+}
 
 export function contractLabel(index: string, strike: number | null | undefined, optionType: string | null | undefined) {
   return [index, strike != null ? fmtStrike(strike) : null, optionType].filter(Boolean).join(' ');

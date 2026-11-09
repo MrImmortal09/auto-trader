@@ -534,6 +534,10 @@ export interface ExecuteBoard {
   /** The subscribed window: 7 strikes each side of ATM, or of the strike the
    * stream was asked to centre on. v1 shows 11 of them. */
   rows: ExecuteRow[];
+  /** A contract price older than this (ms) can't be bought from this board:
+   * 5 min on the owner's desk, 10 s on a paper desk. Missing from an older
+   * server. */
+  buy_max_age_ms?: number;
 }
 
 export interface ExecutePosition {

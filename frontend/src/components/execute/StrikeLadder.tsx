@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { LoaderCircle } from 'lucide-react';
 import type { ExecuteBoard, ExecutePosition, ExecuteQuote, ExecuteRow } from '../../types';
-import { CONTRACT_STALE_MS, contractLabel, fmtPnl, fmtSpot, fmtStrike, VISIBLE_HALF } from '../../lib/execute';
+import { buyMaxAgeMs, contractLabel, fmtAgeLimit, fmtPnl, fmtSpot, fmtStrike, VISIBLE_HALF } from '../../lib/execute';
 import { PriceCell } from './PriceCell';
 
 /** How long a touch on the ladder holds its rows still. */
@@ -79,7 +79,7 @@ function HeldChip({ p, side, onExit, exitBusy }: { p: ExecutePosition; side: Sid
   );
 }
 
-function SideCell({ side, quote, outside, itm, held, label, pending, exitBusy, blocked, onBuy, onExit }: {
+function SideCell({ side, quote, outside, itm, held, label, pending, exitBusy, blocked, maxAgeMs, onBuy, onExit }: {
   side: Side;
   quote: ExecuteQuote | null;
   /** Held on screen while ATM moved past it: no live price streamed for it now. */
@@ -90,6 +90,8 @@ function SideCell({ side, quote, outside, itm, held, label, pending, exitBusy, b
   pending: boolean;
   exitBusy: boolean;
   blocked: string | null;
+  /** A price older than this (ms) can't be bought: the board's limit. */
+  maxAgeMs: number;
   onBuy: (at: number) => void;
   onExit: () => void;
 }) {
@@ -101,14 +103,14 @@ function SideCell({ side, quote, outside, itm, held, label, pending, exitBusy, b
     );
   }
   const noPrice = quote.ltp == null;
-  const stale = quote.age_ms == null || quote.age_ms > CONTRACT_STALE_MS;
+  const stale = quote.age_ms == null || quote.age_ms > maxAgeMs;
   const button = (
     <BuyButton
       held={Boolean(held)}
       pending={pending || Boolean(held?.placing || held?.adding)}
       blocked={
         blocked ??
-        (noPrice ? 'No live price for this strike yet' : stale ? "This strike's price hasn't updated in 10 s" : null)
+        (noPrice ? 'No live price for this strike yet' : stale ? `This strike's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}` : null)
       }
       onClick={onBuy}
       label={label}
@@ -232,6 +234,7 @@ export function StrikeLadder({ board, nowMs, heldBySymbol, pendingSyms, busyIds,
                 pending={Boolean(row.ce && pendingSyms[row.ce.sym])}
                 exitBusy={Boolean(ceHeld && busyIds[ceHeld.id])}
                 blocked={blocked}
+                maxAgeMs={buyMaxAgeMs(board)}
                 onBuy={(at) => row.ce && buy(row.ce.sym, ceLabel, at)}
                 onExit={() => ceHeld && onExit(ceHeld)}
               />
@@ -253,6 +256,7 @@ export function StrikeLadder({ board, nowMs, heldBySymbol, pendingSyms, busyIds,
                 pending={Boolean(row.pe && pendingSyms[row.pe.sym])}
                 exitBusy={Boolean(peHeld && busyIds[peHeld.id])}
                 blocked={blocked}
+                maxAgeMs={buyMaxAgeMs(board)}
                 onBuy={(at) => row.pe && buy(row.pe.sym, peLabel, at)}
                 onExit={() => peHeld && onExit(peHeld)}
               />
