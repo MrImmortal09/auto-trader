@@ -169,6 +169,18 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     });
     if (!c) return;
     chart.current = c;
+    // KLineChart 10.0.4 counts two presses within 500 ms as a double-click,
+    // and a double-click on the price axis puts it back to auto-fit. A press
+    // during which the wheel zoomed isn't a click: clear the count, so
+    // pressing again to keep zooming doesn't throw the zoom away. (Its own
+    // event handler, not public API: a later version without it is a no-op.)
+    const clicks = (c as unknown as { _chartEvent?: { _event?: { _resetClickTimeout?: () => void } } })._chartEvent?._event;
+    // An upgrade that renames it would bring the reset back silently.
+    if (import.meta.env.DEV && typeof clicks?._resetClickTimeout !== 'function') {
+      console.warn('KChart: klinecharts click-count hook not found; wheel-zoom may reset the price axis');
+    }
+    const onWheel = () => clicks?._resetClickTimeout?.();
+    el.addEventListener('wheel', onWheel, { capture: true, passive: true });
     const drawn = new KlineDrawings(c);
     drawings.current = drawn;
     drawn.setPrefs(prefsNow.current);
@@ -213,6 +225,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       c.executeAction('onCrosshairChange', p.x == null ? {} : { x: p.x, paneId: 'candle_pane' });
     });
     return () => {
+      el.removeEventListener('wheel', onWheel, { capture: true });
       unsub();
       c.unsubscribeAction('onCrosshairChange', onCross);
       VWAP_SERIES.delete(chartId);
@@ -451,8 +464,10 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     const key = (xs: number[]) => xs.map((x) => x.toFixed(2)).sort().join(',');
     if (key(prices) !== key(linePrices.current)) {
       linePrices.current = prices;
-      // Asking again makes the axis take the new prices in.
-      c.overrideYAxis({ paneId: 'candle_pane', createRange: rangeWithLines(linePrices) });
+      // The axis reads the new prices on its next layout. Lay out, don't
+      // override the axis: overriding it turns auto-fit back on, which threw
+      // away the user's own price-scale zoom whenever a line moved.
+      c.resize();
     }
 
     for (const o of c.getOverlays()) {
