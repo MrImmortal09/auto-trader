@@ -15,8 +15,9 @@ export const VISIBLE_HALF = 5;
 export const FEED_STALE_MS = 5_000;
 /** Above this the feed badge turns amber. */
 export const FEED_SLOW_MS = 2_000;
-/** A strike whose own price is older than this can't be bought (server: 10 s). */
-export const CONTRACT_STALE_MS = 10_000;
+/** A strike whose own price is older than this can't be bought (server: 5 min,
+ * so illiquid options can be bought too). */
+export const CONTRACT_STALE_MS = 300_000;
 
 export function contractLabel(index: string, strike: number | null | undefined, optionType: string | null | undefined) {
   return [index, strike != null ? fmtStrike(strike) : null, optionType].filter(Boolean).join(' ');

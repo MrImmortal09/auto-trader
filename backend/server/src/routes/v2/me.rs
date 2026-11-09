@@ -246,10 +246,14 @@ pub async fn buy_handler(
     let Some(ltp) = execute::price(&state, &ws_key) else {
         return refuse(StatusCode::CONFLICT, format!("No live price for {} yet", record.trading_symbol));
     };
-    if execute::contract_age_secs(&ws_key).is_none_or(|age| age > execute::MAX_CONTRACT_AGE_SECS) {
+    if execute::contract_age_secs(&ws_key).is_none_or(|age| age > execute::MAX_BUY_PRICE_AGE_SECS) {
         return refuse(
             StatusCode::CONFLICT,
-            format!("{}'s price hasn't updated in over {:.0} s — not buying blind", record.trading_symbol, execute::MAX_CONTRACT_AGE_SECS),
+            format!(
+                "{}'s price hasn't updated in over {:.0} min — not buying blind",
+                record.trading_symbol,
+                execute::MAX_BUY_PRICE_AGE_SECS / 60.0
+            ),
         );
     }
     let Some(strike) = record.normalized_strike() else {

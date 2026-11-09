@@ -108,7 +108,7 @@ function SideCell({ side, quote, outside, itm, held, label, pending, exitBusy, b
       pending={pending || Boolean(held?.placing || held?.adding)}
       blocked={
         blocked ??
-        (noPrice ? 'No live price for this strike yet' : stale ? "This strike's price hasn't updated in 10 s" : null)
+        (noPrice ? 'No live price for this strike yet' : stale ? "This strike's price hasn't updated in 5 min" : null)
       }
       onClick={onBuy}
       label={label}

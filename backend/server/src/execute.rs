@@ -87,10 +87,17 @@ impl SubPool {
 pub const STREAM_EVERY: Duration = Duration::from_millis(250);
 /// A feed quieter than this is stale: no manual buy is accepted on it.
 pub const MAX_FEED_AGE_SECS: f64 = 5.0;
-/// A contract whose own price hasn't ticked for this long isn't bought: the
-/// price on screen may be long gone even while the feed itself is alive.
-/// Near-the-money index options tick about once a second.
+/// A contract whose own price hasn't ticked for this long is stale: a paper
+/// position's chart level doesn't trigger on it, the price may be long gone
+/// even while the feed itself is alive. Near-the-money index options tick
+/// about once a second.
 pub const MAX_CONTRACT_AGE_SECS: f64 = 10.0;
+/// A contract whose own price hasn't ticked for this long isn't bought by
+/// hand (the owner's desk and the users' paper desk). Illiquid options trade
+/// minutes apart, so this is far longer than [`MAX_CONTRACT_AGE_SECS`] — the
+/// owner's call. The buy goes in at market, so the fill may be well away
+/// from the price on screen.
+pub const MAX_BUY_PRICE_AGE_SECS: f64 = 300.0;
 /// Engine errors are kept this long, so a failed tap can say why.
 const RECENT_ERROR_MS: i64 = 60_000;
 

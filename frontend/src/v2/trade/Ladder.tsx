@@ -11,7 +11,7 @@ import { LotsStepper } from '../ui/LotsStepper';
 function quoteBlocked(q: ExecuteQuote | null, blocked: string | null): string | null {
   if (blocked) return blocked;
   if (!q || q.ltp == null) return 'No price for this contract yet';
-  if (q.age_ms != null && q.age_ms > CONTRACT_STALE_MS) return "This contract's price is stale";
+  if (q.age_ms != null && q.age_ms > CONTRACT_STALE_MS) return "This contract's price hasn't updated in 5 min";
   return null;
 }
 
