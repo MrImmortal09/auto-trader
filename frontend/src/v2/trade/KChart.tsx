@@ -175,6 +175,10 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     // pressing again to keep zooming doesn't throw the zoom away. (Its own
     // event handler, not public API: a later version without it is a no-op.)
     const clicks = (c as unknown as { _chartEvent?: { _event?: { _resetClickTimeout?: () => void } } })._chartEvent?._event;
+    // An upgrade that renames it would bring the reset back silently.
+    if (import.meta.env.DEV && typeof clicks?._resetClickTimeout !== 'function') {
+      console.warn('KChart: klinecharts click-count hook not found; wheel-zoom may reset the price axis');
+    }
     const onWheel = () => clicks?._resetClickTimeout?.();
     el.addEventListener('wheel', onWheel, { capture: true, passive: true });
     const drawn = new KlineDrawings(c);
