@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::NaiveDate;
 use serde::Serialize;
+use shared_domain::FeatureFlags;
 use sqlx::SqlitePool;
 
 use crate::scrip_files::{ScripFiles, SEGMENTS};
@@ -176,6 +177,9 @@ pub struct Catalog {
     pool: Option<SqlitePool>,
     files: ScripFiles,
     fts: bool,
+    /// The v2 switches as loaded: `search` gates the background rebuilds,
+    /// read at the moment of each one so flipping it needs no restart.
+    flags: Arc<tokio::sync::RwLock<FeatureFlags>>,
     index: RwLock<Arc<SearchIndex>>,
     status: Mutex<CatalogStatus>,
     loading: tokio::sync::Mutex<()>,
@@ -185,8 +189,9 @@ impl Catalog {
     /// Opens (or creates) the catalog database at `db_path` and restores the
     /// search list from the last build, so search works right after a
     /// restart. Never fails: a database that cannot be opened leaves an
-    /// empty catalog whose status carries the error.
-    pub async fn open(files: ScripFiles, db_path: &Path) -> Arc<Catalog> {
+    /// empty catalog whose status carries the error. `flags` is the loaded
+    /// `FeatureFlags`: a background rebuild runs only while `search` is on.
+    pub async fn open(files: ScripFiles, db_path: &Path, flags: Arc<tokio::sync::RwLock<FeatureFlags>>) -> Arc<Catalog> {
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -204,6 +209,7 @@ impl Catalog {
             pool,
             files,
             fts,
+            flags,
             index: RwLock::new(Arc::new(SearchIndex::empty())),
             status: Mutex::new(CatalogStatus { fts, last_error: error, ..Default::default() }),
             loading: tokio::sync::Mutex::new(()),
@@ -216,6 +222,12 @@ impl Catalog {
 
     pub fn status(&self) -> CatalogStatus {
         self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The catalog database's pool, which the quote hub's close snapshot
+    /// (`quote_eod`) shares; `None` when the database could not be opened.
+    pub fn pool(&self) -> Option<SqlitePool> {
+        self.pool.clone()
     }
 
     fn index(&self) -> Arc<SearchIndex> {
@@ -417,10 +429,18 @@ impl Catalog {
         }
     }
 
-    /// `load_if_changed` on its own task, its outcome logged.
+    /// `load_if_changed` on its own task, its outcome logged — while the
+    /// `search` switch is on. Off, nothing is built: the CSVs on disk are
+    /// still written by every download, and the build they are owed runs
+    /// when the switch is turned on (`PUT /api/v2/flags`) or at the first
+    /// download after that.
     pub fn rebuild_in_background(self: &Arc<Self>, reason: &'static str) {
         let catalog = Arc::clone(self);
         tokio::spawn(async move {
+            if !catalog.flags.read().await.search {
+                tracing::info!(reason, "Instrument catalog rebuild skipped — the `search` switch is off");
+                return;
+            }
             match catalog.load_if_changed(reason).await {
                 Ok(LoadOutcome::Unchanged) => tracing::info!(reason, "Instrument catalog is already built from the CSVs on disk"),
                 Ok(LoadOutcome::Loaded(report)) => tracing::debug!(reason, day = %report.day, "Instrument catalog build finished"),
@@ -485,18 +505,17 @@ impl Catalog {
 
     /// The instrument with `id` (`<segment>:<token>`), with its underlying's
     /// key and, for an F&O underlying's own row, the nearest expiry listed
-    /// from `today`. One primary-key lookup, and one indexed range for the
-    /// expiry. `None` for an id the catalog has no row for.
-    pub async fn instrument(&self, id: &str, today: NaiveDate) -> Option<Instrument> {
-        let pool = self.pool.as_ref()?;
-        let row = sqlx::query_as::<_, DetailRow>(SELECT_DETAIL)
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, id, "Instrument catalog: instrument lookup failed");
-                None
-            })?;
+    /// from `today`. One primary-key lookup, and seeks for the expiry.
+    /// `Ok(None)` for an id the catalog has no row for (an unopened catalog
+    /// has none); `Err` when the lookup itself failed, which the route
+    /// reports as a server error rather than "no instrument".
+    pub async fn instrument(&self, id: &str, today: NaiveDate) -> Result<Option<Instrument>, sqlx::Error> {
+        let Some(pool) = self.pool.as_ref() else { return Ok(None) };
+        let row = sqlx::query_as::<_, DetailRow>(SELECT_DETAIL).bind(id).fetch_optional(pool).await.map_err(|e| {
+            tracing::error!(error = %e, id, "Instrument catalog: instrument lookup failed");
+            e
+        })?;
+        let Some(row) = row else { return Ok(None) };
         let index = self.index();
         let underlying = index.get(&row.row.underlying);
         let underlying_key = underlying.and_then(|u| u.ws_key.clone());
@@ -505,21 +524,21 @@ impl Catalog {
             Some(u) if u.has_fo && matches!(row_kind, Kind::Eq | Kind::Index) => self.nearest_expiry(&u.symbol, today).await,
             _ => None,
         };
-        Some(Instrument {
+        Ok(Some(Instrument {
             row: row.row.into_row(&index),
             segment: row.segment,
             token: row.token,
             isin: row.isin,
             underlying_key,
             nearest_expiry: nearest_expiry.map(day_text),
-        })
+        }))
     }
 
     /// The nearest expiry any contract under `underlying` is listed for
-    /// from `today`.
+    /// from `today`: one `MIN(expiry)` seek per kind on the chain index.
     async fn nearest_expiry(&self, underlying: &str, today: NaiveDate) -> Option<NaiveDate> {
         let pool = self.pool.as_ref()?;
-        sqlx::query_scalar::<_, Option<String>>("SELECT MIN(expiry) FROM instruments WHERE underlying = ? AND expiry >= ?")
+        sqlx::query_scalar::<_, Option<String>>(NEAREST_EXPIRY)
             .bind(underlying)
             .bind(day_text(today))
             .fetch_one(pool)
@@ -634,17 +653,11 @@ impl Catalog {
     }
 
     /// The expiries the underlying's options are listed for from `today`,
-    /// nearest first.
+    /// nearest first: a seek per expiry (`OPTION_EXPIRIES`), never a walk
+    /// of the chain.
     async fn option_expiries(&self, underlying: &str, today: NaiveDate) -> Vec<NaiveDate> {
         let Some(pool) = &self.pool else { return Vec::new() };
-        match sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT expiry FROM instruments WHERE underlying = ? AND expiry >= ? AND kind IN ('CE', 'PE') ORDER BY expiry",
-        )
-        .bind(underlying)
-        .bind(day_text(today))
-        .fetch_all(pool)
-        .await
-        {
+        match sqlx::query_scalar::<_, String>(OPTION_EXPIRIES).bind(underlying).bind(day_text(today)).fetch_all(pool).await {
             Ok(days) => days.iter().filter_map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()).collect(),
             Err(e) => {
                 tracing::error!(error = %e, "Instrument catalog: expiries lookup failed");
@@ -834,6 +847,40 @@ struct LoadRow {
 
 const SELECT_ROW: &str =
     "SELECT id, kind, symbol, name, exchange, trading_symbol, underlying, expiry, strike, lot_size, tick_size, ws_key FROM instruments";
+
+/// The nearest expiry from `?2` under underlying `?1`: the least of one
+/// `MIN(expiry)` per kind, each a seek on the chain index
+/// (`underlying, kind, expiry`), so NIFTY's 17,000 contracts are never
+/// walked. `NULL` when nothing is listed from that day.
+const NEAREST_EXPIRY: &str = "SELECT MIN(e) FROM (
+    SELECT MIN(expiry) AS e FROM instruments WHERE underlying = ?1 AND kind = 'FUT' AND expiry >= ?2
+    UNION ALL
+    SELECT MIN(expiry) FROM instruments WHERE underlying = ?1 AND kind = 'CE' AND expiry >= ?2
+    UNION ALL
+    SELECT MIN(expiry) FROM instruments WHERE underlying = ?1 AND kind = 'PE' AND expiry >= ?2
+)";
+
+/// The option expiries from `?2` under underlying `?1`, ascending: each row
+/// is the next expiry after the last, found by a `MIN(expiry)` seek on the
+/// chain index per side (CE, then PE), so the cost is the number of
+/// expiries, not of contracts. `DISTINCT` is implied: a `MIN` strictly
+/// greater than the last never repeats one.
+const OPTION_EXPIRIES: &str = "WITH RECURSIVE next(expiry) AS (
+    SELECT MIN(e) FROM (
+        SELECT MIN(expiry) AS e FROM instruments WHERE underlying = ?1 AND kind = 'CE' AND expiry >= ?2
+        UNION ALL
+        SELECT MIN(expiry) FROM instruments WHERE underlying = ?1 AND kind = 'PE' AND expiry >= ?2
+    )
+    UNION ALL
+    SELECT (
+        SELECT MIN(e) FROM (
+            SELECT MIN(expiry) AS e FROM instruments WHERE underlying = ?1 AND kind = 'CE' AND expiry > next.expiry
+            UNION ALL
+            SELECT MIN(expiry) FROM instruments WHERE underlying = ?1 AND kind = 'PE' AND expiry > next.expiry
+        )
+    ) FROM next WHERE next.expiry IS NOT NULL
+)
+SELECT expiry FROM next WHERE expiry IS NOT NULL";
 
 /// `SELECT_ROW`'s columns and the instrument page's, by primary key.
 const SELECT_DETAIL: &str =

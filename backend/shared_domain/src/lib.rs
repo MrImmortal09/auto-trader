@@ -70,10 +70,20 @@ pub const MARKET_CLOSE_MINUTE: u32 = 40;
 pub const EXPIRY_SQUAREOFF_HOUR: u32 = 15;
 pub const EXPIRY_SQUAREOFF_MINUTE: u32 = 38;
 
+/// Whether the market is open right now: [`is_market_open_at`] for the
+/// current IST time.
 pub fn is_market_open() -> bool {
+    is_market_open_at(now_ist())
+}
+
+/// Whether the market is open at `now`: a weekday, 09:15 to 15:40 IST (the
+/// close exclusive). Weekends only — exchange holidays are the caller's
+/// (`telegram_ingester::parser::is_trading_holiday`, which the paper loop,
+/// the desk and the quote hub consult). Takes the time so callers can pass
+/// a fixed one in tests.
+pub fn is_market_open_at(now: DateTime<FixedOffset>) -> bool {
     use chrono::Timelike;
     use chrono::Datelike;
-    let now = now_ist();
 
     // Check if it is a weekday
     let weekday = now.weekday();
@@ -1350,6 +1360,27 @@ pub enum DbWriteMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_market_is_open_on_weekdays_from_0915_until_1540() {
+        let ist = |y, m, d, h, min| {
+            NaiveDate::from_ymd_opt(y, m, d)
+                .unwrap()
+                .and_hms_opt(h, min, 0)
+                .unwrap()
+                .and_local_timezone(ist_offset())
+                .single()
+                .unwrap()
+        };
+        // 2026-11-04 is a Wednesday.
+        assert!(!is_market_open_at(ist(2026, 11, 4, 9, 14)));
+        assert!(is_market_open_at(ist(2026, 11, 4, 9, 15)));
+        assert!(is_market_open_at(ist(2026, 11, 4, 15, 39)));
+        assert!(!is_market_open_at(ist(2026, 11, 4, 15, 40)));
+        assert!(!is_market_open_at(ist(2026, 11, 4, 20, 0)));
+        assert!(!is_market_open_at(ist(2026, 11, 7, 12, 0)), "Saturday");
+        assert!(!is_market_open_at(ist(2026, 11, 8, 12, 0)), "Sunday");
+    }
 
     #[test]
     fn signal_saved_before_entry_ranges_still_loads() {

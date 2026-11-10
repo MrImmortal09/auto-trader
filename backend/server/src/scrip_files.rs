@@ -8,18 +8,22 @@
 //! VM that shares them with the engine's 50 ms tick. The admin's CSV
 //! downloads (`/api/scrip/download`, `/api/auth/kotak/scrip-master/raw`)
 //! stream these files back in the shape that merged text had: one header,
-//! then every segment's rows. And after a restart with nothing to download
-//! against, the files give the engine the store a server that stayed up
-//! overnight would still hold.
+//! then every segment's rows, and the instrument catalog
+//! (`crate::instruments`) is built from them.
+//!
+//! The engine never reads these files back: its `ScripStore` is filled by a
+//! login's download and by nothing else, so after a restart every signal
+//! is refused with "Scrip Master not loaded" until the login, exactly as
+//! before the files existed. Only the catalog restores from disk, and it
+//! serves search alone, labelled with its day.
 //!
 //! `ScripStore::parse_csv` always receives the text exactly as Kotak sent
-//! it, whether it is parsed off the download or read back from here.
+//! it, parsed off the download.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use axum::body::{Body, Bytes};
 use futures::stream::StreamExt as _;
@@ -61,27 +65,6 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct ScripFiles {
     dir: Arc<PathBuf>,
-}
-
-/// What the files on disk parse into — see [`ScripFiles::load_store`].
-pub struct OnDisk {
-    pub store: ScripStore,
-    /// The segments found, in [`SEGMENTS`] order.
-    pub segments: Vec<&'static str>,
-    /// When the oldest of them was written: the store is at least this old.
-    pub saved_at: Option<SystemTime>,
-}
-
-impl OnDisk {
-    /// `saved_at` as IST `YYYY-MM-DD HH:MM:SS`.
-    pub fn saved_at_ist(&self) -> Option<String> {
-        self.saved_at.map(|t| {
-            chrono::DateTime::<chrono::Utc>::from(t)
-                .with_timezone(&shared_domain::ist_offset())
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-    }
 }
 
 /// What one pass over [`SEGMENTS`] produced — see [`download`].
@@ -155,33 +138,6 @@ impl ScripFiles {
     /// The segments on disk, in [`SEGMENTS`] order.
     pub fn present(&self) -> Vec<&'static str> {
         SEGMENTS.into_iter().filter(|segment| self.path(segment).is_file()).collect()
-    }
-
-    /// Every segment on disk parsed into one store, each from the same text
-    /// the download that wrote it was parsed from. `None` when nothing is on
-    /// disk; a file that cannot be read is logged and left out. Blocking.
-    pub fn load_store(&self) -> Option<OnDisk> {
-        let mut store: Option<ScripStore> = None;
-        let mut segments = Vec::new();
-        let mut saved_at: Option<SystemTime> = None;
-        for segment in SEGMENTS {
-            let csv = match self.read(segment) {
-                Ok(Some(csv)) => csv,
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!(segment, path = %self.path(segment).display(), error = %e, "Scrip Master CSV on disk unreadable — left out");
-                    continue;
-                }
-            };
-            let parsed = ScripStore::parse_csv(&csv, segment);
-            drop(csv);
-            store.get_or_insert_with(ScripStore::default).merge(parsed);
-            segments.push(segment);
-            if let Ok(modified) = std::fs::metadata(self.path(segment)).and_then(|m| m.modified()) {
-                saved_at = Some(saved_at.map_or(modified, |oldest| oldest.min(modified)));
-            }
-        }
-        store.map(|store| OnDisk { store, segments, saved_at })
     }
 
     /// The files as one CSV body: the first file's header, then every file's
@@ -402,34 +358,23 @@ mod tests {
         std::fs::remove_dir_all(files.dir()).unwrap();
     }
 
+    /// The files are the catalog's and the admin downloads' only: nothing
+    /// here parses them back into a `ScripStore`, so a restart leaves the
+    /// engine's store empty until a login's download, as on main.
     #[test]
-    fn the_store_loaded_from_disk_is_the_one_the_downloads_built() {
-        let files = scratch("load-store");
-        assert!(files.load_store().is_none(), "nothing on disk, nothing to restore");
+    fn nothing_here_restores_the_engines_store_from_disk() {
+        let files = scratch("no-restore");
         files.write("nse_cm", NSE_CM).unwrap();
         files.write("bse_fo", BSE_FO).unwrap();
         files.write("nse_fo", NSE_FO).unwrap();
-
-        let on_disk = files.load_store().expect("three files");
-        assert_eq!(on_disk.segments, vec!["nse_fo", "bse_fo", "nse_cm"]);
-        assert!(on_disk.saved_at.is_some());
-        assert!(on_disk.saved_at_ist().is_some());
-        let mut downloaded = ScripStore::default();
-        downloaded.merge(ScripStore::parse_csv(NSE_FO, "nse_fo"));
-        downloaded.merge(ScripStore::parse_csv(BSE_FO, "bse_fo"));
-        downloaded.merge(ScripStore::parse_csv(NSE_CM, "nse_cm"));
-        assert_eq!(records(&on_disk.store), records(&downloaded));
-        // Each file was parsed as its own segment.
-        assert_eq!(on_disk.store.records["SENSEX"][0].exchange_segment_code, "bse_fo");
-        assert_eq!(on_disk.store.records["TCS"][0].exchange_segment_code, "nse_cm");
-        assert_eq!(on_disk.store.records["RELIANCE"].len(), 2, "the option from nse_fo and the share from nse_cm");
-
-        // A missing segment is simply absent; the others still load.
+        assert_eq!(files.present(), vec!["nse_fo", "bse_fo", "nse_cm"]);
+        // What is on disk reads back byte for byte, segment by segment — the
+        // catalog's loader and the merged download work from that; a
+        // segment never downloaded is simply absent.
+        assert_eq!(files.read("bse_fo").unwrap().as_deref(), Some(BSE_FO));
         std::fs::remove_file(files.path("nse_fo")).unwrap();
-        let on_disk = files.load_store().expect("two files");
-        assert_eq!(on_disk.segments, vec!["bse_fo", "nse_cm"]);
-        assert!(!on_disk.store.records.contains_key("NIFTY"));
-
+        assert_eq!(files.read("nse_fo").unwrap(), None);
+        assert_eq!(files.present(), vec!["bse_fo", "nse_cm"]);
         std::fs::remove_dir_all(files.dir()).unwrap();
     }
 

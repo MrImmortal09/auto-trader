@@ -789,7 +789,7 @@ async fn main() {
     // The instrument catalog (`instruments`): the search tables built from
     // those CSVs, in their own SQLite file beside them. Search only; the
     // engine never reads it.
-    let instruments = instruments::Catalog::open(scrip_files.clone(), &scrip_files::data_dir().join("instruments.db")).await;
+    let instruments = instruments::Catalog::open(scrip_files.clone(), &scrip_files::data_dir().join("instruments.db"), Arc::clone(&flags)).await;
     let scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>> = Arc::new(RwLock::new(None));
     // Set when a login below has started a Scrip Master download that will
     // fill the store in the background.
@@ -868,34 +868,12 @@ async fn main() {
         }
     }
 
-    // 7a. A server that stays up overnight still holds the last download's
-    // Scrip Master until the morning login replaces it; a restart used to
-    // lose it. When nothing above produced one — no session to restore and
-    // no auto-login, or every segment failed to download — the CSVs the
-    // last download saved give it back. Not while a login's download is in
-    // flight: that store arrives within minutes, and until then no signal
-    // resolves, as before. `scrip_loaded_at` stays unset: it means
-    // "downloaded today", and the 09:10 recycle decides on it whether it has
-    // anything to do.
-    if !scrip_download_pending && scrip_store.read().await.is_none() {
-        let files = scrip_files.clone();
-        match tokio::task::spawn_blocking(move || files.load_store()).await {
-            Ok(Some(on_disk)) => {
-                tracing::info!(
-                    segments = ?on_disk.segments,
-                    saved_at = on_disk.saved_at_ist().as_deref().unwrap_or("unknown"),
-                    "Scrip Master restored from disk — that download's contracts until the next login replaces them"
-                );
-                let mut store = scrip_store.write().await;
-                if store.is_none() {
-                    *store = Some(on_disk.store);
-                }
-            }
-            Ok(None) => tracing::info!("No Scrip Master on disk — no signal resolves until a login downloads it"),
-            Err(e) => tracing::error!(error = %e, "Scrip Master restore from disk failed"),
-        }
-    }
-
+    // 7a. The engine's Scrip Master is never restored from the CSVs on disk:
+    // with no session to restore and no auto-login, `scrip_store` stays
+    // `None` and every signal is refused with "Scrip Master not loaded"
+    // until a login's download fills it, exactly as before the files
+    // existed. The files serve the instrument catalog (7c) and the admin's
+    // CSV downloads only.
 
     // 7b. VWAP + PCR indicator feed — filled by the Upstox poller (9b) and read
     // by the position monitor at the moment an entry triggers. Seeded from
@@ -904,8 +882,10 @@ async fn main() {
     market_data::seed_indicator_feed(&pool, &indicator_feed).await;
 
     // 7c. The instrument catalog: rebuilt from the CSVs on disk when they
-    // are newer than its last build. Not while a login's download is in
-    // flight: `fetch_scrip_master_background` rebuilds it once the new
+    // are newer than its last build, while the `search` switch is on (off,
+    // the search list restored from `instruments.db` is all search has; the
+    // build runs when the switch is turned on). Not while a login's download
+    // is in flight: `fetch_scrip_master_background` rebuilds it once the new
     // files are written.
     if !scrip_download_pending {
         instruments.rebuild_in_background("startup");
@@ -1046,8 +1026,10 @@ async fn main() {
     );
 
     // 9e. The quote hub: what the search and the instrument page price
-    // by. Its poller asks Kotak only while the session watchdog finds the
-    // session healthy, and its close sweep runs at 15:35 IST.
+    // by. Its poller asks Kotak only while the `search` switch is on and
+    // the session watchdog finds the session healthy, and its close sweep
+    // runs at 15:35 IST on trading days, again only while the switch is on.
+    // Its close snapshot lives in the catalog's `instruments.db`.
     let quotes = {
         let catalog = Arc::clone(&instruments);
         Arc::new(quotes::QuoteHub::new(Arc::clone(&prices), Box::new(move |key: &str| catalog.upstox_key(key))))
@@ -1058,10 +1040,8 @@ async fn main() {
             kotak: Arc::clone(&kotak_client_opt),
             healthy: Arc::clone(&kotak_session_healthy),
             upstox: upstox.clone(),
-            pool: pool.clone(),
             catalog: Arc::clone(&instruments),
-            paper: Arc::clone(&paper_desk),
-            positions: Arc::clone(&positions),
+            flags: Arc::clone(&flags),
         },
     )
     .await;

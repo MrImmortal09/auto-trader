@@ -9,6 +9,15 @@
 //! tick of the last ten seconds ahead of any REST read, and the others fill
 //! in the day's figures it lacks. After the close, the 15:35 sweep's row is
 //! served as the day's close instead, until the next day's quotes arrive.
+//!
+//! What a quote tells a signed-in user is the price and the day's figures,
+//! never where the price came from in a way that names the feed: the feed
+//! carries exactly the contracts the owner's engine, the ladder and the
+//! paper desks subscribed, so a contract answered from the feed before the
+//! REST poller has read it would say the owner holds it. Hence a contract
+//! key's feed tick is used only once the key has a REST read too (so the
+//! first call for any contract is `missing` alike), and `source` is
+//! serialised as `live` for the feed and REST both.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,7 +26,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use dashmap::DashMap;
 use kotak_client::{KotakError, KotakQuote};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use shared_domain::{index_close_key, telemetry};
 use upstox_client::UpstoxClient;
 
@@ -29,6 +38,11 @@ use super::rest::{self, Chunk, Outcome, Scheduler};
 pub const FEED_FRESH: Duration = Duration::from_secs(10);
 /// Keys asked for within this are watched: the close sweep includes them.
 pub const WATCH_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// Keys the hub keeps interest in at once; past it the least recently
+/// asked for are forgotten. Caps what one caller can set polling (and what
+/// the close sweep takes on beyond the catalog's cash keys) at twelve
+/// seconds of calls — a screen shows a few dozen keys, not hundreds.
+pub const MAX_WANTED: usize = 600;
 /// A REST or Upstox quote not refreshed for this long is dropped.
 const EVICT_AFTER: Duration = Duration::from_secs(30 * 60);
 const EVICT_EVERY: Duration = Duration::from_secs(60);
@@ -37,9 +51,10 @@ const UPSTOX_BATCH: usize = 100;
 const UPSTOX_PAUSE: Duration = Duration::from_secs(5);
 const UPSTOX_PAUSE_MAX: Duration = Duration::from_secs(60);
 
-/// Where a quote's price came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+/// Where a quote's price came from. Serialised by [`Source::label`]: the
+/// feed and REST both as `live`, so an answer never says which keys the
+/// feed carries (the owner's and the paper desks' contracts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     /// The Kotak feed's tick.
     Feed,
@@ -51,38 +66,48 @@ pub enum Source {
     Close,
 }
 
-/// One instrument's quote.
+impl Source {
+    /// What a client sees: `live` (Kotak's feed or REST, during hours),
+    /// `upstox` (the fallback while Kotak is down; equities and indices
+    /// only, so it names no contract) or `close` (the 15:35 snapshot).
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Feed | Source::Rest => "live",
+            Source::Upstox => "upstox",
+            Source::Close => "close",
+        }
+    }
+}
+
+impl Serialize for Source {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
+/// One instrument's quote. Every figure is serialised, `null` when absent,
+/// like the rest of the v2 answers.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Quote {
     /// The price-map key.
     pub key: String,
     pub ltp: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub open: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub high: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub low: Option<f64>,
     /// The previous close.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub close: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Against the previous close, for this quote's own `ltp`.
     pub change: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub per_change: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub oi: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub year_high: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub year_low: Option<f64>,
     /// Unix ms the price was read: the tick's, the REST read's, the sweep's.
     pub at: i64,
     pub source: Source,
     /// For a close: the IST day and time it stands for, `YYYY-MM-DD 15:30`.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
 }
 
@@ -179,7 +204,10 @@ pub fn from_upstox(key: &str, q: &upstox_client::Quote, at: i64) -> Option<Quote
 
 /// The live quote for a key from its candidates: the freshest gives the
 /// price, except that a feed tick of the last [`FEED_FRESH`] always does;
-/// the rest fill in what it lacks.
+/// the rest fill in what it lacks. The change is always the winner's own
+/// LTP against the close: a feed tick that borrows REST's previous close
+/// gets its change worked out from it, never REST's change for REST's
+/// (older) price.
 pub fn merge_live(feed: Option<Quote>, rest: Option<Quote>, upstox: Option<Quote>, now_ms: i64) -> Option<Quote> {
     let mut candidates: Vec<Quote> = [feed, rest, upstox].into_iter().flatten().collect();
     if candidates.is_empty() {
@@ -194,10 +222,22 @@ pub fn merge_live(feed: Option<Quote>, rest: Option<Quote>, upstox: Option<Quote
         candidates.insert(0, feed);
     }
     let mut winner = candidates[0].clone();
+    let own_change = winner.change.is_some();
     for other in &candidates[1..] {
         winner.fill_from(other);
     }
+    if !own_change {
+        let (change, per_change) = change_against(winner.ltp, winner.close);
+        winner.change = change;
+        winner.per_change = per_change;
+    }
     Some(winner)
+}
+
+/// Whether `key` is a derivative's (`nse_fo|…`, `bse_fo|…`): the keys the
+/// feed carries only because someone holds or watches the contract.
+fn is_contract_key(key: &str) -> bool {
+    key.split_once('|').is_some_and(|(segment, _)| segment.ends_with("_fo"))
 }
 
 /// What `get` answers from a live quote and the close on file: the close
@@ -256,6 +296,12 @@ impl Sweep {
     fn done(&self, now: Instant) -> bool {
         (self.pending.is_empty() && self.in_flight == 0) || now >= self.deadline
     }
+
+    /// Whether the deadline passed with keys still to ask for (or asked
+    /// and unanswered).
+    pub fn cut_short(&self) -> bool {
+        !self.pending.is_empty() || self.in_flight > 0
+    }
 }
 
 struct UpstoxState {
@@ -313,7 +359,13 @@ pub struct SweepStatus {
 pub struct CloseStatus {
     pub day: String,
     pub taken_at: String,
+    /// Keys with a close.
     pub rows: usize,
+    /// Keys the sweep asked for.
+    pub asked: usize,
+    /// Some key got no close: the sweep was cut short by the 15:40
+    /// deadline, or Kotak left keys out.
+    pub partial: bool,
 }
 
 /// What the hub is doing, for the System screen and the log.
@@ -349,6 +401,9 @@ pub struct HubStatus {
     pub close: Option<CloseStatus>,
 }
 
+/// `HubStatus.paused` while the `search` switch is off.
+pub const PAUSED_SWITCHED_OFF: &str = "the `search` switch is off";
+
 /// The quote hub — see the module doc.
 pub struct QuoteHub {
     /// The feed's price map, read only.
@@ -367,6 +422,8 @@ pub struct QuoteHub {
     last_evicted: Mutex<Instant>,
     /// Whether the last poll found a healthy Kotak session.
     session_ok: Mutex<bool>,
+    /// Whether the poller last found the `search` switch off.
+    switched_off: Mutex<bool>,
 }
 
 impl QuoteHub {
@@ -396,6 +453,7 @@ impl QuoteHub {
             stats: Mutex::new(Stats::default()),
             last_evicted: Mutex::new(now),
             session_ok: Mutex::new(false),
+            switched_off: Mutex::new(false),
         }
     }
 
@@ -407,14 +465,23 @@ impl QuoteHub {
     /// 15 s, and the close sweep includes them for 15 minutes. A key with
     /// no REST form is still answered from the feed or the close. Called by
     /// the search, quote and instrument routes for every key they answer.
+    /// At most [`MAX_WANTED`] keys are kept; past that the least recently
+    /// asked for go first.
     pub fn want<I: IntoIterator<Item = String>>(&self, keys: I) {
-        let now = Instant::now();
+        self.want_at(keys, Instant::now());
+    }
+
+    fn want_at<I: IntoIterator<Item = String>>(&self, keys: I, now: Instant) {
         let mut wanted = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
         for key in keys {
             wanted.insert(key, now);
         }
-        if wanted.len() > 2_000 {
-            wanted.retain(|_, at| now.saturating_duration_since(*at) < WATCH_WINDOW);
+        if wanted.len() > MAX_WANTED {
+            let mut by_age: Vec<(Instant, String)> = wanted.iter().map(|(k, at)| (*at, k.clone())).collect();
+            by_age.sort();
+            for (_, key) in by_age.into_iter().take(wanted.len() - MAX_WANTED) {
+                wanted.remove(&key);
+            }
         }
     }
 
@@ -435,11 +502,17 @@ impl QuoteHub {
 
     /// The quote for `key` as of `now` (the routes pass the clock through,
     /// so their tests can set it) — see the module doc for which source
-    /// answers.
+    /// answers. A contract's feed tick counts only once the key has a REST
+    /// read as well: the feed carries a contract because the owner's
+    /// engine, the ladder or a paper desk subscribed it, and a quote
+    /// answered before the poller's first read would say so. Equities and
+    /// indices are answered from the feed at once (the indices are always
+    /// on it; no equity ever is).
     pub fn get_at(&self, key: &str, now: DateTime<FixedOffset>) -> Option<Quote> {
         let rest = self.rest.get(key).map(|h| h.quote.clone());
         let upstox = self.upstox.get(key).map(|h| h.quote.clone());
-        let live = merge_live(self.feed_quote(key), rest, upstox, now.timestamp_millis());
+        let feed = if is_contract_key(key) && rest.is_none() { None } else { self.feed_quote(key) };
+        let live = merge_live(feed, rest, upstox, now.timestamp_millis());
         let close = self.snapshot().and_then(|s| s.quote(key).map(|q| (s.day, q)));
         serve(live, close, now)
     }
@@ -473,11 +546,18 @@ impl QuoteHub {
         let now = Instant::now();
         let wanted = self.wanted_within(rest::WANT_WINDOW, now).len();
         let session_ok = *self.session_ok.lock().unwrap_or_else(|e| e.into_inner());
+        let switched_off = *self.switched_off.lock().unwrap_or_else(|e| e.into_inner());
         let (batch_size, quarantined, sched_paused) = {
             let sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
             (sched.batch_size(), sched.quarantined(), sched.paused(now).map(str::to_string))
         };
-        let paused = if session_ok { sched_paused } else { Some("no healthy Kotak session".to_string()) };
+        let paused = if switched_off {
+            Some(PAUSED_SWITCHED_OFF.to_string())
+        } else if session_ok {
+            sched_paused
+        } else {
+            Some("no healthy Kotak session".to_string())
+        };
         let sweep = self
             .sweep
             .lock()
@@ -488,6 +568,8 @@ impl QuoteHub {
             day: s.day.to_string(),
             taken_at: s.taken_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             rows: s.rows.len(),
+            asked: s.asked,
+            partial: s.partial(),
         });
         let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         Stats::prune(&mut stats.recent_calls, now);
@@ -520,6 +602,17 @@ impl QuoteHub {
     // -----------------------------------------------------------------------
     // The poller's side
     // -----------------------------------------------------------------------
+
+    /// What the poller found the `search` switch to be, for the status.
+    pub(super) fn set_switched_off(&self, off: bool) {
+        *self.switched_off.lock().unwrap_or_else(|e| e.into_inner()) = off;
+    }
+
+    /// Charges the 2-calls-a-second bucket for a call sent at `now` — see
+    /// `Scheduler::reserve`.
+    pub(super) fn reserve_call(&self, now: Instant) -> Result<(), Duration> {
+        self.sched.lock().unwrap_or_else(|e| e.into_inner()).reserve(now)
+    }
 
     /// The calls to make now: the wanted keys with a REST form, those the
     /// feed carries last (their price is live anyway), and the sweep's.
@@ -731,12 +824,12 @@ impl QuoteHub {
 
     /// For tests: a REST quote as the poller would store it.
     #[cfg(test)]
-    pub(super) fn put_rest(&self, quote: Quote) {
+    pub(crate) fn put_rest(&self, quote: Quote) {
         self.rest.insert(quote.key.clone(), Held { quote, seen: Instant::now() });
     }
 
     #[cfg(test)]
-    pub(super) fn put_upstox(&self, quote: Quote) {
+    pub(crate) fn put_upstox(&self, quote: Quote) {
         self.upstox.insert(quote.key.clone(), Held { quote, seen: Instant::now() });
     }
 }
@@ -798,7 +891,8 @@ mod tests {
         let q = hub.get_at("nse_fo|1", noon).unwrap();
         assert_eq!((q.ltp, q.source), (104.0, Source::Rest));
 
-        // The feed ticks 3 s after that read: its price, REST's day.
+        // The feed ticks 3 s after that read: its price, REST's day, and the
+        // change worked out for the feed's price, not copied for REST's.
         prices.insert("nse_fo|1".into(), 105.5);
         tick_ms.store(ms(noon) + 2_000, Ordering::Relaxed);
         let q = hub.get_at("nse_fo|1", noon + chrono::Duration::seconds(3)).unwrap();
@@ -806,6 +900,16 @@ mod tests {
         assert_eq!((q.open, q.high, q.low, q.close), (Some(100.0), Some(110.0), Some(95.0), Some(98.0)));
         assert_eq!(q.volume, Some(1_000.0));
         assert_eq!(q.at, ms(noon) + 2_000);
+        assert_eq!(q.change, Some(7.5));
+        assert!((q.per_change.unwrap() - 7.5 / 98.0 * 100.0).abs() < 1e-9);
+        // Serialised, the feed and REST both say `live`, and every figure is
+        // present, `null` when absent.
+        let json = serde_json::to_value(&q).unwrap();
+        assert_eq!(json["source"], "live");
+        assert!(json["oi"].is_null() && json["as_of"].is_null() && json.get("year_high").is_some());
+        assert_eq!(serde_json::to_value(Source::Rest).unwrap(), "live");
+        assert_eq!(serde_json::to_value(Source::Upstox).unwrap(), "upstox");
+        assert_eq!(serde_json::to_value(Source::Close).unwrap(), "close");
 
         // A REST read later than the tick, with the tick still within 10 s:
         // the feed still gives the price.
@@ -818,6 +922,16 @@ mod tests {
         // The feed's 0.0 placeholder is no price.
         prices.insert("nse_fo|2".into(), 0.0);
         assert_eq!(hub.get_at("nse_fo|2", noon), None);
+        // A contract the feed carries but REST has not read yet is not
+        // answered: that it is on the feed is the owner's business.
+        prices.insert("nse_fo|3".into(), 42.0);
+        assert_eq!(hub.get_at("nse_fo|3", noon), None, "a held contract looks like any other until polled");
+        hub.put_rest(Quote::bare("nse_fo|3", 41.5, ms(noon) - 500, Source::Rest));
+        let q = hub.get_at("nse_fo|3", noon).unwrap();
+        assert_eq!((q.ltp, q.source), (42.0, Source::Feed), "once polled, the fresher tick gives the price");
+        // Indices are on the feed for everyone: answered at once.
+        prices.insert("idx|SENSEX".into(), 80_000.0);
+        assert_eq!(hub.get_at("idx|SENSEX", noon).map(|q| q.ltp), Some(80_000.0));
         // An index carries its close from the feed.
         prices.insert("idx|NIFTY 50".into(), 25_100.0);
         prices.insert("idx_close|NIFTY 50".into(), 25_000.0);
@@ -845,7 +959,7 @@ mod tests {
             "nse_cm|2885".to_string(),
             eod::Row { key: "nse_cm|2885".into(), ltp: 1_410.0, open: Some(1_400.0), high: Some(1_415.0), low: Some(1_395.0), close: Some(1_405.0), volume: Some(5e6) },
         );
-        hub.set_snapshot(Snapshot { day, taken_at: sweep_at, rows });
+        hub.set_snapshot(Snapshot { day, taken_at: sweep_at, rows, asked: 1 });
 
         // After 15:40 the close answers, even over a REST read from 15:39.
         hub.put_rest(rest_quote("nse_cm|2885", 1_411.0, ist(2026, 11, 4, 15, 39)));
@@ -869,8 +983,33 @@ mod tests {
         hub.put_rest(rest_quote("nse_cm|9999", 5.0, ist(2026, 11, 4, 15, 0)));
         assert_eq!(hub.get_at("nse_cm|9999", ist(2026, 11, 4, 16, 0)).unwrap().source, Source::Rest);
         let status = hub.status();
-        assert_eq!(status.close, Some(CloseStatus { day: "2026-11-04".into(), taken_at: "2026-11-04 15:35:00".into(), rows: 1 }));
+        assert_eq!(
+            status.close,
+            Some(CloseStatus { day: "2026-11-04".into(), taken_at: "2026-11-04 15:35:00".into(), rows: 1, asked: 1, partial: false })
+        );
         assert_eq!(status.paused.as_deref(), Some("no healthy Kotak session"));
+        // While the switch is off the status says so first.
+        hub.set_switched_off(true);
+        assert_eq!(hub.status().paused.as_deref(), Some(PAUSED_SWITCHED_OFF));
+        hub.set_switched_off(false);
+    }
+
+    #[test]
+    fn interest_is_capped_at_600_keys_oldest_first() {
+        let hub = hub(Arc::new(DashMap::new()), Arc::new(AtomicI64::new(0)));
+        let t0 = Instant::now();
+        hub.want_at((0..600).map(|i| format!("nse_cm|{i}")), t0);
+        hub.want_at(["nse_fo|new".to_string()], t0 + Duration::from_secs(1));
+        let watched: std::collections::HashSet<String> = hub.wanted_within(WATCH_WINDOW, t0 + Duration::from_secs(2)).into_iter().collect();
+        assert_eq!(watched.len(), MAX_WANTED);
+        assert!(watched.contains("nse_fo|new"));
+        assert!(!watched.contains("nse_cm|0") && watched.contains("nse_cm|1"), "one of the oldest went, not the newest");
+        // Asking again refreshes a key's place.
+        hub.want_at(["nse_cm|1".to_string()], t0 + Duration::from_secs(3));
+        hub.want_at((0..60).map(|i| format!("bse_fo|{i}")), t0 + Duration::from_secs(4));
+        let watched: std::collections::HashSet<String> = hub.wanted_within(WATCH_WINDOW, t0 + Duration::from_secs(5)).into_iter().collect();
+        assert_eq!(watched.len(), MAX_WANTED);
+        assert!(watched.contains("nse_cm|1") && watched.contains("nse_fo|new") && watched.contains("bse_fo|59"));
     }
 
     #[test]
@@ -941,7 +1080,12 @@ mod tests {
         // The rate counts the last minute's calls, whatever came of them.
         assert_eq!((status.calls_last_minute, status.upstox_calls_last_minute), (1, 0));
         assert!((status.calls_per_sec - 1.0 / 60.0).abs() < 1e-9);
-        assert_eq!(hub.get_at("nse_cm|2885", shared_domain::now_ist()).unwrap().ltp, 1_400.0);
+        let noon = ist(2026, 11, 4, 12, 0);
+        assert_eq!(hub.get_at("nse_cm|2885", noon).unwrap().ltp, 1_400.0);
+        // The poller charges the bucket as it sends: the second's two calls.
+        assert!(hub.reserve_call(now).is_ok());
+        assert!(hub.reserve_call(now).is_ok());
+        assert!(hub.reserve_call(now + Duration::from_millis(100)).is_err());
         // Nothing is sent while the session is down, and the status says so.
         assert!(hub.plan(false, now + Duration::from_secs(3)).is_empty());
         assert_eq!(hub.status().paused.as_deref(), Some("no healthy Kotak session"));
@@ -950,7 +1094,7 @@ mod tests {
         let day = NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
         let keys: BTreeSet<String> = ["nse_cm|2885", "nse_cm|11536", "idx_close|NIFTY 50"].iter().map(|s| s.to_string()).collect();
         let later = now + Duration::from_secs(10);
-        assert_eq!(hub.start_sweep(keys, day, shared_domain::now_ist(), later + Duration::from_secs(60)), 2);
+        assert_eq!(hub.start_sweep(keys, day, noon, later + Duration::from_secs(60)), 2);
         assert!(hub.take_sweep_if_done(later).is_none());
         let chunks = hub.plan(true, later);
         let sweep_chunk = chunks.iter().find(|c| c.sweep).unwrap().clone();
@@ -964,12 +1108,22 @@ mod tests {
             later,
         );
         let sweep = hub.take_sweep_if_done(later).unwrap();
-        assert_eq!((sweep.total, sweep.rows.len()), (2, 1));
+        assert_eq!((sweep.total, sweep.rows.len(), sweep.cut_short()), (2, 1, false), "every key was asked; one got no answer");
         assert_eq!(sweep.rows["nse_cm|11536"].ltp, 3_000.0);
+        // A sweep the deadline cuts short says so.
+        let keys: BTreeSet<String> = (1..=60).map(|i| format!("nse_cm|{i}")).collect();
+        let t = later + Duration::from_secs(5);
+        hub.start_sweep(keys, day, noon, t + Duration::from_secs(1));
+        let chunks = hub.plan(true, t);
+        assert_eq!(chunks.iter().filter(|c| c.sweep).count(), 2, "two calls of 25, ten keys still pending");
+        assert!(hub.take_sweep_if_done(t).is_none());
+        let cut = hub.take_sweep_if_done(t + Duration::from_secs(2)).unwrap();
+        assert!(cut.cut_short());
+        assert_eq!((cut.total, cut.rows.len()), (60, 0));
         // A refused sweep chunk with one key is dropped from the sweep.
         let keys: BTreeSet<String> = ["nse_cm|1".to_string()].into_iter().collect();
-        let t = later + Duration::from_secs(5);
-        hub.start_sweep(keys, day, shared_domain::now_ist(), t + Duration::from_secs(60));
+        let t = t + Duration::from_secs(5);
+        hub.start_sweep(keys, day, noon, t + Duration::from_secs(60));
         let chunk = hub.plan(true, t).into_iter().find(|c| c.sweep).unwrap();
         let keys = QuoteHub::rest_keys(&chunk);
         hub.settle_kotak(chunk, &keys, Err(KotakError::ApiError { status_code: 1009, message: "Invalid instrument/code".into() }), t);
@@ -978,6 +1132,15 @@ mod tests {
         assert_eq!((status.refused, status.quarantined), (1, 1));
         assert!(status.last_error.as_deref().unwrap().contains("Invalid instrument/code"));
         assert_eq!(status.calls_last_minute, 3);
+    }
+
+    #[test]
+    fn only_derivative_keys_wait_for_a_rest_read() {
+        assert!(is_contract_key("nse_fo|51386"));
+        assert!(is_contract_key("bse_fo|874001"));
+        assert!(!is_contract_key("nse_cm|2885"));
+        assert!(!is_contract_key("idx|NIFTY 50"));
+        assert!(!is_contract_key("junk"));
     }
 
     #[test]

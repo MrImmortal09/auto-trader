@@ -372,7 +372,8 @@ async fn fetch_scrip_master_background(
             // failed never looks "ready" to the 09:10 recycle.
             *scrip_loaded_at.write().await = Some(shared_domain::now_ist());
             // The files just written are the catalog's source; search
-            // keeps answering from the previous build until this lands.
+            // keeps answering from the previous build until this lands
+            // (and nothing is built while the `search` switch is off).
             instruments.rebuild_in_background("Scrip Master download");
             send_log(&db_tx, &log_tx, "INFO", serde_json::json!({
                 "event": "SCRIP_FETCH_SUCCESS",

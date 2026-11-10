@@ -1,11 +1,15 @@
 //! `GET /api/v2/search`, `GET /api/v2/quotes`, `GET /api/v2/instruments/:id`
 //! and `GET /api/v2/instruments/status` — the instrument catalog
-//! (`crate::instruments`) and the quote hub (`crate::quotes`) over HTTP, for
-//! anyone signed in, behind the `search` feature flag: while it is off every
-//! route answers 404. Read-only, and nothing here reaches the engine, the
-//! order path or anyone's positions. Every key a route answers is marked
-//! wanted on the hub, so its quote is polled for the next 15 s and the
-//! client's next call (the front end re-polls every 2 s) finds it priced.
+//! (`crate::instruments`) and the quote hub (`crate::quotes`) over HTTP,
+//! behind the `search` feature flag: while it is off every route answers
+//! 404. The first three are for anyone signed in; the status page, with the
+//! hub's error text and call times, is the admin's (`auth::policy`).
+//! Read-only, and nothing here reaches the engine, the order path or
+//! anyone's positions: a quote never says whether the feed carries its key
+//! (`QuoteHub::get_at`), and an error is reported in general terms. Every
+//! key a route answers is marked wanted on the hub, so its quote is polled
+//! for the next 15 s and the client's next call (the front end re-polls
+//! every 2 s) finds it priced.
 
 use axum::{
     extract::{Path, Query, State},
@@ -21,8 +25,8 @@ use crate::instruments::{Catalog, CatalogStatus, Instrument, SearchRow, PER_GROU
 use crate::quotes::{eod, hub::Quote, HubStatus, QuoteHub};
 use crate::AppState;
 
-/// Keys one `/api/v2/quotes` call may ask for.
-pub const MAX_QUOTE_KEYS: usize = 50;
+/// Keys one `/api/v2/quotes` call may ask for; a longer list is a 400.
+pub const MAX_QUOTE_KEYS: usize = 60;
 /// The longest query `/api/v2/search` reads, in characters.
 const MAX_QUERY_CHARS: usize = 64;
 /// The longest key `/api/v2/quotes` reads, in characters.
@@ -48,6 +52,12 @@ async fn gate(state: &AppState) -> Option<Response> {
 
 fn bad_request(message: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": message.into() }))).into_response()
+}
+
+/// A 500 with a general message: the cause is logged, never answered.
+fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
+    tracing::error!("v2 instruments: {what}: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("could not read {what}") }))).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +242,7 @@ pub async fn quotes_answer(catalog: &Catalog, hub: &QuoteHub, keys: Vec<String>,
     QuotesOut { at: now.timestamp_millis(), market_open: eod::open_at(now), quotes, missing, unknown }
 }
 
-/// `GET /api/v2/quotes?keys=` — the quotes for up to 50 price-map keys,
+/// `GET /api/v2/quotes?keys=` — the quotes for up to 60 price-map keys,
 /// the feed's tick first, then Kotak's REST quotes, Upstox while Kotak is
 /// down, the day's close after hours. The keys are marked wanted, so the
 /// hub polls them for the next 15 s.
@@ -267,28 +277,31 @@ pub struct InstrumentOut {
     pub market_open: bool,
 }
 
-/// The instrument page for `id` as of `now`; `None` for an id the catalog
-/// has no row for. Its key (and its underlying's) are marked wanted.
-pub async fn instrument_answer(catalog: &Catalog, hub: &QuoteHub, id: &str, now: DateTime<FixedOffset>) -> Option<InstrumentOut> {
-    let instrument = catalog.instrument(id, now.date_naive()).await?;
+/// The instrument page for `id` as of `now`; `Ok(None)` for an id the
+/// catalog has no row for, `Err` when the catalog could not be read. Its
+/// key (and its underlying's) are marked wanted.
+pub async fn instrument_answer(catalog: &Catalog, hub: &QuoteHub, id: &str, now: DateTime<FixedOffset>) -> Result<Option<InstrumentOut>, sqlx::Error> {
+    let Some(instrument) = catalog.instrument(id, now.date_naive()).await? else { return Ok(None) };
     let quote = hub.get_at(&instrument.row.ws_key, now);
     let spot_key = instrument.underlying_key.as_deref().filter(|k| *k != instrument.row.ws_key);
     let spot = spot_key.and_then(|key| hub.get_at(key, now));
     hub.want(std::iter::once(instrument.row.ws_key.clone()).chain(spot_key.map(str::to_string)));
-    Some(InstrumentOut { instrument, quote, spot, catalog_day: catalog.status().day, market_open: eod::open_at(now) })
+    Ok(Some(InstrumentOut { instrument, quote, spot, catalog_day: catalog.status().day, market_open: eod::open_at(now) }))
 }
 
 /// `GET /api/v2/instruments/:id` — one instrument (`<segment>:<token>`,
 /// as search rows carry it) with its lot and tick size, ISIN, exchange,
-/// nearest expiry for an F&O underlying, and its quote.
+/// nearest expiry for an F&O underlying, and its quote. 404 for an id the
+/// catalog has no row for; 500 when the catalog could not be read.
 pub async fn instrument_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if let Some(off) = gate(&state).await {
         return off;
     }
     let now = shared_domain::now_ist();
     match instrument_answer(&state.instruments, &state.quotes, id.trim(), now).await {
-        Some(out) => Json(out).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({ "error": format!("no instrument {id}") }))).into_response(),
+        Ok(Some(out)) => Json(out).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": format!("no instrument {id}") }))).into_response(),
+        Err(e) => server_error("the instrument catalog", e),
     }
 }
 
@@ -325,7 +338,9 @@ pub fn status_answer(catalog: &Catalog, hub: &QuoteHub, now: DateTime<FixedOffse
 }
 
 /// `GET /api/v2/instruments/status` — the catalog's day and row counts and
-/// the quote hub's rates, for the search UI's notes and the System screen.
+/// the quote hub's rates, errors and sweep, for the admin's System screen
+/// (`Access::Admin`: the error text names Kotak's answers and the
+/// catalog's paths).
 pub async fn instruments_status_handler(State(state): State<AppState>) -> Response {
     if let Some(off) = gate(&state).await {
         return off;
@@ -351,6 +366,10 @@ mod tests {
     use crate::instruments::tests::Scratch;
     use crate::quotes::eod::{Row, Snapshot};
     use crate::quotes::hub::Source;
+
+    fn ms(t: DateTime<FixedOffset>) -> i64 {
+        t.timestamp_millis()
+    }
 
     fn ist(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<FixedOffset> {
         NaiveDate::from_ymd_opt(y, m, d)
@@ -408,8 +427,15 @@ mod tests {
             symbols(&out.options),
             vec!["RELIANCE26NOV1380CE", "RELIANCE26NOV1380PE", "RELIANCE26NOV1400CE", "RELIANCE26NOV1400PE", "RELIANCE26NOV1420CE", "RELIANCE26NOV1420PE"]
         );
-        assert_eq!(out.options[0].quote.as_ref().map(|q| q.ltp), Some(12.5));
+        // A contract on the feed is priced like any other: not before the
+        // poller has read it, so a held contract never stands out.
+        assert!(out.options[0].quote.is_none(), "the 1380 CE is on the feed, but not polled yet");
         assert!(out.options[1].quote.is_none(), "no source has the 1380 PE yet");
+        hub.put_rest(Quote::bare("nse_fo|41226", 12.4, ms(noon) - 1_000, Source::Rest));
+        let out = search_answer(&catalog, &hub, "reliance", PER_GROUP, noon).await;
+        let ce = out.options[0].quote.as_ref().unwrap();
+        assert_eq!((ce.ltp, ce.source), (12.5, Source::Feed), "polled once, the feed's fresher tick gives the price");
+        assert_eq!(serde_json::to_value(ce).unwrap()["source"], "live");
         assert_eq!(symbols(&out.futures), vec!["RELIANCE26NOVFUT", "RELIANCE26DECFUT"]);
         assert!(out.futures.iter().all(|r| r.quote.is_none()));
         // Every row's key is wanted now, so the poller fetches it.
@@ -445,7 +471,7 @@ mod tests {
             "nse_cm|11536".to_string(),
             Row { key: "nse_cm|11536".into(), ltp: 3_010.0, open: Some(3_000.0), high: Some(3_020.0), low: Some(2_990.0), close: Some(2_995.0), volume: Some(1e6) },
         );
-        hub.set_snapshot(Snapshot { day: NaiveDate::from_ymd_opt(2026, 11, 4).unwrap(), taken_at: ist(2026, 11, 4, 15, 35), rows });
+        hub.set_snapshot(Snapshot { day: NaiveDate::from_ymd_opt(2026, 11, 4).unwrap(), taken_at: ist(2026, 11, 4, 15, 35), rows, asked: 1 });
 
         let out = search_answer(&catalog, &hub, "tcs", PER_GROUP, evening).await;
         assert!(!out.market_open);
@@ -456,7 +482,7 @@ mod tests {
         let out = quotes_answer(&catalog, &hub, vec!["nse_cm|11536".into(), "nse_cm|2885".into()], evening).await;
         assert_eq!((out.quotes.len(), out.quotes[0].source, out.market_open), (1, Source::Close, false));
         assert_eq!((out.missing, out.unknown), (vec!["nse_cm|2885".to_string()], Vec::<String>::new()));
-        let page = instrument_answer(&catalog, &hub, "nse_cm:11536", evening).await.unwrap();
+        let page = instrument_answer(&catalog, &hub, "nse_cm:11536", evening).await.unwrap().unwrap();
         assert_eq!(page.quote.map(|q| q.source), Some(Source::Close));
         assert_eq!(status_answer(&catalog, &hub, evening).snapshot_day.as_deref(), Some("2026-11-04"));
     }
@@ -467,10 +493,10 @@ mod tests {
         assert_eq!(parse_keys("idx|NIFTY 50").unwrap(), vec!["idx|NIFTY 50"]);
         assert!(parse_keys("").is_err());
         assert!(parse_keys(" , ,").is_err());
-        let fifty: Vec<String> = (1..=50).map(|i| format!("nse_fo|{i}")).collect();
-        assert_eq!(parse_keys(&fifty.join(",")).unwrap().len(), 50);
-        let too_many = (1..=51).map(|i| format!("nse_fo|{i}")).collect::<Vec<_>>().join(",");
-        assert_eq!(parse_keys(&too_many).unwrap_err(), "at most 50 keys a call");
+        let sixty: Vec<String> = (1..=60).map(|i| format!("nse_fo|{i}")).collect();
+        assert_eq!(parse_keys(&sixty.join(",")).unwrap().len(), 60);
+        let too_many = (1..=61).map(|i| format!("nse_fo|{i}")).collect::<Vec<_>>().join(",");
+        assert_eq!(parse_keys(&too_many).unwrap_err(), "at most 60 keys a call");
         // Repeats do not count toward the cap.
         let repeated = (1..=60).map(|i| format!("nse_fo|{}", i % 10)).collect::<Vec<_>>().join(",");
         assert_eq!(parse_keys(&repeated).unwrap().len(), 10);
@@ -516,24 +542,27 @@ mod tests {
         prices.insert("nse_fo|51386".into(), 150.0);
         let hub = hub(Arc::clone(&prices), noon);
 
-        let page = instrument_answer(&catalog, &hub, "nse_fo:51386", noon).await.unwrap();
+        let page = instrument_answer(&catalog, &hub, "nse_fo:51386", noon).await.unwrap().unwrap();
         assert_eq!((page.instrument.row.kind, page.instrument.row.strike, page.instrument.row.lot_size), (Kind::Ce, Some(23_000.0), 65));
-        assert_eq!(page.quote.as_ref().map(|q| q.ltp), Some(150.0));
+        assert!(page.quote.is_none(), "on the feed, not yet polled: unpriced like any contract");
         assert_eq!(page.spot.as_ref().map(|q| (q.key.as_str(), q.ltp)), Some(("idx|NIFTY 50", 25_000.0)));
         assert!(page.market_open);
         let mut watched = hub.watched_keys();
         watched.sort();
         assert_eq!(watched, vec!["idx|NIFTY 50", "nse_fo|51386"]);
+        hub.put_rest(Quote::bare("nse_fo|51386", 149.0, ms(noon) - 1_000, Source::Rest));
+        let page = instrument_answer(&catalog, &hub, "nse_fo:51386", noon).await.unwrap().unwrap();
+        assert_eq!(page.quote.as_ref().map(|q| q.ltp), Some(150.0));
         // A cash row is its own spot: no second quote, one key wanted.
-        let page = instrument_answer(&catalog, &hub, "nse_cm:2885", noon).await.unwrap();
+        let page = instrument_answer(&catalog, &hub, "nse_cm:2885", noon).await.unwrap().unwrap();
         assert!(page.spot.is_none() && page.quote.is_none());
         assert_eq!(page.instrument.nearest_expiry.as_deref(), Some("2026-11-24"));
         let json = serde_json::to_value(&page).unwrap();
         assert_eq!((json["id"].as_str(), json["symbol"].as_str(), json["isin"].as_str()), (Some("nse_cm:2885"), Some("RELIANCE"), Some("INE002A01018")));
         assert_eq!((json["tick_size"].as_f64(), json["nearest_expiry"].as_str(), json["underlying_key"].as_str()), (Some(0.05), Some("2026-11-24"), Some("nse_cm|2885")));
         assert!(json["quote"].is_null() && json["spot"].is_null());
-        assert!(instrument_answer(&catalog, &hub, "nse_cm:0", noon).await.is_none());
-        assert!(instrument_answer(&catalog, &hub, "status", noon).await.is_none());
+        assert!(instrument_answer(&catalog, &hub, "nse_cm:0", noon).await.unwrap().is_none());
+        assert!(instrument_answer(&catalog, &hub, "status", noon).await.unwrap().is_none());
 
         let status = status_answer(&catalog, &hub, noon);
         assert_eq!((status.now.as_str(), status.market_open, status.snapshot_day), ("2026-11-04 12:00:00", true, None));
@@ -550,6 +579,10 @@ mod tests {
         let response = bad_request("q is required");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(response).await["error"], "q is required");
+        // A catalog failure is a 500 in general terms, never the cause.
+        let response = server_error("the instrument catalog", "sqlite: disk I/O error at /srv/x.db");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(response).await["error"], "could not read the instrument catalog");
     }
 
     /// `/api/v2/instruments/status` is registered beside

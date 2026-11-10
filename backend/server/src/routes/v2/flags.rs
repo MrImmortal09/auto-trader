@@ -78,6 +78,12 @@ pub async fn put_flags_handler(
             .into_response();
     }
     *state.flags.write().await = after;
+    // The catalog is built only while `search` is on, so turning it on owes
+    // the build the downloads since made (nothing to do when the CSVs on
+    // disk are the ones it was last built from).
+    if !before.search && after.search {
+        state.instruments.rebuild_in_background("search switched on");
+    }
 
     let summary = changes
         .iter()

@@ -255,24 +255,6 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
-    // The close snapshot the quote hub sweeps at 15:35 IST (see
-    // `quotes::eod`): one row per instrument per day, served as the day's
-    // close once the Kotak session is cleared and until the next login. New
-    // table, so existing databases keep working.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS quote_eod (
-            key TEXT NOT NULL,
-            day TEXT NOT NULL,
-            ltp REAL NOT NULL,
-            close REAL,
-            open REAL,
-            high REAL,
-            low REAL,
-            volume REAL,
-            taken_at TEXT NOT NULL,
-            PRIMARY KEY (key, day)
-        )",
-    ).execute(&pool).await.unwrap();
 
     // Upstox option-chain analytics (see `market_data.rs`). New table, so this
     // is backward compatible with existing databases.
@@ -436,11 +418,16 @@ pub const INSTRUMENTS_COLUMNS: &str = "
     ws_key TEXT NOT NULL,
     loaded_day TEXT NOT NULL";
 
-/// Its indexes: by symbol, by chain (underlying, expiry, strike, kind) and
-/// by ISIN. A rebuild creates them again on the renamed table.
+/// Its indexes: by symbol, by chain (underlying, kind, expiry, strike) and
+/// by ISIN. A rebuild creates them again on the renamed table. The chain
+/// index leads with `kind` after the underlying so the search's lookups are
+/// seeks, never a walk of every contract under NIFTY: the futures from
+/// today (`underlying, 'FUT', expiry >=`), an option expiry list as repeated
+/// `MIN(expiry)` seeks per kind, one expiry's strikes around the spot
+/// (`underlying, kind, expiry, strike`) — see `instruments::Catalog`.
 pub const INSTRUMENT_INDEXES: [&str; 3] = [
     "CREATE INDEX IF NOT EXISTS idx_instruments_symbol ON instruments (symbol)",
-    "CREATE INDEX IF NOT EXISTS idx_instruments_chain ON instruments (underlying, expiry, strike, kind)",
+    "CREATE INDEX IF NOT EXISTS idx_instruments_chain ON instruments (underlying, kind, expiry, strike)",
     "CREATE INDEX IF NOT EXISTS idx_instruments_isin ON instruments (isin)",
 ];
 
@@ -448,10 +435,13 @@ pub const INSTRUMENT_INDEXES: [&str; 3] = [
 /// (`data/instruments.db`, see `instruments`). Its own file, apart from
 /// trades.db: a rebuild writes 150-200k rows in one transaction, and SQLite
 /// allows one writer at a time, so in trades.db it would hold the engine's
-/// `db_writer` behind the busy timeout. Everything in it is rebuilt from
-/// the CSVs on disk. Tables are created if missing, never altered. Returns
-/// the pool and whether FTS5 is available (`instruments_fts` could be
-/// created), which the bundled SQLite has.
+/// `db_writer` behind the busy timeout. The quote hub's close snapshot
+/// (`quote_eod`) lives here too, for the same reason: its 15:35 write of a
+/// few thousand rows then never queues behind, or holds up, the engine's
+/// single writer. Everything in the file is market data rebuilt or
+/// re-swept from Kotak. Tables are created if missing, never altered.
+/// Returns the pool and whether FTS5 is available (`instruments_fts` could
+/// be created), which the bundled SQLite has.
 pub async fn init_catalog_db(path: &Path) -> Result<(SqlitePool, bool), sqlx::Error> {
     let opts = SqliteConnectOptions::new()
         .filename(path)
@@ -505,6 +495,41 @@ pub async fn init_catalog_db(path: &Path) -> Result<(SqlitePool, bool), sqlx::Er
     // as the file is parsed, so the status never counts the table. Additive,
     // so a catalog from before the column keeps working.
     ensure_column(&pool, "ALTER TABLE instrument_load ADD COLUMN kinds TEXT").await;
+    // The close snapshot the quote hub sweeps at 15:35 IST (see
+    // `quotes::eod`): one row per instrument per day. The hub serves a
+    // day's row as the instrument's close whenever the market is shut —
+    // after 15:40, before 09:15, weekends and holidays — in place of any
+    // live quote from that day or earlier, session or no session, until a
+    // later day's quote arrives; never while the market is open.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS quote_eod (
+            key TEXT NOT NULL,
+            day TEXT NOT NULL,
+            ltp REAL NOT NULL,
+            close REAL,
+            open REAL,
+            high REAL,
+            low REAL,
+            volume REAL,
+            taken_at TEXT NOT NULL,
+            PRIMARY KEY (key, day)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    // One row per sweep: how many keys it asked for and how many answered,
+    // so a snapshot cut short by the 15:40 deadline (or short of answers) is
+    // known to be partial after a restart too.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS quote_eod_days (
+            day TEXT PRIMARY KEY,
+            taken_at TEXT NOT NULL,
+            asked INTEGER NOT NULL,
+            answered INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
     let fts = match sqlx::query(
         "CREATE VIRTUAL TABLE IF NOT EXISTS instruments_fts USING fts5(symbol, name, tokenize = 'unicode61')",
     )
@@ -1128,6 +1153,11 @@ pub(crate) mod test_support {
 
         pub(crate) fn url(&self) -> String {
             format!("sqlite://{}", self.0.display())
+        }
+
+        /// The file itself, for `init_catalog_db`.
+        pub(crate) fn path(&self) -> &std::path::Path {
+            &self.0
         }
 
         fn remove(&self) {

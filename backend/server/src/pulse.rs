@@ -34,10 +34,15 @@ const RATE_WINDOW: Duration = Duration::from_secs(10);
 const QUANTILE_WINDOW: Duration = Duration::from_secs(30);
 /// Per-scrip last-tick entries older than this are dropped (clears overnight).
 const SCRIP_TICK_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
-/// `MEMORY_WARN_MB` unset: of the VM's 954 MB, leaving the engine's tick,
-/// the Node bridge and the OS the rest. An OOM kill stops the engine with
-/// nothing restarting it, so the warning comes well before.
-pub const DEFAULT_MEMORY_WARN_MB: f64 = 600.0;
+/// `MEMORY_WARN_MB` unset. Sized to the VM's real headroom, not its 954 MB:
+/// on 2026-11-04 the server sat at 149 MB resident with 332 MB free and the
+/// 1 GB swapfile already 261 MB in use (`answers.json` item 6), so the
+/// process can grow by roughly 300 MB before the kernel starts paging it —
+/// and a paged engine is what the alarm exists to warn about, since the
+/// 50 ms tick's latency is then unpredictable long before an OOM kill (which
+/// would stop the engine with nothing restarting it). 450 MB warns while
+/// the growth is still in RAM.
+pub const DEFAULT_MEMORY_WARN_MB: f64 = 450.0;
 /// The alarm clears only once RSS is this far back under the threshold, so
 /// a process hovering at it warns once, not on every sample.
 const MEMORY_WARN_CLEAR_RATIO: f64 = 0.95;

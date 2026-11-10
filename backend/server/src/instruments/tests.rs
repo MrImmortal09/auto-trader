@@ -12,91 +12,129 @@ use super::load::{expiry_of, strike_of, Kind};
 use super::*;
 use crate::scrip_files::ScripFiles;
 
-/// Kotak's documented header, with the stray `dStrikePrice;` the real
-/// files have. nse_fo: the Unix epoch minus 315511200.
-const NSE_FO: &str = "pSymbol,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,lLotSize,lExpiryDate,dStrikePrice;,pTickSize,pISIN,pDesc\r\n\
-51380,nse_fo,OPTIDX,NIFTY,NIFTY26O2722900CE,CE,65,1477548000,2290000.00,0.05,,NIFTY 27OCT26 22900 CE\r\n\
-51386,nse_fo,OPTIDX,NIFTY,NIFTY26N0323000CE,CE,65,1478152800,2300000.00,0.05,,NIFTY 03NOV26 23000 CE\r\n\
-51387,nse_fo,OPTIDX,NIFTY,NIFTY26N0323000PE,PE,65,1478152800,2300000.00,0.05,,NIFTY 03NOV26 23000 PE\r\n\
-51388,nse_fo,OPTIDX,NIFTY,NIFTY26N0323050CE,CE,65,1478152800,2305000.00,0.05,,NIFTY 03NOV26 23050 CE\r\n\
-51389,nse_fo,OPTIDX,NIFTY,NIFTY26N0323050PE,PE,65,1478152800,2305000.00,0.05,,NIFTY 03NOV26 23050 PE\r\n\
-51390,nse_fo,OPTIDX,NIFTY,NIFTY26N0322950CE,CE,65,1478152800,2295000.00,0.05,,NIFTY 03NOV26 22950 CE\r\n\
-51391,nse_fo,OPTIDX,NIFTY,NIFTY26N0322950PE,PE,65,1478152800,2295000.00,0.05,,NIFTY 03NOV26 22950 PE\r\n\
+/// Kotak's documented header, with the stray `dStrikePrice;` and the padded
+/// `dTickSize ` the real files have (ticks in paise, like strikes). nse_fo:
+/// the Unix epoch minus 315511200.
+const NSE_FO: &str = "pSymbol,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,lLotSize,lExpiryDate,dStrikePrice;,dTickSize ,pISIN,pDesc\r\n\
+51380,nse_fo,OPTIDX,NIFTY,NIFTY26O2722900CE,CE,65,1477548000,2290000.00,5,,NIFTY 27OCT26 22900 CE\r\n\
+51386,nse_fo,OPTIDX,NIFTY,NIFTY26N0323000CE,CE,65,1478152800,2300000.00,5,,NIFTY 03NOV26 23000 CE\r\n\
+51387,nse_fo,OPTIDX,NIFTY,NIFTY26N0323000PE,PE,65,1478152800,2300000.00,5,,NIFTY 03NOV26 23000 PE\r\n\
+51388,nse_fo,OPTIDX,NIFTY,NIFTY26N0323050CE,CE,65,1478152800,2305000.00,5,,NIFTY 03NOV26 23050 CE\r\n\
+51389,nse_fo,OPTIDX,NIFTY,NIFTY26N0323050PE,PE,65,1478152800,2305000.00,5,,NIFTY 03NOV26 23050 PE\r\n\
+51390,nse_fo,OPTIDX,NIFTY,NIFTY26N0322950CE,CE,65,1478152800,2295000.00,5,,NIFTY 03NOV26 22950 CE\r\n\
+51391,nse_fo,OPTIDX,NIFTY,NIFTY26N0322950PE,PE,65,1478152800,2295000.00,5,,NIFTY 03NOV26 22950 PE\r\n\
 \r\n\
-52001,nse_fo,OPTIDX,NIFTY,NIFTY26NOV23000CE,CE,65,1479967200,2300000.00,0.05,,NIFTY 24NOV26 23000 CE\r\n\
-52002,nse_fo,OPTIDX,NIFTY,NIFTY26NOV23000PE,PE,65,1479967200,2300000.00,0.05,,NIFTY 24NOV26 23000 PE\r\n\
-52003,nse_fo,OPTIDX,NIFTY,NIFTY26NOV23100CE,CE,65,1479967200,2310000.00,0.05,,NIFTY 24NOV26 23100 CE\r\n\
-52004,nse_fo,OPTIDX,NIFTY,NIFTY26NOV22900PE,PE,65,1479967200,2290000.00,0.05,,NIFTY 24NOV26 22900 PE\r\n\
-52005,nse_fo,OPTIDX,NIFTY,NIFTY26DEC23000CE,CE,65,1482991200,2300000.00,0.05,,NIFTY 29DEC26 23000 CE\r\n\
-35013,nse_fo,FUTIDX,NIFTY,NIFTY26NOVFUT,XX,65,1479967200,0.00,0.05,,NIFTY 24NOV26 FUT\r\n\
-35014,nse_fo,FUTIDX,NIFTY,NIFTY26DECFUT,XX,65,1482991200,0.00,0.05,,NIFTY 29DEC26 FUT\r\n\
-44001,nse_fo,OPTIDX,BANKNIFTY,BANKNIFTY26NOV45300CE,CE,30,1479967200,45300.00,0.05,,BANKNIFTY 24NOV26 45300 CE\r\n\
-44002,nse_fo,OPTIDX,BANKNIFTY,BANKNIFTY26NOV45300PE,PE,30,1479967200,45300.00,0.05,,BANKNIFTY 24NOV26 45300 PE\r\n\
-\"41222\",nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1400CE,CE,500,1479967200,140000.00,0.05,,RELIANCE 24NOV26 1400 CE\r\n\
-41223,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1400PE,PE,500,1479967200,140000.00,0.05,,RELIANCE 24NOV26 1400 PE\r\n\
-41224,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1420CE,CE,500,1479967200,142000.00,0.05,,RELIANCE 24NOV26 1420 CE\r\n\
-41225,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1420PE,PE,500,1479967200,142000.00,0.05,,RELIANCE 24NOV26 1420 PE\r\n\
-41226,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1380CE,CE,500,1479967200,138000.00,0.05,,RELIANCE 24NOV26 1380 CE\r\n\
-41227,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1380PE,PE,500,1479967200,138000.00,0.05,,RELIANCE 24NOV26 1380 PE\r\n\
-41228,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1440CE,CE,500,1479967200,144000.00,0.05,,RELIANCE 24NOV26 1440 CE\r\n\
-41229,nse_fo,OPTSTK,RELIANCE,RELIANCE26DEC1400CE,CE,500,1482991200,140000.00,0.05,,RELIANCE 29DEC26 1400 CE\r\n\
-41230,nse_fo,OPTSTK,RELIANCE,RELIANCE26DEC1400PE,PE,500,1482991200,140000.00,0.05,,RELIANCE 29DEC26 1400 PE\r\n\
-43001,nse_fo,FUTSTK,RELIANCE,RELIANCE26NOVFUT,XX,500,1479967200,0.00,0.05,,RELIANCE 24NOV26 FUT\r\n\
-43002,nse_fo,FUTSTK,RELIANCE,RELIANCE26DECFUT,XX,500,1482991200,0.00,0.05,,RELIANCE 29DEC26 FUT\r\n\
-45001,nse_fo,OPTSTK,IDEA,IDEA26NOV7.5CE,CE,80000,1479967200,750.00,0.05,,IDEA 24NOV26 7.5 CE\r\n\
-45002,nse_fo,OPTSTK,IDEA,IDEA26NOV7.5PE,PE,80000,1479967200,750.00,0.05,,IDEA 24NOV26 7.5 PE\r\n\
-46001,nse_fo,OPTSTK,M&M,M&M26NOV2800CE,CE,350,1479967200,280000.00,0.05,,M&M 24NOV26 2800 CE\r\n\
-46002,nse_fo,OPTSTK,M&M,M&M26NOV2800PE,PE,350,1479967200,280000.00,0.05,,M&M 24NOV26 2800 PE\r\n\
-47001,nse_fo,OPTSTK,BAJAJ-AUTO,BAJAJ-AUTO26NOV9000CE,CE,75,1479967200,900000.00,0.05,,BAJAJ-AUTO 24NOV26 9000 CE\r\n\
-47002,nse_fo,FUTSTK,BAJAJ-AUTO,BAJAJ-AUTO26NOVFUT,XX,75,1479967200,0.00,0.05,,BAJAJ-AUTO 24NOV26 FUT\r\n\
-48001,nse_fo,OPTSTK,TATAMOTORS,TATAMOTORS26NOV700CE,CE,1400,1479967200,70000.00,0.05,,TATAMOTORS 24NOV26 700 CE\r\n\
-48002,nse_fo,FUTSTK,TATAMOTORS,TATAMOTORS26NOVFUT,XX,1400,1479967200,0.00,0.05,,TATAMOTORS 24NOV26 FUT\r\n\
-49001,nse_fo,OPTIDX,NIFTYNXT50,NIFTYNXT5026NOV70000CE,CE,25,1479967200,7000000.00,0.05,,NIFTYNXT50 24NOV26 70000 CE\r\n\
-50001,nse_fo,OPTSTK,WEIRD,WEIRD26NOV500CE,CE,100,1479967200,12345.00,0.05,,WEIRD 24NOV26 500 CE\r\n\
-50002,nse_fo,OPTSTK,NOEXP,NOEXP26NOV100CE,CE,100,,10000.00,0.05,,NOEXP 24NOV26 100 CE\r\n\
-50003,nse_fo,,ODD,ODD26NOVXYZ,XX,100,1479967200,0.00,0.05,,\r\n\
-41222,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1400CE,CE,500,1479967200,140000.00,0.05,,a second row with the first token\r\n";
+52001,nse_fo,OPTIDX,NIFTY,NIFTY26NOV23000CE,CE,65,1479967200,2300000.00,5,,NIFTY 24NOV26 23000 CE\r\n\
+52002,nse_fo,OPTIDX,NIFTY,NIFTY26NOV23000PE,PE,65,1479967200,2300000.00,5,,NIFTY 24NOV26 23000 PE\r\n\
+52003,nse_fo,OPTIDX,NIFTY,NIFTY26NOV23100CE,CE,65,1479967200,2310000.00,5,,NIFTY 24NOV26 23100 CE\r\n\
+52004,nse_fo,OPTIDX,NIFTY,NIFTY26NOV22900PE,PE,65,1479967200,2290000.00,5,,NIFTY 24NOV26 22900 PE\r\n\
+52005,nse_fo,OPTIDX,NIFTY,NIFTY26DEC23000CE,CE,65,1482991200,2300000.00,5,,NIFTY 29DEC26 23000 CE\r\n\
+35013,nse_fo,FUTIDX,NIFTY,NIFTY26NOVFUT,XX,65,1479967200,0.00,5,,NIFTY 24NOV26 FUT\r\n\
+35014,nse_fo,FUTIDX,NIFTY,NIFTY26DECFUT,XX,65,1482991200,0.00,5,,NIFTY 29DEC26 FUT\r\n\
+44001,nse_fo,OPTIDX,BANKNIFTY,BANKNIFTY26NOV45300CE,CE,30,1479967200,45300.00,5,,BANKNIFTY 24NOV26 45300 CE\r\n\
+44002,nse_fo,OPTIDX,BANKNIFTY,BANKNIFTY26NOV45300PE,PE,30,1479967200,45300.00,5,,BANKNIFTY 24NOV26 45300 PE\r\n\
+\"41222\",nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1400CE,CE,500,1479967200,140000.00,5,,RELIANCE 24NOV26 1400 CE\r\n\
+41223,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1400PE,PE,500,1479967200,140000.00,5,,RELIANCE 24NOV26 1400 PE\r\n\
+41224,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1420CE,CE,500,1479967200,142000.00,5,,RELIANCE 24NOV26 1420 CE\r\n\
+41225,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1420PE,PE,500,1479967200,142000.00,5,,RELIANCE 24NOV26 1420 PE\r\n\
+41226,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1380CE,CE,500,1479967200,138000.00,5,,RELIANCE 24NOV26 1380 CE\r\n\
+41227,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1380PE,PE,500,1479967200,138000.00,5,,RELIANCE 24NOV26 1380 PE\r\n\
+41228,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1440CE,CE,500,1479967200,144000.00,5,,RELIANCE 24NOV26 1440 CE\r\n\
+41229,nse_fo,OPTSTK,RELIANCE,RELIANCE26DEC1400CE,CE,500,1482991200,140000.00,5,,RELIANCE 29DEC26 1400 CE\r\n\
+41230,nse_fo,OPTSTK,RELIANCE,RELIANCE26DEC1400PE,PE,500,1482991200,140000.00,5,,RELIANCE 29DEC26 1400 PE\r\n\
+43001,nse_fo,FUTSTK,RELIANCE,RELIANCE26NOVFUT,XX,500,1479967200,0.00,5,,RELIANCE 24NOV26 FUT\r\n\
+43002,nse_fo,FUTSTK,RELIANCE,RELIANCE26DECFUT,XX,500,1482991200,0.00,5,,RELIANCE 29DEC26 FUT\r\n\
+45001,nse_fo,OPTSTK,IDEA,IDEA26NOV7.5CE,CE,80000,1479967200,750.00,5,,IDEA 24NOV26 7.5 CE\r\n\
+45002,nse_fo,OPTSTK,IDEA,IDEA26NOV7.5PE,PE,80000,1479967200,750.00,5,,IDEA 24NOV26 7.5 PE\r\n\
+46001,nse_fo,OPTSTK,M&M,M&M26NOV2800CE,CE,350,1479967200,280000.00,5,,M&M 24NOV26 2800 CE\r\n\
+46002,nse_fo,OPTSTK,M&M,M&M26NOV2800PE,PE,350,1479967200,280000.00,5,,M&M 24NOV26 2800 PE\r\n\
+47001,nse_fo,OPTSTK,BAJAJ-AUTO,BAJAJ-AUTO26NOV9000CE,CE,75,1479967200,900000.00,5,,BAJAJ-AUTO 24NOV26 9000 CE\r\n\
+47002,nse_fo,FUTSTK,BAJAJ-AUTO,BAJAJ-AUTO26NOVFUT,XX,75,1479967200,0.00,5,,BAJAJ-AUTO 24NOV26 FUT\r\n\
+48001,nse_fo,OPTSTK,TATAMOTORS,TATAMOTORS26NOV700CE,CE,1400,1479967200,70000.00,5,,TATAMOTORS 24NOV26 700 CE\r\n\
+48002,nse_fo,FUTSTK,TATAMOTORS,TATAMOTORS26NOVFUT,XX,1400,1479967200,0.00,5,,TATAMOTORS 24NOV26 FUT\r\n\
+49001,nse_fo,OPTIDX,NIFTYNXT50,NIFTYNXT5026NOV70000CE,CE,25,1479967200,7000000.00,5,,NIFTYNXT50 24NOV26 70000 CE\r\n\
+50001,nse_fo,OPTSTK,WEIRD,WEIRD26NOV500CE,CE,100,1479967200,12345.00,5,,WEIRD 24NOV26 500 CE\r\n\
+50002,nse_fo,OPTSTK,NOEXP,NOEXP26NOV100CE,CE,100,,10000.00,5,,NOEXP 24NOV26 100 CE\r\n\
+50003,nse_fo,,ODD,ODD26NOVXYZ,XX,100,1479967200,0.00,5,,\r\n\
+41222,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1400CE,CE,500,1479967200,140000.00,5,,a second row with the first token\r\n";
 
 /// bse_fo: the plain epoch; SENSEX and BANKEX index contracts, and a stock
 /// option the catalog does not take from BSE.
-const BSE_FO: &str = "pSymbol,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,lLotSize,lExpiryDate,dStrikePrice;,pTickSize,pISIN,pDesc\n\
-874001,bse_fo,OPTIDX,SENSEX,SENSEX26N0575100CE,CE,20,1793836800,7510000.00,0.05,,SENSEX 05NOV26 75100 CE\n\
-874002,bse_fo,OPTIDX,SENSEX,SENSEX26N0575100PE,PE,20,1793836800,7510000.00,0.05,,SENSEX 05NOV26 75100 PE\n\
-874003,bse_fo,FUTIDX,SENSEX,SENSEX26NOVFUT,XX,20,1795651200,0.00,0.05,,SENSEX 26NOV26 FUT\n\
-875001,bse_fo,OPTIDX,BANKEX,BANKEX26NOV60000CE,CE,30,1795651200,6000000.00,0.05,,BANKEX 26NOV26 60000 CE\n\
-876001,bse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1400CE,CE,500,1795478400,140000.00,0.05,,RELIANCE 24NOV26 1400 CE";
+const BSE_FO: &str = "pSymbol,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,lLotSize,lExpiryDate,dStrikePrice;,dTickSize ,pISIN,pDesc\n\
+874001,bse_fo,OPTIDX,SENSEX,SENSEX26N0575100CE,CE,20,1793836800,7510000.00,5,,SENSEX 05NOV26 75100 CE\n\
+874002,bse_fo,OPTIDX,SENSEX,SENSEX26N0575100PE,PE,20,1793836800,7510000.00,5,,SENSEX 05NOV26 75100 PE\n\
+874003,bse_fo,FUTIDX,SENSEX,SENSEX26NOVFUT,XX,20,1795651200,0.00,5,,SENSEX 26NOV26 FUT\n\
+875001,bse_fo,OPTIDX,BANKEX,BANKEX26NOV60000CE,CE,30,1795651200,6000000.00,5,,BANKEX 26NOV26 60000 CE\n\
+876001,bse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1400CE,CE,500,1795478400,140000.00,5,,RELIANCE 24NOV26 1400 CE";
 
 /// nse_cm: the cash header has no strike, option or expiry column; series
 /// are the trading symbol's suffix.
-const NSE_CM: &str = "pSymbol,pExchSeg,pInstType,pSymbolName,pTrdSymbol,lLotSize,pTickSize,pISIN,pDesc\n\
-2885,nse_cm,EQ,RELIANCE,RELIANCE-EQ,1,0.05,INE002A01018,Reliance Industries\n\
-11536,nse_cm,EQ,TCS,TCS-EQ,1,0.05,INE467B01029,Tata Consultancy Services\n\
-2031,nse_cm,EQ,M&M,M&M-EQ,1,0.05,INE101A01026,Mahindra & Mahindra\n\
-16669,nse_cm,EQ,BAJAJ-AUTO,BAJAJ-AUTO-EQ,1,0.05,INE917I01010,Bajaj Auto\n\
-10604,nse_cm,EQ,NIFTYBEES,NIFTYBEES-EQ,1,0.01,INF204KB14I2,Nippon India ETF Nifty 50 BeES\n\
-3456,nse_cm,EQ,TATAMOTORS,TATAMOTORS-EQ,1,0.05,INE155A01022,Tata Motors\n\
-14366,nse_cm,EQ,IDEA,IDEA-EQ,1,0.01,INE669E01016,Vodafone Idea\n\
-99002,nse_cm,BE,TFTSTOCK,TFTSTOCK-BE,1,0.05,INE000000002,Trade For Trade Co\n\
-99001,nse_cm,EQ,SMEONE,SMEONE-SM,1,0.05,INE000000001,Some SME\n\
-99003,nse_cm,EQ,JUNK,JUNK-BZ,1,0.05,,Junk Series\n\
-99004,nse_cm,,Nifty 50,Nifty 50,1,0.05,,\n\
-99005,nse_cm,EQ,XA01,XA01-EQ,1,0.05,,Xa 01\n\
-99006,nse_cm,EQ,XA02,XA02-EQ,1,0.05,,Xa 02\n\
-99007,nse_cm,EQ,XA03,XA03-EQ,1,0.05,,Xa 03\n\
-99008,nse_cm,EQ,XA04,XA04-EQ,1,0.05,,Xa 04\n\
-99009,nse_cm,EQ,XA05,XA05-EQ,1,0.05,,Xa 05\n\
-99010,nse_cm,EQ,XA06,XA06-EQ,1,0.05,,Xa 06\n\
-99011,nse_cm,EQ,XA07,XA07-EQ,1,0.05,,Xa 07\n\
-99012,nse_cm,EQ,XA08,XA08-EQ,1,0.05,,Xa 08\n\
-99013,nse_cm,EQ,XA09,XA09-EQ,1,0.05,,Xa 09\n\
-99014,nse_cm,EQ,XA10,XA10-EQ,1,0.05,,Xa 10\n";
+const NSE_CM: &str = "pSymbol,pExchSeg,pInstType,pSymbolName,pTrdSymbol,lLotSize,dTickSize ,pISIN,pDesc\n\
+2885,nse_cm,EQ,RELIANCE,RELIANCE-EQ,1,5,INE002A01018,Reliance Industries\n\
+11536,nse_cm,EQ,TCS,TCS-EQ,1,5,INE467B01029,Tata Consultancy Services\n\
+2031,nse_cm,EQ,M&M,M&M-EQ,1,5,INE101A01026,Mahindra & Mahindra\n\
+16669,nse_cm,EQ,BAJAJ-AUTO,BAJAJ-AUTO-EQ,1,5,INE917I01010,Bajaj Auto\n\
+10604,nse_cm,EQ,NIFTYBEES,NIFTYBEES-EQ,1,1,INF204KB14I2,Nippon India ETF Nifty 50 BeES\n\
+3456,nse_cm,EQ,TATAMOTORS,TATAMOTORS-EQ,1,5,INE155A01022,Tata Motors\n\
+14366,nse_cm,EQ,IDEA,IDEA-EQ,1,1,INE669E01016,Vodafone Idea\n\
+99002,nse_cm,BE,TFTSTOCK,TFTSTOCK-BE,1,5,INE000000002,Trade For Trade Co\n\
+99001,nse_cm,EQ,SMEONE,SMEONE-SM,1,5,INE000000001,Some SME\n\
+99003,nse_cm,EQ,JUNK,JUNK-BZ,1,5,,Junk Series\n\
+99004,nse_cm,,Nifty 50,Nifty 50,1,5,,\n\
+99005,nse_cm,EQ,XA01,XA01-EQ,1,5,,Xa 01\n\
+99006,nse_cm,EQ,XA02,XA02-EQ,1,5,,Xa 02\n\
+99007,nse_cm,EQ,XA03,XA03-EQ,1,5,,Xa 03\n\
+99008,nse_cm,EQ,XA04,XA04-EQ,1,5,,Xa 04\n\
+99009,nse_cm,EQ,XA05,XA05-EQ,1,5,,Xa 05\n\
+99010,nse_cm,EQ,XA06,XA06-EQ,1,5,,Xa 06\n\
+99011,nse_cm,EQ,XA07,XA07-EQ,1,5,,Xa 07\n\
+99012,nse_cm,EQ,XA08,XA08-EQ,1,5,,Xa 08\n\
+99013,nse_cm,EQ,XA09,XA09-EQ,1,5,,Xa 09\n\
+99014,nse_cm,EQ,XA10,XA10-EQ,1,5,,Xa 10\n";
 
 /// A cash file as another day's export might come: a BOM, the columns in
 /// another order with unknown ones among them, `dTickSize` padded, no
 /// `pDesc` and no `pISIN`, and a quoted name with a comma.
 const NSE_CM_OTHER_SHAPE: &str = "\u{feff}pGroup,pSymbol,pExchSeg,lFreezeQty,pTrdSymbol,pSymbolName,dTickSize ,lLotSize,pScripRefKey\n\
-EQ,2885,nse_cm,0,RELIANCE-EQ,RELIANCE,0.05,1,x\n\
-EQ,500,nse_cm,0,\"LT-EQ\",LT,0.05,1,x\n";
+EQ,2885,nse_cm,0,RELIANCE-EQ,RELIANCE,5,1,x\n\
+EQ,500,nse_cm,0,\"LT-EQ\",LT,5,1,x\n";
+
+/// The real files' shape, from the 2026-11-04 scrip master: the header's
+/// first 21 columns verbatim (the files go on for 58 more the catalog never
+/// reads — surveillance text and the like), no BOM, LF endings. Cash rows
+/// carry the series in `pGroup` and as the `-EQ`/`-BE` suffix, a blank
+/// `pInstType`, `-1` in the expiry, multiplier and strike, and ticks in
+/// paise (`10` on RELIANCE, `1` on IDEA, `100` on BAJAJ-AUTO); the four
+/// index rows have no suffix and no series. nse_fo rows have `pDesc` blank
+/// on every row, `pGroup` `XX`, strikes as plain integers or in scientific
+/// notation, `-1` for a future's strike, and the epoch minus 315511200
+/// landing on 14:00 IST of the expiry day. bse_fo says `IO`/`SO`/`IF`/`SF`
+/// for `pInstType`, never OPTIDX, with the plain epoch at 23:59:59 IST.
+const REAL_HEADER: &str = "pSymbol,pGroup,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,pScripRefKey,pISIN,pAssetCode,pSubGroup,pCombinedSymbol,pDesc,pAmcCode,pContractId,dTickSize ,lLotSize,lExpiryDate ,lMultiplier ,lPrecision,dStrikePrice;";
+
+const REAL_NSE_CM: &str = "pSymbol,pGroup,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,pScripRefKey,pISIN,pAssetCode,pSubGroup,pCombinedSymbol,pDesc,pAmcCode,pContractId,dTickSize ,lLotSize,lExpiryDate ,lMultiplier ,lPrecision,dStrikePrice;\n\
+2885,EQ,nse_cm,,RELIANCE,RELIANCE-EQ,,RELIANCE,INE002A01018,,,,RELIANCE INDUSTRIES LTD,,,10,1,-1,-1,2,-1\n\
+1333,EQ,nse_cm,,HDFCBANK,HDFCBANK-EQ,,HDFCBANK,INE040A01034,,,,HDFC BANK LTD,,,5,1,-1,-1,2,-1\n\
+14366,EQ,nse_cm,,IDEA,IDEA-EQ,,IDEA,INE669E01016,,,,VODAFONE IDEA LIMITED,,,1,1,-1,-1,2,-1\n\
+16669,EQ,nse_cm,,BAJAJ-AUTO,BAJAJ-AUTO-EQ,,BAJAJ-AUTO,INE917I01010,,,,BAJAJ AUTO LIMITED,,,100,1,-1,-1,2,-1\n\
+26000,,nse_cm,,Nifty 50,Nifty 50,,Nifty 50,,,,,Nifty 50,,,5,1,-1,-1,2,-1\n\
+99999,SM,nse_cm,,SMECO,SMECO-SM,,SMECO,INE000000001,,,,SOME SME CO,,,5,1,-1,-1,2,-1\n\
+\n";
+
+const REAL_NSE_FO: &str = "pSymbol,pGroup,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,pScripRefKey,pISIN,pAssetCode,pSubGroup,pCombinedSymbol,pDesc,pAmcCode,pContractId,dTickSize ,lLotSize,lExpiryDate ,lMultiplier ,lPrecision,dStrikePrice;\n\
+52001,XX,nse_fo,OPTIDX,NIFTY,NIFTY26N0917000CE,CE,NIFTY,,,,,,,,5,65,1478701800,1,2,1700000\n\
+49001,XX,nse_fo,OPTIDX,NIFTYNXT50,NIFTYNXT5026NOV69600CE,CE,NIFTYNXT50,,,,,,,,5,25,1479997800,1,2,6.96e+06\n\
+41222,XX,nse_fo,OPTSTK,RELIANCE,RELIANCE26NOV1280CE,CE,RELIANCE,,,,,,,,5,500,1479997800,1,2,128000\n\
+43001,XX,nse_fo,FUTSTK,RELIANCE,RELIANCE26NOVFUT,XX,RELIANCE,,,,,,,,5,500,1479997800,1,2,-1\n\
+45001,XX,nse_fo,OPTSTK,IDEA,IDEA26NOV7.5CE,CE,IDEA,,,,,,,,5,80000,1479997800,1,2,750\n\
+\n";
+
+const REAL_BSE_FO: &str = "pSymbol,pGroup,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,pScripRefKey,pISIN,pAssetCode,pSubGroup,pCombinedSymbol,pDesc,pAmcCode,pContractId,dTickSize ,lLotSize,lExpiryDate ,lMultiplier ,lPrecision,dStrikePrice;\n\
+874001,XX,bse_fo,IO,SENSEX,SENSEX26N0564600CE,CE,SENSEX,,,,,,,,5,20,1793903399,1,2,6460000\n\
+874003,XX,bse_fo,IF,SENSEX,SENSEX26NOVFUT,XX,SENSEX,,,,,,,,5,20,1795717799,1,2,-1\n\
+876001,XX,bse_fo,SO,RELIANCE,RELIANCE26NOV1280CE,CE,RELIANCE,,,,,,,,5,500,1795544999,1,2,128000\n\
+876002,XX,bse_fo,SF,RELIANCE,RELIANCE26NOVFUT,XX,RELIANCE,,,,,,,,5,500,1795544999,1,2,-1\n\
+\n";
 
 /// A scratch `data/` directory of its own: `scrip/` for the CSVs and the
 /// catalog database beside it. Removed when dropped. The route tests
@@ -133,8 +171,19 @@ impl Scratch {
         self.write("bse_fo", BSE_FO);
     }
 
+    fn write_real_shape(&self) {
+        self.write("nse_cm", REAL_NSE_CM);
+        self.write("nse_fo", REAL_NSE_FO);
+        self.write("bse_fo", REAL_BSE_FO);
+    }
+
+    /// A catalog with the `search` switch on.
     pub(crate) async fn catalog(&self) -> Arc<Catalog> {
-        Catalog::open(self.files(), &self.db()).await
+        self.catalog_with(FeatureFlags { search: true, ..Default::default() }).await
+    }
+
+    async fn catalog_with(&self, flags: FeatureFlags) -> Arc<Catalog> {
+        Catalog::open(self.files(), &self.db(), Arc::new(tokio::sync::RwLock::new(flags))).await
     }
 }
 
@@ -369,7 +418,7 @@ async fn a_failed_build_leaves_the_catalog_as_it_was_and_a_good_one_replaces_it_
     scratch.write(
         "nse_fo",
         "pSymbol,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,lLotSize,lExpiryDate,dStrikePrice;,pTickSize,pISIN,pDesc\n\
-         43001,nse_fo,FUTSTK,RELIANCE,RELIANCE26NOVFUT,XX,500,1479967200,0.00,0.05,,RELIANCE 24NOV26 FUT\n",
+         43001,nse_fo,FUTSTK,RELIANCE,RELIANCE26NOVFUT,XX,500,1479967200,0.00,5,,RELIANCE 24NOV26 FUT\n",
     );
     let report = loaded(catalog.load_if_changed("smaller").await);
     assert_eq!(report.segments.iter().find(|r| r.segment == "nse_fo").unwrap().kept, 1);
@@ -670,7 +719,7 @@ async fn an_instrument_page_row_carries_its_underlying_and_nearest_expiry() {
     loaded(catalog.load_if_changed("test").await);
 
     // An F&O stock: lot and tick from its cash row, the nearest expiry from its contracts.
-    let reliance = catalog.instrument("nse_cm:2885", today()).await.unwrap();
+    let reliance = catalog.instrument("nse_cm:2885", today()).await.unwrap().unwrap();
     assert_eq!((reliance.row.kind, reliance.row.symbol.as_str(), reliance.row.name.as_str()), (Kind::Eq, "RELIANCE", "Reliance Industries"));
     assert_eq!((reliance.row.lot_size, reliance.row.tick_size, reliance.row.has_fo, reliance.row.exchange.as_str()), (1, 0.05, true, "NSE"));
     assert_eq!((reliance.segment.as_str(), reliance.token.as_str(), reliance.isin.as_deref()), ("nse_cm", "2885", Some("INE002A01018")));
@@ -678,25 +727,189 @@ async fn an_instrument_page_row_carries_its_underlying_and_nearest_expiry() {
     assert_eq!(reliance.nearest_expiry.as_deref(), Some("2026-11-24"));
     assert_eq!(reliance.row.tier, None);
     // A stock with no F&O has no expiry to show.
-    let tcs = catalog.instrument("nse_cm:11536", today()).await.unwrap();
+    let tcs = catalog.instrument("nse_cm:11536", today()).await.unwrap().unwrap();
     assert_eq!((tcs.row.has_fo, tcs.nearest_expiry), (false, None));
     // An index: on the 3rd its weekly expiry, on the 4th the monthly.
-    let nifty = catalog.instrument("nse_cm:Nifty 50", d(2026, 11, 3)).await.unwrap();
+    let nifty = catalog.instrument("nse_cm:Nifty 50", d(2026, 11, 3)).await.unwrap().unwrap();
     assert_eq!((nifty.row.kind, nifty.row.ws_key.as_str(), nifty.nearest_expiry.as_deref()), (Kind::Index, "idx|NIFTY 50", Some("2026-11-03")));
-    assert_eq!(catalog.instrument("nse_cm:Nifty 50", today()).await.unwrap().nearest_expiry.as_deref(), Some("2026-11-24"));
-    assert_eq!(catalog.instrument("nse_cm:Nifty 50", d(2027, 1, 1)).await.unwrap().nearest_expiry, None);
+    assert_eq!(catalog.instrument("nse_cm:Nifty 50", today()).await.unwrap().unwrap().nearest_expiry.as_deref(), Some("2026-11-24"));
+    assert_eq!(catalog.instrument("nse_cm:Nifty 50", d(2027, 1, 1)).await.unwrap().unwrap().nearest_expiry, None);
     // A contract: its strike and expiry, its underlying's spot key, no nearest expiry of its own.
-    let option = catalog.instrument("nse_fo:51386", today()).await.unwrap();
+    let option = catalog.instrument("nse_fo:51386", today()).await.unwrap().unwrap();
     assert_eq!((option.row.kind, option.row.strike, option.row.expiry.as_deref()), (Kind::Ce, Some(23_000.0), Some("2026-11-03")));
     assert_eq!((option.row.lot_size, option.row.underlying.as_str(), option.row.has_fo), (65, "NIFTY", true));
     assert_eq!((option.underlying_key.as_deref(), option.nearest_expiry), (Some("idx|NIFTY 50"), None));
-    let sensex_fut = catalog.instrument("bse_fo:874003", today()).await.unwrap();
+    let sensex_fut = catalog.instrument("bse_fo:874003", today()).await.unwrap().unwrap();
     assert_eq!((sensex_fut.row.kind, sensex_fut.row.exchange.as_str(), sensex_fut.underlying_key.as_deref()), (Kind::Fut, "BSE", Some("idx|SENSEX")));
     // An underlying with no row of its own.
-    let nxt = catalog.instrument("nse_fo:49001", today()).await.unwrap();
+    let nxt = catalog.instrument("nse_fo:49001", today()).await.unwrap().unwrap();
     assert_eq!((nxt.underlying_key, nxt.row.has_fo), (None, true));
     // Unknown ids.
-    assert!(catalog.instrument("nse_cm:0", today()).await.is_none());
-    assert!(catalog.instrument("status", today()).await.is_none());
-    assert!(catalog.instrument("", today()).await.is_none());
+    assert!(catalog.instrument("nse_cm:0", today()).await.unwrap().is_none());
+    assert!(catalog.instrument("status", today()).await.unwrap().is_none());
+    assert!(catalog.instrument("", today()).await.unwrap().is_none());
+    // A catalog whose database is gone answers an error, not "no instrument".
+    catalog.pool.as_ref().unwrap().close().await;
+    assert!(catalog.instrument("nse_cm:2885", today()).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_real_files_shape_loads_with_paise_ticks_and_every_column_found() {
+    let scratch = Scratch::new("real-shape");
+    scratch.write_real_shape();
+    let catalog = scratch.catalog().await;
+    let report = loaded(catalog.load_if_changed("test").await);
+    let by_segment = |segment: &str| report.segments.iter().find(|r| r.segment == segment).unwrap();
+
+    // The real header names every column the catalog wants, in every file.
+    for segment in ["nse_cm", "nse_fo", "bse_fo"] {
+        let r = by_segment(segment);
+        assert_eq!(r.header, REAL_HEADER, "{segment}");
+        assert!(r.missing.is_empty(), "{segment}: {:?}", r.missing);
+    }
+    // nse_cm: the four equities; the index line (no series) and the SME series are out.
+    let cm = by_segment("nse_cm");
+    assert_eq!((cm.kept, cm.skipped), (4, 2));
+    assert_eq!((cm.skip_reasons.get("no series"), cm.skip_reasons.get("series not EQ or BE")), (Some(&1), Some(&1)));
+    // nse_fo: every row; bse_fo: the SENSEX contracts, not the stock's.
+    let fo = by_segment("nse_fo");
+    assert_eq!((fo.kept, fo.skipped, fo.unresolved_strikes), (5, 0, 0));
+    let bse = by_segment("bse_fo");
+    assert_eq!((bse.kept, bse.skipped), (2, 2));
+    assert_eq!(bse.skip_reasons.get("bse_fo contract on a stock"), Some(&2));
+
+    // Ticks are paise in the files and rupees in the catalog.
+    let tick = |id: &str| {
+        let catalog = Arc::clone(&catalog);
+        let id = id.to_string();
+        async move {
+            sqlx::query_scalar::<_, f64>("SELECT tick_size FROM instruments WHERE id = ?")
+                .bind(id)
+                .fetch_one(catalog.pool.as_ref().unwrap())
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(tick("nse_cm:2885").await, 0.10, "RELIANCE-EQ: 10 paise");
+    assert_eq!(tick("nse_cm:1333").await, 0.05, "HDFCBANK-EQ");
+    assert_eq!(tick("nse_cm:14366").await, 0.01, "IDEA-EQ: 1 paisa");
+    assert_eq!(tick("nse_cm:16669").await, 1.0, "BAJAJ-AUTO-EQ: 100 paise");
+    assert_eq!(tick("nse_fo:52001").await, 0.05, "every option: 5 paise");
+    assert_eq!(tick("bse_fo:874001").await, 0.05);
+    assert_eq!(tick("nse_cm:Nifty 50").await, 0.05, "the virtual index row agrees with its options");
+    let index = catalog.index();
+    assert_eq!(index.get("RELIANCE").unwrap().tick_size, 0.10, "the search list carries the cash row's tick");
+    assert_eq!((index.get("RELIANCE").unwrap().name.as_str(), index.get("RELIANCE").unwrap().isin.as_deref()), ("RELIANCE INDUSTRIES LTD", Some("INE002A01018")));
+    assert!(index.get("SMECO").is_none());
+
+    // Strikes: a plain integer, scientific notation, a half rupee; expiries
+    // from the segment's epoch rule land on the day the symbol encodes; a
+    // blank pDesc gets a derived name.
+    let row = |id: &str| {
+        let catalog = Arc::clone(&catalog);
+        let id = id.to_string();
+        async move {
+            sqlx::query_as::<_, (String, Option<String>, Option<f64>, String, i64, String)>(
+                "SELECT kind, expiry, strike, name, lot_size, exchange FROM instruments WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(catalog.pool.as_ref().unwrap())
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(row("nse_fo:52001").await, ("CE".into(), Some("2026-11-09".into()), Some(17_000.0), "NIFTY 09 NOV 26 17000 CE".into(), 65, "NSE".into()));
+    assert_eq!(row("nse_fo:49001").await, ("CE".into(), Some("2026-11-24".into()), Some(69_600.0), "NIFTYNXT50 24 NOV 26 69600 CE".into(), 25, "NSE".into()));
+    assert_eq!(row("nse_fo:41222").await, ("CE".into(), Some("2026-11-24".into()), Some(1_280.0), "RELIANCE 24 NOV 26 1280 CE".into(), 500, "NSE".into()));
+    assert_eq!(row("nse_fo:45001").await, ("CE".into(), Some("2026-11-24".into()), Some(7.5), "IDEA 24 NOV 26 7.5 CE".into(), 80_000, "NSE".into()));
+    assert_eq!(row("nse_fo:43001").await, ("FUT".into(), Some("2026-11-24".into()), None, "RELIANCE 24 NOV 26 FUT".into(), 500, "NSE".into()));
+    assert_eq!(row("bse_fo:874001").await, ("CE".into(), Some("2026-11-05".into()), Some(64_600.0), "SENSEX 05 NOV 26 64600 CE".into(), 20, "BSE".into()));
+    assert_eq!(row("bse_fo:874003").await, ("FUT".into(), Some("2026-11-26".into()), None, "SENSEX 26 NOV 26 FUT".into(), 20, "BSE".into()), "an `IF` row is a future by its symbol");
+    assert_eq!(row("nse_cm:2885").await, ("EQ".into(), None, None, "RELIANCE INDUSTRIES LTD".into(), 1, "NSE".into()));
+    assert!(ids(&catalog, "SELECT id FROM instruments WHERE id IN ('bse_fo:876001', 'bse_fo:876002', 'nse_cm:26000', 'nse_cm:99999')").await.is_empty());
+
+    // Search over it: symbols, a name's words, an ISIN, a typed contract, futures.
+    let answer = catalog.search("reliance", today(), &no_spot).await;
+    assert_eq!((answer.stocks[0].symbol.as_str(), answer.stocks[0].tick_size, answer.stocks[0].has_fo), ("RELIANCE", 0.10, true));
+    assert_eq!(symbols(&answer.futures), vec!["RELIANCE26NOVFUT"]);
+    assert_eq!(symbols(&answer.options), vec!["RELIANCE26NOV1280CE"]);
+    assert_eq!(catalog.search("hdfc bank", today(), &no_spot).await.stocks[0].symbol, "HDFCBANK");
+    assert_eq!(catalog.search("INE669E01016", today(), &no_spot).await.stocks[0].symbol, "IDEA");
+    assert_eq!(symbols(&catalog.search("nifty 17000 ce", today(), &no_spot).await.options), vec!["NIFTY26N0917000CE"]);
+    assert_eq!(symbols(&catalog.search("niftynxt 69600 ce", today(), &no_spot).await.options), vec!["NIFTYNXT5026NOV69600CE"]);
+    assert_eq!(symbols(&catalog.search("idea 7.5 ce", today(), &no_spot).await.options), vec!["IDEA26NOV7.5CE"]);
+    let sensex = catalog.search("sensex", today(), &no_spot).await;
+    assert_eq!((sensex.indices[0].symbol.as_str(), symbols(&sensex.futures), symbols(&sensex.options)), ("SENSEX", vec!["SENSEX26NOVFUT"], vec!["SENSEX26N0564600CE"]));
+    assert!(catalog.search("nifty", today(), &no_spot).await.stocks.is_empty(), "the cash file's index line is not a stock");
+    let page = catalog.instrument("nse_cm:2885", today()).await.unwrap().unwrap();
+    assert_eq!((page.row.tick_size, page.nearest_expiry.as_deref(), page.isin.as_deref()), (0.10, Some("2026-11-24"), Some("INE002A01018")));
+}
+
+/// The chain index is `(underlying, kind, expiry, strike)` so every lookup
+/// the search makes is a seek: no query walks an underlying's contracts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_chain_lookup_seeks_the_chain_index_by_underlying_and_kind() {
+    let scratch = Scratch::new("plans");
+    scratch.write_all();
+    let catalog = scratch.catalog().await;
+    loaded(catalog.load_if_changed("test").await);
+    let pool = catalog.pool.as_ref().unwrap();
+
+    let futures = format!("{SELECT_ROW} WHERE underlying = ? AND kind = 'FUT' AND expiry >= ? ORDER BY expiry LIMIT ?");
+    let strikes_under = "SELECT DISTINCT strike FROM instruments WHERE underlying = ? AND expiry = ? AND strike <= ? AND kind IN ('CE', 'PE') ORDER BY strike DESC LIMIT ?";
+    let options_at = format!("{SELECT_ROW} WHERE underlying = ? AND expiry = ? AND strike BETWEEN ? AND ? AND kind IN ('CE', 'PE') ORDER BY kind");
+    let queries: Vec<(&str, &str, usize)> = vec![
+        ("futures_of", futures.as_str(), 3),
+        ("nearest_expiry", NEAREST_EXPIRY, 2),
+        ("option_expiries", OPTION_EXPIRIES, 2),
+        ("strikes_near", strikes_under, 4),
+        ("options_at", options_at.as_str(), 4),
+    ];
+    for (name, sql, binds) in queries {
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+        for _ in 0..binds {
+            query = query.bind("NIFTY");
+        }
+        let plan: Vec<String> = query.fetch_all(pool).await.unwrap().into_iter().map(|(_, _, _, detail)| detail).collect();
+        let on_table: Vec<&String> = plan.iter().filter(|d| d.contains(" instruments ")).collect();
+        assert!(!on_table.is_empty(), "{name}: {plan:?}");
+        for step in on_table {
+            assert!(
+                step.starts_with("SEARCH instruments USING") && step.contains("idx_instruments_chain (underlying=? AND kind=?"),
+                "{name}: {step}\n{plan:#?}"
+            );
+        }
+    }
+    // The queries answer what they did before the index changed.
+    assert_eq!(catalog.option_expiries("NIFTY", d(2026, 10, 1)).await, vec![d(2026, 10, 27), d(2026, 11, 3), d(2026, 11, 24), d(2026, 12, 29)]);
+    assert_eq!(catalog.option_expiries("RELIANCE", today()).await, vec![d(2026, 11, 24), d(2026, 12, 29)]);
+    assert!(catalog.option_expiries("TCS", today()).await.is_empty());
+    assert_eq!(catalog.nearest_expiry("NIFTY", d(2026, 11, 4)).await, Some(d(2026, 11, 24)));
+    assert_eq!(catalog.nearest_expiry("NIFTY", d(2026, 11, 3)).await, Some(d(2026, 11, 3)));
+    assert_eq!(catalog.nearest_expiry("TCS", today()).await, None);
+}
+
+/// Off, the `search` switch stops the background rebuild; the direct build
+/// (and the one the switch's turning on starts) still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_search_switch_off_skips_the_background_rebuild() {
+    let scratch = Scratch::new("gate");
+    scratch.write_all();
+    let flags = Arc::new(tokio::sync::RwLock::new(FeatureFlags::default()));
+    let catalog = Catalog::open(scratch.files(), &scratch.db(), Arc::clone(&flags)).await;
+    catalog.rebuild_in_background("test, switch off");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _not_building = catalog.loading.lock().await;
+    assert_eq!(catalog.status().total_rows(), 0, "nothing was built");
+    drop(_not_building);
+
+    flags.write().await.search = true;
+    catalog.rebuild_in_background("test, switch on");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while catalog.status().total_rows() == 0 {
+        assert!(std::time::Instant::now() < deadline, "the build did not run with the switch on");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(catalog.status().total_rows(), 65);
 }

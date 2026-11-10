@@ -11,6 +11,11 @@
 //! it; a key refused on its own is left out for a while, since one bad key
 //! must not keep shrinking the batch for everyone else. A 429 pauses the
 //! poller for a doubling interval, as does a transport error or a 5xx.
+//!
+//! The bucket is charged when a call is sent, not when it is planned:
+//! `plan` only hands out as many chunks as the second has room for, and the
+//! poller takes a slot (`reserve`) right before each `quotes` call, so a
+//! slow call never lets three land in one wall-clock second.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +23,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kotak_client::{KotakClient, KotakError};
-use shared_domain::{kotak_index_feed, INDEX_NAMES};
-use tokio::sync::Mutex;
+use shared_domain::{kotak_index_feed, FeatureFlags, INDEX_NAMES};
+use tokio::sync::{Mutex, RwLock};
 use upstox_client::UpstoxClient;
 
 use super::hub::QuoteHub;
@@ -83,19 +88,23 @@ pub enum Outcome {
     Refused,
 }
 
-/// How a failed call is scheduled.
+/// How a failed call is scheduled. A body that is not JSON (a gateway's
+/// HTML page behind an HTTP 200, mid-outage) is transient: the keys were
+/// not refused, and treating it as a refusal would halve the batch down to
+/// one and then quarantine every wanted key for ten minutes.
 pub fn classify(err: &KotakError) -> Outcome {
     match err {
         KotakError::ApiError { status_code: 429, .. } => Outcome::RateLimited,
         KotakError::ApiError { status_code, .. } if (500..=599).contains(status_code) => Outcome::Transient,
         // The dashboard access token refused: nothing a smaller batch fixes.
         KotakError::ApiError { status_code: 401 | 403, .. } => Outcome::Transient,
-        KotakError::ApiError { .. } | KotakError::Json(_) => Outcome::Refused,
+        KotakError::ApiError { .. } => Outcome::Refused,
         _ => Outcome::Transient,
     }
 }
 
-/// At most `per_second` calls in any one-second window, process-wide.
+/// At most `per_second` calls in any one-second window, process-wide. The
+/// window starts at the first call charged after the previous one ended.
 pub struct Bucket {
     per_second: u32,
     window: Instant,
@@ -107,8 +116,22 @@ impl Bucket {
         Bucket { per_second, window: now, used: 0 }
     }
 
+    fn window_over(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.window) >= Duration::from_secs(1)
+    }
+
+    /// Calls the second has room for at `now`, without taking any.
+    pub fn remaining(&self, now: Instant) -> u32 {
+        if self.window_over(now) {
+            self.per_second
+        } else {
+            self.per_second.saturating_sub(self.used)
+        }
+    }
+
+    /// Charges one call at `now`; `false` when the second is spent.
     pub fn try_take(&mut self, now: Instant) -> bool {
-        if now.saturating_duration_since(self.window) >= Duration::from_secs(1) {
+        if self.window_over(now) {
             self.window = now;
             self.used = 0;
         }
@@ -118,6 +141,11 @@ impl Bucket {
         } else {
             false
         }
+    }
+
+    /// How long until the window has room again, at `now`.
+    pub fn wait(&self, now: Instant) -> Duration {
+        Duration::from_secs(1).saturating_sub(now.saturating_duration_since(self.window))
     }
 }
 
@@ -246,12 +274,15 @@ impl Scheduler {
         }
     }
 
-    /// The calls to make now. `wanted` is the live keys in the caller's
-    /// priority order; those sent within [`POLL_EVERY`] wait. `sweep` is
-    /// the close sweep's queue, taken from the front; when both have keys,
-    /// calls alternate between them, so a sweep of thousands of keys
-    /// neither starves the screens nor waits behind them. Nothing is sent
-    /// while the session is down or a pause is on.
+    /// The calls to make now: as many as the second has room for
+    /// ([`Bucket::remaining`]; the caller charges the bucket with
+    /// [`Scheduler::reserve`] as it sends each one). `wanted` is the live
+    /// keys in the caller's priority order; those sent within
+    /// [`POLL_EVERY`] wait. `sweep` is the close sweep's queue, taken from
+    /// the front; when both have keys, calls alternate between them, so a
+    /// sweep of thousands of keys neither starves the screens nor waits
+    /// behind them. Nothing is sent while the session is down or a pause is
+    /// on.
     pub fn plan(&mut self, wanted: &[String], sweep: &mut VecDeque<String>, session_ok: bool, now: Instant) -> Vec<Chunk> {
         if !session_ok || self.paused(now).is_some() {
             return Vec::new();
@@ -272,10 +303,14 @@ impl Scheduler {
 
         let mut out = Vec::new();
         let mut live_turn = true;
+        let mut slots = self.bucket.remaining(now);
         loop {
             let live = !due.is_empty();
             let swept = !sweep.is_empty();
             if !live && !swept {
+                break;
+            }
+            if slots == 0 {
                 break;
             }
             let from_sweep = if live && swept { !live_turn } else { swept };
@@ -300,14 +335,7 @@ impl Scheduler {
             if keys.is_empty() {
                 continue;
             }
-            if !self.bucket.try_take(now) {
-                if from_sweep {
-                    for k in keys.into_iter().rev() {
-                        sweep.push_front(k);
-                    }
-                }
-                break;
-            }
+            slots -= 1;
             for k in &keys {
                 self.last_sent.insert(k.clone(), now);
             }
@@ -315,6 +343,17 @@ impl Scheduler {
             live_turn = !live_turn;
         }
         out
+    }
+
+    /// Charges the bucket for a call sent at `now`; `Err` says how long to
+    /// wait for the second to have room again. The poller calls this right
+    /// before each `quotes` call, so the limit counts calls as they go out.
+    pub fn reserve(&mut self, now: Instant) -> Result<(), Duration> {
+        if self.bucket.try_take(now) {
+            Ok(())
+        } else {
+            Err(self.bucket.wait(now))
+        }
     }
 
     /// What `chunk`'s call came to. A call that did not answer puts its
@@ -361,26 +400,40 @@ impl Scheduler {
     }
 }
 
-/// Runs forever: every [`TICK`], the calls the hub's scheduler allows,
-/// against a clone of the Kotak client (the mutex is never held across a
-/// call). While there is no healthy session, nothing is asked of Kotak;
-/// Upstox's quotes stand in then, when it is configured.
+/// Runs forever: every [`TICK`], while the `search` switch is on, the calls
+/// the hub's scheduler allows, against a clone of the Kotak client (the
+/// mutex is never held across a call), each charged to the bucket as it is
+/// sent. While there is no healthy session, nothing is asked of Kotak;
+/// Upstox's quotes stand in then, when it is configured. With the switch
+/// off nothing at all is sent, to Kotak or Upstox.
 pub async fn run_poller(
     hub: Arc<QuoteHub>,
     kotak: Arc<Mutex<Option<KotakClient>>>,
     healthy: Arc<AtomicBool>,
     upstox: Option<UpstoxClient>,
+    flags: Arc<RwLock<FeatureFlags>>,
 ) {
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        let on = flags.read().await.search;
+        hub.set_switched_off(!on);
+        if !on {
+            continue;
+        }
         let client = kotak.lock().await.clone();
         let session_ok = client.is_some() && healthy.load(Ordering::Relaxed);
         let chunks = hub.plan(session_ok, Instant::now());
         match client.filter(|_| session_ok) {
             Some(client) => {
                 for chunk in chunks {
+                    // The bucket counts the call as it goes out, not as it
+                    // was planned: a slow call before this one may have
+                    // carried the plan into a new second.
+                    while let Err(wait) = hub.reserve_call(Instant::now()) {
+                        tokio::time::sleep(wait.max(Duration::from_millis(10))).await;
+                    }
                     let keys = QuoteHub::rest_keys(&chunk);
                     let asked: Vec<String> = keys.iter().map(|(rest, _)| rest.clone()).collect();
                     let result = client.quotes(&asked, "all").await;
@@ -408,6 +461,16 @@ mod tests {
         Duration::from_secs_f64(n)
     }
 
+    /// `plan`, then the bucket charged for each chunk, as the poller does
+    /// when it sends them.
+    fn sent(s: &mut Scheduler, wanted: &[String], sweep: &mut VecDeque<String>, session_ok: bool, now: Instant) -> Vec<Chunk> {
+        let chunks = s.plan(wanted, sweep, session_ok, now);
+        for _ in &chunks {
+            s.reserve(now).expect("the plan never hands out more than the second has room for");
+        }
+        chunks
+    }
+
     #[test]
     fn rest_keys_name_an_index_by_its_segment_and_exact_name() {
         assert_eq!(rest_key("idx|NIFTY 50").as_deref(), Some("nse_cm|Nifty 50"));
@@ -428,14 +491,45 @@ mod tests {
     fn the_bucket_allows_two_calls_a_second() {
         let t0 = Instant::now();
         let mut bucket = Bucket::new(2, t0);
+        assert_eq!(bucket.remaining(t0), 2);
         assert!(bucket.try_take(t0));
+        assert_eq!(bucket.remaining(t0), 1);
         assert!(bucket.try_take(t0));
+        assert_eq!(bucket.remaining(t0), 0);
         assert!(!bucket.try_take(t0));
         assert!(!bucket.try_take(t0 + secs(0.999)));
+        assert_eq!(bucket.wait(t0 + secs(0.75)), secs(0.25));
+        assert_eq!(bucket.remaining(t0 + secs(1.0)), 2);
         assert!(bucket.try_take(t0 + secs(1.0)));
         assert!(bucket.try_take(t0 + secs(1.5)));
         assert!(!bucket.try_take(t0 + secs(1.9)));
         assert!(bucket.try_take(t0 + secs(2.0)));
+    }
+
+    #[test]
+    fn the_bucket_is_charged_as_calls_go_out_not_as_they_are_planned() {
+        let t0 = Instant::now();
+        let mut s = Scheduler::new(t0);
+        let wanted = keys("nse_cm", 100);
+        let mut sweep = VecDeque::new();
+        // Two calls planned at t0; the first takes a second to answer, so
+        // the second goes out at t0 + 1.0, in a new window.
+        let chunks = s.plan(&wanted, &mut sweep, true, t0);
+        assert_eq!(chunks.len(), 2);
+        assert!(s.reserve(t0).is_ok());
+        assert!(s.reserve(t0 + secs(1.0)).is_ok());
+        // The tick at t0 + 1.0 finds one slot left in that window, not two:
+        // at most two calls land in [t0 + 1.0, t0 + 2.0).
+        let chunks = s.plan(&wanted, &mut sweep, true, t0 + secs(1.0));
+        assert_eq!(chunks.len(), 1);
+        assert!(s.reserve(t0 + secs(1.1)).is_ok());
+        assert_eq!(s.reserve(t0 + secs(1.2)), Err(secs(0.8)));
+        assert!(s.plan(&wanted, &mut sweep, true, t0 + secs(1.5)).is_empty());
+        // Planning alone never charges: the same instant planned twice
+        // hands the same room out twice, which is why the poller reserves.
+        let mut fresh = Scheduler::new(t0);
+        assert_eq!(fresh.plan(&wanted, &mut sweep, true, t0).len(), 2);
+        assert_eq!(fresh.plan(&keys("nse_fo", 100), &mut sweep, true, t0).len(), 2);
     }
 
     #[test]
@@ -445,26 +539,26 @@ mod tests {
         let wanted = keys("nse_cm", 60);
         let mut sweep = VecDeque::new();
         // Unhealthy: nothing, however much is wanted.
-        assert!(s.plan(&wanted, &mut sweep, false, t0).is_empty());
+        assert!(sent(&mut s, &wanted, &mut sweep, false, t0).is_empty());
         // Healthy: two calls of 25 (the second's limit), the rest waits.
-        let chunks = s.plan(&wanted, &mut sweep, true, t0);
+        let chunks = sent(&mut s, &wanted, &mut sweep, true, t0);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].keys, &wanted[..25]);
         assert_eq!(chunks[1].keys, &wanted[25..50]);
         assert!(!chunks[0].sweep);
         // The same second: the bucket is spent.
-        assert!(s.plan(&wanted, &mut sweep, true, t0 + secs(0.5)).is_empty());
+        assert!(sent(&mut s, &wanted, &mut sweep, true, t0 + secs(0.5)).is_empty());
         // The next second: the ten not yet sent; the fifty wait their 2 s.
-        let chunks = s.plan(&wanted, &mut sweep, true, t0 + secs(1.0));
+        let chunks = sent(&mut s, &wanted, &mut sweep, true, t0 + secs(1.0));
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].keys, &wanted[50..]);
         // At 2 s the first fifty are due again, least recently sent first.
-        let chunks = s.plan(&wanted, &mut sweep, true, t0 + secs(2.0));
+        let chunks = sent(&mut s, &wanted, &mut sweep, true, t0 + secs(2.0));
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].keys, &wanted[..25]);
         assert_eq!(chunks[1].keys, &wanted[25..50]);
         // Nothing wanted: nothing sent.
-        assert!(s.plan(&[], &mut sweep, true, t0 + secs(10.0)).is_empty());
+        assert!(sent(&mut s, &[], &mut sweep, true, t0 + secs(10.0)).is_empty());
     }
 
     #[test]
@@ -473,12 +567,12 @@ mod tests {
         let mut s = Scheduler::new(t0);
         let wanted = keys("nse_fo", 25);
         let mut sweep = VecDeque::new();
-        let chunk = s.plan(&wanted, &mut sweep, true, t0).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, t0).remove(0);
         assert_eq!(chunk.keys.len(), 25);
         assert_eq!(s.settle(&chunk, Outcome::Refused, &mut sweep, t0), None);
         assert_eq!(s.batch_size(), 12);
         // Its keys are due at once, in calls of 12.
-        let chunks = s.plan(&wanted, &mut sweep, true, t0 + secs(1.0));
+        let chunks = sent(&mut s, &wanted, &mut sweep, true, t0 + secs(1.0));
         assert_eq!(chunks.iter().map(|c| c.keys.len()).collect::<Vec<_>>(), vec![12, 12]);
         // Down to one key a call, then the one key refused is left out.
         // (Keys sent a second ago are not due yet, so two seconds a step;
@@ -486,7 +580,7 @@ mod tests {
         let mut now = t0 + secs(3.0);
         let mut bad = None;
         for expect in [6, 3, 1, 1] {
-            let chunk = s.plan(&wanted, &mut sweep, true, now).remove(0);
+            let chunk = sent(&mut s, &wanted, &mut sweep, true, now).remove(0);
             let quarantined = s.settle(&chunk, Outcome::Refused, &mut sweep, now);
             assert_eq!(s.batch_size(), expect);
             assert_eq!(quarantined.is_some(), chunk.keys.len() == 1);
@@ -496,7 +590,7 @@ mod tests {
         assert_eq!(s.quarantined(), 1);
         let bad = bad.unwrap();
         assert_eq!(bad, wanted[0]);
-        let chunk = s.plan(&wanted, &mut sweep, true, now).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, now).remove(0);
         assert!(!chunk.keys.contains(&bad));
         // Ten good calls at a size double it, back up to 25.
         let mut size = 1;
@@ -510,7 +604,7 @@ mod tests {
         }
         // The quarantined key comes back after its time.
         let later = now + QUARANTINE + secs(1.0);
-        let chunk = s.plan(&wanted, &mut sweep, true, later).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, later).remove(0);
         assert!(chunk.keys.contains(&bad));
     }
 
@@ -520,38 +614,38 @@ mod tests {
         let mut s = Scheduler::new(t0);
         let wanted = keys("nse_cm", 3);
         let mut sweep = VecDeque::new();
-        let chunk = s.plan(&wanted, &mut sweep, true, t0).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, t0).remove(0);
         s.settle(&chunk, Outcome::RateLimited, &mut sweep, t0);
         assert_eq!(s.paused(t0 + secs(1.0)), Some("rate limited by Kotak"));
-        assert!(s.plan(&wanted, &mut sweep, true, t0 + secs(1.9)).is_empty());
+        assert!(sent(&mut s, &wanted, &mut sweep, true, t0 + secs(1.9)).is_empty());
         // 2 s later the keys are sent again (they were put back), and a
         // second 429 pauses for 4 s, a third for 8 s.
         let t1 = t0 + secs(2.0);
-        let chunk = s.plan(&wanted, &mut sweep, true, t1).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, t1).remove(0);
         assert_eq!(chunk.keys, wanted);
         s.settle(&chunk, Outcome::RateLimited, &mut sweep, t1);
-        assert!(s.plan(&wanted, &mut sweep, true, t1 + secs(3.9)).is_empty());
+        assert!(sent(&mut s, &wanted, &mut sweep, true, t1 + secs(3.9)).is_empty());
         let t2 = t1 + secs(4.0);
-        let chunk = s.plan(&wanted, &mut sweep, true, t2).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, t2).remove(0);
         s.settle(&chunk, Outcome::RateLimited, &mut sweep, t2);
-        assert!(s.plan(&wanted, &mut sweep, true, t2 + secs(7.9)).is_empty());
+        assert!(sent(&mut s, &wanted, &mut sweep, true, t2 + secs(7.9)).is_empty());
         let t3 = t2 + secs(8.0);
-        let chunk = s.plan(&wanted, &mut sweep, true, t3).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, t3).remove(0);
         s.settle(&chunk, Outcome::Ok, &mut sweep, t3);
         assert_eq!(s.paused(t3), None);
         // After a success the next 429 starts over at 2 s.
         let t4 = t3 + secs(2.0);
-        let chunk = s.plan(&wanted, &mut sweep, true, t4).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, t4).remove(0);
         s.settle(&chunk, Outcome::RateLimited, &mut sweep, t4);
-        assert!(s.plan(&wanted, &mut sweep, true, t4 + secs(1.9)).is_empty());
-        assert_eq!(s.plan(&wanted, &mut sweep, true, t4 + secs(2.0)).len(), 1);
+        assert!(sent(&mut s, &wanted, &mut sweep, true, t4 + secs(1.9)).is_empty());
+        assert_eq!(sent(&mut s, &wanted, &mut sweep, true, t4 + secs(2.0)).len(), 1);
         // A transport error pauses too, from 1 s.
         let t5 = t4 + secs(4.0);
-        let chunk = s.plan(&wanted, &mut sweep, true, t5).remove(0);
+        let chunk = sent(&mut s, &wanted, &mut sweep, true, t5).remove(0);
         s.settle(&chunk, Outcome::Transient, &mut sweep, t5);
         assert_eq!(s.paused(t5), Some("backing off after an error"));
-        assert!(s.plan(&wanted, &mut sweep, true, t5 + secs(0.9)).is_empty());
-        assert_eq!(s.plan(&wanted, &mut sweep, true, t5 + secs(1.0)).len(), 1);
+        assert!(sent(&mut s, &wanted, &mut sweep, true, t5 + secs(0.9)).is_empty());
+        assert_eq!(sent(&mut s, &wanted, &mut sweep, true, t5 + secs(1.0)).len(), 1);
         // The cap: many 429s in a row never pause past a minute.
         let mut b = Backoff::new(RATE_LIMIT_PAUSE, RATE_LIMIT_PAUSE_MAX);
         let pauses: Vec<u64> = (0..7).map(|_| b.hit(t0).as_secs()).collect();
@@ -565,7 +659,7 @@ mod tests {
         let wanted = keys("nse_fo", 30);
         let mut sweep: VecDeque<String> = keys("nse_cm", 100).into();
         // Both pending: one live call, one sweep call.
-        let chunks = s.plan(&wanted, &mut sweep, true, t0);
+        let chunks = sent(&mut s, &wanted, &mut sweep, true, t0);
         assert_eq!(chunks.len(), 2);
         assert!(!chunks[0].sweep && chunks[1].sweep);
         assert_eq!(chunks[0].keys, &wanted[..25]);
@@ -577,16 +671,16 @@ mod tests {
         assert_eq!(sweep.front().map(String::as_str), Some("nse_cm|1"));
         // Only the sweep pending: both calls are its.
         let t1 = t0 + secs(1.0);
-        let chunks = s.plan(&[], &mut sweep, true, t1 + secs(1.0));
+        let chunks = sent(&mut s, &[], &mut sweep, true, t1 + secs(1.0));
         assert_eq!(chunks.len(), 2);
         assert!(chunks.iter().all(|c| c.sweep));
         assert_eq!(sweep.len(), 50);
-        // The bucket spent, a sweep chunk already taken is put back.
-        assert!(s.plan(&[], &mut sweep, true, t1 + secs(1.5)).is_empty());
+        // The bucket spent, no sweep chunk is taken.
+        assert!(sent(&mut s, &[], &mut sweep, true, t1 + secs(1.5)).is_empty());
         assert_eq!(sweep.len(), 50);
         // A refusal of a sweep chunk halves the batch and puts it back too
         // (the second call of that second took the other 25).
-        let chunks = s.plan(&[], &mut sweep, true, t1 + secs(2.0));
+        let chunks = sent(&mut s, &[], &mut sweep, true, t1 + secs(2.0));
         assert_eq!(chunks.len(), 2);
         assert!(sweep.is_empty());
         s.settle(&chunks[0], Outcome::Refused, &mut sweep, t1 + secs(2.0));
@@ -605,7 +699,9 @@ mod tests {
         assert_eq!(classify(&api(1009)), Outcome::Refused);
         assert_eq!(classify(&KotakError::NotAuthenticated), Outcome::Transient);
         assert_eq!(classify(&KotakError::SessionExpired { status: 401 }), Outcome::Transient);
+        // A non-JSON body behind an HTTP 200 (a gateway's page) is an
+        // outage, not a refusal: no halving, no quarantine.
         let junk = serde_json::from_str::<serde_json::Value>("<").unwrap_err();
-        assert_eq!(classify(&KotakError::Json(junk)), Outcome::Refused);
+        assert_eq!(classify(&KotakError::Json(junk)), Outcome::Transient);
     }
 }

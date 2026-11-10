@@ -365,6 +365,23 @@ pub fn strike_text(strike: f64) -> Option<String> {
     })
 }
 
+/// Kotak's `dTickSize` in rupees. The real files carry it in paise, as they
+/// do strikes: `5` on every NSE and BSE option (₹0.05), `10` on RELIANCE-EQ
+/// (₹0.10), `1` on IDEA-EQ (₹0.01), `100` on BAJAJ-AUTO-EQ (₹1.00) — a value
+/// of 1 or more is paise and is divided by 100; a fraction under 1 is
+/// already rupees (no real file writes one, but a tick is never ₹1 or more
+/// on these exchanges, so the rule cannot misread either form). Blank or
+/// unreadable is the exchanges' usual ₹0.05. The engine's `ScripRecord`
+/// never read this column (it looks for `pTickSize`), so nothing there
+/// changes.
+pub fn tick_size_of(raw: &str) -> f64 {
+    match raw.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 1.0 => v / 100.0,
+        Ok(v) if v.is_finite() && v > 0.0 => v,
+        _ => 0.05,
+    }
+}
+
 /// Kotak's `lExpiryDate` as an IST calendar date. nse_fo (and cde_fo) files
 /// carry the Unix epoch minus [`NSE_FO_EXPIRY_OFFSET`]; bse_fo and mcx_fo
 /// the plain epoch. The engine's parser (`ScripStore::parse_csv`) tells the
@@ -485,7 +502,7 @@ fn row_from(segment: &'static str, c: &Columns, line: &str) -> Result<Parsed, Sk
     }
     let symbol_name = field(c.symbol_name).to_uppercase();
     let lot_size = field(c.lot_size).parse::<u32>().map(i64::from).unwrap_or(1);
-    let tick_size = field(c.tick_size).parse::<f64>().unwrap_or(0.05);
+    let tick_size = tick_size_of(field(c.tick_size));
     let isin = Some(field(c.isin)).filter(|s| !s.is_empty()).map(str::to_string);
     let desc = Some(field(c.desc)).filter(|s| !s.is_empty()).map(str::to_string);
     let exchange = exchange_of(segment);
@@ -836,6 +853,15 @@ async fn build(mut conn: PoolConnection<Sqlite>, sources: Vec<Source>, fts: bool
     sqlx::query("DELETE FROM instrument_load WHERE loaded_at < ?").bind(&keep_from).execute(&mut *tx).await?;
     tx.commit().await?;
 
+    // The build just wrote the whole catalog through the WAL; fold it back
+    // into the database file and truncate it, or the WAL stays the size of
+    // a full catalog (tens of MB) for good. A reader mid-query keeps the
+    // checkpoint from finishing; that is fine, the next one gets it.
+    match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut *conn).await {
+        Ok(_) => tracing::debug!("Instrument catalog WAL checkpointed"),
+        Err(e) => tracing::warn!(error = %e, "Instrument catalog WAL checkpoint failed — the WAL file stays large until the next build"),
+    }
+
     Ok(LoadReport {
         day,
         loaded_at,
@@ -1007,6 +1033,21 @@ mod tests {
             vec!["pInstType", "pOptionType", "lExpiryDate", "dStrikePrice", "dTickSize", "pDesc"]
         );
         assert!(!Columns::from_header("pExchSeg,pSymbolName").usable());
+    }
+
+    #[test]
+    fn tick_sizes_are_read_as_paise() {
+        // The real files: every option 5, RELIANCE-EQ 10, IDEA-EQ 1, BAJAJ-AUTO-EQ 100.
+        assert_eq!(tick_size_of("5"), 0.05);
+        assert_eq!(tick_size_of(" 10 "), 0.10);
+        assert_eq!(tick_size_of("1"), 0.01);
+        assert_eq!(tick_size_of("100"), 1.0);
+        assert_eq!(tick_size_of("500"), 5.0);
+        // Already in rupees (no real file writes this), blank, junk.
+        assert_eq!(tick_size_of("0.05"), 0.05);
+        assert_eq!(tick_size_of(""), 0.05);
+        assert_eq!(tick_size_of("-1"), 0.05);
+        assert_eq!(tick_size_of("abc"), 0.05);
     }
 
     #[test]

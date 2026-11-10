@@ -1,23 +1,28 @@
-//! The close snapshot: at 15:35 IST one sweep of every catalog equity and
-//! index, every held contract and every key watched lately, through the
-//! same scheduler as the live polling, into `quote_eod`; served as the
-//! day's close ("as of 15:30") once the market is shut, until the next
-//! day's quotes arrive. Necessary, not a nicety: the Kotak base URL lives
-//! only in the session, which the 15:40 clear drops, so no REST quote is
-//! possible after it until the next login.
+//! The close snapshot: at 15:35 IST on a trading day one sweep of every
+//! catalog equity and index and every key watched lately, through the same
+//! scheduler as the live polling, into `quote_eod` (in the catalog's
+//! `instruments.db`); served as the day's close ("as of 15:30") once the
+//! market is shut, until the next day's quotes arrive. Necessary, not a
+//! nicety: the Kotak base URL lives only in the session, which the 15:40
+//! clear drops, so no REST quote is possible after it until the next login.
+//!
+//! The sweep's key set is public market data only — the catalog's cash keys
+//! and what signed-in users asked about in the last 15 minutes. It never
+//! takes the owner's open contracts or the paper desks' from their
+//! subscriptions: a close answered for a contract nobody asked about would
+//! tell a user it was held at 15:35.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, Timelike};
-use shared_domain::{MonitoredPosition, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE, MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
+use shared_domain::FeatureFlags;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
 use super::hub::{Quote, QuoteHub, Source};
 use crate::instruments::Catalog;
-use crate::paper::PaperDesk;
 
 /// When the sweep starts, IST.
 pub const SWEEP_HOUR: u32 = 15;
@@ -55,9 +60,17 @@ pub struct Snapshot {
     pub day: NaiveDate,
     pub taken_at: DateTime<FixedOffset>,
     pub rows: HashMap<String, Row>,
+    /// Keys the sweep asked for. More than `rows` means some got no close:
+    /// the sweep was cut short by its deadline, or Kotak left keys out.
+    pub asked: usize,
 }
 
 impl Snapshot {
+    /// Whether some key asked for got no close.
+    pub fn partial(&self) -> bool {
+        self.rows.len() < self.asked
+    }
+
     /// The close quote for `key`, if the sweep saw it.
     pub fn quote(&self, key: &str) -> Option<Quote> {
         let r = self.rows.get(key)?;
@@ -79,14 +92,12 @@ impl Snapshot {
     }
 }
 
-/// Whether the market is open at `now`: a weekday, 09:15 to 15:40 IST, as
-/// `shared_domain::is_market_open` reads the clock.
+/// Whether the market is open at `now`: the shared 09:15-15:40 weekday rule
+/// (`shared_domain::is_market_open_at`) on a day that is not an exchange
+/// holiday, from the calendar the paper loop and the desk read
+/// (`telegram_ingester::parser::is_trading_holiday`).
 pub fn open_at(now: DateTime<FixedOffset>) -> bool {
-    if matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
-        return false;
-    }
-    let minute = now.hour() * 60 + now.minute();
-    (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE..MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE).contains(&minute)
+    shared_domain::is_market_open_at(now) && !telegram_ingester::parser::is_trading_holiday(now.date_naive())
 }
 
 /// The next `hour:minute` IST at or after `now`: today's, or tomorrow's
@@ -125,6 +136,10 @@ pub async fn load_latest(pool: &SqlitePool) -> sqlx::Result<Option<Snapshot>> {
     .bind(&day)
     .fetch_all(pool)
     .await?;
+    let asked = sqlx::query_scalar::<_, i64>("SELECT asked FROM quote_eod_days WHERE day = ?")
+        .bind(&day)
+        .fetch_optional(pool)
+        .await?;
     let Some(day) = NaiveDate::parse_from_str(&day, "%Y-%m-%d").ok() else {
         tracing::error!(day, "quote_eod: unreadable day");
         return Ok(None);
@@ -139,11 +154,14 @@ pub async fn load_latest(pool: &SqlitePool) -> sqlx::Result<Option<Snapshot>> {
                 .single()
                 .expect("IST time is unambiguous")
         });
-    let rows = rows
+    let rows: HashMap<String, Row> = rows
         .into_iter()
         .map(|(key, ltp, open, high, low, close, volume)| (key.clone(), Row { key, ltp, open, high, low, close, volume }))
         .collect();
-    Ok(Some(Snapshot { day, taken_at, rows }))
+    // A day with no `quote_eod_days` row (written before the table existed)
+    // is taken as complete.
+    let asked = asked.map_or(rows.len(), |n| usize::try_from(n).unwrap_or(rows.len()));
+    Ok(Some(Snapshot { day, taken_at, rows, asked }))
 }
 
 /// Writes a snapshot's rows, replacing the day's, in one transaction.
@@ -173,25 +191,29 @@ pub async fn save(pool: &SqlitePool, snapshot: &Snapshot) -> sqlx::Result<()> {
         }
         query.execute(&mut *tx).await?;
     }
+    sqlx::query("INSERT OR REPLACE INTO quote_eod_days (day, taken_at, asked, answered) VALUES (?, ?, ?, ?)")
+        .bind(&day)
+        .bind(&taken_at)
+        .bind(snapshot.asked as i64)
+        .bind(snapshot.rows.len() as i64)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await
 }
 
-/// Drops the closes of days before `before`.
+/// Drops the closes of days before `before`; returns how many rows went.
 pub async fn prune(pool: &SqlitePool, before: NaiveDate) -> sqlx::Result<u64> {
-    Ok(sqlx::query("DELETE FROM quote_eod WHERE day < ?").bind(day_text(before)).execute(pool).await?.rows_affected())
+    let before = day_text(before);
+    sqlx::query("DELETE FROM quote_eod_days WHERE day < ?").bind(&before).execute(pool).await?;
+    Ok(sqlx::query("DELETE FROM quote_eod WHERE day < ?").bind(&before).execute(pool).await?.rows_affected())
 }
 
-/// Runs forever: at 15:35 IST every weekday, sweeps the catalog's equities
-/// and indices, every held contract (the owner's and the paper desks')
-/// and every key watched lately, then writes what came back and keeps it
-/// in memory as the day's close.
-pub async fn run_close_sweep(
-    hub: Arc<QuoteHub>,
-    pool: SqlitePool,
-    catalog: Arc<Catalog>,
-    paper: Arc<PaperDesk>,
-    positions: Arc<RwLock<Vec<MonitoredPosition>>>,
-) {
+/// Runs forever: at 15:35 IST every trading day, while the `search` switch
+/// is on, sweeps the catalog's equities and indices and every key watched
+/// lately, then writes what came back and keeps it in memory as the day's
+/// close. `pool` is the catalog database's; without one the close is held
+/// in memory only.
+pub async fn run_close_sweep(hub: Arc<QuoteHub>, pool: Option<SqlitePool>, catalog: Arc<Catalog>, flags: Arc<RwLock<FeatureFlags>>) {
     loop {
         let now = shared_domain::now_ist();
         let at = next_at(now, SWEEP_HOUR, SWEEP_MINUTE);
@@ -200,16 +222,19 @@ pub async fn run_close_sweep(
         tokio::time::sleep(Duration::from_secs(secs)).await;
 
         let now = shared_domain::now_ist();
-        if matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
-            tracing::info!("Close snapshot sweep skipped — weekend");
+        if telegram_ingester::parser::is_trading_holiday(now.date_naive()) {
+            tracing::info!(day = %now.date_naive(), "Close snapshot sweep skipped — not a trading day");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        if !flags.read().await.search {
+            tracing::info!("Close snapshot sweep skipped — the `search` switch is off");
             tokio::time::sleep(Duration::from_secs(60)).await;
             continue;
         }
 
         let mut keys: BTreeSet<String> = catalog.cash_keys().into_iter().collect();
         let catalog_keys = keys.len();
-        keys.extend(paper.feed_keys().await.0);
-        keys.extend(positions.read().await.iter().filter_map(|p| p.ws_scrip_key.clone()));
         keys.extend(hub.watched_keys());
         let total = hub.start_sweep(keys, now.date_naive(), now, Instant::now() + SWEEP_WINDOW);
         tracing::info!(keys = total, catalog_keys, "Close snapshot sweep started");
@@ -220,21 +245,38 @@ pub async fn run_close_sweep(
                 break sweep;
             }
         };
-        let snapshot = Snapshot { day: sweep.day, taken_at: sweep.started, rows: sweep.rows };
+        let cut_short = sweep.cut_short();
+        let snapshot = Snapshot { day: sweep.day, taken_at: sweep.started, rows: sweep.rows, asked: sweep.total };
         if snapshot.rows.is_empty() {
             tracing::warn!(
                 day = %snapshot.day, keys = sweep.total,
                 "Close snapshot sweep got no quotes — no Kotak session, or every call failed; the last close on file stays"
             );
         } else {
-            match save(&pool, &snapshot).await {
-                Ok(()) => tracing::info!(day = %snapshot.day, rows = snapshot.rows.len(), keys = sweep.total, "Close snapshot saved"),
-                Err(e) => tracing::error!(day = %snapshot.day, error = %e, "Close snapshot could not be saved — served from memory until a restart"),
+            if cut_short {
+                tracing::warn!(
+                    day = %snapshot.day, rows = snapshot.rows.len(), keys = snapshot.asked,
+                    "Close snapshot sweep cut short by the 15:40 deadline — the day's close is partial (instrument status says so)"
+                );
+            } else if snapshot.partial() {
+                tracing::warn!(
+                    day = %snapshot.day, rows = snapshot.rows.len(), keys = snapshot.asked,
+                    "Close snapshot sweep finished with keys unanswered — the day's close is partial (instrument status says so)"
+                );
             }
-            match prune(&pool, snapshot.day - chrono::Duration::days(KEEP_DAYS)).await {
-                Ok(n) if n > 0 => tracing::info!(rows = n, "Old closes pruned"),
-                Ok(_) => {}
-                Err(e) => tracing::error!(error = %e, "quote_eod prune failed"),
+            match &pool {
+                Some(pool) => {
+                    match save(pool, &snapshot).await {
+                        Ok(()) => tracing::info!(day = %snapshot.day, rows = snapshot.rows.len(), keys = snapshot.asked, "Close snapshot saved"),
+                        Err(e) => tracing::error!(day = %snapshot.day, error = %e, "Close snapshot could not be saved — served from memory until a restart"),
+                    }
+                    match prune(pool, snapshot.day - chrono::Duration::days(KEEP_DAYS)).await {
+                        Ok(n) if n > 0 => tracing::info!(rows = n, "Old closes pruned"),
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(error = %e, "quote_eod prune failed"),
+                    }
+                }
+                None => tracing::warn!(day = %snapshot.day, "Close snapshot held in memory only — the catalog database is not open"),
             }
             hub.set_snapshot(snapshot);
         }
@@ -260,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn the_market_is_open_on_weekdays_from_0915_until_1540() {
+    fn the_market_is_open_on_trading_days_from_0915_until_1540() {
         // 2026-11-04 is a Wednesday.
         assert!(!open_at(ist(2026, 11, 4, 9, 14)));
         assert!(open_at(ist(2026, 11, 4, 9, 15)));
@@ -269,6 +311,10 @@ mod tests {
         assert!(!open_at(ist(2026, 11, 4, 20, 0)));
         assert!(!open_at(ist(2026, 11, 7, 12, 0)), "Saturday");
         assert!(!open_at(ist(2026, 11, 8, 12, 0)), "Sunday");
+        // An exchange holiday on a weekday, from the shared calendar.
+        assert!(telegram_ingester::parser::is_trading_holiday(NaiveDate::from_ymd_opt(2026, 11, 10).unwrap()));
+        assert!(!open_at(ist(2026, 11, 10, 12, 0)), "Tuesday 2026-11-10 is a holiday");
+        assert!(open_at(ist(2026, 11, 11, 12, 0)), "the day after is not");
     }
 
     #[test]
@@ -284,18 +330,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closes_round_trip_through_the_table_and_the_latest_day_is_loaded() {
+    async fn closes_round_trip_through_the_catalog_database_and_the_latest_day_is_loaded() {
         let db = TempDb::new("quote-eod");
-        let pool = crate::db::init_db(&db.url()).await;
+        let (pool, _) = crate::db::init_catalog_db(db.path()).await.unwrap();
         assert!(load_latest(&pool).await.unwrap().is_none());
 
         let day = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
         let rows: HashMap<String, Row> = (1..=450).map(|i| (format!("nse_cm|{i}"), row(&format!("nse_cm|{i}"), i as f64))).collect();
-        save(&pool, &Snapshot { day, taken_at: ist(2026, 11, 3, 15, 35), rows }).await.unwrap();
+        save(&pool, &Snapshot { day, taken_at: ist(2026, 11, 3, 15, 35), rows, asked: 452 }).await.unwrap();
         let loaded = load_latest(&pool).await.unwrap().unwrap();
         assert_eq!(loaded.day, day);
         assert_eq!(loaded.taken_at, ist(2026, 11, 3, 15, 35));
-        assert_eq!(loaded.rows.len(), 450);
+        assert_eq!((loaded.rows.len(), loaded.asked, loaded.partial()), (450, 452, true), "two keys got no close");
         assert_eq!(loaded.rows["nse_cm|7"], row("nse_cm|7", 7.0));
         let q = loaded.quote("nse_cm|7").unwrap();
         assert_eq!((q.ltp, q.source, q.as_of.as_deref()), (7.0, Source::Close, Some("2026-11-03 15:30")));
@@ -305,16 +351,21 @@ mod tests {
         let next = NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
         let mut rows = HashMap::new();
         rows.insert("nse_cm|7".to_string(), row("nse_cm|7", 8.0));
-        save(&pool, &Snapshot { day: next, taken_at: ist(2026, 11, 4, 15, 35), rows: rows.clone() }).await.unwrap();
+        save(&pool, &Snapshot { day: next, taken_at: ist(2026, 11, 4, 15, 35), rows: rows.clone(), asked: 1 }).await.unwrap();
         rows.insert("nse_cm|8".to_string(), row("nse_cm|8", 9.0));
-        save(&pool, &Snapshot { day: next, taken_at: ist(2026, 11, 4, 15, 36), rows }).await.unwrap();
+        save(&pool, &Snapshot { day: next, taken_at: ist(2026, 11, 4, 15, 36), rows, asked: 2 }).await.unwrap();
         let loaded = load_latest(&pool).await.unwrap().unwrap();
-        assert_eq!((loaded.day, loaded.rows.len()), (next, 2));
+        assert_eq!((loaded.day, loaded.rows.len(), loaded.partial()), (next, 2, false));
         assert_eq!(loaded.rows["nse_cm|7"].ltp, 8.0);
-        // Pruning drops the older day only.
+        // Pruning drops the older day only, its sweep row with it.
         assert_eq!(prune(&pool, next).await.unwrap(), 450);
         assert_eq!(prune(&pool, next).await.unwrap(), 0);
+        let days: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM quote_eod_days").fetch_one(&pool).await.unwrap();
+        assert_eq!(days, 1);
         assert_eq!(load_latest(&pool).await.unwrap().unwrap().rows.len(), 2);
+        // A day saved before `quote_eod_days` existed counts as complete.
+        sqlx::query("DELETE FROM quote_eod_days").execute(&pool).await.unwrap();
+        assert!(!load_latest(&pool).await.unwrap().unwrap().partial());
         pool.close().await;
     }
 }

@@ -61,9 +61,12 @@ const RULES: &[Rule] = &[
     rule(On::Read, "/api/v2/status", Access::SignedIn),
     rule(On::Read, "/api/execute/stream", Access::SignedIn),
     rule(On::Read, "/api/market/*", Access::SignedIn),
-    // The instrument search and its quotes (behind the `search` flag).
+    // The instrument search and its quotes (behind the `search` flag). The
+    // status page is the owner's: it carries the hub's error text, call
+    // times and the catalog's paths — diagnostics, not market data.
     rule(On::Read, "/api/v2/search", Access::SignedIn),
     rule(On::Read, "/api/v2/quotes", Access::SignedIn),
+    rule(On::Read, "/api/v2/instruments/status", Access::Admin),
     rule(On::Read, "/api/v2/instruments/*", Access::SignedIn),
     // A user's own paper portfolio.
     rule(On::Any, "/api/v2/me/*", Access::PhoneUser),
@@ -210,7 +213,7 @@ mod tests {
         (GET, "/api/v2/candles/stream", Access::SignedIn),
         (GET, "/api/v2/search", Access::SignedIn),
         (GET, "/api/v2/quotes", Access::SignedIn),
-        (GET, "/api/v2/instruments/status", Access::SignedIn),
+        (GET, "/api/v2/instruments/status", Access::Admin),
         (GET, "/api/v2/instruments/nse_cm:2885", Access::SignedIn),
         (GET, "/api/v2/instruments/nse_cm:Nifty%2050", Access::SignedIn),
         (GET, "/api/v2/me/desk", Access::PhoneUser),
