@@ -92,12 +92,14 @@ impl Snapshot {
     }
 }
 
-/// Whether the market is open at `now`: the paper loop's rule
-/// (`paper::engine`) — an admin-set special session (`shared_domain::
+/// Whether the market is open at `now`, in the shape of the paper loop's rule
+/// (`paper::engine`): an admin-set special session (`shared_domain::
 /// in_special_session_at`, Muhurat trading, even on a holiday or a Sunday),
-/// or the regular 09:15-15:40 weekday hours on a day that is not an
-/// exchange holiday, from the calendar the paper loop and the desk read
-/// (`telegram_ingester::parser::is_trading_holiday`).
+/// or the regular weekday hours on a day that is not an exchange holiday,
+/// from the calendar the paper loop and the desk read
+/// (`telegram_ingester::parser::is_trading_holiday`). One difference: the
+/// regular close here is `shared_domain`'s 15:40 (the hub's 15:35 sweep
+/// depends on it), while the paper loop still closes its own window at 15:30.
 pub fn open_at(now: DateTime<FixedOffset>) -> bool {
     shared_domain::in_special_session_at(now)
         || (shared_domain::is_regular_market_hours_at(now) && !telegram_ingester::parser::is_trading_holiday(now.date_naive()))
