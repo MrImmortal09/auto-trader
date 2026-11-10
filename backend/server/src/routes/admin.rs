@@ -197,13 +197,14 @@ pub async fn delete_user_handler(State(state): State<AppState>, Path(id): Path<i
         Ok(tx) => tx,
         Err(e) => return server_error("remove the user", e),
     };
-    // A user's paper portfolio goes with them: a later user given the same id
-    // must start from nothing.
+    // A user's paper portfolio and watchlists go with them: a later user
+    // given the same id must start from nothing.
     let done = async {
         sqlx::query("DELETE FROM otp_codes WHERE phone = ?").bind(&current.phone).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM user_trades WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM user_positions WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM user_wallets WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
+        crate::watchlists::delete_all(&mut *tx, id).await?;
         sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&mut *tx).await?;
         Ok::<(), sqlx::Error>(())
     }

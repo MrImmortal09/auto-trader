@@ -23,6 +23,7 @@ mod quotes;
 mod routes;
 mod scrip_files;
 mod system;
+mod watchlists;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1329,6 +1330,15 @@ async fn main() {
         .route("/api/v2/quotes",                    get(routes::v2::quotes_handler))
         .route("/api/v2/instruments/status",        get(routes::v2::instruments_status_handler))
         .route("/api/v2/instruments/:id",           get(routes::v2::instrument_handler))
+        // Each signed-in person's watchlists, behind the `watchlists` flag —
+        // see `routes::v2::watchlists`.
+        .route("/api/v2/watchlists",                get(routes::v2::watchlists::list_handler)
+                                                   .post(routes::v2::watchlists::create_handler))
+        .route("/api/v2/watchlists/:id",            axum::routing::patch(routes::v2::watchlists::patch_handler)
+                                                   .delete(routes::v2::watchlists::delete_handler))
+        .route("/api/v2/watchlists/:id/items",      axum::routing::put(routes::v2::watchlists::put_items_handler))
+        .route("/api/v2/watchlists/:id/items/:key", post(routes::v2::watchlists::add_item_handler)
+                                                   .delete(routes::v2::watchlists::remove_item_handler))
         .route("/api/v2/me/desk",                   get(routes::v2::me::desk_handler))
         .route("/api/v2/me/history",                get(routes::v2::me::history_handler))
         .route("/api/v2/me/marks",                  get(routes::v2::me::marks_handler))

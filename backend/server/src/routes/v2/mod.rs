@@ -11,6 +11,7 @@ pub mod me;
 pub mod positions;
 pub mod scalp;
 pub mod system;
+pub mod watchlists;
 
 pub use candles::{candles_handler, candles_stream_handler};
 pub use desk::{desk_handler, feed_handler, status_handler};

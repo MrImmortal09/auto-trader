@@ -68,6 +68,11 @@ const RULES: &[Rule] = &[
     rule(On::Read, "/api/v2/quotes", Access::SignedIn),
     rule(On::Read, "/api/v2/instruments/status", Access::Admin),
     rule(On::Read, "/api/v2/instruments/*", Access::SignedIn),
+    // Each signed-in person's own watchlists (behind the `watchlists`
+    // flag), the admin's included: they are keyed by user id in the
+    // routes, and `PhoneUser` would refuse the admin.
+    rule(On::Any, "/api/v2/watchlists", Access::SignedIn),
+    rule(On::Any, "/api/v2/watchlists/*", Access::SignedIn),
     // A user's own paper portfolio.
     rule(On::Any, "/api/v2/me/*", Access::PhoneUser),
 ];
@@ -222,6 +227,13 @@ mod tests {
         (GET, "/api/v2/instruments/status", Access::Admin),
         (GET, "/api/v2/instruments/nse_cm:2885", Access::SignedIn),
         (GET, "/api/v2/instruments/nse_cm:Nifty%2050", Access::SignedIn),
+        (GET, "/api/v2/watchlists", Access::SignedIn),
+        (POST, "/api/v2/watchlists", Access::SignedIn),
+        (PATCH, "/api/v2/watchlists/3", Access::SignedIn),
+        (DELETE, "/api/v2/watchlists/3", Access::SignedIn),
+        (PUT, "/api/v2/watchlists/3/items", Access::SignedIn),
+        (POST, "/api/v2/watchlists/3/items/nse_cm%7C2885", Access::SignedIn),
+        (DELETE, "/api/v2/watchlists/3/items/idx%7CNIFTY%2050", Access::SignedIn),
         (GET, "/api/v2/me/desk", Access::PhoneUser),
         (GET, "/api/v2/me/history", Access::PhoneUser),
         (GET, "/api/v2/me/marks", Access::PhoneUser),
@@ -251,6 +263,7 @@ mod tests {
         assert_eq!(required(&GET, "/api/market"), Access::Admin);
         assert_eq!(required(&GET, "/api/v2/me"), Access::Admin);
         assert_eq!(required(&GET, "/api/v2/instruments"), Access::Admin);
+        assert_eq!(required(&GET, "/api/v2/watchlistsx"), Access::Admin);
         // The search routes are read-only: a write to them is nobody's.
         assert_eq!(required(&POST, "/api/v2/search"), Access::Admin);
         assert_eq!(required(&PUT, "/api/v2/quotes"), Access::Admin);

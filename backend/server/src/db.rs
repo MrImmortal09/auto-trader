@@ -443,6 +443,36 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    // Each signed-in person's watchlists (`watchlists`, `/api/v2/watchlists`):
+    // up to five named lists of up to fifty price-map keys, kept by user id
+    // (the admin is a `users` row too). Nothing here is read by the engine;
+    // a list never touches the feed. New tables, so existing databases keep
+    // working. The caps are enforced by the conditional inserts in
+    // `watchlists`, never by a trigger, so a row written by hand is never
+    // refused at start-up.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_watchlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_watchlists_user ON user_watchlists (user_id, position)")
+        .execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_watchlist_items (
+            watchlist_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (watchlist_id, key)
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_watchlist_items_order ON user_watchlist_items (watchlist_id, position)")
+        .execute(&pool).await.unwrap();
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS special_sessions (
             date TEXT PRIMARY KEY,
@@ -1663,12 +1693,12 @@ mod tests {
         let pool = init_db(&db.url()).await;
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: true, chart_stops: false, search: false },
+            FeatureFlags { index_options_only: true, chart_stops: false, search: false, watchlists: false },
         );
-        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true), ("search", true)]).await.unwrap();
+        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true), ("search", true), ("watchlists", true)]).await.unwrap();
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: false, chart_stops: true, search: true },
+            FeatureFlags { index_options_only: false, chart_stops: true, search: true, watchlists: true },
         );
         pool.close().await;
     }

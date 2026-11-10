@@ -22,7 +22,7 @@ pub mod search;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -501,6 +501,61 @@ impl Catalog {
             Err(e) => tracing::error!(error = %e, "Instrument catalog: key lookup failed"),
         }
         known
+    }
+
+    /// The catalog's row for each of `keys` that names one, by the key as
+    /// given: a price-map key (`nse_cm|2885`, `idx|NIFTY 50`) or a row's id
+    /// (`nse_cm:2885`, `nse_cm:Nifty 50`). Equities and indices come from
+    /// the search list in memory, contracts by one primary-key lookup of
+    /// their ids; a price-map key is accepted only when it is the row's own
+    /// (`nse_cm|Nifty 50` names an index's virtual row but is not its key,
+    /// as in `known_keys`). A key with no row is simply absent from the
+    /// answer. What the watchlists check keys against and label rows with;
+    /// the row's `ws_key` is what they keep.
+    pub async fn rows_for_keys(&self, keys: &[String]) -> HashMap<String, SearchRow> {
+        let index = self.index();
+        let mut found: HashMap<String, SearchRow> = HashMap::new();
+        let mut ids: Vec<String> = Vec::new();
+        for key in keys {
+            if found.contains_key(key) {
+                continue;
+            }
+            if let Some(row) = index.by_ws_key(key).and_then(|u| cash_row(u, Tier::Exact)) {
+                found.insert(key.clone(), SearchRow { tier: None, ..row });
+            } else if let Some((segment, token)) = key.split_once('|') {
+                if !segment.is_empty() && !token.is_empty() {
+                    ids.push(format!("{segment}:{token}"));
+                }
+            } else if key.split_once(':').is_some_and(|(segment, token)| !segment.is_empty() && !token.is_empty()) {
+                ids.push(key.clone());
+            }
+        }
+        let Some(pool) = &self.pool else { return found };
+        if ids.is_empty() {
+            return found;
+        }
+        ids.sort();
+        ids.dedup();
+        let sql = format!("{SELECT_ROW} WHERE id IN ({})", vec!["?"; ids.len()].join(","));
+        let mut query = sqlx::query_as::<_, DbRow>(&sql);
+        for id in &ids {
+            query = query.bind(id);
+        }
+        match query.fetch_all(pool).await {
+            Ok(rows) => {
+                let rows: Vec<SearchRow> = rows.into_iter().map(|r| r.into_row(&index)).collect();
+                for key in keys {
+                    if found.contains_key(key) {
+                        continue;
+                    }
+                    if let Some(row) = rows.iter().find(|r| r.ws_key == *key || r.id == *key) {
+                        found.insert(key.clone(), row.clone());
+                    }
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "Instrument catalog: rows lookup failed"),
+        }
+        found
     }
 
     /// The instrument with `id` (`<segment>:<token>`), with its underlying's
