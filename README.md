@@ -348,7 +348,7 @@ Expected behavior:
 - Kotak bridge starts only after valid Kotak login tokens exist
 - Telegram auth state is stored in `session.json`
 
-### 5. Run it under tmux, and keep it updated with `update.sh`
+### 5. Run it under tmux; GitHub Actions deploys every release
 
 This project runs the backend in the foreground of a dedicated `tmux` pane rather than under systemd, so a live trading process is never silently backgrounded or auto-restarted mid-position without a human noticing:
 
@@ -358,11 +358,13 @@ tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server-*-x86_64-unknown-lin
 tmux attach -t 0
 ```
 
-Session `0`, window `0` (i.e. pane `0:0`) is what `update.sh` restarts by default — using the exact names above means it works with no edits. If you'd rather use a different session/window name, update `TMUX_PANE` at the top of `backend/server/update.sh` to match.
+Session `0`, window `0` (i.e. pane `0:0`) is what the deploy workflow restarts — using the exact names above means it works with no edits. If you'd rather use a different session/window name, change `PANE` in `.github/workflows/deploy.yml` to match.
 
-`backend/server/update.sh` (already in the repo) handles subsequent updates: it's what `POST /api/update_server` spawns, or you can run it by hand. It syncs `origin/main`, downloads the newest release binary, backs up the binary that's currently running, swaps it in, restarts the `tmux` pane, and health-checks `/api/health` — rolling back to the backup automatically if the new binary doesn't come up healthy. All output goes to `/tmp/update.log` on the VM.
+Updates are deployed by GitHub Actions. Every push to `main` builds a release (`release-server.yml`, version `0.1.<run number>`) and then runs `deploy.yml`, at any time of day. Over SSH it starts the deploy detached on the VM (a dropped connection can't stop it halfway) and streams its log. Before anything stops, it downloads the release's binary, checks it is a Linux binary whose SHA-256 matches GitHub's, stages it, backs up the one running and syncs `~/auto-trader` to the release's tag (the Kotak bridge is plain JS read at spawn). Then it stops the server (Ctrl-C in its `tmux` pane, then SIGTERM, then SIGKILL, and waits for port 8080 to be free), swaps the binary in with an atomic rename, starts it (making the `tmux` session again if a reboot lost it), and waits up to 180 s for `/api/health` to answer and `/api/version` to report the new version — rolling back the binary and the source if it doesn't, or at once if the process dies. Only one deploy runs at a time. The engine is down from the stop until the new server answers: a few seconds, up to a minute or two when it restores the Kotak session and downloads the Scrip Master first — open positions included. Run **Deploy server** from the Actions tab to deploy again, or to go back to an older release by its tag. On the VM, each run's output is appended to `/tmp/deploy.log`.
 
-If you'd rather run under systemd with auto-restart-on-crash instead of tmux, that's a reasonable alternative for a less hands-on setup — just be aware `update.sh` as written assumes tmux, so you'd need to adapt its stop/start steps to `systemctl restart` first.
+The deploy needs four repository secrets: `ORACLE_VM_HOST`, `ORACLE_VM_USER`, `ORACLE_VM_SSH_KEY` (a key used only for deploys, its public half in the VM's `~/.ssh/authorized_keys`) and `ORACLE_VM_FINGERPRINT` (the VM's host key, `ssh-keyscan -t ed25519 <host> | ssh-keygen -lf -`, the `SHA256:…` part). `deploy-test.yml` runs the deploy script against a simulated VM on every pull request that changes it.
+
+If you'd rather run under systemd with auto-restart-on-crash instead of tmux, that's a reasonable alternative for a less hands-on setup — just be aware the deploy workflow as written assumes tmux, so you'd need to adapt its stop/start steps to `systemctl restart` first.
 
 ### 6. Optional: expose backend through Nginx
 
@@ -475,7 +477,7 @@ These files should remain on persistent disk on the VM, inside `backend/`:
 - `kotak-bridge/node_modules/`
 - `data/` (`DATA_DIR`): the three Scrip Master CSVs the last download saved (`data/scrip/<segment>.csv`) and the instrument catalog built from them with its close snapshot (`data/instruments.db` + `-wal`/`-shm`). Gitignored, and **rebuildable**: the next Kotak login downloads the CSVs again and the catalog is rebuilt from them, so it is safe to delete (it costs one download, and search is empty until then) and need not be copied to a fresh VM. The engine never reads it: its Scrip Master comes from the login's download alone.
 
-`update.sh` already keeps one previous binary as `backend/.server_prev` for rollback and prunes older ones — you don't need to manage binary versions by hand. If you ever move to a fresh VM, copy over `trades.db*`, `session.json`, and `.env` from `backend/` before starting the server there.
+The deploy workflow keeps the previous binary (and a copy as `backend/.server_prev`) for rollback and prunes older ones — you don't need to manage binary versions by hand. If you ever move to a fresh VM, copy over `trades.db*`, `session.json`, and `.env` from `backend/` before starting the server there.
 
 ### 11. Day one of the instrument search: what to check
 
@@ -535,7 +537,7 @@ The server writes its log to its terminal: on the VM, the `tmux` pane `0:0` it r
 tmux attach -t 0      # watch the live log; detach with Ctrl-b then d
 ```
 
-`update.sh` keeps its own log at `/tmp/update.log`. The engine's events also reach the dashboard's log terminal and the `system_logs` table in `trades.db`. **The admin's code is not in any of these logs**: they only say `Admin sign-in code also written on the server`, so the code doesn't travel wherever the log is shipped (Grafana Alloy, for example). Only `admin-otp.log` holds it.
+Deploys append their output to `/tmp/deploy.log` on the VM (and show it in the Actions run). The engine's events also reach the dashboard's log terminal and the `system_logs` table in `trades.db`. **The admin's code is not in any of these logs**: they only say `Admin sign-in code also written on the server`, so the code doesn't travel wherever the log is shipped (Grafana Alloy, for example). Only `admin-otp.log` holds it.
 
 ---
 
@@ -775,7 +777,7 @@ The **Daily Reports** page provides an aggregated view of trading performance by
 | `GET` | `/api/v2/me/history?range=&group=` · `/me/marks` · `/me/positions` · `/me/activity` | The user's closed calls (`/api/v2/history`'s shape), today's fills for the charts, open positions, and the last 100 things that happened to them (in memory) |
 | `POST` | `/api/v2/me/buy` | `{trading_symbol, lots}`: a paper buy, filled at once at the live price — the same checks as `/api/execute/buy` but the kill switch, plus 10 open contracts per user, 40 across all users, and no buy of a contract being squared off. Charges are Kotak's with ₹20 brokerage a leg; the wallet never goes below zero |
 | `POST` | `/api/v2/me/positions/:id/sell` · `/close` · `/api/v2/me/exit-all` | `{lots}` / all of one / all of them, at the live price (from the last 10 s), 09:15–15:30 IST. Never more than is held |
-| `PATCH` | `/api/v2/me/positions/:id` | Chart `stop` and `target`, as `/api/v2/positions/:id` (not gated by `chart_stops`). Checked every 500 ms; a crossed level sells everything at a fresh price. An expiring position is sold from 15:29:30 IST |
+| `PATCH` | `/api/v2/me/positions/:id` | Chart `stop` and `target`, as `/api/v2/positions/:id` (not gated by `chart_stops`). Checked every 500 ms; a crossed level sells everything at a fresh price. An expiring position is sold at 15:38 IST on its expiry day |
 | `POST` | `/api/v2/me/reset` | Start over with ₹10,00,000 and an empty history (only when nothing is open) |
 
 ---

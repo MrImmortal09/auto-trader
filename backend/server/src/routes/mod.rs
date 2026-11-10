@@ -10,7 +10,7 @@ pub mod positions;
 
 pub use portfolio::{webhook_handler, sse_logs_handler, portfolio_handler, logs_history_handler};
 pub use positions::{positions_handler, delete_position_handler, patch_position_handler, close_position_handler, sell_position_handler, reconcile_preview_handler, reconcile_apply_handler, prices_handler, scrip_search_handler, scrip_download_handler};
-pub use settings::{get_settings_handler, post_settings_handler, get_wallet_balance_handler, post_wallet_balance_handler, post_clear_database_handler, post_update_server_handler};
+pub use settings::{get_settings_handler, post_settings_handler, get_wallet_balance_handler, post_wallet_balance_handler, post_clear_database_handler};
 pub use auth_kotak::{kotak_login_handler, kotak_auto_login_handler, kotak_status_handler, kotak_scrip_raw_handler, kotak_scrip_json_handler, reset_creds, system_status, disconnect_kotak};
 pub use auth_telegram::{
     telegram_request_code_handler, telegram_submit_code_handler,
@@ -24,8 +24,10 @@ pub mod auth_phone;
 pub use auth_phone::{otp_request_handler, otp_verify_handler, me_handler};
 pub mod admin;
 pub use admin::{list_users_handler, create_user_handler, patch_user_handler, delete_user_handler};
+pub mod admin_data;
 pub mod admin_paper;
 pub mod admin_report;
+pub mod admin_sessions;
 pub mod market;
 pub use market::{market_indicator_handler, market_live_handler, market_option_chain_handler, market_trend_handler};
 pub mod kill_switch;

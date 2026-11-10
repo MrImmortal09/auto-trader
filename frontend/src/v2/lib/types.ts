@@ -1,6 +1,10 @@
 // What the v2 endpoints answer — mirrors backend/server/src/desk.rs and
 // history.rs. v1's own types stay in src/types.ts.
 
+import type { ChartLevels } from '../../types';
+
+export type { ChartLevel, ChartLevels, ChartTarget } from '../../types';
+
 export type Mode = 'PAPER' | 'LIVE';
 export type Tone = 'profit' | 'loss' | 'neutral';
 
@@ -10,15 +14,6 @@ export interface Outcome {
   tone: Tone;
 }
 
-export interface ChartLevel {
-  price: number;
-  trigger: 'premium' | 'index';
-}
-
-export interface ChartLevels {
-  stop: ChartLevel | null;
-  target: ChartLevel | null;
-}
 
 export interface Source {
   kind: 'telegram' | 'scalp' | 'other';
@@ -246,6 +241,20 @@ export interface AdminUser {
   paper: AdminPaper | null;
 }
 
+/** One special trading session (e.g. Diwali Muhurat). Times are IST `HH:MM`. */
+export interface SpecialSession {
+  date: string;
+  start: string;
+  end: string;
+}
+
+/** `GET /api/admin/special-sessions` */
+export interface SpecialSessionsAnswer {
+  sessions: SpecialSession[];
+  today: string;
+  active: boolean;
+}
+
 /** A user's paper portfolio at a glance, on the Admin page. */
 export interface AdminPaper {
   balance: number;
@@ -290,6 +299,136 @@ export interface AdminTradesAnswer {
   count: number;
   /** The P&L of every sell in the range. */
   realized: number;
+}
+
+/** Count, mean, median and 95th percentile of one latency, in ms. */
+export interface LatencySummary {
+  n: number;
+  mean: number;
+  p50: number;
+  p95: number;
+}
+
+export interface LatencyFigures {
+  /** Upstox's tick against the exchange's time of the trade. */
+  upstox_delay: LatencySummary | null;
+  /** Kotak's tick against the same trade's exchange time (from Upstox). */
+  kotak_delay: LatencySummary | null;
+  /** How much sooner Kotak had the price; negative when Upstox was first. */
+  kotak_lead: LatencySummary | null;
+}
+
+export type LatencyClass = 'index' | 'future' | 'position';
+
+/** How late each feed's prices arrive (`GET /api/admin/latency`). */
+export interface LatencyAnswer {
+  status: 'not_configured' | 'market_closed' | 'streaming';
+  /** The IST day the figures are for. */
+  day: string | null;
+  upstox_error: string | null;
+  /** Kotak's feed is connected and ticked in the last 10 s. */
+  kotak_streaming: boolean;
+  window_s: number;
+  classes: { class: LatencyClass; label: string; minute: LatencyFigures; day: LatencyFigures }[];
+  instruments: {
+    label: string;
+    class: LatencyClass;
+    upstox_key: string;
+    kotak_key: string;
+    upstox_age_ms: number | null;
+    kotak_age_ms: number | null;
+    minute: LatencyFigures;
+    day: LatencyFigures;
+  }[];
+  kotak_lagged: number;
+}
+
+/** One LIVE order's timing (`GET /api/admin/order-timings`). Times are Unix
+ * ms on the server's clock unless named otherwise. */
+export interface OrderTimingRow {
+  order_no: string | null;
+  trading_symbol: string | null;
+  /** `B` / `S`. */
+  side: string | null;
+  /** `MKT`, `L`, `SL`, `SL-M`. */
+  order_type: string | null;
+  qty: number | null;
+  price: number | null;
+  trigger_price: number | null;
+  sent_at_ms: number | null;
+  /** When Kotak answered the send. */
+  replied_at_ms: number | null;
+  /** Why Kotak refused the send. */
+  error: string | null;
+  /** From the push stream: `open`, `complete`, `rejected`, `cancelled`, … */
+  status: string | null;
+  filled_qty: number | null;
+  avg_price: number | null;
+  reject_reason: string | null;
+  first_update_ms: number | null;
+  accepted_at_ms: number | null;
+  first_fill_ms: number | null;
+  filled_at_ms: number | null;
+  /** Kotak's own receive time of the latest update, epoch ns. */
+  kotak_received_ns: number | null;
+  /** The exchange's broadcast time, epoch seconds. */
+  exchange_epoch_s: number | null;
+  /** The exchange's confirmation time, as Kotak writes it. */
+  exchange_confirm: string | null;
+  order_time: string | null;
+}
+
+export interface OrderTimingAnswer {
+  day: string;
+  push: {
+    /** `KOTAK_ORDER_STREAM=on` on the server. */
+    enabled: boolean;
+    connected: boolean;
+    style: 'json' | 'raw' | null;
+    last_event_ms: number | null;
+    error: string | null;
+    updates: number;
+  };
+  /** Newest first. */
+  orders: OrderTimingRow[];
+}
+
+/** What the server's database keeps (`GET /api/admin/data`). */
+export interface StoredData {
+  /** The database file, its write-ahead log aside. */
+  db_bytes: number;
+  tables: StoredTable[];
+  /** Indices first, each followed by its futures by expiry. */
+  archive: ArchivedSymbol[];
+  /** Upstox is configured, so the daily archive sweep runs. */
+  archiving: boolean;
+}
+
+export interface StoredTable {
+  table: string;
+  label: string;
+  what: string;
+  /** "Forever", "30 days", "Today". */
+  kept: string;
+  rows: number;
+  /** IST `YYYY-MM-DD HH:MM:SS` of the oldest and newest row. */
+  first: string | null;
+  last: string | null;
+}
+
+/** One index or future in the candle archive. */
+export interface ArchivedSymbol {
+  /** `NIFTY`, or `NIFTY:FUT:2026-11-24`. */
+  symbol: string;
+  index: string;
+  /** A future's expiry; null for the index. */
+  expiry: string | null;
+  first_day: string;
+  last_day: string;
+  days: number;
+  candles: number;
+  /** Candles that traded; an index never does. */
+  with_volume: number;
 }
 
 /** One open paper position (`GET /api/admin/positions`). */

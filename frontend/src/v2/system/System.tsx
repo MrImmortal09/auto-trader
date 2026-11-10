@@ -113,9 +113,9 @@ function Details({ serverBase, t, marketOpen, compact }: { serverBase: string; t
           {grid('grid-cols-2', <><EndpointCard title="Kotak REST by endpoint" rows={s.kotak_endpoints} keyLabel="Endpoint" errorLabel="Not 2xx" /><EndpointCard title="Dashboard API by route" rows={s.http_routes} keyLabel="Route" errorLabel="5xx" /></>)}
         </>
       ) : (
-        <p className="type-body text-fg-muted">Waiting for the first sample from the server…</p>
+        <p className="type-body text-fg-subtle">Waiting for the first sample from the server…</p>
       )}
-      <p className="type-caption text-fg-muted">The same figures are at /metrics in Prometheus text format, for any outside scraper.</p>
+      <p className="type-caption text-fg-subtle">The same figures are at /metrics in Prometheus text format, for any outside scraper.</p>
     </>
   );
 }
@@ -137,7 +137,7 @@ export function System({ serverBase, desktop, health, marketOpen }: { serverBase
   if (!desktop && view === 'details') {
     return (
       <div className="flex flex-col gap-3 p-4">
-        <button type="button" onClick={() => setView('overview')} className="flex items-center gap-1 self-start type-label text-fg-muted hover:text-fg">
+        <button type="button" onClick={() => setView('overview')} className="flex items-center gap-1 self-start type-label text-fg-muted transition-colors duration-120 hover:text-fg">
           <ChevronLeft size={16} /> System
         </button>
         <h2 className="type-title text-fg">Server details</h2>
@@ -151,7 +151,7 @@ export function System({ serverBase, desktop, health, marketOpen }: { serverBase
     return (
       <div className="flex flex-col gap-3 p-4">
         <div className="flex items-center justify-between">
-          <button type="button" onClick={() => setView('overview')} className="flex items-center gap-1 type-label text-fg-muted hover:text-fg">
+          <button type="button" onClick={() => setView('overview')} className="flex items-center gap-1 type-label text-fg-muted transition-colors duration-120 hover:text-fg">
             <ChevronLeft size={16} /> System
           </button>
           <Button size="sm" icon={<Download size={14} />} onClick={() => downloadLog(log.lines)} disabled={log.lines.length === 0}>
@@ -167,7 +167,7 @@ export function System({ serverBase, desktop, health, marketOpen }: { serverBase
   if (!desktop) {
     return (
       <div className="flex flex-col gap-3 p-4">
-        <p className="type-caption text-fg-muted">{caption}</p>
+        <p className="type-caption text-fg-subtle tnum">{caption}</p>
         <div className="grid grid-cols-2 gap-3">{tiles(t, d, level, health, true)}</div>
         <Card title="Today">
           <CountRow label="Calls parsed" value={n(sig?.calls)} />
@@ -177,7 +177,7 @@ export function System({ serverBase, desktop, health, marketOpen }: { serverBase
         </Card>
         <CpuCard s={t.latest} history={t.history} height={64} />
         <MemoryCard s={t.latest} history={t.history} height={64} />
-        <section className="rounded-12 bg-panel p-4">
+        <section className="rounded-12 border border-line bg-panel p-4">
           <div className="flex items-center justify-between">
             <h3 className="type-title text-fg">Engine log</h3>
             <Button size="sm" kind="ghost" onClick={() => setView('log')}>
@@ -186,10 +186,10 @@ export function System({ serverBase, desktop, health, marketOpen }: { serverBase
           </div>
           <LogPreview lines={log.lines} count={5} />
         </section>
-        <button type="button" onClick={() => setView('details')} className="flex min-h-[60px] items-center gap-3 rounded-12 bg-panel px-4 py-3 text-left">
+        <button type="button" onClick={() => setView('details')} className="flex min-h-[60px] items-center gap-3 rounded-12 border border-line bg-panel px-4 py-3 text-left transition-colors duration-120 hover:bg-raised/40">
           <span className="min-w-0 flex-1">
             <span className="block type-body-strong text-fg">Server details</span>
-            <span className="mt-0.5 block type-caption text-fg-muted">Runtime, traffic, counts since start, connections, host, positions, latency</span>
+            <span className="mt-0.5 block type-caption text-fg-subtle">Runtime, traffic, counts since start, connections, host, positions, latency</span>
           </span>
           <ChevronRight size={16} className="shrink-0 text-fg-muted" />
         </button>
@@ -200,7 +200,7 @@ export function System({ serverBase, desktop, health, marketOpen }: { serverBase
   return (
     <div className="flex flex-col gap-4 p-6">
       <div className="flex items-center justify-between">
-        <p className="type-caption text-fg-muted">{caption}</p>
+        <p className="type-caption text-fg-subtle tnum">{caption}</p>
         <Button size="md" icon={<Download size={14} />} onClick={() => downloadLog(log.lines)} disabled={log.lines.length === 0}>
           Download log
         </Button>
@@ -233,7 +233,7 @@ export function System({ serverBase, desktop, health, marketOpen }: { serverBase
           <TickChart history={t.history} height={190} />
         </Card>
       </div>
-      <section className="rounded-12 bg-panel p-4">
+      <section className="rounded-12 border border-line bg-panel p-4">
         <EngineLog lines={log.lines} connected={log.connected} compact={false} maxHeight={560} />
       </section>
       <Details serverBase={serverBase} t={t} marketOpen={marketOpen} compact={false} />

@@ -101,7 +101,7 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
         return refuse(StatusCode::CONFLICT, "Kill switch is active — trading is halted");
     }
     if !execute::manual_buy_window_open() || trading_engine::is_entry_cutoff_passed() {
-        return refuse(StatusCode::CONFLICT, "Market is closed — manual buys run 09:15–15:30 IST");
+        return refuse(StatusCode::CONFLICT, execute::manual_buy_closed_message());
     }
     if !execute::feed_fresh() {
         return refuse(StatusCode::CONFLICT, "Price feed is stale — not buying blind");
@@ -122,10 +122,14 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
     };
     // The feed being alive says nothing about this contract: its own price
     // must be recent too, or the user is looking at a price that's gone.
-    if execute::contract_age_secs(&ws_key).is_none_or(|age| age > execute::MAX_CONTRACT_AGE_SECS) {
+    if execute::contract_age_secs(&ws_key).is_none_or(|age| age > execute::buy_max_age_secs(execute::SubPool::Owner)) {
         return refuse(
             StatusCode::CONFLICT,
-            format!("{}'s price hasn't updated in over {:.0} s — not buying blind", record.trading_symbol, execute::MAX_CONTRACT_AGE_SECS),
+            format!(
+                "{}'s price hasn't updated in over {:.0} min — not buying blind",
+                record.trading_symbol,
+                execute::buy_max_age_secs(execute::SubPool::Owner) / 60.0
+            ),
         );
     }
     let Some(strike) = record.normalized_strike() else {
@@ -200,7 +204,7 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
                 override_qty: Some(req.lots),
                 resolved_order: Some(record.order_template()),
                 resolved_expiry: Some(record.expiry_date),
-                ws_scrip_key: Some(ws_key),
+                ws_scrip_key: Some(ws_key.clone()),
                 tick_size: record.tick_size,
                 manual: true,
                 ..Default::default()
@@ -210,6 +214,12 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
     };
     let snapshot = positions.clone();
     drop(positions);
+    // The position's own subscription, as every position has: the ladder's
+    // band lets go of a strike once spot moves away, and a held contract's
+    // stop needs its ticks. Sent after the positions lock is let go.
+    if let Some(tx) = state.ws_tx.lock().await.clone() {
+        let _ = tx.send(json!({ "action": "subscribe", "scrips": ws_key }).to_string());
+    }
     persist_positions_snapshot(&state, &snapshot).await;
 
     let qty = req.lots * record.lot_size as i32;

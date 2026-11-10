@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Info } from 'lucide-react';
 import type { MonitoredPosition } from '../types';
 import { apiFetch } from '../lib/api';
-import { chartLevelLabel, fmt, instrumentLabel } from '../lib/format';
+import { chartLevelLabel, chartTargets, fmt, instrumentLabel, targetLotsLabel } from '../lib/format';
 import { useAuth } from '../context/AuthContext';
 import { QtyInput } from './QtyInput';
 import { SyncWithKotakButton } from './SyncWithKotakButton';
@@ -28,10 +28,10 @@ function stopLabel(p: MonitoredPosition): string {
 }
 
 function targetLabel(p: MonitoredPosition): string {
-  const target = p.chart?.target;
-  return target
-    ? `${chartLevelLabel(p.signal.instrument_name, p.signal.option_type, target, 'target')} (chart)`
-    : nextTargetLabel(p);
+  const targets = chartTargets(p.chart);
+  if (targets.length === 0) return nextTargetLabel(p);
+  const each = targets.map((t) => `${chartLevelLabel(p.signal.instrument_name, p.signal.option_type, t, 'target')}${t.lots == null && targets.length === 1 ? '' : ` × ${targetLotsLabel(t.lots)}`}`);
+  return `${each.join(' / ')} (chart)`;
 }
 
 // A range call (`PUTS 140-145`) is stored as `ABOVE 140` capped at

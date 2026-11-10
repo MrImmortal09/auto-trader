@@ -90,6 +90,9 @@ pub struct IndexLive {
     pub future_symbol: Option<String>,
     pub fut_ltp: Option<f64>,
     pub fut_vwap: Option<f64>,
+    /// The previous session's close, from Upstox's quote of the index: the
+    /// day's change when Kotak's feed has none.
+    pub prev_close: Option<f64>,
     /// IST `YYYY-MM-DD HH:MM:SS` of the last successful chain poll.
     pub updated_at: Option<String>,
     pub last_error: Option<String>,
@@ -195,13 +198,26 @@ const POLL_END_MINUTE: u32 = 15 * 60 + 31;
 /// download and parse do not land on top of the 09:15 open on the small VM.
 const FUTURES_REFRESH_START_MINUTE: u32 = 9 * 60;
 
-/// True on a weekday when the IST minute-of-day is within `start..=end`.
+/// True on a weekday when the IST minute-of-day is within `start..=end`,
+/// or on a special session date from 15 min before START (for futures refresh)
+/// or START (for quotes) through END+1.
 fn weekday_minute_between(start: u32, end: u32) -> bool {
     let now = shared_domain::now_ist();
+    let m = now.hour() * 60 + now.minute();
+    if let Some(session) = shared_domain::special_session_on(now.date_naive()) {
+        let session_start = if start == FUTURES_REFRESH_START_MINUTE {
+            session.start.saturating_sub(15)
+        } else {
+            session.start
+        };
+        let session_end = session.end + 1;
+        if (session_start..=session_end).contains(&m) {
+            return true;
+        }
+    }
     if matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
         return false;
     }
-    let m = now.hour() * 60 + now.minute();
     (start..=end).contains(&m)
 }
 
@@ -289,6 +305,16 @@ pub async fn run_poller(
                 HashMap::new()
             }
         };
+        // The indices' own quotes, for the previous close only: asked apart
+        // from the futures', so a failure here never costs the VWAP.
+        let index_keys: Vec<String> = INDICES.iter().map(|s| s.underlying_key.to_string()).collect();
+        let index_quotes = match client.quotes(&index_keys).await {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::debug!(error = %e, "Upstox index quote failed");
+                HashMap::new()
+            }
+        };
 
         for spec in &INDICES {
             let result = poll_index(&client, spec, today, &mut expiries).await;
@@ -296,6 +322,10 @@ pub async fn run_poller(
             let quote = fut.and_then(|f| quotes.get(&f.instrument_key));
             let fut_ltp = quote.map(|q| q.last_price).filter(|v| *v > 0.0);
             let fut_vwap = quote.map(|q| q.average_price).filter(|v| *v > 0.0);
+            let prev_close = index_quotes
+                .get(spec.underlying_key)
+                .map(|q| q.last_price - q.net_change)
+                .filter(|c| c.is_finite() && *c > 0.0);
 
             match result {
                 Ok((expiry, rows, spot)) => {
@@ -344,6 +374,9 @@ pub async fn run_poller(
                     live.future_symbol = fut.map(|f| f.trading_symbol.clone());
                     live.fut_ltp = fut_ltp;
                     live.fut_vwap = fut_vwap;
+                    if prev_close.is_some() {
+                        live.prev_close = prev_close;
+                    }
                     live.updated_at = Some(ts.clone());
                     live.last_error = None;
                 }

@@ -28,6 +28,8 @@ use chrono::NaiveDate;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use shared_domain::{ChartLevel, ChartLevels, LevelTrigger};
+
+use crate::routes::v2::positions::{level_refusal, LevelsUpdate};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, MutexGuard};
 use trading_engine::ChargeBreakdown;
@@ -438,7 +440,7 @@ impl PaperDesk {
         let Some(price) = quote(&pos) else {
             return Err(Refusal::conflict(format!("{}'s price isn't live — not selling blind", pos.label())));
         };
-        self.sell_held(&mut book, user_id, &pos, qty, price, reason).await
+        self.sell_held(&mut book, user_id, &pos, qty, price, reason, &[]).await
     }
 
     /// Sell every position `user_id` holds at the price `quote` gives for
@@ -456,7 +458,7 @@ impl PaperDesk {
                 kept.push(format!("{}'s price isn't live — not selling blind", pos.label()));
                 continue;
             };
-            match self.sell_held(&mut book, user_id, &pos, pos.qty, price, "MANUAL_EXIT_ALL").await {
+            match self.sell_held(&mut book, user_id, &pos, pos.qty, price, "MANUAL_EXIT_ALL", &[]).await {
                 Ok(f) => sold.push(f),
                 Err(r) => kept.push(format!("{}: {}", pos.label(), r.message)),
             }
@@ -473,11 +475,36 @@ impl PaperDesk {
             .and_then(|l| l.iter().find(|p| p.id == id))
             .cloned()
             .ok_or_else(Refusal::not_found)?;
-        self.sell_held(&mut book, user_id, &pos, pos.qty, price, reason).await
+        self.sell_held(&mut book, user_id, &pos, pos.qty, price, reason, &[]).await
+    }
+
+    /// Sell the lots of `user_id`'s position `id`'s chart targets `ids` at
+    /// `price`, and drop those targets — the watch loop's partial exit. Only
+    /// targets still there count (one removed meanwhile sells nothing); a
+    /// position or targets already gone is a plain `not_found`.
+    pub async fn settle_targets(&self, user_id: i64, id: &str, ids: &[String], price: f64) -> Result<Filled, Refusal> {
+        let mut book = self.book.lock().await;
+        let pos = book
+            .get(&user_id)
+            .and_then(|l| l.iter().find(|p| p.id == id))
+            .cloned()
+            .ok_or_else(Refusal::not_found)?;
+        let still: Vec<_> = pos.chart.targets.iter().filter(|t| ids.contains(&t.id)).collect();
+        if still.is_empty() {
+            return Err(Refusal::not_found());
+        }
+        let qty = if still.iter().any(|t| t.lots.is_none()) {
+            pos.qty
+        } else {
+            still.iter().filter_map(|t| t.lots).fold(0, i32::saturating_add).saturating_mul(pos.lot_size)
+        };
+        self.sell_held(&mut book, user_id, &pos, qty, price, "CHART_TARGET", ids).await
     }
 
     /// Sell `qty` of `pos` (at most what it holds) at `price` (0 settles a
-    /// contract that was never priced, with no charges).
+    /// contract that was never priced, with no charges), dropping its chart
+    /// targets `sold_targets` in the same write.
+    #[allow(clippy::too_many_arguments)]
     async fn sell_held(
         &self,
         book: &mut Book,
@@ -486,6 +513,7 @@ impl PaperDesk {
         qty: i32,
         price: f64,
         reason: &'static str,
+        sold_targets: &[String],
     ) -> Result<Filled, Refusal> {
         let mut next = book.get(&user_id).cloned().unwrap_or_default();
         let Some(i) = next.iter().position(|p| p.id == pos.id) else {
@@ -501,6 +529,7 @@ impl PaperDesk {
             next.remove(i);
         } else {
             next[i].qty = held;
+            next[i].chart.take_targets(sold_targets);
         }
         let lots = if pos.lot_size > 0 { qty / pos.lot_size } else { qty };
         let leg = LegOut {
@@ -539,21 +568,15 @@ impl PaperDesk {
         })
     }
 
-    /// Set, clear or keep the chart stop and target of `user_id`'s position
-    /// `id` (`None` keeps a level, `Some(None)` clears it).
-    pub async fn set_levels(
-        &self,
-        user_id: i64,
-        id: &str,
-        stop: Option<Option<ChartLevel>>,
-        target: Option<Option<ChartLevel>>,
-    ) -> Result<PaperPosition, Refusal> {
+    /// Apply `update` to the chart stop and targets of `user_id`'s position
+    /// `id`: the position after, and the id of a target it set, if it set one.
+    pub async fn set_levels(&self, user_id: i64, id: &str, update: &LevelsUpdate) -> Result<(PaperPosition, Option<String>), Refusal> {
         let mut book = self.book.lock().await;
         let mut next = book.get(&user_id).cloned().unwrap_or_default();
         let Some(pos) = next.iter_mut().find(|p| p.id == id) else {
             return Err(Refusal::not_found());
         };
-        for level in stop.iter().chain(target.iter()).flatten() {
+        for level in update.new_levels() {
             if !(level.price.is_finite() && level.price > 0.0) {
                 return Err(Refusal::bad_request("a level's price must be a positive number"));
             }
@@ -561,31 +584,38 @@ impl PaperDesk {
                 return Err(Refusal::bad_request(format!("{} has no index feed to trigger on", pos.index)));
             }
         }
-        let before = pos.chart;
-        if let Some(stop) = stop {
-            pos.chart.stop = stop;
-        }
-        if let Some(target) = target {
-            pos.chart.target = target;
-        }
+        let before = pos.chart.clone();
+        let lots = pos.lots();
+        let target_id = update.apply(&mut pos.chart, lots).map_err(|r| {
+            let (status, message) = level_refusal(r);
+            Refusal { status, message }
+        })?;
         let pos = pos.clone();
         if pos.chart != before {
             self.write_snapshot(user_id, &next).await?;
             book.insert(user_id, next);
             drop(book);
-            let describe = |l: Option<ChartLevel>| match l {
-                Some(l) if l.trigger == LevelTrigger::Index => format!("{} on the index", l.price),
-                Some(l) => format!("₹{}", l.price),
-                None => "none".to_string(),
+            let describe = |l: &ChartLevel| match l.trigger {
+                LevelTrigger::Index => format!("{} on the index", l.price),
+                LevelTrigger::Premium => format!("₹{}", l.price),
             };
-            self.note(
-                user_id,
-                "levels",
-                Some(&pos.id),
-                format!("{}: stop {}, target {}", pos.label(), describe(pos.chart.stop), describe(pos.chart.target)),
-            );
+            let stop = pos.chart.stop.as_ref().map(describe).unwrap_or_else(|| "none".to_string());
+            let targets = if pos.chart.targets.is_empty() {
+                "none".to_string()
+            } else {
+                pos.chart
+                    .targets
+                    .iter()
+                    .map(|t| {
+                        let lots = t.lots.map(|n| format!("{n} lot(s)")).unwrap_or_else(|| "all left".to_string());
+                        format!("{} ({lots})", describe(&ChartLevel { price: t.price, trigger: t.trigger }))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            self.note(user_id, "levels", Some(&pos.id), format!("{}: stop {stop}, targets {targets}", pos.label()));
         }
-        Ok(pos)
+        Ok((pos, target_id))
     }
 
     /// Start `user_id`'s portfolio over: the wallet back to
@@ -863,7 +893,8 @@ pub(crate) mod tests {
         assert!(desk.open(2).await.is_empty());
         let at = |_: &PaperPosition| Some(100.0);
         assert_eq!(desk.sell(2, &a.position_id, None, "MANUAL_CLOSE", at).await.unwrap_err().status, StatusCode::NOT_FOUND);
-        assert_eq!(desk.set_levels(2, &a.position_id, Some(None), None).await.unwrap_err().status, StatusCode::NOT_FOUND);
+        let clear = LevelsUpdate { stop: Some(None), ..Default::default() };
+        assert_eq!(desk.set_levels(2, &a.position_id, &clear).await.unwrap_err().status, StatusCode::NOT_FOUND);
         let (sold, kept) = desk.exit_all(2, at).await;
         assert!(sold.is_empty() && kept.is_empty());
         assert_eq!(desk.open(1).await.len(), 1);
@@ -893,12 +924,15 @@ pub(crate) mod tests {
         let desk = PaperDesk::load(pool.clone(), Arc::new(DashMap::new())).await.unwrap();
         let a = desk.buy(4, &nifty(25_000.0, "PE"), 1, 100.0).await.unwrap();
         let stop = ChartLevel { price: 25_150.0, trigger: LevelTrigger::Index };
-        desk.set_levels(4, &a.position_id, Some(Some(stop)), None).await.unwrap();
+        let target = shared_domain::TargetEdit { id: None, price: 130.0, trigger: LevelTrigger::Premium, lots: Some(Some(1)) };
+        let update = LevelsUpdate { stop: Some(Some(stop)), set_target: Some(target), ..Default::default() };
+        desk.set_levels(4, &a.position_id, &update).await.unwrap();
         let before = desk.open(4).await;
         drop(desk);
         let again = PaperDesk::load(pool, Arc::new(DashMap::new())).await.unwrap();
         assert_eq!(again.open(4).await, before);
         assert_eq!(again.open(4).await[0].chart.stop, Some(stop));
+        assert_eq!(again.open(4).await[0].chart.targets[0].lots, Some(1));
         let (scrips, indices) = again.feed_keys().await;
         assert_eq!(scrips.into_iter().collect::<Vec<_>>(), ["nse_fo|25000PE"]);
         assert_eq!(indices.into_iter().collect::<Vec<_>>(), ["NIFTY"]);
@@ -909,11 +943,43 @@ pub(crate) mod tests {
         let (_db, desk) = desk("levels").await;
         let a = desk.buy(6, &nifty(25_000.0, "CE"), 1, 100.0).await.unwrap();
         let bad = ChartLevel { price: -1.0, trigger: LevelTrigger::Premium };
-        assert_eq!(desk.set_levels(6, &a.position_id, Some(Some(bad)), None).await.unwrap_err().status, StatusCode::BAD_REQUEST);
+        let update = LevelsUpdate { stop: Some(Some(bad)), ..Default::default() };
+        assert_eq!(desk.set_levels(6, &a.position_id, &update).await.unwrap_err().status, StatusCode::BAD_REQUEST);
+        // One lot held: a 2-lot target is more than that.
+        let too_many = shared_domain::TargetEdit { id: None, price: 130.0, trigger: LevelTrigger::Premium, lots: Some(Some(2)) };
+        let update = LevelsUpdate { set_target: Some(too_many), ..Default::default() };
+        assert_eq!(desk.set_levels(6, &a.position_id, &update).await.unwrap_err().status, StatusCode::CONFLICT);
         let gone = desk.settle(6, &a.position_id, 0.0, "EXPIRY_SQUAREOFF").await.unwrap();
         assert_eq!((gone.net_value, gone.held), (0.0, 0));
         assert_eq!(desk.activity(6)[0].kind, "sell");
         assert_eq!(desk.settle(6, &a.position_id, 0.0, "EXPIRY_SQUAREOFF").await.unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_target_sells_its_lots_and_leaves_the_rest_with_its_other_levels() {
+        let (_db, desk) = desk("target-lots").await;
+        let a = desk.buy(7, &nifty(25_000.0, "CE"), 4, 100.0).await.unwrap();
+        let edit = |price: f64, lots: Option<i32>| LevelsUpdate {
+            set_target: Some(shared_domain::TargetEdit { id: None, price, trigger: LevelTrigger::Premium, lots: Some(lots) }),
+            ..Default::default()
+        };
+        let (_, first) = desk.set_levels(7, &a.position_id, &edit(120.0, Some(2))).await.unwrap();
+        let (_, rest) = desk.set_levels(7, &a.position_id, &edit(140.0, None)).await.unwrap();
+        let (first, rest) = (first.unwrap(), rest.unwrap());
+        let stop = LevelsUpdate { stop: Some(Some(ChartLevel { price: 90.0, trigger: LevelTrigger::Premium })), ..Default::default() };
+        desk.set_levels(7, &a.position_id, &stop).await.unwrap();
+
+        let sold = desk.settle_targets(7, &a.position_id, std::slice::from_ref(&first), 121.0).await.unwrap();
+        assert_eq!((sold.qty, sold.held, sold.reason), (150, 150, Some("CHART_TARGET")));
+        let left = &desk.open(7).await[0];
+        assert_eq!(left.chart.targets.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [rest.as_str()]);
+        assert!(left.chart.stop.is_some());
+        // A target already sold sells nothing more.
+        assert_eq!(desk.settle_targets(7, &a.position_id, &[first], 121.0).await.unwrap_err().status, StatusCode::NOT_FOUND);
+        // "All left" sells whatever is still held.
+        let sold = desk.settle_targets(7, &a.position_id, &[rest], 141.0).await.unwrap();
+        assert_eq!((sold.qty, sold.held), (150, 0));
+        assert!(desk.open(7).await.is_empty());
     }
 
     #[tokio::test]

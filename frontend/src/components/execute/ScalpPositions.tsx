@@ -1,7 +1,7 @@
 import { LoaderCircle, Moon } from 'lucide-react';
 import type { ExecutePosition } from '../../types';
 import { contractLabel, fmtPnl } from '../../lib/execute';
-import { chartLevelLabel, fmt } from '../../lib/format';
+import { chartLevelLabel, chartTargets, fmt, targetLotsLabel } from '../../lib/format';
 import { PriceCell } from './PriceCell';
 
 function Tag({ tone, children }: { tone: 'scalp' | 'signal' | 'busy' | 'bad' | 'night'; children: React.ReactNode }) {
@@ -28,6 +28,7 @@ function PositionRow({ p, busy, nearClose, onExit, onSellLot }: {
 }) {
   const label = contractLabel(p.index, p.strike, p.option_type);
   const pnl = p.pnl;
+  const targets = chartTargets(p.chart);
   const pct = pnl != null && p.avg > 0 && p.qty > 0 ? (pnl / (p.avg * p.qty)) * 100 : null;
   const locked = busy || p.placing || p.exiting || p.halted;
   const canTrimLot = p.qty > p.lot_size && !locked;
@@ -58,15 +59,20 @@ function PositionRow({ p, busy, nearClose, onExit, onSellLot }: {
             </>
           )}
         </div>
-        {(p.chart?.stop || p.chart?.target) && (
+        {(p.chart?.stop || targets.length > 0) && (
           <div className="mt-0.5 text-[11px] font-mono-code tabular-nums flex flex-wrap items-center gap-x-1">
-            {p.chart.stop && (
+            {p.chart?.stop && (
               <span className="font-semibold text-error">stop {chartLevelLabel(p.index, p.option_type, p.chart.stop, 'stop')}</span>
             )}
-            {p.chart.stop && p.chart.target && <span className="mx-1 text-outline">·</span>}
-            {p.chart.target && (
-              <span className="font-semibold text-secondary">target {chartLevelLabel(p.index, p.option_type, p.chart.target, 'target')}</span>
-            )}
+            {targets.map((t, i) => (
+              <span key={t.id || i} className="contents">
+                {(p.chart?.stop || i > 0) && <span className="mx-1 text-outline">·</span>}
+                <span className="font-semibold text-secondary">
+                  target {chartLevelLabel(p.index, p.option_type, t, 'target')}
+                  {(t.lots != null || targets.length > 1) && ` × ${targetLotsLabel(t.lots)}`}
+                </span>
+              </span>
+            ))}
           </div>
         )}
       </div>

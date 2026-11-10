@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod entry_gate;
+pub mod special_session;
 pub mod telemetry;
+
+pub use special_session::*;
 
 /// Underlying index names this app treats as "index" options (vs. stock
 /// options, which fall back to `TradingConfig::other_lots`). Matched against
@@ -70,41 +73,6 @@ pub const MARKET_CLOSE_MINUTE: u32 = 40;
 pub const EXPIRY_SQUAREOFF_HOUR: u32 = 15;
 pub const EXPIRY_SQUAREOFF_MINUTE: u32 = 38;
 
-/// Whether the market is open right now: [`is_market_open_at`] for the
-/// current IST time.
-pub fn is_market_open() -> bool {
-    is_market_open_at(now_ist())
-}
-
-/// Whether the market is open at `now`: a weekday, 09:15 to 15:40 IST (the
-/// close exclusive). Weekends only — exchange holidays are the caller's
-/// (`telegram_ingester::parser::is_trading_holiday`, which the paper loop,
-/// the desk and the quote hub consult). Takes the time so callers can pass
-/// a fixed one in tests.
-pub fn is_market_open_at(now: DateTime<FixedOffset>) -> bool {
-    use chrono::Timelike;
-    use chrono::Datelike;
-
-    // Check if it is a weekday
-    let weekday = now.weekday();
-    if weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun {
-        return false;
-    }
-
-    let h = now.hour();
-    let m = now.minute();
-
-    // Market hours are 09:15 to 15:40 IST (close is exclusive — sharp cutoff)
-    if h < MARKET_OPEN_HOUR || (h == MARKET_OPEN_HOUR && m < MARKET_OPEN_MINUTE) {
-        return false;
-    }
-    if h > MARKET_CLOSE_HOUR || (h == MARKET_CLOSE_HOUR && m >= MARKET_CLOSE_MINUTE) {
-        return false;
-    }
-
-    true
-}
-
 /// Today's market close instant (15:40:00 IST), regardless of weekday.
 pub fn today_market_close_ist() -> DateTime<FixedOffset> {
     now_ist()
@@ -114,52 +82,6 @@ pub fn today_market_close_ist() -> DateTime<FixedOffset> {
         .and_local_timezone(ist_offset())
         .single()
         .expect("IST close time is unambiguous")
-}
-
-/// The next market open instant (09:15:00 IST) strictly in the future,
-/// skipping weekends. If today is a weekday and it's before 09:15, returns
-/// today's open; otherwise returns the next weekday's open.
-pub fn next_market_open_ist() -> DateTime<FixedOffset> {
-    use chrono::Datelike;
-    let now = now_ist();
-    let mut date = now.date_naive();
-
-    let today_open = date
-        .and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)
-        .expect("valid open time")
-        .and_local_timezone(ist_offset())
-        .single()
-        .expect("IST open time is unambiguous");
-
-    let is_weekday = date.weekday() != chrono::Weekday::Sat && date.weekday() != chrono::Weekday::Sun;
-    if is_weekday && now < today_open {
-        return today_open;
-    }
-
-    // Advance to the next weekday
-    loop {
-        date += ChronoDuration::days(1);
-        if date.weekday() != chrono::Weekday::Sat && date.weekday() != chrono::Weekday::Sun {
-            break;
-        }
-    }
-
-    date
-        .and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)
-        .expect("valid open time")
-        .and_local_timezone(ist_offset())
-        .single()
-        .expect("IST open time is unambiguous")
-}
-
-/// Duration to sleep until the next market open. Zero if the market is open right now.
-pub fn duration_until_market_open() -> std::time::Duration {
-    if is_market_open() {
-        return std::time::Duration::ZERO;
-    }
-    let now = now_ist();
-    let next_open = next_market_open_ist();
-    (next_open - now).to_std().unwrap_or(std::time::Duration::ZERO)
 }
 
 /// Duration to sleep until today's 15:40:00 IST market close. `None` if that
@@ -837,6 +759,11 @@ pub struct MonitoredPosition {
     /// exactly as before.
     #[serde(default, skip_serializing_if = "ChartLevels::is_empty")]
     pub chart: ChartLevels,
+    /// LIVE: the chart targets the sell now at the broker is for
+    /// (`pending_exit_reason` `CHART_TARGET`), out of `chart` while it
+    /// settles. An IOC that misses puts back what it didn't sell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chart_targets_selling: Vec<ChartTarget>,
 }
 
 /// What a chart stop or target watches.
@@ -858,60 +785,268 @@ pub struct ChartLevel {
     pub trigger: LevelTrigger,
 }
 
-/// A scalp's stop and target, set from a v2 chart
+/// Most chart targets one position may have.
+pub const MAX_CHART_TARGETS: usize = 5;
+
+/// One chart target: a level, and how many lots reaching it sells.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartTarget {
+    /// Names it in an edit, so a move never lands on a target that has
+    /// already sold and been replaced.
+    pub id: String,
+    pub price: f64,
+    pub trigger: LevelTrigger,
+    /// Lots it sells. `None` is "all left": whatever is still held when it
+    /// is reached, lots added later included — what a target was before
+    /// targets had lots.
+    #[serde(default)]
+    pub lots: Option<i32>,
+}
+
+impl ChartTarget {
+    pub fn new_id() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+    }
+}
+
+/// A scalp's stop and targets, set from a v2 chart
 /// (`PATCH /api/v2/positions/:id`, behind `FeatureFlags::chart_stops`).
-/// Reaching either sells the whole holding at market, through the same exit
-/// as any stop. Once set they protect the position until it closes, whatever
-/// the switch says later.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+/// The stop sells the whole holding at market, through the same exit as any
+/// stop; each target sells its own lots (see [`chart_hit`]). Once set they
+/// protect the position until it closes, whatever the switch says later.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ChartLevels {
-    #[serde(default)]
     pub stop: Option<ChartLevel>,
+    /// In the order they were set.
+    pub targets: Vec<ChartTarget>,
+}
+
+/// Also reads the one-target shape stored before targets had lots
+/// (`{stop, target}`), as an "all left" target, so a position open across
+/// the upgrade keeps its target.
+impl<'de> Deserialize<'de> for ChartLevels {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            #[serde(default)]
+            stop: Option<ChartLevel>,
+            #[serde(default)]
+            targets: Option<Vec<ChartTarget>>,
+            #[serde(default)]
+            target: Option<ChartLevel>,
+        }
+        let s = Stored::deserialize(d)?;
+        let targets = match (s.targets, s.target) {
+            (Some(targets), _) => targets,
+            (None, Some(t)) => vec![ChartTarget { id: ChartTarget::new_id(), price: t.price, trigger: t.trigger, lots: None }],
+            (None, None) => Vec::new(),
+        };
+        Ok(Self { stop: s.stop, targets })
+    }
+}
+
+/// One target set or moved from a chart. `id` names the target to move or
+/// resize; without one it is a new target. `lots`: left out keeps a moved
+/// target's lots, `None` is "all left", `Some(n)` is `n` lots.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetEdit {
     #[serde(default)]
-    pub target: Option<ChartLevel>,
+    pub id: Option<String>,
+    pub price: f64,
+    pub trigger: LevelTrigger,
+    #[serde(default, deserialize_with = "present_lots")]
+    pub lots: Option<Option<i32>>,
+}
+
+/// Tells `lots: null` from `lots` left out.
+fn present_lots<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<i32>>, D::Error> {
+    Option::<i32>::deserialize(d).map(Some)
+}
+
+/// Why a chart level edit can't be applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LevelRefusal {
+    /// The request itself is wrong (a bad price or lot count).
+    BadRequest(String),
+    /// It can't apply to the position as it stands now.
+    Conflict(String),
 }
 
 impl ChartLevels {
     pub fn is_empty(&self) -> bool {
-        self.stop.is_none() && self.target.is_none()
+        self.stop.is_none() && self.targets.is_empty()
+    }
+
+    /// Every level, stop first.
+    pub fn levels(&self) -> impl Iterator<Item = ChartLevel> + '_ {
+        self.stop.into_iter().chain(self.targets.iter().map(|t| ChartLevel { price: t.price, trigger: t.trigger }))
+    }
+
+    /// Set or move one target on a position holding `held_lots`; its id.
+    /// A target's lots may only use what no other target has: a change that
+    /// adds lots past the holding is refused. A move that keeps its lots, or
+    /// a resize down, is always taken — the holding may have shrunk below
+    /// the targets after a partial sell. Sums saturate, so no lot count can
+    /// wrap round to pass.
+    pub fn set_target(&mut self, edit: &TargetEdit, held_lots: i32) -> Result<String, LevelRefusal> {
+        if !(edit.price.is_finite() && edit.price > 0.0) {
+            return Err(LevelRefusal::BadRequest("a level's price must be a positive number".to_string()));
+        }
+        if let Some(Some(n)) = edit.lots {
+            if n < 1 {
+                return Err(LevelRefusal::BadRequest("a target sells at least 1 lot".to_string()));
+            }
+        }
+        let at = match edit.id.as_deref() {
+            Some(id) => Some(self.targets.iter().position(|t| t.id == id).ok_or_else(|| {
+                LevelRefusal::Conflict("that target is gone — it may just have sold".to_string())
+            })?),
+            None if self.targets.len() >= MAX_CHART_TARGETS => {
+                return Err(LevelRefusal::Conflict(format!("a trade can have at most {MAX_CHART_TARGETS} targets")));
+            }
+            None => None,
+        };
+        let lots = match (edit.lots, at) {
+            (Some(lots), _) => lots,
+            (None, Some(i)) => self.targets[i].lots,
+            (None, None) => None,
+        };
+        // The explicit lots this target sold before: a new one, or an "all
+        // left" one turned into a count, adds every lot it now asks for.
+        let before = at.and_then(|i| self.targets[i].lots).unwrap_or(0);
+        if let Some(n) = lots.filter(|n| *n > before) {
+            let others = self
+                .targets
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != at)
+                .filter_map(|(_, t)| t.lots)
+                .fold(0, i32::saturating_add);
+            let total = others.saturating_add(n);
+            if total > held_lots {
+                return Err(LevelRefusal::Conflict(format!("the targets would sell {total} lots — you hold {held_lots}")));
+            }
+        }
+        let target = ChartTarget {
+            id: at.map(|i| self.targets[i].id.clone()).unwrap_or_else(ChartTarget::new_id),
+            price: edit.price,
+            trigger: edit.trigger,
+            lots,
+        };
+        let id = target.id.clone();
+        match at {
+            Some(i) => self.targets[i] = target,
+            None => self.targets.push(target),
+        }
+        Ok(id)
+    }
+
+    /// Remove the target `id`; whether it was there.
+    pub fn remove_target(&mut self, id: &str) -> bool {
+        let before = self.targets.len();
+        self.targets.retain(|t| t.id != id);
+        self.targets.len() != before
+    }
+
+    /// Take the targets `ids` out (those still there), as a sell for them
+    /// goes out.
+    pub fn take_targets(&mut self, ids: &[String]) -> Vec<ChartTarget> {
+        let (taken, kept) = std::mem::take(&mut self.targets).into_iter().partition(|t| ids.contains(&t.id));
+        self.targets = kept;
+        taken
+    }
+
+    /// Put back what a sell for `taken` left unsold: `sold_lots` come off
+    /// the first targets, the rest return with what they still have to sell.
+    pub fn restore_unsold(&mut self, taken: Vec<ChartTarget>, sold_lots: i32) {
+        let (_, unsold) = split_target_lots(taken, sold_lots);
+        self.targets.extend(unsold);
     }
 }
 
-/// The exit reason once an option's `premium`, or its index's `index` value,
-/// has reached `chart`'s stop (checked first) or target. `option_type` is
+/// `taken` split at `lots`: the first `lots` lots, off the first targets
+/// (a target split in two keeps its id on both sides), and what is left of
+/// them. An "all left" target is never counted into the first part.
+pub fn split_target_lots(taken: Vec<ChartTarget>, lots: i32) -> (Vec<ChartTarget>, Vec<ChartTarget>) {
+    let (mut first, mut rest) = (Vec::new(), Vec::new());
+    let mut left = lots.max(0);
+    for t in taken {
+        let Some(n) = t.lots else {
+            rest.push(t);
+            continue;
+        };
+        let now = left.clamp(0, n);
+        left -= now;
+        if now > 0 {
+            first.push(ChartTarget { lots: Some(now), ..t.clone() });
+        }
+        if n > now {
+            rest.push(ChartTarget { lots: Some(n - now), ..t });
+        }
+    }
+    (first, rest)
+}
+
+/// What reaching a chart level sells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChartHit {
+    /// The whole holding: the stop, or targets that cover all of it.
+    All { reason: &'static str },
+    /// `lots` lots for the targets `ids`, leaving the rest held — reason
+    /// `CHART_TARGET`.
+    Part { lots: i32, ids: Vec<String> },
+}
+
+/// What a position holding `held_lots` sells now that an option's `premium`,
+/// or its index's `index` value, has reached `chart`'s stop (checked first)
+/// or targets. Targets reached together sell together; "all left" among
+/// them, or lots covering the holding, sell everything. `option_type` is
 /// `CE` or `PE`; anything else never reaches a level. Shared by the engine's
 /// scalps and the users' paper positions.
-pub fn chart_level_reached(option_type: Option<&str>, chart: &ChartLevels, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
+pub fn chart_hit(option_type: Option<&str>, chart: &ChartLevels, premium: Option<f64>, index: Option<f64>, held_lots: i32) -> Option<ChartHit> {
     let call = match option_type {
         Some(t) if t.eq_ignore_ascii_case("CE") => true,
         Some(t) if t.eq_ignore_ascii_case("PE") => false,
         _ => return None,
     };
-    let reached = |level: &ChartLevel, is_stop: bool| {
-        let (value, falling) = match level.trigger {
+    let reached = |price: f64, trigger: LevelTrigger, is_stop: bool| {
+        let (value, falling) = match trigger {
             // On its own premium a stop is reached falling and a target
             // rising, for a call and a put alike.
             LevelTrigger::Premium => (premium, is_stop),
             // On the index a call loses as it falls, a put as it rises.
             LevelTrigger::Index => (index, is_stop == call),
         };
-        value.is_some_and(|v| v > 0.0 && if falling { v <= level.price } else { v >= level.price })
+        value.is_some_and(|v| v > 0.0 && if falling { v <= price } else { v >= price })
     };
-    if chart.stop.as_ref().is_some_and(|l| reached(l, true)) {
-        return Some("CHART_STOP");
+    if chart.stop.as_ref().is_some_and(|l| reached(l.price, l.trigger, true)) {
+        return Some(ChartHit::All { reason: "CHART_STOP" });
     }
-    if chart.target.as_ref().is_some_and(|l| reached(l, false)) {
-        return Some("CHART_TARGET");
+    let hit: Vec<&ChartTarget> = chart.targets.iter().filter(|t| reached(t.price, t.trigger, false)).collect();
+    if hit.is_empty() {
+        return None;
     }
-    None
+    let mut lots = 0;
+    for t in &hit {
+        match t.lots {
+            Some(n) => lots = i32::saturating_add(lots, n.max(0)),
+            None => return Some(ChartHit::All { reason: "CHART_TARGET" }),
+        }
+    }
+    if lots >= held_lots {
+        return Some(ChartHit::All { reason: "CHART_TARGET" });
+    }
+    Some(ChartHit::Part { lots, ids: hit.iter().map(|t| t.id.clone()).collect() })
 }
 
 impl MonitoredPosition {
-    /// The exit reason once the option's `premium`, or its index's `index`
-    /// value, has reached this position's chart stop (checked first) or
-    /// target — see [`chart_level_reached`].
-    pub fn chart_level_hit(&self, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
-        chart_level_reached(self.signal.option_type.as_deref(), &self.chart, premium, index)
+    /// What this position sells now that the option's `premium`, or its
+    /// index's `index` value, has reached its chart stop or targets — see
+    /// [`chart_hit`]. `lot` is the contract's lot size.
+    pub fn chart_hit(&self, premium: Option<f64>, index: Option<f64>, lot: i32) -> Option<ChartHit> {
+        let held_lots = if lot > 0 { self.executed_qty / lot } else { self.executed_qty };
+        chart_hit(self.signal.option_type.as_deref(), &self.chart, premium, index, held_lots)
     }
     /// A buy on top of the holding is pending: a manual add not sent yet, a
     /// top-up order at the broker, or one whose send outcome is unknown.
@@ -1263,8 +1398,71 @@ pub struct OrderRequest {
 }
 
 // ===========================================================================
+// Order timing (analytics only — see `kotak_client::orders`)
+// ===========================================================================
+
+/// One order sent to Kotak, timed on this server's clock.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderSent {
+    /// Just before the request went out, and when Kotak's answer came back.
+    pub sent_at_ms: i64,
+    pub replied_at_ms: i64,
+    /// Kotak's order number, when it took the order.
+    pub order_no: Option<String>,
+    /// Why it didn't, when it didn't.
+    pub error: Option<String>,
+    pub trading_symbol: String,
+    /// `B` / `S`.
+    pub side: String,
+    /// `MKT`, `L`, `SL`, `SL-M`.
+    pub order_type: String,
+    pub qty: i64,
+    pub price: f64,
+    pub trigger: f64,
+}
+
+/// One order update Kotak pushed, stamped with when this server received it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderUpdate {
+    pub received_at_ms: i64,
+    pub order_no: String,
+    /// `open`, `complete`, `rejected`, `cancelled`, `trigger pending`, …
+    pub status: String,
+    pub trading_symbol: Option<String>,
+    pub side: Option<String>,
+    pub qty: Option<i64>,
+    pub filled_qty: Option<i64>,
+    pub avg_price: Option<f64>,
+    pub reject_reason: Option<String>,
+    /// When Kotak received the update (`updRecvTm`), epoch nanoseconds.
+    pub kotak_received_ns: Option<i64>,
+    /// The exchange's broadcast time (`boeSec`), epoch seconds.
+    pub exchange_epoch_s: Option<i64>,
+    /// The exchange's confirmation time (`exCfmTm`), as Kotak writes it.
+    pub exchange_confirm: Option<String>,
+    /// When the order was placed (`ordDtTm`), as Kotak writes it.
+    pub order_time: Option<String>,
+}
+
+// ===========================================================================
 // Internal persistence channel
 // ===========================================================================
+
+/// One finished 1-minute candle for the permanent archive (see
+/// [`DbWriteMessage::ArchiveCandles`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArchivedCandle {
+    /// Unix ms of the minute's start.
+    pub t: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    /// Traded in the minute; 0 for an index, which has none.
+    pub volume: f64,
+    /// Open interest at the minute; 0 for an index.
+    pub oi: f64,
+}
 
 /// Message sent over the `mpsc` channel to the dedicated SQLite writer task.
 ///
@@ -1332,9 +1530,22 @@ pub enum DbWriteMessage {
         volume: Option<f64>,
         source: &'static str,
     },
+    /// Finished 1-minute candles for the permanent archive, all one symbol's,
+    /// written in one transaction (analytics only — from Upstox, never read
+    /// by the engine). Upstox's latest answer for a minute replaces any
+    /// stored one.
+    ArchiveCandles {
+        symbol: String,
+        candles: Vec<ArchivedCandle>,
+    },
     /// A message from a monitored Telegram chat, for the v2 Desk's feed
     /// (display only — never read by the engine). Kept per chat and message
     /// id, so an edit replaces the text it was first stored with.
+    /// A timed order send, for the admin's order timing (analytics only).
+    OrderSent(OrderSent),
+    /// An order update from Kotak's push stream, merged into its order's
+    /// timing row (analytics only).
+    OrderUpdate(OrderUpdate),
     TelegramMessage {
         chat_id: i64,
         chat_title: Option<String>,
@@ -1363,6 +1574,10 @@ mod tests {
 
     #[test]
     fn the_market_is_open_on_weekdays_from_0915_until_1540() {
+        // `is_market_open_at` (`special_session.rs`) also opens for a special
+        // session on the day; the guard clears them, so this checks the
+        // regular hours alone and no other test's session reaches it.
+        let _guard = special_sessions_test_guard();
         let ist = |y, m, d, h, min| {
             NaiveDate::from_ymd_opt(y, m, d)
                 .unwrap()
@@ -1557,45 +1772,184 @@ mod tests {
         ChartLevel { price, trigger: LevelTrigger::Premium }
     }
 
+    /// An "all left" target at `l`.
+    fn all_at(l: ChartLevel) -> ChartTarget {
+        ChartTarget { id: format!("t{}", l.price), price: l.price, trigger: l.trigger, lots: None }
+    }
+
+    fn lots_at(id: &str, l: ChartLevel, lots: i32) -> ChartTarget {
+        ChartTarget { id: id.into(), price: l.price, trigger: l.trigger, lots: Some(lots) }
+    }
+
+    fn levels(stop: Option<ChartLevel>, targets: Vec<ChartTarget>) -> ChartLevels {
+        ChartLevels { stop, targets }
+    }
+
+    /// The exit reason a whole-holding hit gives, for a position of 4 lots.
+    fn reason(p: &MonitoredPosition, premium: Option<f64>, index: Option<f64>) -> Option<&'static str> {
+        match p.chart_hit(premium, index, 1) {
+            Some(ChartHit::All { reason }) => Some(reason),
+            Some(ChartHit::Part { .. }) => Some("PART"),
+            None => None,
+        }
+    }
+
+    fn holding(side: &str, chart: ChartLevels) -> MonitoredPosition {
+        MonitoredPosition { executed_qty: 4, ..scalp(side, chart) }
+    }
+
     #[test]
     fn index_levels_follow_the_side_of_the_option() {
         // A call: stop below the index, target above it.
-        let call = scalp("CE", ChartLevels { stop: Some(on_index(25_060.0)), target: Some(on_index(25_180.0)) });
-        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_100.0)), None);
-        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_060.0)), Some("CHART_STOP"));
-        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_000.0)), Some("CHART_STOP"));
-        assert_eq!(call.chart_level_hit(Some(100.0), Some(25_180.0)), Some("CHART_TARGET"));
+        let call = holding("CE", levels(Some(on_index(25_060.0)), vec![all_at(on_index(25_180.0))]));
+        assert_eq!(reason(&call, Some(100.0), Some(25_100.0)), None);
+        assert_eq!(reason(&call, Some(100.0), Some(25_060.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&call, Some(100.0), Some(25_000.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&call, Some(100.0), Some(25_180.0)), Some("CHART_TARGET"));
         // A put: stop above the index, target below it.
-        let put = scalp("PE", ChartLevels { stop: Some(on_index(25_140.0)), target: Some(on_index(25_020.0)) });
-        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_100.0)), None);
-        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_140.0)), Some("CHART_STOP"));
-        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_200.0)), Some("CHART_STOP"));
-        assert_eq!(put.chart_level_hit(Some(100.0), Some(25_020.0)), Some("CHART_TARGET"));
+        let put = holding("PE", levels(Some(on_index(25_140.0)), vec![all_at(on_index(25_020.0))]));
+        assert_eq!(reason(&put, Some(100.0), Some(25_100.0)), None);
+        assert_eq!(reason(&put, Some(100.0), Some(25_140.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&put, Some(100.0), Some(25_200.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&put, Some(100.0), Some(25_020.0)), Some("CHART_TARGET"));
         // No index value yet: nothing fires.
-        assert_eq!(call.chart_level_hit(Some(100.0), None), None);
+        assert_eq!(reason(&call, Some(100.0), None), None);
     }
 
     #[test]
     fn premium_levels_work_the_same_for_calls_and_puts() {
         for side in ["CE", "PE"] {
-            let pos = scalp(side, ChartLevels { stop: Some(on_premium(92.5)), target: Some(on_premium(140.0)) });
-            assert_eq!(pos.chart_level_hit(Some(100.0), Some(25_000.0)), None, "{side}");
-            assert_eq!(pos.chart_level_hit(Some(92.5), None), Some("CHART_STOP"), "{side}");
-            assert_eq!(pos.chart_level_hit(Some(140.05), None), Some("CHART_TARGET"), "{side}");
-            assert_eq!(pos.chart_level_hit(None, Some(25_000.0)), None, "{side}");
+            let pos = holding(side, levels(Some(on_premium(92.5)), vec![all_at(on_premium(140.0))]));
+            assert_eq!(reason(&pos, Some(100.0), Some(25_000.0)), None, "{side}");
+            assert_eq!(reason(&pos, Some(92.5), None), Some("CHART_STOP"), "{side}");
+            assert_eq!(reason(&pos, Some(140.05), None), Some("CHART_TARGET"), "{side}");
+            assert_eq!(reason(&pos, None, Some(25_000.0)), None, "{side}");
         }
     }
 
     #[test]
     fn a_stop_wins_over_a_target_and_only_real_prices_count() {
-        let mixed = scalp("CE", ChartLevels { stop: Some(on_premium(92.5)), target: Some(on_index(25_180.0)) });
-        assert_eq!(mixed.chart_level_hit(Some(90.0), Some(25_200.0)), Some("CHART_STOP"));
-        assert_eq!(mixed.chart_level_hit(Some(0.0), Some(0.0)), None);
-        assert_eq!(scalp("CE", ChartLevels::default()).chart_level_hit(Some(1.0), Some(1.0)), None);
+        let mixed = holding("CE", levels(Some(on_premium(92.5)), vec![all_at(on_index(25_180.0))]));
+        assert_eq!(reason(&mixed, Some(90.0), Some(25_200.0)), Some("CHART_STOP"));
+        assert_eq!(reason(&mixed, Some(0.0), Some(0.0)), None);
+        assert_eq!(reason(&holding("CE", ChartLevels::default()), Some(1.0), Some(1.0)), None);
         // Only options have chart levels.
         let mut not_an_option = mixed;
         not_an_option.signal.option_type = None;
-        assert_eq!(not_an_option.chart_level_hit(Some(90.0), Some(25_200.0)), None);
+        assert_eq!(reason(&not_an_option, Some(90.0), Some(25_200.0)), None);
+    }
+
+    #[test]
+    fn a_target_with_lots_sells_only_its_lots() {
+        // 4 lots of 75: 2 at ₹120, 2 at ₹140.
+        let mut pos = holding("CE", levels(Some(on_premium(90.0)), vec![lots_at("a", on_premium(120.0), 2), lots_at("b", on_premium(140.0), 2)]));
+        pos.executed_qty = 300;
+        assert_eq!(pos.chart_hit(Some(110.0), None, 75), None);
+        assert_eq!(pos.chart_hit(Some(120.0), None, 75), Some(ChartHit::Part { lots: 2, ids: vec!["a".into()] }));
+        // Both reached at once (a jump, or a line dropped past the price): one sell for all their lots — here the whole holding.
+        assert_eq!(pos.chart_hit(Some(141.0), None, 75), Some(ChartHit::All { reason: "CHART_TARGET" }));
+        // After the first sold: the second's 2 lots are all that's left.
+        pos.executed_qty = 150;
+        pos.chart.targets.remove(0);
+        assert_eq!(pos.chart_hit(Some(140.0), None, 75), Some(ChartHit::All { reason: "CHART_TARGET" }));
+        // The stop still sells everything.
+        assert_eq!(pos.chart_hit(Some(89.0), None, 75), Some(ChartHit::All { reason: "CHART_STOP" }));
+    }
+
+    #[test]
+    fn an_all_left_target_sells_whatever_is_held() {
+        // 2 lots at ₹120, all left at ₹130 — including lots added later.
+        let mut pos = holding("CE", levels(None, vec![lots_at("a", on_premium(120.0), 2), all_at(on_premium(130.0))]));
+        pos.executed_qty = 6;
+        assert_eq!(pos.chart_hit(Some(120.0), None, 1), Some(ChartHit::Part { lots: 2, ids: vec!["a".into()] }));
+        assert_eq!(pos.chart_hit(Some(130.0), None, 1), Some(ChartHit::All { reason: "CHART_TARGET" }));
+    }
+
+    #[test]
+    fn target_lots_never_add_up_past_the_holding() {
+        let mut chart = ChartLevels::default();
+        let edit = |id: Option<&str>, price: f64, lots: Option<Option<i32>>| TargetEdit { id: id.map(Into::into), price, trigger: LevelTrigger::Premium, lots };
+        let a = chart.set_target(&edit(None, 120.0, Some(Some(2))), 4).unwrap();
+        let b = chart.set_target(&edit(None, 140.0, Some(Some(2))), 4).unwrap();
+        assert_ne!(a, b);
+        assert!(matches!(chart.set_target(&edit(None, 150.0, Some(Some(1))), 4), Err(LevelRefusal::Conflict(_))));
+        // "All left" always fits.
+        chart.set_target(&edit(None, 150.0, Some(None)), 4).unwrap();
+        // A move keeps its lots — even once the holding is smaller than the targets.
+        chart.set_target(&edit(Some(&a), 125.0, None), 3).unwrap();
+        assert_eq!(chart.targets[0], ChartTarget { id: a.clone(), price: 125.0, trigger: LevelTrigger::Premium, lots: Some(2) });
+        // Resizing past the holding is refused; within it, taken.
+        assert!(matches!(chart.set_target(&edit(Some(&a), 125.0, Some(Some(3))), 4), Err(LevelRefusal::Conflict(_))));
+        chart.set_target(&edit(Some(&a), 125.0, Some(Some(1))), 4).unwrap();
+        assert_eq!(chart.targets[0].lots, Some(1));
+        // A target that has sold can't be moved; no lot count below 1, no bad price.
+        assert!(chart.remove_target(&a));
+        assert!(matches!(chart.set_target(&edit(Some(&a), 125.0, None), 4), Err(LevelRefusal::Conflict(_))));
+        assert!(matches!(chart.set_target(&edit(None, 125.0, Some(Some(0))), 4), Err(LevelRefusal::BadRequest(_))));
+        assert!(matches!(chart.set_target(&edit(None, f64::NAN, None), 4), Err(LevelRefusal::BadRequest(_))));
+        // At most MAX_CHART_TARGETS.
+        while chart.targets.len() < MAX_CHART_TARGETS {
+            chart.set_target(&edit(None, 160.0, Some(None)), 4).unwrap();
+        }
+        assert!(matches!(chart.set_target(&edit(None, 170.0, Some(None)), 4), Err(LevelRefusal::Conflict(_))));
+    }
+
+    #[test]
+    fn no_lot_count_wraps_round_past_the_check() {
+        let edit = |id: Option<&str>, lots: i32| TargetEdit { id: id.map(Into::into), price: 140.0, trigger: LevelTrigger::Premium, lots: Some(Some(lots)) };
+        let mut chart = ChartLevels::default();
+        chart.set_target(&edit(None, 2), 4).unwrap();
+        // 2 + i32::MAX would wrap negative in a release build and pass.
+        assert!(matches!(chart.set_target(&edit(None, i32::MAX), 4), Err(LevelRefusal::Conflict(_))));
+        assert_eq!(chart.targets.len(), 1);
+        // Stored counts that big, reached together, sell everything — never a negative part.
+        let huge = levels(None, vec![lots_at("a", on_premium(120.0), i32::MAX), lots_at("b", on_premium(121.0), i32::MAX)]);
+        assert_eq!(chart_hit(Some("CE"), &huge, Some(125.0), None, 4), Some(ChartHit::All { reason: "CHART_TARGET" }));
+    }
+
+    #[test]
+    fn a_target_can_shrink_after_the_holding_has() {
+        // 2 + 2 lots of targets, then a −2 lots sell: 2 held.
+        let mut chart = levels(None, vec![lots_at("a", on_premium(120.0), 2), lots_at("b", on_premium(140.0), 2)]);
+        let resize = |lots: i32| TargetEdit { id: Some("a".into()), price: 120.0, trigger: LevelTrigger::Premium, lots: Some(Some(lots)) };
+        chart.set_target(&resize(1), 2).unwrap();
+        assert_eq!(chart.targets[0].lots, Some(1));
+        // Growing it back past the holding is still refused.
+        assert!(matches!(chart.set_target(&resize(2), 2), Err(LevelRefusal::Conflict(_))));
+        // "All left" turned into a count adds every lot it asks for.
+        let mut all = levels(None, vec![lots_at("a", on_premium(120.0), 2), all_at(on_premium(140.0))]);
+        let id = all.targets[1].id.clone();
+        let count = TargetEdit { id: Some(id), price: 140.0, trigger: LevelTrigger::Premium, lots: Some(Some(3)) };
+        assert!(matches!(all.set_target(&count, 4), Err(LevelRefusal::Conflict(_))));
+    }
+
+    #[test]
+    fn a_trimmed_target_sell_splits_its_targets_at_the_lots_sent() {
+        let taken = vec![lots_at("a", on_premium(120.0), 2), lots_at("b", on_premium(121.0), 3)];
+        // 3 of the 5 lots sent: all of a and 1 of b go out, 2 of b stay on the chart.
+        let (sent, unsent) = split_target_lots(taken.clone(), 3);
+        assert_eq!(sent.iter().map(|t| (t.id.as_str(), t.lots)).collect::<Vec<_>>(), [("a", Some(2)), ("b", Some(1))]);
+        assert_eq!(unsent.iter().map(|t| (t.id.as_str(), t.lots)).collect::<Vec<_>>(), [("b", Some(2))]);
+        assert_eq!(split_target_lots(taken.clone(), 0).0, vec![]);
+        assert_eq!(split_target_lots(taken.clone(), 9).1, vec![]);
+        // "All left" is never counted as sent.
+        let (sent, unsent) = split_target_lots(vec![all_at(on_premium(150.0))], 4);
+        assert!(sent.is_empty() && unsent.len() == 1);
+    }
+
+    #[test]
+    fn an_unfilled_target_sell_puts_back_what_it_did_not_sell() {
+        let mut chart = levels(None, vec![lots_at("a", on_premium(120.0), 2), lots_at("b", on_premium(121.0), 3), lots_at("c", on_premium(140.0), 1)]);
+        let taken = chart.take_targets(&["a".into(), "b".into()]);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(chart.targets.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["c"]);
+        // 3 of the 5 lots filled: a is done, b has 2 left.
+        chart.restore_unsold(taken.clone(), 3);
+        assert_eq!(chart.targets.iter().map(|t| (t.id.as_str(), t.lots)).collect::<Vec<_>>(), [("c", Some(1)), ("b", Some(2))]);
+        // Nothing filled: both back as they were.
+        let mut none = levels(None, vec![]);
+        none.restore_unsold(taken, 0);
+        assert_eq!(none.targets.iter().map(|t| (t.id.as_str(), t.lots)).collect::<Vec<_>>(), [("a", Some(2)), ("b", Some(3))]);
     }
 
     #[test]
@@ -1603,14 +1957,30 @@ mod tests {
         let plain = scalp("CE", ChartLevels::default());
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json.get("chart").is_none(), "positions without levels serialize as before");
+        assert!(json.get("chart_targets_selling").is_none());
         let restored: MonitoredPosition = serde_json::from_value(json).unwrap();
         assert!(restored.chart.is_empty());
 
-        let with = scalp("PE", ChartLevels { stop: Some(on_index(25_140.0)), target: None });
+        let with = scalp("PE", levels(Some(on_index(25_140.0)), vec![lots_at("a", on_premium(140.0), 2)]));
         let json = serde_json::to_value(&with).unwrap();
-        assert_eq!(json["chart"], serde_json::json!({ "stop": { "price": 25140.0, "trigger": "index" }, "target": null }));
+        assert_eq!(
+            json["chart"],
+            serde_json::json!({ "stop": { "price": 25140.0, "trigger": "index" }, "targets": [{ "id": "a", "price": 140.0, "trigger": "premium", "lots": 2 }] })
+        );
         let restored: MonitoredPosition = serde_json::from_value(json).unwrap();
         assert_eq!(restored.chart, with.chart);
+    }
+
+    #[test]
+    fn a_target_stored_before_lots_comes_back_as_all_left() {
+        let stored = serde_json::json!({ "stop": null, "target": { "price": 140.0, "trigger": "premium" } });
+        let chart: ChartLevels = serde_json::from_value(stored).unwrap();
+        assert_eq!(chart.stop, None);
+        assert_eq!(chart.targets.len(), 1);
+        assert_eq!((chart.targets[0].price, chart.targets[0].trigger, chart.targets[0].lots), (140.0, LevelTrigger::Premium, None));
+        assert!(!chart.targets[0].id.is_empty());
+        let none: ChartLevels = serde_json::from_value(serde_json::json!({ "stop": null, "target": null })).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]

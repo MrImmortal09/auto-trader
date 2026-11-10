@@ -9,6 +9,8 @@ import type { TradingConfig } from '../../types';
 import type { Bar, Tf } from '../trade/model';
 import type {
   AdminPosition,
+  LatencyAnswer,
+  OrderTimingAnswer,
   AdminTradesAnswer,
   AdminUser,
   ChainAnswer,
@@ -30,7 +32,9 @@ import type {
   RangeId,
   RawPosition,
   SessionUser,
+  SpecialSessionsAnswer,
   StatusAnswer,
+  StoredData,
   SystemAnswer,
   TelegramState,
   TrendAnswer,
@@ -73,6 +77,41 @@ export const getHistory = (base: string, range: RangeId, group: GroupId) =>
   getJson<HistoryAnswer>(base, `/api/v2/history?range=${range}&group=${group}`);
 export const getFlags = (base: string) => getJson<Flags>(base, '/api/v2/flags');
 export const getPositionsRaw = (base: string) => getJson<RawPosition[]>(base, '/api/positions');
+
+/** One of today's orders at Kotak. */
+export interface KotakOrderRow {
+  id: string;
+  symbol: string;
+  /** "NIFTY 25100 CE", when the server knows the symbol. */
+  contract: string | null;
+  side: 'BUY' | 'SELL';
+  /** `MKT`, `L`, `SL`, `SL-M`. */
+  order_type: string;
+  qty: number;
+  filled: number;
+  /** What it filled at, once anything did. */
+  avg: number | null;
+  price: number | null;
+  trigger: number | null;
+  /** Kotak's word: `complete`, `rejected`, `cancelled`, `open`, … */
+  status: string;
+  /** Still working at Kotak. */
+  open: boolean;
+  reason: string | null;
+  /** IST `HH:MM:SS`, when Kotak says. */
+  time: string | null;
+}
+
+/** Kotak's order book: working orders first, then the rest, newest first in each. */
+export interface OrdersAnswer {
+  /** IST `HH:MM:SS` of the read. */
+  fetched_at: string | null;
+  orders: KotakOrderRow[];
+  /** Why the latest read failed; the orders are the last good read's. */
+  error: string | null;
+}
+
+export const getOrders = (base: string) => getJson<OrdersAnswer>(base, '/api/v2/orders');
 export const getExpiries = (base: string, index: string) => getJson<ExpiriesAnswer>(base, `/api/v2/expiries?index=${encodeURIComponent(index)}`);
 /** One expiry's strikes; the nearest when `expiry` is left out. */
 export const getChain = (base: string, index: string, expiry?: string | null) =>
@@ -188,6 +227,13 @@ export function getAdminTrades(base: string, user: number | null, from: string |
   return getJson<AdminTradesAnswer>(base, `/api/admin/trades${q.size ? `?${q}` : ''}`);
 }
 export const getAdminPositions = (base: string) => getJson<AdminPosition[]>(base, '/api/admin/positions');
+/** How late each feed's prices arrive: the last minute and the day. */
+export const getLatency = (base: string) => getJson<LatencyAnswer>(base, '/api/admin/latency');
+/** How long each LIVE order took on `day` (IST `YYYY-MM-DD`; today without it). */
+export const getOrderTimings = (base: string, day?: string) =>
+  getJson<OrderTimingAnswer>(base, `/api/admin/order-timings${day ? `?day=${day}` : ''}`);
+/** What the database keeps, and the candle archive's coverage. */
+export const getStoredData = (base: string) => getJson<StoredData>(base, '/api/admin/data');
 /** One user's paper P&L over the IST days `from`..`to` (from their first fill without `from`). */
 export function getUserReport(base: string, user: number, from: string | null, to: string) {
   const q = new URLSearchParams({ to });
@@ -200,8 +246,12 @@ export const patchUser = (base: string, id: number, patch: { name?: string; enab
   send(base, `/api/admin/users/${id}`, 'PATCH', patch);
 export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE');
 
-/** Run update.sh on the server: the latest release, a restart and a health check. */
-export const updateServer = (base: string) => send(base, '/api/update_server', 'POST');
+// Special trading sessions (e.g. Diwali Muhurat).
+export const listSpecialSessions = (base: string) => getJson<SpecialSessionsAnswer>(base, '/api/admin/special-sessions');
+export const putSpecialSession = (base: string, date: string, start: string, end: string) =>
+  send(base, `/api/admin/special-sessions/${encodeURIComponent(date)}`, 'PUT', { start, end });
+export const deleteSpecialSession = (base: string, date: string) =>
+  send(base, `/api/admin/special-sessions/${encodeURIComponent(date)}`, 'DELETE');
 
 // ── A user's own paper portfolio (`/api/v2/me/*`) ─────────────────────── //
 // Fills are booked at once at the live price: an answer is the fill.
@@ -238,8 +288,7 @@ export const paperSellLots = (base: string, id: string, lots: number) => send(ba
 export const paperClose = (base: string, id: string) => send(base, `${mine(id)}/close`, 'POST');
 /** Sells everything: `{sold, not_sold}`, the second saying why each wasn't. */
 export const paperExitAll = (base: string) => send(base, '/api/v2/me/exit-all', 'POST');
-export const setPaperLevels = (base: string, id: string, levels: { stop?: ChartLevel | null; target?: ChartLevel | null }) =>
-  send(base, mine(id), 'PATCH', levels);
+export const setPaperLevels = (base: string, id: string, levels: LevelsUpdate) => send(base, mine(id), 'PATCH', levels);
 /** Back to ₹10,00,000 and no history; refused while anything is open. */
 export const resetPortfolio = (base: string) => send(base, '/api/v2/me/reset', 'POST');
 
@@ -260,10 +309,28 @@ export const executeBuy = (base: string, tradingSymbol: string, lots: number) =>
   send(base, '/api/execute/buy', 'POST', { trading_symbol: tradingSymbol, lots });
 /** Sell every scalp at market — v1's Exit all. */
 export const executeExitAll = (base: string) => send(base, '/api/execute/exit-all', 'POST');
-/** Set (`{price, trigger}`), clear (`null`) or keep (left out) a scalp's chart
- * stop and target — PR 4's endpoint, behind the `chart_stops` switch. */
-export const setChartLevels = (base: string, id: string, levels: { stop?: ChartLevel | null; target?: ChartLevel | null }) =>
-  send(base, `/api/v2/positions/${encodeURIComponent(id)}`, 'PATCH', levels);
+/** A change to a scalp's chart levels; anything left out stays as it is.
+ * `stop`: `{price, trigger}` sets it, `null` clears it. `set_target`: a new
+ * target (no `id`) or one moved or resized (its `id`), with `lots` — `null`
+ * for "all left", left out to keep a moved target's. `remove_target`: an id. */
+export interface LevelsUpdate {
+  stop?: ChartLevel | null;
+  set_target?: ChartLevel & { id?: string; lots?: number | null };
+  remove_target?: string;
+}
+
+/** What a levels change answers: `sells_now` when a level set is already
+ * past the price — `sells_lots` of them, or everything when `null` —
+ * and the id of a target it set. */
+export interface LevelsAnswer {
+  sells_now?: boolean;
+  sells_lots?: number | null;
+  target_id?: string | null;
+}
+
+/** Change a scalp's chart stop and targets — PR 4's endpoint, behind the
+ * `chart_stops` switch. */
+export const setChartLevels = (base: string, id: string, levels: LevelsUpdate) => send(base, `/api/v2/positions/${encodeURIComponent(id)}`, 'PATCH', levels);
 
 /** Replace the whole trading config — v1's save. Send back every field,
  * including those v2 doesn't show. */

@@ -1,16 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import type { ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
-import { CONTRACT_STALE_MS, expiryLabel } from '../../lib/execute';
+import { buyMaxAgeMs, expiryLabel, fmtAgeLimit } from '../../lib/execute';
 import { level, price, signedMoney } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
+import { useTickFlash } from '../lib/useTickFlash';
 import { Button } from '../ui/Button';
 import { LotsStepper } from '../ui/LotsStepper';
 
 /** Why one side of a row can't be bought now, or null. */
-function quoteBlocked(q: ExecuteQuote | null, blocked: string | null): string | null {
+function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: number): string | null {
   if (blocked) return blocked;
   if (!q || q.ltp == null) return 'No price for this contract yet';
-  if (q.age_ms != null && q.age_ms > CONTRACT_STALE_MS) return "This contract's price is stale";
+  if (q.age_ms != null && q.age_ms > maxAgeMs) return `This contract's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}`;
   return null;
 }
 
@@ -42,6 +43,34 @@ function ladderRows(chain: ChainAnswer | undefined, board: ExecuteBoard): Ladder
 }
 
 /**
+ * A side's price, tapped to chart the contract, and under it, on a contract
+ * held, the quantity and its P&L. The price flashes its tint as it ticks —
+ * only near ATM and on held strikes: a 40-row chain at 09:15 would strobe.
+ */
+function Quote({ q, kind, label, position, flashes, onChart }: {
+  q: ExecuteQuote | null;
+  kind: 'CE' | 'PE';
+  label: string;
+  position: ExecutePosition | undefined;
+  flashes: boolean;
+  onChart: () => void;
+}) {
+  const flash = useTickFlash(q?.ltp, flashes, q?.sym);
+  return (
+    <button type="button" disabled={!q} onClick={onChart} title={`Chart ${label}`} className={`flex min-w-0 flex-1 flex-col justify-center ${kind === 'CE' ? 'items-end text-right' : 'items-start text-left'}`}>
+      <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium ${q?.ltp == null ? 'text-fg-muted' : 'text-fg'} ${flash.className}`}>
+        {q?.ltp == null ? '—' : price(q.ltp)}
+      </span>
+      {position && (
+        <span className={`type-caption tnum ${position.pnl != null && position.pnl < 0 ? 'text-loss' : 'text-profit'}`}>
+          {position.qty} · {position.pnl == null ? '—' : signedMoney(position.pnl, 0)}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/**
  * Figma "Ladder row": every strike of the chosen expiry, a Buy each side —
  * one tap, a market order, no confirm — and "Add" on a contract already held.
  * Tapping a price charts that contract. Prices flow for the strikes around
@@ -66,7 +95,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
    * around it. `null` is back at ATM. */
   onCentre: (strike: number | null) => void;
   desktop: boolean;
-  /** Phone: a row under the lots stepper (the expiry picker). */
+  /** Phone: next to the lots stepper (the expiry picker). */
   header?: ReactNode;
 }) {
   const rows = ladderRows(chain, board);
@@ -142,10 +171,10 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
     [],
   );
 
-  const side = (q: ExecuteQuote | null, strike: number, kind: 'CE' | 'PE', itm: boolean) => {
+  const side = (q: ExecuteQuote | null, strike: number, kind: 'CE' | 'PE', itm: boolean, near: boolean) => {
     const label = `${board.index} ${strike} ${kind} (${expiryLabel(board.expiry)})`;
     const position = q ? held.get(q.sym) : undefined;
-    const why = quoteBlocked(q, blocked);
+    const why = quoteBlocked(q, blocked, buyMaxAgeMs(board));
     const busy = q ? !!sending[q.sym] : false;
     const button = (
       <Button
@@ -160,17 +189,9 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
         {position ? 'Add' : 'Buy'}
       </Button>
     );
-    const quote = (
-      <button type="button" disabled={!q} onClick={() => onChart(strike, kind)} title={`Chart ${label}`} className={`flex min-w-0 flex-1 flex-col justify-center ${kind === 'CE' ? 'items-end text-right' : 'items-start text-left'}`}>
-        <span className={`num-medium ${q?.ltp == null ? 'text-fg-muted' : 'text-fg'}`}>{q?.ltp == null ? '—' : price(q.ltp)}</span>
-        {position && (
-          <span className={`type-caption tnum ${position.pnl != null && position.pnl < 0 ? 'text-loss' : 'text-profit'}`}>
-            {position.qty} · {position.pnl == null ? '—' : signedMoney(position.pnl, 0)}
-          </span>
-        )}
-      </button>
-    );
-    const shade = position ? 'bg-profit-subtle' : itm ? 'bg-raised/50' : '';
+    const quote = <Quote q={q} kind={kind} label={label} position={position} flashes={near || position != null} onChart={() => onChart(strike, kind)} />;
+    // A held contract is tinted profit; one in the money is shaded.
+    const shade = position ? 'bg-profit-subtle' : itm ? 'bg-itm' : '';
     return (
       <div className={`flex min-w-0 flex-1 items-center gap-3 px-2 ${shade}`}>
         {kind === 'CE' ? (
@@ -191,16 +212,24 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
   const anyHeld = (strike: number) => rows.some((r) => r.strike === strike && [r.ce, r.pe].some((q) => q && held.has(q.sym)));
   // Where the spot line falls: before the first strike above it.
   const spotBefore = spot == null ? -1 : rows.findIndex((r) => r.strike > spot);
+  const atmAt = atm == null ? -1 : rows.findIndex((r) => r.strike === atm);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className={`flex items-center gap-3 ${desktop ? 'px-3 pb-3' : 'px-4 pb-2'}`}>
-        <LotsStepper lots={lots} lotSize={board.lot_size} onChange={onLots} size={desktop ? 'sm' : 'lg'} />
-        <span className="ml-auto type-caption text-fg-muted">Lot size {board.lot_size}</span>
-      </div>
-      {header && <div className="flex items-center px-4 pb-2">{header}</div>}
+      {desktop ? (
+        <div className="flex items-center gap-3 px-3 pb-3">
+          <LotsStepper lots={lots} lotSize={board.lot_size} onChange={onLots} size="sm" />
+          <span className="ml-auto type-caption text-fg-subtle">Lot size {board.lot_size}</span>
+        </div>
+      ) : (
+        // One row, so the strikes get the room; the qty beside the stepper says the lot size.
+        <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 pb-2">
+          <LotsStepper lots={lots} lotSize={board.lot_size} onChange={onLots} size="lg" label={false} />
+          {header && <div className="ml-auto">{header}</div>}
+        </div>
+      )}
       {desktop && (
-        <div className="flex px-2 pb-1 type-caption text-fg-muted">
+        <div className="flex px-2 pb-1 type-eyebrow text-fg-muted">
           <span className="flex-1">Calls</span>
           <span className="w-16 text-center">Strike</span>
           <span className="flex-1 text-right">Puts</span>
@@ -217,6 +246,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
                   else rowEls.current.delete(r.strike);
                 }}
               >
+                {/* Within three strikes of ATM the prices flash as they tick. */}
                 {i === spotBefore && spot != null && (
                   <div className="relative my-0.5 flex items-center justify-center">
                     <span className="absolute inset-x-0 top-1/2 border-t border-dashed border-line-strong" />
@@ -224,9 +254,9 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
                   </div>
                 )}
                 <div className={`flex items-stretch border-t border-line ${desktop ? 'h-10' : 'h-14'}`}>
-                  {side(r.ce, r.strike, 'CE', spot != null && r.strike < spot)}
-                  <span className={`grid w-16 shrink-0 place-items-center num-medium ${anyHeld(r.strike) ? 'm-1 rounded-6 border border-line-strong text-fg' : r.strike === atm ? 'text-fg' : 'text-fg-muted'}`}>{r.strike}</span>
-                  {side(r.pe, r.strike, 'PE', spot != null && r.strike > spot)}
+                  {side(r.ce, r.strike, 'CE', spot != null && r.strike < spot, atmAt >= 0 && Math.abs(i - atmAt) <= 3)}
+                  <span className={`grid w-16 shrink-0 place-items-center num-medium ${anyHeld(r.strike) ? 'm-1 rounded-6 border border-line-strong text-fg' : r.strike === atm ? 'text-fg' : 'text-fg-subtle'}`}>{r.strike}</span>
+                  {side(r.pe, r.strike, 'PE', spot != null && r.strike > spot, atmAt >= 0 && Math.abs(i - atmAt) <= 3)}
                 </div>
               </div>
             ))}
@@ -239,13 +269,13 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, sending, onB
               scrollToAtm('smooth');
               onCentre(null);
             }}
-            className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full border border-line bg-panel px-3 py-1 type-label text-fg shadow-lg hover:bg-raised"
+            className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full border border-line bg-panel px-3 py-1 type-label text-fg shadow-md hover:bg-raised"
           >
             ATM {atm}
           </button>
         )}
       </div>
-      {desktop && <p className="shrink-0 px-3 pt-3 type-caption text-fg-muted">One tap = market order, no confirm · tap a price to chart it · prices follow where you scroll</p>}
+      {desktop && <p className="shrink-0 px-3 pt-3 type-caption text-fg-subtle">One tap = market order, no confirm · tap a price to chart it · prices follow where you scroll</p>}
     </div>
   );
 }

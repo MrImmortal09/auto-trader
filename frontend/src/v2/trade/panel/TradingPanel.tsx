@@ -1,19 +1,23 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp } from 'lucide-react';
 import type { ExecutePosition } from '../../../types';
 import { contractLabel, expiryLabel } from '../../../lib/execute';
-import { getPositionsRaw } from '../../lib/api';
+import { getOrders, getPositionsRaw, type KotakOrderRow } from '../../lib/api';
 import { money, plural, price, signedMoney, signedPct, toneOf } from '../../lib/format';
 import { usePoll } from '../../lib/usePoll';
+import { useTickFlash } from '../../lib/useTickFlash';
 import type { Call, DeskAnswer, FillMark } from '../../lib/types';
 import { Button } from '../../ui/Button';
 import { Chip } from '../../ui/Chip';
 import { HoldButton } from '../../ui/HoldButton';
-import type { LevelKind } from '../lines';
+import { ResizeHandle } from '../../ui/ResizeHandle';
+import { chartTargets, targetLotsLabel } from '../../../lib/format';
+import { targetRoom, type LevelKind, type LevelRef } from '../lines';
 import type { PaperAccount, PositionHandlers } from '../Positions';
 import { busyNote, levelWords } from '../words';
 import { activityEvents, type EngineError } from './activity';
 import { MIN_CHART_HEIGHT, MIN_PANEL_HEIGHT } from './height';
+import { DEFAULT_DESK_WIDTH, MAX_DESK_WIDTH, MIN_DESK_WIDTH, MIN_PANEL_BODY, useWidth } from '../paneSizes';
 import { ActivityList, HistoryList, PaperActivityList } from './lists';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -38,7 +42,7 @@ function roomFor(panel: HTMLElement | null, charts: HTMLElement | null, height: 
   return Math.max(MIN_PANEL_HEIGHT, Math.floor(own + above - MIN_CHART_HEIGHT - spill));
 }
 
-/** A panel tab: its label and count, underlined while open. */
+/** A panel tab: its label and count, underlined in accent while open. */
 function PanelTab({ id, label, count, active, onSelect }: { id: TabId; label: string; count: number | null; active: boolean; onSelect: (id: TabId) => void }) {
   return (
     <button
@@ -46,11 +50,11 @@ function PanelTab({ id, label, count, active, onSelect }: { id: TabId; label: st
       role="tab"
       aria-selected={active}
       onClick={() => onSelect(id)}
-      className={`-mb-px flex h-11 shrink-0 items-center gap-2 border-b-2 px-3 type-body ${active ? 'border-fg text-fg' : 'border-transparent text-fg-muted hover:text-fg'}`}
+      className={`-mb-px flex h-11 shrink-0 items-center gap-2 border-b-2 px-3 type-body transition-colors duration-120 ${active ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}`}
     >
       {label}
       {count != null && (
-        <span className={`grid h-5 min-w-5 place-items-center rounded-full px-1.5 type-caption tnum ${active ? 'bg-fg text-canvas' : 'bg-raised text-fg-muted'}`}>{count}</span>
+        <span className={`grid h-5 min-w-5 place-items-center rounded-full px-1.5 type-caption tnum ${active ? 'bg-accent text-on-accent' : 'bg-raised text-fg-muted'}`}>{count}</span>
       )}
     </button>
   );
@@ -76,13 +80,15 @@ function Block({ label, right, children }: { label: ReactNode; right?: ReactNode
  * ₹10,00,000 they started with; the owner's desk shows its funds — Kotak's
  * in LIVE, the paper wallet otherwise.
  */
-export function AccountColumn({ mode, desk, positions, paper, vertical }: {
+export function AccountColumn({ mode, desk, positions, paper, vertical, onHide }: {
   mode: string;
   desk: DeskAnswer | null;
   /** The open positions (not a buy still being placed). */
   positions: ExecutePosition[];
   paper?: PaperAccount;
   vertical: boolean;
+  /** Folds the column away, where it can be (the desktop trading panel). */
+  onHide?: () => void;
 }) {
   const live = !paper && mode === 'LIVE';
   const cash = desk?.wallet.balance ?? null;
@@ -115,12 +121,12 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
         <div className="flex flex-col gap-0.5">
           <span className="type-label text-fg-muted">{fundsLabel}</span>
           <span className="num-medium text-fg">{funds == null ? '—' : money(funds)}</span>
-          {fundsNote && <span className="type-caption text-fg-muted tnum">{fundsNote}</span>}
+          {fundsNote && <span className="type-caption text-fg-subtle tnum">{fundsNote}</span>}
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="type-label text-fg-muted">Today</span>
           <span className={`num-medium ${TONE_TEXT[toneOf(booked)]}`}>{signedMoney(booked)}</span>
-          <span className="type-caption text-fg-muted">{todayLine}</span>
+          <span className="type-caption text-fg-subtle">{todayLine}</span>
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="type-label text-fg-muted">Open · {plural(positions.length, 'position')}</span>
@@ -140,16 +146,27 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
     <div className="flex flex-col">
       <div className="flex items-center gap-2 border-b border-line px-4 py-2.5">
         <span className="type-body-strong text-fg">{paper ? 'Paper portfolio' : 'Owner desk'}</span>
-        <Chip kind={live ? 'live' : 'profit'}>{live ? 'LIVE' : 'Paper'}</Chip>
+        <Chip kind={live ? 'live' : 'outline'}>{live ? 'LIVE' : 'Paper'}</Chip>
+        {onHide && (
+          <button
+            type="button"
+            onClick={onHide}
+            aria-label={`Hide the ${paper ? 'portfolio' : 'owner desk'}`}
+            title={`Hide the ${paper ? 'portfolio' : 'owner desk'}`}
+            className="ml-auto grid size-6 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
+          >
+            <ChevronLeft size={14} />
+          </button>
+        )}
       </div>
       <Block label={fundsLabel}>
         <span className="num-large text-fg">{funds == null ? '—' : money(funds)}</span>
-        {fundsNote && <span className="type-caption text-fg-muted tnum">{fundsNote}</span>}
+        {fundsNote && <span className="type-caption text-fg-subtle tnum">{fundsNote}</span>}
       </Block>
-      <Block label="Today" right={closed > 0 || booked !== 0 ? <span className={`num-small ${TONE_TEXT[toneOf(booked)]}`}>{signedMoney(booked)}</span> : undefined}>
+      <Block label="Today" right={closed > 0 || booked !== 0 ? <span className={`num-medium ${TONE_TEXT[toneOf(booked)]}`}>{signedMoney(booked)}</span> : undefined}>
         <span className="type-body text-fg">{todayLine}</span>
       </Block>
-      <Block label={`Open · ${plural(positions.length, 'position')}`} right={<span className={`num-small ${TONE_TEXT[toneOf(openPnl)]}`}>{signedMoney(openPnl)}</span>}>
+      <Block label={`Open · ${plural(positions.length, 'position')}`} right={<span className={`num-medium ${TONE_TEXT[toneOf(openPnl)]}`}>{signedMoney(openPnl)}</span>}>
         {positions.map((p) => (
           <span key={p.id} className="flex items-baseline gap-2 type-caption">
             <span className="text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
@@ -157,7 +174,7 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
           </span>
         ))}
       </Block>
-      {paper && <Block label="Cash" right={<span className="num-small text-fg">{cash == null ? '—' : money(cash)}</span>} />}
+      {paper && <Block label="Cash" right={<span className="num-medium text-fg">{cash == null ? '—' : money(cash)}</span>} />}
     </div>
   );
 }
@@ -170,7 +187,7 @@ export function AccountColumn({ mode, desk, positions, paper, vertical }: {
  * Exit all is held. Its top edge drags to resize it — up into the charts,
  * never past the bottom of the window — and the chevron folds it.
  */
-export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, chartsRef, layout, paper }: {
+export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, deskWidth, onDeskWidth, deskHidden, onDeskHidden, deskRemoved, chartsRef, layout, paper }: {
   serverBase: string;
   mode: string;
   desk: DeskAnswer | null;
@@ -183,13 +200,21 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   h: PositionHandlers;
   canSet: boolean;
   onAdd: (p: ExecutePosition, kind: LevelKind) => void;
-  onRemove: (p: ExecutePosition, kind: LevelKind) => void;
+  onRemove: (p: ExecutePosition, ref: LevelRef) => void;
   /** The body shown; the tab row stays either way. */
   open: boolean;
   onToggle: () => void;
   /** Height while open, in px. */
   height: number;
   onHeight: (h: number) => void;
+  /** The left column (the owner's desk, or a user's portfolio): its width,
+   * and whether it is folded away. */
+  deskWidth: number;
+  onDeskWidth: (w: number) => void;
+  deskHidden: boolean;
+  /** Taken away in Settings: no column, no strip, no edge. */
+  deskRemoved: boolean;
+  onDeskHidden: (hidden: boolean) => void;
   /** The charts above, which give the panel its room. */
   chartsRef: RefObject<HTMLElement | null>;
   /** Changes whenever the screen above changes shape (the index bar shown
@@ -203,13 +228,24 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   const [dragged, setDragged] = useState<number | null>(null);
   const drag = useRef<{ y: number; h: number; max: number } | null>(null);
   const sectionRef = useRef<HTMLElement>(null);
+  // The desk column's width under a drag; the tabs beside it keep their room.
+  const [deskDrag, setDeskDrag] = useState<number | null>(null);
+  const panelWidth = useWidth(sectionRef, open);
+  const deskMax = Math.max(MIN_DESK_WIDTH, Math.min(MAX_DESK_WIDTH, Math.round(panelWidth - MIN_PANEL_BODY)));
+  const deskName = paper ? 'portfolio' : 'owner desk';
   const active = scalps.filter((p) => !p.placing);
   const waiting = scalps.filter((p) => p.placing);
   const openPnl = active.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
+  // The stream refreshes every 2 s, so a flash never re-triggers mid-way.
+  // A position opening or closing changes the sum without a tick.
+  const flash = useTickFlash(openPnl, true, active.map((p) => p.id).join());
   const closed = history.filter((c) => c.channel === 'Scalps');
   const shown: TabId = paper && (tab === 'waiting' || tab === 'orders') ? 'positions' : tab;
-  // Resting orders only matter while that tab is open.
-  const raw = usePoll(() => getPositionsRaw(serverBase), 5_000, serverBase, !paper && open && shown === 'orders');
+  // Orders only matter while that tab is open: Kotak's book, and the engine's
+  // own sends it may not list yet.
+  const ordersOpen = !paper && open && shown === 'orders';
+  const raw = usePoll(() => getPositionsRaw(serverBase), 5_000, serverBase, ordersOpen);
+  const book = usePoll(() => getOrders(serverBase), 5_000, serverBase, ordersOpen);
   // Every order of a manual trade that is at Kotak right now.
   const atKotak = (raw.data ?? [])
     .filter((p) => p.manual && p.state !== 'Closed')
@@ -254,34 +290,49 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
     setDragged(null);
   };
 
-  const level = (p: ExecutePosition, kind: LevelKind, locked: boolean) => {
-    const lvl = p.chart?.[kind] ?? null;
-    const word = kind === 'stop' ? 'Stop' : 'Target';
-    if (lvl) {
-      return (
-        <span className={`inline-flex items-center gap-1 type-caption tnum ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-          {levelWords(p, kind, lvl)}
-          <button type="button" disabled={locked} title={`Remove the ${kind}`} aria-label={`Remove the ${kind}`} onClick={() => onRemove(p, kind)} className="grid size-5 place-items-center rounded-4 border border-current/40 hover:bg-raised disabled:opacity-40">
-            ×
-          </button>
-        </span>
-      );
-    }
-    if (!canSet) return <span className="type-caption text-fg-muted">—</span>;
-    return (
-      <button type="button" disabled={locked} onClick={() => onAdd(p, kind)} className={`type-caption hover:underline disabled:opacity-40 ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-        + {word}
+  /** A level with its × — a target with the lots it sells. */
+  const setLevel = (p: ExecutePosition, ref: LevelRef, words: string, locked: boolean) => (
+    <span key={ref.kind === 'stop' ? 'stop' : ref.target.id} className={`inline-flex items-center gap-1 type-caption tnum ${ref.kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
+      {words}
+      <button type="button" disabled={locked} title={`Remove the ${ref.kind}`} aria-label={`Remove the ${ref.kind}`} onClick={() => onRemove(p, ref)} className="grid size-5 place-items-center rounded-4 border border-current/40 hover:bg-raised disabled:opacity-40">
+        ×
       </button>
+    </span>
+  );
+  const addLevel = (p: ExecutePosition, kind: LevelKind, locked: boolean) => (
+    <button type="button" disabled={locked} onClick={() => onAdd(p, kind)} className={`self-start type-caption hover:underline disabled:opacity-40 ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
+      + {kind === 'stop' ? 'Stop' : 'Target'}
+    </button>
+  );
+  const stopCell = (p: ExecutePosition, locked: boolean) => {
+    const stop = p.chart?.stop ?? null;
+    if (stop) return setLevel(p, { kind: 'stop' }, levelWords(p, 'stop', stop), locked);
+    return canSet ? addLevel(p, 'stop', locked) : <span className="type-caption text-fg-muted">—</span>;
+  };
+  // Each target with its lots, then "+ Target" while some lots have none.
+  const targetCell = (p: ExecutePosition, locked: boolean) => {
+    const targets = chartTargets(p.chart);
+    const lone = targets.length === 1 && targets[0].lots == null;
+    const room = canSet && targetRoom(p) != null;
+    if (targets.length === 0 && !room) return <span className="type-caption text-fg-muted">—</span>;
+    return (
+      <span className="flex flex-col gap-1">
+        {targets.map((target) => setLevel(p, { kind: 'target', target }, `${levelWords(p, 'target', target)}${lone ? '' : ` · ${targetLotsLabel(target.lots)}`}`, locked))}
+        {room && addLevel(p, 'target', locked)}
+      </span>
     );
   };
 
-  const GRID = 'grid grid-cols-[minmax(170px,1.3fr)_110px_120px_88px_88px_minmax(110px,1fr)_minmax(110px,1fr)_150px] items-center gap-3';
+  // Measured for Inter: a contract name is at most 156 px, a level with its ×
+  // ("BANKNIFTY ≥ 57,890.00 ×") 158, the two buttons 112, and the panel at
+  // 1440 px holds 1042 of columns and gaps.
+  const GRID = 'grid grid-cols-[minmax(158px,1.3fr)_88px_120px_88px_88px_minmax(160px,1fr)_minmax(160px,1fr)_120px] items-center gap-2';
   const positions =
     active.length === 0 ? (
-      <p className="px-1 py-3 type-body text-fg-muted">No open trade. Tap Buy on the ladder to open one.</p>
+      <p className="px-1 py-3 type-body text-fg-subtle">No open trade. Tap Buy on the ladder to open one.</p>
     ) : (
       <div className="flex flex-col">
-        <div className={`${GRID} sticky top-0 border-b border-line bg-panel px-1 py-2 type-caption text-fg-muted`}>
+        <div className={`${GRID} sticky top-0 border-b border-line bg-panel px-1 py-2 type-eyebrow text-fg-muted`}>
           <span>Symbol</span>
           <span className="text-right">Qty</span>
           <span className="text-right">Open P&L</span>
@@ -299,7 +350,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
             <div key={p.id} className={`${GRID} border-b border-line px-1 py-2.5`}>
               <span className="flex min-w-0 flex-col">
                 <span className="truncate type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
-                <span className="truncate type-caption text-fg-muted">
+                <span className="truncate type-caption text-fg-subtle">
                   {p.expiry ? expiryLabel(p.expiry) : 'Scalp'}
                   {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
                 </span>
@@ -314,13 +365,13 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
               </span>
               <span className="text-right num-medium text-fg">{price(p.avg)}</span>
               <span className="text-right num-medium text-fg">{p.ltp == null ? '—' : price(p.ltp)}</span>
-              <span>{level(p, 'stop', locked)}</span>
-              <span>{level(p, 'target', locked)}</span>
+              <span>{stopCell(p, locked)}</span>
+              <span>{targetCell(p, locked)}</span>
               <span className="flex justify-end gap-2">
-                <Button pointerOnly kind="ghost" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)} title={`Sell ${p.lot_size} at market`}>
+                <Button pointerOnly kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)} title={`Sell ${p.lot_size} at market`}>
                   −1 lot
                 </Button>
-                <Button pointerOnly kind="loss-outline" disabled={locked} onClick={() => h.onExit(p)} title={`Sell all ${p.qty} at market`}>
+                <Button pointerOnly kind="loss" disabled={locked} onClick={() => h.onExit(p)} title={`Sell all ${p.qty} at market`}>
                   Close
                 </Button>
               </span>
@@ -332,19 +383,19 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
 
   const waitingRows =
     waiting.length === 0 ? (
-      <p className="px-1 py-3 type-body text-fg-muted">No buy waiting. A tap on the ladder shows here until its order is sent.</p>
+      <p className="px-1 py-3 type-body text-fg-subtle">No buy waiting. A tap on the ladder shows here until its order is sent.</p>
     ) : (
       <ul className="flex flex-col">
         {waiting.map((p) => (
-          <li key={p.id} className="flex items-center gap-3 border-b border-line px-1 py-2.5">
+          <li key={p.id} className="flex items-center gap-3 border-b border-line px-1 py-2">
             <span className="min-w-0 flex-1 type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
             <span className="type-caption text-fg">{p.halted ? 'Halted by the engine — see System' : 'Buying at market…'}</span>
             {mode === 'LIVE' ? (
               // In LIVE the row can't be dropped safely while the engine may be mid-send:
               // the engine abandons a buy it couldn't send within 15 s.
-              <span className="type-caption text-fg-muted">Dropped by the engine if not sent in 15 s</span>
+              <span className="type-caption text-fg-subtle">Dropped by the engine if not sent in 15 s</span>
             ) : (
-              <Button pointerOnly kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
+              <Button pointerOnly kind="neutral" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
                 Cancel
               </Button>
             )}
@@ -353,25 +404,76 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
       </ul>
     );
 
+  // Kotak's book: still working first, then the rest with what they filled
+  // at, newest first in each (the server's order). The engine's own sends
+  // Kotak doesn't list yet go with the working ones.
+  const kotakOrders = book.data?.orders ?? [];
+  const listed = new Set(kotakOrders.map((o) => o.id));
+  const sending = atKotak.filter((o) => !listed.has(o.id.trim()));
+  const working = kotakOrders.filter((o) => o.open);
+  const done = kotakOrders.filter((o) => !o.open);
+  const ORDER_GRID = 'grid grid-cols-[minmax(150px,1.4fr)_72px_minmax(120px,1fr)_minmax(150px,1.2fr)_64px_minmax(110px,auto)] items-center gap-3';
+  const orderRow = (o: KotakOrderRow) => {
+    const tone = o.side === 'BUY' ? 'text-profit' : 'text-loss';
+    const statusTone = o.status === 'rejected' ? 'text-loss' : o.open ? 'text-fg' : 'text-fg-muted';
+    const asked = o.trigger != null ? `trigger ${price(o.trigger)}` : o.price != null ? `limit ${price(o.price)}` : 'market';
+    return (
+      <li key={o.id} className={`${ORDER_GRID} border-b border-line px-1 py-2.5`}>
+        <span className="min-w-0 truncate type-body-strong text-fg" title={o.symbol}>
+          {o.contract ?? o.symbol}
+        </span>
+        <span className={`type-caption tnum ${tone}`}>
+          {o.side} · {o.order_type || '—'}
+        </span>
+        <span className="type-caption tnum text-fg">{o.filled > 0 ? `${o.filled}${o.filled < o.qty ? ` of ${o.qty}` : ''} @ ${price(o.avg ?? 0)}` : o.open ? `${o.qty} · ${asked}` : `0 of ${o.qty}`}</span>
+        <span className={`min-w-0 truncate type-caption ${statusTone}`} title={o.reason ?? undefined}>
+          {o.status}
+          {o.reason ? ` · ${o.reason}` : ''}
+        </span>
+        <span className="type-caption tnum text-fg-muted">{o.time ?? '—'}</span>
+        <span className="truncate text-right type-caption tnum text-fg-muted">#{o.id}</span>
+      </li>
+    );
+  };
+  const orderGroup = (title: string, count: number, rows: ReactNode) => (
+    <section className="flex flex-col">
+      <div className="sticky top-0 border-b border-line bg-panel px-1 py-2 type-caption text-fg-muted">
+        {title} · {count}
+      </div>
+      <ul className="flex flex-col">{rows}</ul>
+    </section>
+  );
+  const bookNote = book.data?.error ?? (book.data?.fetched_at ? `Kotak's order book as of ${book.data.fetched_at}` : null);
   const orders =
-    atKotak.length === 0 ? (
-      <p className="px-1 py-3 type-body text-fg-muted">
-        {raw.data
-          ? mode === 'LIVE'
-            ? 'Nothing is at Kotak right now. A buy or an exit shows here while it fills; chart stops and targets are watched by the engine and sent at market when hit.'
-            : 'Paper trades place no orders at Kotak.'
+    kotakOrders.length === 0 && sending.length === 0 ? (
+      <p className="px-1 py-3 type-body text-fg-subtle">
+        {book.data || raw.data
+          ? (book.data?.error ??
+            (mode === 'LIVE'
+              ? 'No orders at Kotak today. A buy or an exit shows here as it is sent; chart stops and targets are watched by the engine and sent at market when hit.'
+              : 'Paper trades place no orders at Kotak.'))
           : 'Loading…'}
       </p>
     ) : (
-      <ul className="flex flex-col">
-        {atKotak.map((o) => (
-          <li key={o.key} className="flex items-center gap-3 border-b border-line px-1 py-2.5">
-            <span className="min-w-0 flex-1 type-body-strong text-fg">{o.contract}</span>
-            <span className="type-caption text-fg-muted tnum">{o.what}</span>
-            <span className="type-caption text-fg-muted tnum">#{o.id}</span>
-          </li>
-        ))}
-      </ul>
+      <div className="flex flex-col gap-3 pb-3">
+        {orderGroup(
+          'Working',
+          working.length + sending.length,
+          <>
+            {sending.map((o) => (
+              <li key={o.key} className={`${ORDER_GRID} border-b border-line px-1 py-2.5`}>
+                <span className="min-w-0 truncate type-body-strong text-fg">{o.contract}</span>
+                <span className="col-span-4 type-caption tnum text-fg">{o.what} · not in Kotak's book yet</span>
+                <span className="truncate text-right type-mono text-fg-subtle">#{o.id}</span>
+              </li>
+            ))}
+            {working.map(orderRow)}
+            {working.length + sending.length === 0 && <li className="px-1 py-2.5 type-caption text-fg-subtle">Nothing working at Kotak right now.</li>}
+          </>,
+        )}
+        {done.length > 0 && orderGroup('Filled, rejected or cancelled', done.length, done.map(orderRow))}
+        {bookNote && <p className={`px-1 type-caption ${book.data?.error ? 'text-loss' : 'text-fg-subtle'}`}>{bookNote}</p>}
+      </div>
     );
 
   const header = (
@@ -386,12 +488,14 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
         </div>
       ) : (
         <span className="flex h-11 items-center gap-2 px-3 type-body-strong text-fg">
-          Trading <span className="type-caption text-fg-muted tnum">{plural(active.length, 'open position')}</span>
+          Trading <span className="type-caption text-fg-subtle tnum">{plural(active.length, 'open position')}</span>
         </span>
       )}
       <span className="flex-1" />
       <span className="type-label text-fg-muted">Open</span>
-      <span className={`num-medium ${TONE_TEXT[toneOf(openPnl)]}`}>{signedMoney(openPnl)}</span>
+      <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium ${TONE_TEXT[toneOf(openPnl)]} ${flash.className}`}>
+        {signedMoney(openPnl)}
+      </span>
       <HoldButton size="sm" disabled={active.length === 0 || h.exitAllBusy} onFire={h.onExitAll}>
         {h.exitAllBusy ? 'Exiting…' : 'Hold to exit all'}
       </HoldButton>
@@ -402,11 +506,11 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   );
 
   if (!open) {
-    return <section className="flex shrink-0 flex-col rounded-12 border border-line bg-panel">{header}</section>;
+    return <section className="flex shrink-0 flex-col border-t border-line bg-panel">{header}</section>;
   }
 
   return (
-    <section ref={sectionRef} style={{ height: dragged ?? height }} className="relative flex shrink-0 overflow-hidden rounded-12 border border-line bg-panel">
+    <section ref={sectionRef} style={{ height: dragged ?? height }} className="relative flex shrink-0 overflow-hidden border-t border-line bg-panel">
       {/* The top edge: drag to make the panel taller or shorter. */}
       <div
         role="separator"
@@ -419,11 +523,41 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
         title="Drag to resize"
         className="group absolute inset-x-0 top-0 z-10 flex h-3 cursor-row-resize touch-none justify-center"
       >
-        <span className="mt-1 h-1 w-12 rounded-full bg-line-strong group-hover:bg-fg-muted" />
+        <span className="mt-1 h-1 w-10 rounded-full bg-line transition-colors duration-120 group-hover:bg-line-strong" />
       </div>
-      <aside className="w-[260px] shrink-0 overflow-y-auto border-r border-line">
-        <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical />
-      </aside>
+      {deskRemoved ? null : deskHidden ? (
+        <button
+          type="button"
+          onClick={() => onDeskHidden(false)}
+          aria-label={`Show the ${deskName}`}
+          title={`Show the ${deskName}`}
+          className="flex w-5 shrink-0 items-center justify-center border-r border-line text-fg-muted hover:bg-raised hover:text-fg"
+        >
+          <ChevronRight size={14} />
+        </button>
+      ) : (
+        <>
+          <aside style={{ width: Math.min(deskDrag ?? deskWidth, deskMax) }} className="shrink-0 overflow-y-auto">
+            <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical onHide={() => onDeskHidden(true)} />
+          </aside>
+          <ResizeHandle
+            label={`Resize the ${deskName}`}
+            grows="right"
+            value={Math.min(deskDrag ?? deskWidth, deskMax)}
+            min={MIN_DESK_WIDTH}
+            max={deskMax}
+            onChange={setDeskDrag}
+            onCommit={(w) => {
+              setDeskDrag(null);
+              onDeskWidth(w);
+            }}
+            onReset={() => {
+              setDeskDrag(null);
+              onDeskWidth(DEFAULT_DESK_WIDTH);
+            }}
+          />
+        </>
+      )}
       <div className="flex min-w-0 flex-1 flex-col">
         {header}
         <div className="min-h-0 flex-1 overflow-y-auto px-3">

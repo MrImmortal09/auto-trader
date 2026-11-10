@@ -1,6 +1,7 @@
 //! The Kotak scrip-master CSVs on disk: `data/scrip/<segment>.csv` under the
 //! working directory, beside `trades.db` (`backend/data/` on the VM, which is
-//! gitignored and which `update.sh`'s `git reset --hard` leaves alone).
+//! gitignored, so the deploy workflow's `git reset --hard` to the release's
+//! tag (`.github/workflows/deploy.yml`) leaves it alone).
 //!
 //! Every download is written here and parsed into the in-memory
 //! [`ScripStore`], and the text is then dropped. The merged raw CSV used to

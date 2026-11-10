@@ -92,12 +92,15 @@ impl Snapshot {
     }
 }
 
-/// Whether the market is open at `now`: the shared 09:15-15:40 weekday rule
-/// (`shared_domain::is_market_open_at`) on a day that is not an exchange
-/// holiday, from the calendar the paper loop and the desk read
+/// Whether the market is open at `now`: the paper loop's rule
+/// (`paper::engine`) — an admin-set special session (`shared_domain::
+/// in_special_session_at`, Muhurat trading, even on a holiday or a Sunday),
+/// or the regular 09:15-15:40 weekday hours on a day that is not an
+/// exchange holiday, from the calendar the paper loop and the desk read
 /// (`telegram_ingester::parser::is_trading_holiday`).
 pub fn open_at(now: DateTime<FixedOffset>) -> bool {
-    shared_domain::is_market_open_at(now) && !telegram_ingester::parser::is_trading_holiday(now.date_naive())
+    shared_domain::in_special_session_at(now)
+        || (shared_domain::is_regular_market_hours_at(now) && !telegram_ingester::parser::is_trading_holiday(now.date_naive()))
 }
 
 /// The next `hour:minute` IST at or after `now`: today's, or tomorrow's
@@ -303,6 +306,9 @@ mod tests {
 
     #[test]
     fn the_market_is_open_on_trading_days_from_0915_until_1540() {
+        // Special sessions are process-wide; the guard clears them and keeps
+        // the other tests that set one waiting.
+        let _guard = shared_domain::special_sessions_test_guard();
         // 2026-11-04 is a Wednesday.
         assert!(!open_at(ist(2026, 11, 4, 9, 14)));
         assert!(open_at(ist(2026, 11, 4, 9, 15)));
@@ -315,6 +321,19 @@ mod tests {
         assert!(telegram_ingester::parser::is_trading_holiday(NaiveDate::from_ymd_opt(2026, 11, 10).unwrap()));
         assert!(!open_at(ist(2026, 11, 10, 12, 0)), "Tuesday 2026-11-10 is a holiday");
         assert!(open_at(ist(2026, 11, 11, 12, 0)), "the day after is not");
+        // A special session (Muhurat trading) opens the market on the holiday
+        // for its hours alone, as the paper loop's rule has it.
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: NaiveDate::from_ymd_opt(2026, 11, 10).unwrap(),
+            start: 18 * 60,
+            end: 19 * 60 + 15,
+        }]);
+        assert!(!open_at(ist(2026, 11, 10, 12, 0)), "the holiday's regular hours stay shut");
+        assert!(!open_at(ist(2026, 11, 10, 17, 59)));
+        assert!(open_at(ist(2026, 11, 10, 18, 0)));
+        assert!(open_at(ist(2026, 11, 10, 19, 14)));
+        assert!(!open_at(ist(2026, 11, 10, 19, 15)));
+        shared_domain::set_special_sessions(vec![]);
     }
 
     #[test]

@@ -127,6 +127,17 @@ pub struct KotakOrder {
     pub trigger_price: String,
     #[serde(rename = "rejRsn", default, deserialize_with = "de_loose_string")]
     pub reject_reason: String,
+    /// The limit price asked; `0` for a market order.
+    #[serde(rename = "prc", default, deserialize_with = "de_loose_string")]
+    pub price: String,
+    /// When it was placed, as Kotak writes it (e.g. `05-Nov-2026 10:15:30`);
+    /// empty when not sent. Display only.
+    #[serde(rename = "ordDtTm", default, deserialize_with = "de_loose_string")]
+    pub order_time: String,
+    /// When Kotak last updated it (e.g. `2026/11/05 10:15:31`); empty when
+    /// not sent. Display only.
+    #[serde(rename = "hsUpTm", default, deserialize_with = "de_loose_string")]
+    pub updated_time: String,
 }
 
 impl KotakOrder {
@@ -149,6 +160,10 @@ impl KotakOrder {
     /// Stop trigger price (`0.0` for order types that have none).
     pub fn trigger(&self) -> f64 {
         KotakPosition::parse_f64(&self.trigger_price)
+    }
+    /// The limit price asked; `0.0` for a market order.
+    pub fn limit_price(&self) -> f64 {
+        KotakPosition::parse_f64(&self.price)
     }
     /// `true` for a sell order.
     pub fn is_sell(&self) -> bool {
@@ -782,7 +797,19 @@ impl KotakClient {
     /// Place a live order via `POST {baseUrl}/quick/order/rule/ms/place`.
     ///
     /// The `OrderRequest` is serialised as the `jData` URL-encoded form field.
+    /// The call is timed for the admin's order timing (`orders::subscribe_orders`):
+    /// a copy only, made after the answer is in, that never changes it.
     pub async fn place_live_order(
+        &self,
+        order: &OrderRequest,
+    ) -> Result<ExecutionResult, KotakError> {
+        let sent_at_ms = crate::orders::send_clock();
+        let result = self.place_live_order_inner(order).await;
+        crate::orders::publish_order(order, sent_at_ms, result.as_ref().map(|r| r.order_id.as_str()).map_err(|e| e.to_string()));
+        result
+    }
+
+    async fn place_live_order_inner(
         &self,
         order: &OrderRequest,
     ) -> Result<ExecutionResult, KotakError> {

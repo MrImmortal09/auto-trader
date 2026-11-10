@@ -9,6 +9,7 @@
 //! from Upstox and are not kept. Once nothing has asked for ten minutes it
 //! stops, so with no v2 client open it holds nothing and taps nothing.
 
+pub mod archive;
 pub mod bars;
 pub mod symbols;
 
@@ -45,6 +46,13 @@ const FALLBACK_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const CHANGES_CAPACITY: usize = 1024;
 /// Falling behind Kotak's ticks is logged at most this often.
 const LAG_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Upstox's instruments file for each exchange, and the indices whose
+/// derivatives it lists.
+pub(crate) const UPSTOX_INDEX_FILES: [(&str, &[&str]); 2] = [
+    (upstox_client::NSE_INSTRUMENTS_URL, &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]),
+    (upstox_client::BSE_INSTRUMENTS_URL, &["SENSEX", "BANKEX"]),
+];
 
 fn now_ms() -> i64 {
     shared_domain::now_ist().timestamp_millis()
@@ -400,10 +408,7 @@ impl Running {
             }
         }
         let mut list = Vec::new();
-        for (url, wanted) in [
-            (upstox_client::NSE_INSTRUMENTS_URL, &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"][..]),
-            (upstox_client::BSE_INSTRUMENTS_URL, &["SENSEX", "BANKEX"][..]),
-        ] {
+        for (url, wanted) in UPSTOX_INDEX_FILES {
             match client.index_derivatives(url, wanted).await {
                 Ok(rows) => list.extend(rows),
                 Err(e) => {
@@ -489,8 +494,7 @@ impl Running {
                 _ = check.tick() => {
                     let now = shared_domain::now_ist();
                     let weekday = !matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
-                    let want = weekday
-                        && bars::in_session(now.timestamp_millis())
+                    let want = ((weekday && bars::in_session(now.timestamp_millis())) || shared_domain::in_special_session_at(now))
                         && !kotak_live()
                         && !self.upstox_keys.borrow().is_empty();
                     let running = feed.as_ref().is_some_and(|f| !f.is_finished());

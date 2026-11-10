@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import type { ExecutePosition } from '../../types';
 import { contractLabel, expiryLabel } from '../../lib/execute';
+import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { money, price, signedMoney, signedPct, toneOf } from '../lib/format';
 import type { Call, DeskAnswer, DeskPosition, FillMark, PaperActivity } from '../lib/types';
+import { useTickFlash } from '../lib/useTickFlash';
 import { PositionRail } from '../desk/PositionRail';
 import { railFor } from '../desk/rail';
 import { Button } from '../ui/Button';
@@ -10,7 +12,7 @@ import { SourceChip } from '../ui/Chip';
 import { HoldButton } from '../ui/HoldButton';
 import { Modal } from '../ui/Modal';
 import { Segment } from '../ui/Segment';
-import type { LevelKind } from './lines';
+import { targetQty, targetRoom, type LevelKind, type LevelRef } from './lines';
 import { approxMoney, levelPnl } from './model';
 import { AccountColumn } from './panel/TradingPanel';
 import { activityEvents, type EngineError } from './panel/activity';
@@ -44,15 +46,21 @@ export interface PositionHandlers {
  * Exit all held. A tap opens the sheet. */
 export function ScalpBar({ scalps, h, onOpen, paper }: { scalps: ExecutePosition[]; h: PositionHandlers; onOpen: () => void; paper?: PaperAccount }) {
   const open = scalps.reduce((sum, p) => sum + (p.pnl ?? 0), 0);
+  // A position opening or closing changes the sum without a tick.
+  const flash = useTickFlash(open, true, scalps.map((p) => p.id).join());
   return (
     <div className="flex shrink-0 items-center gap-3 border-t border-line bg-inset px-4 py-2">
       <button type="button" onClick={onOpen} className="min-w-0 flex-1 text-left">
         <div className="type-caption text-fg-muted">Open · {scalps.length === 1 ? '1 trade' : `${scalps.length} trades`}</div>
-        <div className={`num-medium ${TONE_TEXT[toneOf(open)]}`}>{signedMoney(open)}</div>
+        <div key={flash.key} className={`-mx-1 w-fit rounded-4 px-1 num-medium ${TONE_TEXT[toneOf(open)]} ${flash.className}`}>
+          {signedMoney(open)}
+        </div>
         {paper && (
-          <div className="type-caption text-fg-muted tnum">
-            Wallet {paper.balance == null ? '—' : money(paper.balance)} · today{' '}
-            <span className={TONE_TEXT[toneOf(paper.today)]}>{paper.today == null ? '—' : signedMoney(paper.today)}</span>
+          <div className="type-caption text-fg-subtle tnum">
+            <span className="whitespace-nowrap">Wallet {paper.balance == null ? '—' : money(paper.balance)}</span> ·{' '}
+            <span className="whitespace-nowrap">
+              today <span className={TONE_TEXT[toneOf(paper.today)]}>{paper.today == null ? '—' : signedMoney(paper.today)}</span>
+            </span>
           </div>
         )}
       </button>
@@ -91,7 +99,7 @@ function railOf(p: ExecutePosition, indexNow: number | null, levelsOn: boolean) 
     signal_stop: 0,
     targets: [],
     next_target: null,
-    chart: p.chart ?? { stop: null, target: null },
+    chart: { stop: p.chart?.stop ?? null, targets: chartTargets(p.chart) },
     index_ltp: indexNow,
     busy: null,
   } satisfies DeskPosition, levelsOn);
@@ -118,7 +126,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
   /** When each was first bought today, IST `HH:MM`. */
   since: (p: ExecutePosition) => string | null;
   canSet: boolean;
-  onRemove: (p: ExecutePosition, kind: LevelKind) => void;
+  onRemove: (p: ExecutePosition, ref: LevelRef) => void;
   /** Put a level on the chart: the sheet closes so the chart can be tapped. */
   onAdd: (p: ExecutePosition, kind: LevelKind) => void;
   onClose: () => void;
@@ -146,7 +154,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
         />
         {tab === 'history' && <HistoryList calls={closed} large />}
         {tab === 'activity' && (paper ? <PaperActivityList items={paper.activity} large /> : <ActivityList events={activityEvents(fills, errors)} large />)}
-        {tab === 'positions' && scalps.length === 0 && <p className="type-body text-fg-muted">No open trade.</p>}
+        {tab === 'positions' && scalps.length === 0 && <p className="type-body text-fg-subtle">No open trade.</p>}
         {tab === 'positions' &&
           scalps.map((p) => {
             const note = busyNote(p, !!h.sending[p.id]);
@@ -155,23 +163,27 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
             const pct = p.ltp != null && p.avg > 0 ? ((p.ltp - p.avg) / p.avg) * 100 : null;
             const lots = p.lot_size > 0 ? Math.round(p.qty / p.lot_size) : 0;
             const bought = since(p);
-            const row = (kind: LevelKind) => {
-              const lvl = p.chart?.[kind] ?? null;
-              const word = kind === 'stop' ? 'Stop' : 'Target';
+            const targets = chartTargets(p.chart);
+            const lone = targets.length === 1 && targets[0].lots == null;
+            const room = canSet && targetRoom(p) != null;
+            /** One level's row, `null` for an empty one with "Add …". */
+            const row = (kind: LevelKind, ref: LevelRef | null, key: string, title: string) => {
+              const lvl = ref ? (ref.kind === 'stop' ? p.chart?.stop ?? null : ref.target) : null;
+              const qty = ref?.kind === 'target' ? targetQty(p, ref.target.lots, ref.target.id) : p.qty;
               return (
-                <div className="flex items-center gap-3 border-t border-line py-3">
+                <div key={key} className="flex items-center gap-3 border-t border-line py-3">
                   <div className="min-w-0 flex-1">
-                    <div className="type-label text-fg-muted">{word}</div>
+                    <div className="type-label text-fg-muted">{title}</div>
                     {lvl ? (
                       <div className={`type-body-strong tnum ${kind === 'stop' ? 'text-loss' : 'text-profit'}`}>
-                        {levelWords(p, kind, lvl)} · {approxMoney(levelPnl(lvl, p, indexNow(p.index), delta.value))}
+                        {levelWords(p, kind, lvl)} · {approxMoney(levelPnl(lvl, { ...p, qty }, indexNow(p.index), delta.value))}
                       </div>
                     ) : (
-                      <div className="type-body text-fg-muted">None</div>
+                      <div className="type-body text-fg-subtle">{kind === 'target' && targets.length > 0 ? 'For the lots no target has yet' : 'None'}</div>
                     )}
                   </div>
-                  {lvl ? (
-                    <Button size="lg" kind="ghost" disabled={locked} onClick={() => onRemove(p, kind)}>
+                  {ref ? (
+                    <Button size="lg" kind="ghost" disabled={locked} onClick={() => onRemove(p, ref)}>
                       Remove
                     </Button>
                   ) : (
@@ -184,6 +196,12 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                 </div>
               );
             };
+            const targetRows = [
+              ...targets.map((target, i) =>
+                row('target', { kind: 'target', target }, target.id || `t${i}`, lone ? 'Target' : `Target ${i + 1} · ${targetLotsLabel(target.lots)}`),
+              ),
+              ...(targets.length === 0 || room ? [row('target', null, 'add-target', targets.length ? 'Another target' : 'Target')] : []),
+            ];
             return (
               <article key={p.id} className="flex flex-col gap-3">
                 <header className="flex items-start justify-between gap-3">
@@ -192,7 +210,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                       <span className="type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
                       <SourceChip source={{ kind: 'scalp', title: 'Scalp' }} />
                     </div>
-                    <div className="mt-1 type-caption text-fg-muted tnum">
+                    <div className="mt-1 type-caption text-fg-subtle tnum">
                       {[p.expiry ? expiryLabel(p.expiry) : null, `${p.qty} qty (${lots} ${lots === 1 ? 'lot' : 'lots'})`, `avg ${price(p.avg)}`, bought ? `since ${bought}` : null].filter(Boolean).join(' · ')}
                       {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
                     </div>
@@ -204,7 +222,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                 </header>
                 {p.placing ? (
                   mode === 'LIVE' ? (
-                    <p className="type-caption text-fg-muted">Buying at market. The engine drops a buy it couldn't send within 15 s.</p>
+                    <p className="type-caption text-fg-subtle">Buying at market. The engine drops a buy it couldn't send within 15 s.</p>
                   ) : (
                     <Button pointerOnly size="lg" kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancel(p)}>
                       Cancel the buy
@@ -212,12 +230,12 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                   )
                 ) : (
                   <>
-                    <PositionRail spec={railOf(p, indexNow(p.index), canSet)} />
+                    <PositionRail spec={railOf(p, indexNow(p.index), canSet)} surface="panel" />
                     <div>
-                      {row('stop')}
-                      {row('target')}
+                      {row('stop', p.chart?.stop ? { kind: 'stop' } : null, 'stop', 'Stop')}
+                      {targetRows}
                     </div>
-                    <p className="type-caption text-fg-muted">
+                    <p className="type-caption text-fg-subtle">
                       Drag the lines on the {p.index} chart to move them. ≈ amounts use{' '}
                       {delta.assumed ? 'an assumed option delta (0.50) — Upstox has none for this contract' : `the option delta (${Math.abs(delta.value).toFixed(2)})`}.
                     </p>

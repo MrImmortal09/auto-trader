@@ -192,6 +192,22 @@ function main() {
         sendSubscribe(indices, "subscribeIndices", subscribedIndices);
     }
 
+    // The server only asks to drop ladder strikes nothing else streams.
+    // Frame per Kotak's reference client: no json or ack_symbol field.
+    function sendUnsubscribe(tokens) {
+        const live = tokens.filter((t) => subscribedTokens.has(t));
+        if (live.length === 0) return;
+        try {
+            wsClient.send(JSON.stringify({
+                event: "unsubscribeScripsLite",
+                inputtoken: live.join(',')
+            }));
+            for (const token of live) subscribedTokens.delete(token);
+        } catch (e) {
+            console.log(JSON.stringify({ event: "error", message: `unsubscribe failed: ${e.message}` }));
+        }
+    }
+
     function handleControlFrame(text) {
         let msg;
         try {
@@ -334,6 +350,16 @@ function main() {
                     // Not authenticated yet — queue for drain on the auth response
                     pendingSubscriptions.push(msg.scrips);
                 }
+            }
+        } else if (msg.action === 'unsubscribe') {
+            if (wsClient && msg.scrips) {
+                const tokens = String(msg.scrips).split(/[,&]/).map((s) => s.trim()).filter(Boolean);
+                const gone = new Set(tokens);
+                // Not authenticated yet: they must not go out on the drain.
+                pendingSubscriptions = pendingSubscriptions
+                    .map((s) => String(s).split(/[,&]/).map((t) => t.trim()).filter((t) => t && !gone.has(t)).join(','))
+                    .filter(Boolean);
+                if (feedReady) sendUnsubscribe(tokens);
             }
         } else if (msg.action === 'subscribe_indices') {
             if (wsClient && msg.indices) {

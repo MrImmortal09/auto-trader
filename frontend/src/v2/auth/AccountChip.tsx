@@ -22,7 +22,7 @@ export function AccountChip() {
   const [open, setOpen] = useState(false);
   if (!phoneRole) {
     return (
-      <Button size="sm" kind="profit" icon={<LogIn size={14} />} onClick={() => openSignIn()}>
+      <Button size="sm" kind="accent" icon={<LogIn size={14} />} onClick={() => openSignIn()}>
         Sign in
       </Button>
     );
@@ -37,8 +37,9 @@ export function AccountChip() {
         <div className="flex flex-col gap-3 p-1">
           <div className="flex flex-col gap-1">
             <span className="type-body-strong text-fg">{name}</span>
-            {user && <span className="type-caption text-fg-muted tnum">+91 {formatPhone(user.phone)}</span>}
-            <Chip kind={phoneRole === 'admin' ? 'live' : 'neutral'} className="self-start">
+            {user && <span className="type-caption text-fg-subtle tnum">+91 {formatPhone(user.phone)}</span>}
+            {/* Admin is blue: marigold would say "real money" about a role. */}
+            <Chip kind={phoneRole === 'admin' ? 'accent' : 'neutral'} className="self-start">
               {roleLabel(phoneRole)}
             </Chip>
           </div>
@@ -70,7 +71,7 @@ export function AccountRow() {
           Sign out
         </Button>
       ) : (
-        <Button size="sm" kind="profit" onClick={() => openSignIn()}>
+        <Button size="sm" kind="accent" onClick={() => openSignIn()}>
           Sign in
         </Button>
       )}

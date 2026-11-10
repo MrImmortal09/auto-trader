@@ -2,7 +2,8 @@ import type { ReactNode } from 'react';
 import type { Level } from '../lib/types';
 import { HealthDot } from '../ui/Health';
 
-/** The last 15 minutes of one series, as a line: no axes, gaps skipped. */
+/** The last 15 minutes of one series, as a line in the indicator blue: no
+ * axes, gaps skipped. */
 function Sparkline({ values }: { values: (number | null)[] }) {
   const known = values.map((v, i) => [i, v] as const).filter((p): p is readonly [number, number] => p[1] != null && Number.isFinite(p[1]));
   if (known.length < 2) return <div className="h-7" />;
@@ -18,8 +19,8 @@ function Sparkline({ values }: { values: (number | null)[] }) {
   );
 }
 
-/** Figma "Health tile": a dot and name, the reading, a line of detail and,
- * on desktop, the last 15 minutes. */
+/** Figma "Health tile": a white card with a hairline — a dot and name, the
+ * reading, a line of detail and, on desktop, the last 15 minutes. */
 export function HealthTile({ name, level, value, detail, series, compact }: {
   name: string;
   level: Level;
@@ -29,15 +30,16 @@ export function HealthTile({ name, level, value, detail, series, compact }: {
   compact: boolean;
 }) {
   return (
-    <section className="flex min-w-0 flex-col gap-1 rounded-12 bg-panel p-4">
+    <section className="flex min-w-0 flex-col gap-1 rounded-12 border border-line bg-panel p-4">
       <div className="flex items-center gap-2 type-caption text-fg-muted">
         <HealthDot level={level} />
         {name}
       </div>
       <div className={`${compact ? 'type-title' : 'num-large'} truncate text-fg`}>{value}</div>
-      <div className="type-caption text-fg-muted">{detail}</div>
+      <div className="type-caption text-fg-subtle tnum">{detail}</div>
       {!compact && series && (
-        <div className="mt-2">
+        // At the foot of the tile, so the five sparklines line up however the details wrap.
+        <div className="mt-auto pt-2">
           <Sparkline values={series} />
         </div>
       )}

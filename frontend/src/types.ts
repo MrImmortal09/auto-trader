@@ -265,7 +265,7 @@ export interface MonitoredPosition {
   manual?: boolean;
   /** A manual add still waiting to be sent. */
   manual_add?: { lots: number; requested_at: string } | null;
-  /** A scalp's stop and target set from a v2 chart; absent while none is set. */
+  /** A scalp's stop and targets set from a v2 chart; absent while none is set. */
   chart?: ChartLevels;
 }
 
@@ -275,10 +275,20 @@ export interface ChartLevel {
   trigger: 'premium' | 'index';
 }
 
-/** A scalp's chart stop and target. Reaching either sells the whole holding. */
+/** A chart target: a level and the lots it sells — `null` sells all that is
+ * left when it is reached. */
+export interface ChartTarget extends ChartLevel {
+  id: string;
+  lots: number | null;
+}
+
+/** A scalp's chart stop and targets. The stop sells the whole holding; a
+ * target its own lots. Read them with `chartTargets`. */
 export interface ChartLevels {
   stop: ChartLevel | null;
-  target: ChartLevel | null;
+  targets?: ChartTarget[];
+  /** An older server's one target, which sold the whole holding. */
+  target?: ChartLevel | null;
 }
 
 export interface KotakForm {
@@ -533,6 +543,10 @@ export interface ExecuteBoard {
   /** The subscribed window: 7 strikes each side of ATM, or of the strike the
    * stream was asked to centre on. v1 shows 11 of them. */
   rows: ExecuteRow[];
+  /** A contract price older than this (ms) can't be bought from this board:
+   * 5 min on the owner's desk, 10 s on a paper desk. Missing from an older
+   * server. */
+  buy_max_age_ms?: number;
 }
 
 export interface ExecutePosition {
@@ -553,8 +567,17 @@ export interface ExecutePosition {
   adding: boolean;
   exiting: boolean;
   halted: boolean;
-  /** Chart stop and target, when set from a v2 chart. */
+  /** Chart stop and targets, when set from a v2 chart. */
   chart?: ChartLevels;
+}
+
+/** One index at the top of the Trade screen. */
+export interface IndexHeadline {
+  index: string;
+  spot: number | null;
+  /** The previous session's close; absent from a server older than this field. */
+  prev_close?: number | null;
+  change_pct: number | null;
 }
 
 export interface ExecuteFrame {
@@ -566,7 +589,7 @@ export interface ExecuteFrame {
   market_open: boolean;
   feed: { connected: boolean; last_tick_age_ms: number | null };
   kotak_ready: boolean;
-  indices: { index: string; spot: number | null; change_pct: number | null }[];
+  indices: IndexHeadline[];
   board: ExecuteBoard | null;
   board_error: string | null;
   positions: ExecutePosition[];

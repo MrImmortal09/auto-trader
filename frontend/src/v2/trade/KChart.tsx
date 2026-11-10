@@ -5,8 +5,9 @@ import { streamToken } from '../lib/api';
 import { fetchBars, fetchDays, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
 import { CHART_STYLES, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
-import { DRAW_PREFIX, KlineDrawings, type DrawApi } from './drawings';
+import { DRAW_PREFIX, KlineDrawings, NO_DRAW_PREFS, useDrawPrefs, type DrawApi } from './drawings';
 import { pivotsByDay } from './pivots';
+import { drawableStudies, fitPanes, showStudies } from './studies';
 import {
   barAt,
   countdown,
@@ -99,7 +100,9 @@ export interface ChartProps {
  * VWAP is its future's, moved onto the index by the basis. The user's own
  * drawings are kept per instrument (see `drawings.ts`).
  */
-export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, rsi, cci, style, placing, onPlacingDone, bus, onState, compact = false, drawRef }: ChartProps & {
+export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, pivots, rsi, cci, studies, style, placing, onPlacingDone, bus, onState, compact = false, drawRef }: ChartProps & {
+  /** KLineChart's other indicators picked for this chart (`studies.ts`). */
+  studies: string[];
   /** Phone: shorter RSI and CCI panes. */
   compact?: boolean;
   /** Set to this chart's drawing tools while it is up, for the Draw menu. */
@@ -122,6 +125,15 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   const dragging = useRef<string | null>(null);
   const vwapVersion = useRef(0);
   const pivotVersion = useRef(0);
+  // A text's or note's words being asked for, where it was placed.
+  const [asking, setAsking] = useState<Asking | null>(null);
+  // The drawing toolbar's switches (magnet, lock, hide), shared by every
+  // desktop KLine chart. The phone has no toolbar to switch them back, so none.
+  const [sharedPrefs] = useDrawPrefs();
+  const drawPrefs = compact ? NO_DRAW_PREFS : sharedPrefs;
+  const prefsNow = useRef(drawPrefs);
+  // The panes under the price `fitPanes` has sized: a resize keeps their heights.
+  const sizedPanes = useRef(new Set<string>());
   // The lines' prices: the price axis always takes them in, so a stop or
   // target far from the candles is still on screen.
   const linePrices = useRef<number[]>([]);
@@ -157,9 +169,25 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     });
     if (!c) return;
     chart.current = c;
+    // KLineChart 10.0.4 counts two presses within 500 ms as a double-click,
+    // and a double-click on the price axis puts it back to auto-fit. A press
+    // during which the wheel zoomed isn't a click: clear the count, so
+    // pressing again to keep zooming doesn't throw the zoom away. (Its own
+    // event handler, not public API: a later version without it is a no-op.)
+    const clicks = (c as unknown as { _chartEvent?: { _event?: { _resetClickTimeout?: () => void } } })._chartEvent?._event;
+    // An upgrade that renames it would bring the reset back silently.
+    if (import.meta.env.DEV && typeof clicks?._resetClickTimeout !== 'function') {
+      console.warn('KChart: klinecharts click-count hook not found; wheel-zoom may reset the price axis');
+    }
+    const onWheel = () => clicks?._resetClickTimeout?.();
+    el.addEventListener('wheel', onWheel, { capture: true, passive: true });
     const drawn = new KlineDrawings(c);
     drawings.current = drawn;
+    drawn.setPrefs(prefsNow.current);
+    // The box sits at the point, kept inside the chart.
+    drawn.setAsk((at, initial, done) => setAsking({ x: Math.max(4, Math.min(at.x + 4, el.clientWidth - 204)), y: Math.max(4, at.y - 14), initial, done }));
     const placed = applied.current;
+    const sized = sizedPanes.current;
     c.overrideYAxis({ paneId: 'candle_pane', createRange: rangeWithLines(linePrices) });
     c.setDataLoader({
       // A few days of bars, then no more: the candle service keeps those.
@@ -197,18 +225,26 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       c.executeAction('onCrosshairChange', p.x == null ? {} : { x: p.x, paneId: 'candle_pane' });
     });
     return () => {
+      el.removeEventListener('wheel', onWheel, { capture: true });
       unsub();
       c.unsubscribeAction('onCrosshairChange', onCross);
       VWAP_SERIES.delete(chartId);
       PIVOT_SERIES.delete(chartId);
       // A drawing under way ends with the chart.
       drawn.cancel();
+      drawn.setAsk(null);
       drawings.current = null;
       dispose(el);
       chart.current = null;
       placed.clear();
+      sized.clear();
     };
   }, [bus, chartId]);
+
+  useEffect(() => {
+    prefsNow.current = drawPrefs;
+    drawings.current?.setPrefs(drawPrefs);
+  }, [drawPrefs]);
 
   useEffect(() => {
     if (!drawRef) return;
@@ -216,6 +252,12 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       start: (tool, done) => (drawings.current ? drawings.current.start(tool, done) : done()),
       cancel: () => drawings.current?.cancel(),
       clear: () => drawings.current?.clear(),
+      undo: () => drawings.current?.undo() ?? false,
+      redo: () => drawings.current?.redo() ?? false,
+      canUndo: () => drawings.current?.canUndo() ?? false,
+      canRedo: () => drawings.current?.canRedo() ?? false,
+      finish: () => drawings.current?.finish(),
+      setErasing: (on) => drawings.current?.setErasing(on),
     };
     return () => {
       drawRef.current = null;
@@ -283,13 +325,26 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     if (loaded) drawings.current?.show(symbol);
   }, [loaded, symbol, tf]);
 
-  // RSI and CCI: KLineChart's own, each in its pane.
+  // RSI and CCI (the Layers menu's) and the Indicators menu's picks, those
+  // built from volume only on an option; then the panes under the price
+  // share at most part of the chart, so the price keeps the room.
+  const studyKey = drawableStudies(studies, sym.kind === 'index').join(',');
+  const [hostHeight, setHostHeight] = useState(0);
+  useLayoutEffect(() => {
+    const el = host.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setHostHeight(Math.round(el.getBoundingClientRect().height)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   useEffect(() => {
-    if (chart.current) showOscillator(chart.current, 'rsi', rsi, compact);
-  }, [rsi, compact]);
-  useEffect(() => {
-    if (chart.current) showOscillator(chart.current, 'cci', cci, compact);
-  }, [cci, compact]);
+    const c = chart.current;
+    if (!c) return;
+    showOscillator(c, 'rsi', rsi, compact);
+    showOscillator(c, 'cci', cci, compact);
+    showStudies(c, studyKey ? studyKey.split(',') : [], compact);
+    fitPanes(c, hostHeight, compact, sizedPanes.current);
+  }, [rsi, cci, studyKey, compact, hostHeight]);
 
   // VWAP: the option's own, or the future's moved onto the index.
   useEffect(() => {
@@ -409,8 +464,10 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     const key = (xs: number[]) => xs.map((x) => x.toFixed(2)).sort().join(',');
     if (key(prices) !== key(linePrices.current)) {
       linePrices.current = prices;
-      // Asking again makes the axis take the new prices in.
-      c.overrideYAxis({ paneId: 'candle_pane', createRange: rangeWithLines(linePrices) });
+      // The axis reads the new prices on its next layout. Lay out, don't
+      // override the axis: overriding it turns auto-fit back on, which threw
+      // away the user's own price-scale zoom whenever a line moved.
+      c.resize();
     }
 
     for (const o of c.getOverlays()) {
@@ -457,5 +514,51 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     };
   }, [placingKey, loaded]);
 
-  return <div ref={host} className="absolute inset-0" />;
+  return (
+    <>
+      <div ref={host} className="absolute inset-0" />
+      {asking && <TextAsk key={`${asking.x},${asking.y}`} ask={asking} onDone={() => setAsking(null)} />}
+    </>
+  );
+}
+
+interface Asking {
+  x: number;
+  y: number;
+  initial: string;
+  done: (text: string | null) => void;
+}
+
+/** A text's or note's words, typed where it was placed: Enter or a click
+ * away keeps them, Escape gives up. */
+function TextAsk({ ask, onDone }: { ask: Asking; onDone: () => void }) {
+  const [value, setValue] = useState(ask.initial);
+  const said = useRef(false);
+  const end = (text: string | null) => {
+    if (said.current) return;
+    said.current = true;
+    ask.done(text);
+    onDone();
+  };
+  return (
+    <input
+      autoFocus
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') end(value);
+        else if (e.key === 'Escape') {
+          // Not full screen's Escape too.
+          e.stopPropagation();
+          end(null);
+        }
+      }}
+      onBlur={() => end(value)}
+      placeholder="Type, then Enter"
+      aria-label="Drawing text"
+      maxLength={120}
+      style={{ left: ask.x, top: ask.y }}
+      className="absolute z-20 h-7 w-[200px] rounded-6 border border-accent bg-panel px-2 type-label text-fg shadow-md outline-none"
+    />
+  );
 }

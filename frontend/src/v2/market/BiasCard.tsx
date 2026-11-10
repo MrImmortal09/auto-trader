@@ -17,7 +17,7 @@ function Meter({ overall, known }: { overall: number; known: boolean }) {
           return <span key={m} className={`h-1 flex-1 rounded-full ${colour}`} />;
         })}
       </div>
-      <div className="mt-1.5 flex justify-between type-caption text-fg-muted">
+      <div className="mt-1.5 flex justify-between type-caption text-fg-subtle">
         <span>−2 bearish</span>
         <span>+2 bullish</span>
       </div>
@@ -81,7 +81,7 @@ export function BiasCard({ label, answer, check, s, sizingOn, selected, onSelect
           />
         </>
       ) : (
-        <p className="border-t border-line py-3 type-caption text-fg-muted">
+        <p className="border-t border-line py-3 type-caption text-fg-subtle">
           No closed check in the last few minutes, so a call is sized as neutral.
         </p>
       )}
@@ -98,12 +98,13 @@ export function BiasCard({ label, answer, check, s, sizingOn, selected, onSelect
             );
           })
         ) : (
-          <div className="mt-2 type-body text-fg-muted">—</div>
+          <div className="mt-2 type-body text-fg-subtle">—</div>
         )}
       </div>
     </>
   );
-  const frame = `rounded-12 border bg-panel p-4 text-left ${selected ? 'border-line-strong' : 'border-transparent'}`;
+  // A white hairline card; the chosen one carries a 2 px accent outline.
+  const frame = `rounded-12 border bg-panel p-4 text-left ${selected ? 'border-accent ring-1 ring-accent' : 'border-line'}`;
   if (!onSelect) return <section className={frame}>{body}</section>;
   return (
     <section
@@ -117,7 +118,7 @@ export function BiasCard({ label, answer, check, s, sizingOn, selected, onSelect
           onSelect();
         }
       }}
-      className={`${frame} cursor-pointer transition-colors ${selected ? '' : 'hover:border-line'}`}
+      className={`${frame} cursor-pointer transition-colors duration-120 ${selected ? '' : 'hover:border-line-strong'}`}
     >
       {body}
     </section>

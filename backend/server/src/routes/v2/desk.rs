@@ -274,7 +274,7 @@ struct StatusAnswer {
     /// What the kill switch did, while it's on.
     stopped: Option<desk::Stopped>,
     market_open: bool,
-    market: &'static str,
+    market: String,
     /// `None` until the System screen's sampler has run once.
     health: Option<desk::HealthSet>,
     /// Seconds since the price feed's last tick, while it's connected.
@@ -302,7 +302,8 @@ pub async fn status_handler(
     let now = shared_domain::now_ist();
     let today = now.date_naive();
     let day = today.format("%Y-%m-%d").to_string();
-    let (market_open, market) = desk::market_phase(now, !telegram_ingester::parser::is_trading_holiday(today));
+    let trading_day = !telegram_ingester::parser::is_trading_holiday(today);
+    let (market_open, market) = desk::market_phase(now, trading_day);
     let latest = state.pulse.latest();
     let feed_age_secs = latest.as_ref().filter(|s| s.feed_connected).and_then(|s| s.feed_last_tick_age_secs);
     let health = latest.map(|s| {

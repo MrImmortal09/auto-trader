@@ -209,9 +209,9 @@ pub struct Quote {
     /// The day's open, high and low and the previous close, when sent.
     #[serde(default)]
     pub ohlc: Option<Ohlc>,
-    /// Net change from the previous close, when sent.
-    #[serde(default, deserialize_with = "opt_num")]
-    pub net_change: Option<f64>,
+    /// Points from the previous session's close to `last_price`.
+    #[serde(default, deserialize_with = "num")]
+    pub net_change: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -477,6 +477,25 @@ impl UpstoxClient {
             let mut de = serde_json::Deserializer::from_reader(reader);
             let keep = |r: &InstrumentRow| is_index_derivative(r, &wanted);
             let rows = RowFilter { keep: &keep }
+                .deserialize(&mut de)
+                .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))?;
+            Ok(rows.iter().filter_map(to_derivative).collect())
+        })
+        .await
+        .map_err(|e| UpstoxError::Decode(e.to_string()))?
+    }
+
+    /// Every future on the `wanted` underlyings in an instruments file — the
+    /// near, next and far months — stream-filtered the same way as
+    /// [`Self::nearest_index_futures`].
+    pub async fn index_futures(&self, instruments_url: &str, wanted: &[&str]) -> Result<Vec<Derivative>, UpstoxError> {
+        let gz = self.download_instruments(instruments_url).await?;
+        let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
+
+        tokio::task::spawn_blocking(move || {
+            let reader = BufReader::new(flate2::read::GzDecoder::new(&gz[..]));
+            let mut de = serde_json::Deserializer::from_reader(reader);
+            let rows = FutFilter { wanted: &wanted }
                 .deserialize(&mut de)
                 .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))?;
             Ok(rows.iter().filter_map(to_derivative).collect())

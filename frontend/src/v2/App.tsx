@@ -19,6 +19,7 @@ import { Settings } from './settings/Settings';
 import { UserSettings } from './settings/UserSettings';
 import { System } from './system/System';
 import { Segment } from './ui/Segment';
+import { useNavHidden } from './lib/layout';
 
 // The charts are heavy (KLineChart): only loaded once Trade or Market is opened.
 const Trade = lazy(() => import('./trade/Trade').then((m) => ({ default: m.Trade })));
@@ -43,6 +44,8 @@ function stoppedLine(s: Stopped): string {
 export default function App() {
   const serverBase = useServerBase();
   const desktop = useIsDesktop();
+  // Desktop: the navigation rail folded away (the status bar's mode chip).
+  const [navHidden] = useNavHidden();
   const { role, canReadOwner } = useIdentity();
   const screens = visibleScreens(role);
   const nav = navScreens(role);
@@ -93,11 +96,11 @@ export default function App() {
     screen === 'desk' ? (
       <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} role={role} />
     ) : screen === 'trade' ? (
-      <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>
+      <Suspense fallback={<p className="p-6 type-body text-fg-subtle">Loading charts…</p>}>
         <Trade serverBase={serverBase} desktop={desktop} />
       </Suspense>
     ) : screen === 'market' ? (
-      <Suspense fallback={<p className="p-6 type-body text-fg-muted">Loading charts…</p>}>
+      <Suspense fallback={<p className="p-6 type-body text-fg-subtle">Loading charts…</p>}>
         <Market serverBase={serverBase} desktop={desktop} canReadOwner={canReadOwner} />
       </Suspense>
     ) : (
@@ -155,7 +158,7 @@ export default function App() {
       )}
       <StatusBanners serverBase={serverBase} status={s} canReadOwner={canReadOwner} />
       <div className="flex min-h-0 flex-1">
-        {desktop && <NavRail screens={nav} screen={screen} onSelect={go} />}
+        {desktop && !navHidden && <NavRail screens={nav} screen={screen} onSelect={go} />}
         {/* Trade fits the window and never scrolls: its ladder and panel scroll inside. */}
         <main className={`min-w-0 flex-1 ${screen === 'trade' ? 'overflow-hidden' : 'overflow-y-auto'}`}>{content}</main>
       </div>

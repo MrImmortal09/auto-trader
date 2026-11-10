@@ -33,9 +33,15 @@ const CHECK_EVERY: Duration = Duration::from_secs(60);
 /// trading day; outside it a failed read waits for the next hourly one.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
-/// 09:00–15:45 IST on a weekday: from the morning login to the session clear.
+/// 09:00–15:45 IST on a weekday (from the morning login to the session clear),
+/// or START−30 to END+5 on a date with a special session.
 fn in_trading_day(now: DateTime<FixedOffset>) -> bool {
     let minute = now.hour() * 60 + now.minute();
+    if let Some(session) = shared_domain::special_session_on(now.date_naive()) {
+        if (session.start.saturating_sub(30)..session.end + 5).contains(&minute) {
+            return true;
+        }
+    }
     now.weekday().num_days_from_monday() < 5 && (9 * 60..15 * 60 + 45).contains(&minute)
 }
 

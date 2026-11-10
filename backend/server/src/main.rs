@@ -11,9 +11,12 @@ mod candles;
 mod db;
 mod desk;
 mod execute;
+mod feed_latency;
 mod history;
 mod instruments;
 mod market_data;
+mod order_timing;
+mod orders;
 mod paper;
 mod pulse;
 mod quotes;
@@ -50,6 +53,29 @@ pub(crate) fn resolve_auth_secret() -> Option<String> {
 /// limits with the owner). It needs the server's own `.env` and database, so
 /// it is exactly as safe as a shell on the VM. It only reads the database:
 /// the running server needn't stop.
+/// `server order-feed-probe [seconds]`: try Kotak's order push stream with the
+/// session saved in the database and print what it sends — see
+/// `order_timing::probe`. Opens the database read-only; the running server
+/// needn't stop.
+async fn order_feed_probe() -> i32 {
+    let seconds = std::env::args().nth(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://trades.db".into());
+    let opts = match <sqlx::sqlite::SqliteConnectOptions as std::str::FromStr>::from_str(&db_url) {
+        Ok(opts) => opts.read_only(true),
+        Err(e) => {
+            eprintln!("Invalid DATABASE_URL {db_url}: {e}");
+            return 1;
+        }
+    };
+    match SqlitePool::connect_with(opts).await {
+        Ok(pool) => order_timing::probe(&pool, seconds).await,
+        Err(e) => {
+            eprintln!("Can't open {db_url}: {e}");
+            1
+        }
+    }
+}
+
 async fn print_admin_token() -> i32 {
     let (Some(secret), Some(phone)) = (resolve_auth_secret(), auth::admin_phone()) else {
         eprintln!("admin-token needs AUTH_SECRET and ADMIN_PHONE — run it from the server's directory, beside its .env");
@@ -154,6 +180,9 @@ pub(crate) struct AppState {
     /// Kotak balance for `/api/portfolio`, refreshed in the background — see
     /// `balance`. The page never calls Kotak itself.
     pub balance: Arc<balance::BalanceCache>,
+    /// Kotak's order book for v2's Orders tab, read only while it asks — see
+    /// `orders`.
+    pub order_book: Arc<orders::OrderBookCache>,
     /// The Execute screen's option ladders — see `execute`.
     pub execute: Arc<execute::ExecuteBoard>,
     /// Read-only Upstox client (`UPSTOX_ANALYTICS_TOKEN`), when configured.
@@ -174,6 +203,10 @@ pub(crate) struct AppState {
     /// keys it carries, Upstox while Kotak is down, the 15:35 close after
     /// hours — see `quotes`. Its own map; it never writes `prices`.
     pub quotes: Arc<quotes::QuoteHub>,
+    /// How late each feed's prices arrive — see `feed_latency`. Admin only.
+    pub feed_latency: Arc<feed_latency::FeedLatency>,
+    /// How long each LIVE order took — see `order_timing`. Admin only.
+    pub order_timing: Arc<order_timing::OrderTiming>,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +292,76 @@ async fn run_daily_kotak_trigger(handles: KotakAutoLoginHandles, hour: u32, minu
     }
 }
 
+/// Runs forever, managing Kotak auto-login and session clear on dates with a special session:
+///
+/// - auto-login at START − 30 min, START − 5 min, and START (no-op if already connected,
+///   labeled "special session HH:MM IST").
+/// - session clear at END + 10 min.
+///
+/// Wakes every 30s to pick up sessions added or changed after startup.
+async fn run_special_session_kotak_lifecycle(handles: KotakAutoLoginHandles) {
+    use chrono::Timelike;
+    use std::collections::HashSet;
+    let mut fired_logins: HashSet<(chrono::NaiveDate, u32)> = HashSet::new();
+    let mut fired_clears: HashSet<(chrono::NaiveDate, u32)> = HashSet::new();
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        let now = shared_domain::now_ist();
+        let today = now.date_naive();
+
+        // Prune past days
+        fired_logins.retain(|(d, _)| *d >= today);
+        fired_clears.retain(|(d, _)| *d >= today);
+
+        let Some(session) = shared_domain::special_session_on(today) else {
+            continue;
+        };
+
+        let now_minute = now.hour() * 60 + now.minute();
+        let label = format!("special session {} IST", shared_domain::format_hhmm(session.start));
+
+        // Auto-login attempts: START - 30, START - 5, START
+        let trigger_mins = [
+            session.start.saturating_sub(30),
+            session.start.saturating_sub(5),
+            session.start,
+        ];
+
+        for &t_min in &trigger_mins {
+            if now_minute >= t_min && now_minute <= session.start && fired_logins.insert((today, t_min)) {
+                if handles.kotak.lock().await.is_none() {
+                    match routes::try_env_auto_login(handles.as_deps(), &label).await {
+                        Ok(()) => tracing::info!(trigger = %label, "Kotak auto-login succeeded"),
+                        Err(e) => tracing::info!(trigger = %label, reason = %e, "Kotak auto-login not performed"),
+                    }
+                } else {
+                    tracing::info!(trigger = %label, "Kotak auto-login skipped — already connected");
+                }
+            }
+        }
+
+        // Session clear attempt at END + 10
+        let clear_min = session.end + 10;
+        if now_minute >= clear_min && fired_clears.insert((today, clear_min)) {
+            if !shared_domain::is_market_open_at(now) {
+                let clear_reason = format!("special session close {} IST", shared_domain::format_hhmm(session.end));
+                clear_kotak_session(
+                    &handles.kotak,
+                    &handles.ws_task,
+                    &handles.ws_tx,
+                    &handles.pool,
+                    &handles.log_tx,
+                    &clear_reason,
+                )
+                .await;
+            } else {
+                tracing::info!("special session clear skipped — regular market open");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Daily Kotak session clear — shared by the 09:00 and 15:40 IST triggers
 // ---------------------------------------------------------------------------
@@ -321,6 +424,17 @@ async fn run_daily_kotak_clear(
 
         tracing::info!(secs = secs_until, reason, "Kotak session clear scheduled");
         tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
+
+        if hour == 15 && minute == 40 {
+            let now = shared_domain::now_ist();
+            if let Some(session) = shared_domain::special_session_on(now.date_naive()) {
+                if session.end > 15 * 60 + 40 {
+                    tracing::info!(reason, "Kotak session clear skipped at 15:40 — special session ends after 15:40");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            }
+        }
 
         clear_kotak_session(&kotak, &ws_task, &ws_tx, &pool, &log_tx, reason).await;
 
@@ -678,6 +792,9 @@ async fn main() {
     if std::env::args().nth(1).as_deref() == Some("admin-token") {
         std::process::exit(print_admin_token().await);
     }
+    if std::env::args().nth(1).as_deref() == Some("order-feed-probe") {
+        std::process::exit(order_feed_probe().await);
+    }
 
     // 1. Tracing — timestamps in IST (UTC+5:30) so server logs are readable
     let ist_timer = tracing_subscriber::fmt::time::OffsetTime::new(
@@ -735,6 +852,14 @@ async fn main() {
     let flags = Arc::new(RwLock::new(db::load_feature_flags(&pool).await));
     tracing::info!(flags = ?*flags.read().await, "Feature flags loaded");
 
+    // Load special sessions from DB before trading tasks start
+    let special_sessions = db::load_special_sessions(&pool).await.unwrap_or_else(|e| {
+        tracing::error!("load special_sessions: {e}");
+        Vec::new()
+    });
+    tracing::info!(count = special_sessions.len(), "Special sessions loaded");
+    shared_domain::set_special_sessions(special_sessions);
+
     // 4. Shared state
     let prices: Arc<DashMap<String, f64>> = Arc::new(DashMap::new());
     let restored_positions = db::load_open_positions(&pool).await;
@@ -767,6 +892,16 @@ async fn main() {
     }
 
     let kotak_client_opt = Arc::new(tokio::sync::Mutex::new(None));
+    // Order timing (analytics only, see `order_timing`): every send is
+    // recorded from here on — before the monitor can place one — and Kotak's
+    // order push stream runs only with KOTAK_ORDER_STREAM=on.
+    let order_timing = Arc::new(order_timing::OrderTiming::new(order_timing::push_enabled()));
+    tokio::spawn(order_timing::run_recorder(write_tx.clone()));
+    if order_timing::push_enabled() {
+        tokio::spawn(order_timing::run_push_stream(Arc::clone(&order_timing), Arc::clone(&kotak_client_opt), write_tx.clone()));
+    } else {
+        tracing::info!("KOTAK_ORDER_STREAM not on — order fill times come from the send only (try `server order-feed-probe` first)");
+    }
     let ws_task = Arc::new(tokio::sync::Mutex::new(None));
     let ws_tx = Arc::new(tokio::sync::Mutex::new(None));
     // Serializes full Kotak login attempts end-to-end — see
@@ -959,7 +1094,9 @@ async fn main() {
             "market open 09:15 IST",
         ));
         // Mid-day safety net: rebuild the session if it dies between triggers.
-        tokio::spawn(run_kotak_session_watchdog(handles, Arc::clone(&kotak_session_healthy)));
+        tokio::spawn(run_kotak_session_watchdog(handles.clone(), Arc::clone(&kotak_session_healthy)));
+        // Auto-login and clear triggers for special trading sessions (Muhurat trading)
+        tokio::spawn(run_special_session_kotak_lifecycle(handles));
     }
 
 
@@ -1002,13 +1139,20 @@ async fn main() {
         }
     };
     let market = Arc::new(market_data::MarketDataState::new(upstox.is_some()));
+    // How late each feed's prices arrive, for the admin (`feed_latency`):
+    // one read-only Upstox stream in market hours, and Kotak's tick tap.
+    let feed_latency = Arc::new(feed_latency::FeedLatency::new(upstox.is_some()));
     if let Some(client) = upstox.clone() {
         tokio::spawn(market_data::run_poller(
-            client,
+            client.clone(),
             Arc::clone(&market),
             write_tx.clone(),
             Arc::clone(&indicator_feed),
         ));
+        // The permanent 1-minute archive of the indices and their futures,
+        // swept after each day's close (see `candles::archive`).
+        tokio::spawn(candles::archive::run(client.clone(), pool.clone(), write_tx.clone()));
+        tokio::spawn(feed_latency::run(Arc::clone(&feed_latency), client, Arc::clone(&positions), Arc::clone(&ws_tx)));
     }
 
     // 9c. Kotak balance for the dashboard: hourly and after every LIVE trade,
@@ -1070,6 +1214,7 @@ async fn main() {
         indicator_feed,
         pulse: Arc::new(pulse::PulseHub::new()),
         balance,
+        order_book: Arc::new(orders::OrderBookCache::new()),
         execute: Arc::new(execute::ExecuteBoard::new()),
         upstox,
         candles: Arc::new(candles::CandleService::new()),
@@ -1078,6 +1223,8 @@ async fn main() {
         whatsapp,
         paper: paper_desk,
         quotes,
+        feed_latency,
+        order_timing,
     };
     pulse::spawn_sampler(state.clone());
     // Users' paper positions: chart levels and the expiry square-off, and
@@ -1085,6 +1232,8 @@ async fn main() {
     tokio::spawn(paper::engine::run(Arc::clone(&state.paper)));
     paper::feed::spawn_keeper(Arc::clone(&state.paper), Arc::clone(&state.ws_tx));
     state.execute.spawn_error_watch(&state.log_tx);
+    // Ladder strikes that left every ATM band come off the feed.
+    execute::ExecuteBoard::spawn_band_release(state.clone());
     // Reconnect Telegram from the last Start, so a restart or an update needs
     // no login code. Nothing missed while down is replayed.
     tokio::spawn(routes::resume_saved_telegram(state.clone()));
@@ -1126,7 +1275,6 @@ async fn main() {
         .route("/api/settings/clear_database",      post(routes::post_clear_database_handler))
         .route("/api/wallet/balance",               get(routes::get_wallet_balance_handler)
                                                    .post(routes::post_wallet_balance_handler))
-        .route("/api/update_server",                post(routes::post_update_server_handler))
         .route("/api/auth/kotak",                  post(routes::kotak_login_handler)
                                                    .get(routes::kotak_status_handler))
         .route("/api/auth/kotak/auto-login",        post(routes::kotak_auto_login_handler))
@@ -1153,11 +1301,18 @@ async fn main() {
         .route("/api/admin/trades",                 get(routes::admin_paper::trades_handler))
         .route("/api/admin/positions",              get(routes::admin_paper::positions_handler))
         .route("/api/admin/users/:id/report",       get(routes::admin_report::report_handler))
+        .route("/api/admin/latency",                get(feed_latency::latency_handler))
+        .route("/api/admin/order-timings",          get(order_timing::timings_handler))
+        .route("/api/admin/special-sessions",       get(routes::admin_sessions::get_sessions_handler))
+        .route("/api/admin/special-sessions/:date", axum::routing::put(routes::admin_sessions::put_session_handler)
+                                                   .delete(routes::admin_sessions::delete_session_handler))
+        .route("/api/admin/data",                   get(routes::admin_data::data_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))
         .route("/api/v2/history",                   get(routes::v2::history_handler))
         .route("/api/v2/desk",                      get(routes::v2::desk_handler))
+        .route("/api/v2/orders",                    get(orders::orders_handler))
         .route("/api/v2/feed",                      get(routes::v2::feed_handler))
         .route("/api/v2/status",                    get(routes::v2::status_handler))
         .route("/api/v2/expiries",                  get(routes::v2::expiries_handler))

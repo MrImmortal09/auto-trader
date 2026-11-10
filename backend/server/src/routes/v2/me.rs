@@ -25,7 +25,7 @@ use crate::history::{self, Call, GroupBy, Range};
 use crate::paper::{self, ContractRef, PaperPosition, Refusal};
 use crate::routes::v2::desk::{index_ltp, ClosedCall, DeskAnswer, Wallet};
 use crate::routes::v2::history::{range_and_group, Answer};
-use crate::routes::v2::positions::LevelsUpdate;
+use crate::routes::v2::positions::{sells_now, LevelsUpdate};
 use crate::AppState;
 
 fn refuse(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -69,12 +69,24 @@ fn fresh_price(state: &AppState, p: &PaperPosition) -> Option<f64> {
         .filter(|_| execute::contract_age_secs(&p.ws_key).is_some_and(|age| age <= execute::MAX_CONTRACT_AGE_SECS))
 }
 
+fn paper_buy_closed_message() -> String {
+    if let Some(session) = shared_domain::special_session_on(shared_domain::today_ist()) {
+        format!(
+            "Market is closed — today's special session runs {}–{} IST",
+            shared_domain::format_hhmm(session.start),
+            shared_domain::format_hhmm(session.end)
+        )
+    } else {
+        "Market is closed — paper trades run 09:15–15:30 IST".to_string()
+    }
+}
+
 /// Sells run in the same hours as buys: there is no price to fill at outside them.
 fn market_open() -> Result<(), Response> {
     if execute::manual_buy_window_open() {
         Ok(())
     } else {
-        Err(refuse(StatusCode::CONFLICT, "Market is closed — paper trades run 09:15–15:30 IST"))
+        Err(refuse(StatusCode::CONFLICT, paper_buy_closed_message()))
     }
 }
 
@@ -219,7 +231,7 @@ pub async fn buy_handler(
         return refuse(StatusCode::BAD_REQUEST, format!("Lots must be between 1 and {}", paper::MAX_LOTS_PER_TAP));
     }
     if !execute::manual_buy_window_open() || trading_engine::is_entry_cutoff_passed() {
-        return refuse(StatusCode::CONFLICT, "Market is closed — paper trades run 09:15–15:30 IST");
+        return refuse(StatusCode::CONFLICT, paper_buy_closed_message());
     }
     if !execute::feed_fresh() {
         return refuse(StatusCode::CONFLICT, "Price feed is stale — not buying blind");
@@ -323,12 +335,13 @@ pub async fn exit_all_handler(State(state): State<AppState>, Extension(identity)
     Json(json!({ "sold": sold, "not_sold": kept })).into_response()
 }
 
-/// `PATCH /api/v2/me/positions/:id {stop?, target?}` — set, clear or keep a
-/// position's chart stop and target, as `/api/v2/positions/:id` does for the
-/// owner's scalps: `{price, trigger}` with `trigger` `"premium"` or
-/// `"index"`. One already crossed sells the whole holding on the watch
-/// loop's next pass (within half a second, at a fresh price): `sells_now`
-/// says so.
+/// `PATCH /api/v2/me/positions/:id {stop?, set_target?, remove_target?}` —
+/// a position's chart stop and targets, as `/api/v2/positions/:id` does for
+/// the owner's scalps: `{price, trigger}` with `trigger` `"premium"` or
+/// `"index"`, a target with its `lots` (`null` = all left). One already
+/// crossed sells on the watch loop's next pass (within half a second, at a
+/// fresh price) — everything for the stop, a target's lots for a target:
+/// `sells_now` and `sells_lots` say so.
 pub async fn patch_levels_handler(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
@@ -339,14 +352,15 @@ pub async fn patch_levels_handler(
         Ok(id) => id,
         Err(e) => return e,
     };
-    let pos = match state.paper.set_levels(user_id, &id, update.stop, update.target).await {
-        Ok(pos) => pos,
+    let (pos, target_id) = match state.paper.set_levels(user_id, &id, &update).await {
+        Ok(set) => set,
         Err(r) => return r.into_response(),
     };
     let premium = state.paper.price(&pos.ws_key);
     let index = index_ltp(&state, &pos.index);
-    let sells_now = shared_domain::chart_level_reached(Some(&pos.option_type), &pos.chart, premium, index).is_some();
-    Json(json!({ "id": id, "chart": pos.chart, "sells_now": sells_now })).into_response()
+    let hit = shared_domain::chart_hit(Some(&pos.option_type), &pos.chart, premium, index, pos.lots());
+    let (sells, sells_lots) = sells_now(hit.as_ref());
+    Json(json!({ "id": id, "chart": pos.chart, "sells_now": sells, "sells_lots": sells_lots, "target_id": target_id })).into_response()
 }
 
 /// `POST /api/v2/me/reset` — start over with ₹10,00,000 and no history.

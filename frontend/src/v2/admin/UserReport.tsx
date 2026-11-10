@@ -7,6 +7,7 @@ import { getUserReport } from '../lib/api';
 import { downloadCsv } from '../lib/csv';
 import { axisMoney, dateRange, dayLabel, hhmm, hhmmss, indexName, money, pct, plural, price, shortDate, signedMoney, todayIst, toneOf } from '../lib/format';
 import { reasonLabel } from '../lib/labels';
+import { PALETTE } from '../lib/palette';
 import { usePoll } from '../lib/usePoll';
 import type { AdminUser, CurvePoint, LegRow, ReportDay, ReportTrade, UserReport as Report } from '../lib/types';
 import { Button } from '../ui/Button';
@@ -16,9 +17,11 @@ import { Stat } from '../ui/Stat';
 import { PaperLine } from './PaperActivity';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
-const DATE_INPUT = 'min-w-0 rounded-6 border border-line bg-inset px-2 type-body text-fg outline-none focus:border-line-strong tnum';
-// The design's tokens as plain values: SVG attributes can't read CSS variables.
-const C = { profit: '#22b47f', loss: '#ee705c', grid: '#2c3442', muted: '#8e97a7', raised: '#2c3442', line: '#353e4d' };
+// A white well; its border is `border-line` (accent on focus), or `border-loss` while the dates are the
+// wrong way round — focused or not, so the field being corrected keeps looking wrong.
+const DATE_INPUT = 'min-w-0 rounded-6 border bg-panel px-2 type-body text-fg transition-colors duration-120 tnum';
+// The chart's colours as plain values (SVG attributes can't read CSS tokens), from the one source every chart shares.
+const C = { profit: PALETTE.profit, loss: PALETTE.loss, grid: PALETTE.grid, text: PALETTE.subtle, ring: PALETTE.surface, cursor: PALETTE.lineStrong };
 
 // `custom`: the dates typed in, with no preset lit.
 type Preset = 'today' | '7d' | '30d' | 'all' | 'custom';
@@ -137,10 +140,10 @@ function exportTab(r: Report, tab: Tab) {
 
 function Card({ title, note, right, children, padded = true }: { title: ReactNode; note?: ReactNode; right?: ReactNode; children: ReactNode; padded?: boolean }) {
   return (
-    <section className={`flex min-w-0 flex-col rounded-12 bg-panel ${padded ? 'gap-3 p-4' : ''}`}>
+    <section className={`flex min-w-0 flex-col rounded-12 border border-line bg-panel ${padded ? 'gap-3 p-4' : ''}`}>
       <div className={`flex flex-wrap items-baseline gap-x-2 gap-y-1 ${padded ? '' : 'px-4 pt-3.5 pb-2'}`}>
         <h2 className="type-title text-fg">{title}</h2>
-        {note && <span className="type-caption text-fg-muted">{note}</span>}
+        {note && <span className="type-caption text-fg-subtle">{note}</span>}
         {right && <span className="ml-auto">{right}</span>}
       </div>
       {children}
@@ -149,7 +152,7 @@ function Card({ title, note, right, children, padded = true }: { title: ReactNod
 }
 
 function Empty({ children }: { children: ReactNode }) {
-  return <p className="rounded-12 bg-panel px-4 py-6 text-center type-body text-fg-muted">{children}</p>;
+  return <p className="rounded-12 border border-line bg-panel px-4 py-6 text-center type-body text-fg-subtle">{children}</p>;
 }
 
 // ── Figures ──────────────────────────────────────────────────────────── //
@@ -185,7 +188,7 @@ function Kpis({ r, desktop }: { r: Report; desktop: boolean }) {
 /** Booked P&L sell by sell through one day, on a clock axis. */
 function IntradayChart({ curve, start, height, compact }: { curve: CurvePoint[]; start: string | null; height: number; compact: boolean }) {
   if (curve.length === 0) {
-    return <div className="grid place-items-center type-body text-fg-muted" style={{ height }}>Nothing sold in this range yet.</div>;
+    return <div className="grid place-items-center type-body text-fg-subtle" style={{ height }}>Nothing sold in this range yet.</div>;
   }
   const first = start ?? curve[0].t;
   const data = [{ x: secondsOf(first), t: first, pnl: 0 }, ...curve.map((p) => ({ x: secondsOf(p.t), t: p.t, pnl: p.pnl }))];
@@ -202,29 +205,23 @@ function IntradayChart({ curve, start, height, compact }: { curve: CurvePoint[];
     <div style={{ height }} role="img" aria-label={`Booked P&L through the day, ending at ${signedMoney(last.pnl)}`}>
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={data} margin={{ top: 12, right: compact ? 4 : 0, bottom: 0, left: compact ? 4 : 0 }}>
-          <defs>
-            <linearGradient id="user-report-fill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={color} stopOpacity={0.28} />
-              <stop offset="100%" stopColor={color} stopOpacity={0.04} />
-            </linearGradient>
-          </defs>
           <CartesianGrid vertical={false} stroke={C.grid} />
-          <XAxis dataKey="x" type="number" domain={[lo, hi]} ticks={ticks} tickFormatter={clock} tick={{ fill: C.muted, fontSize: 11 }} tickLine={false} axisLine={false} />
-          <YAxis orientation="right" hide={compact} tickFormatter={(v: number) => axisMoney(v)} tick={{ fill: C.muted, fontSize: 11 }} tickLine={false} axisLine={false} width={52} />
+          <XAxis dataKey="x" type="number" domain={[lo, hi]} ticks={ticks} tickFormatter={clock} tick={{ fill: C.text, fontSize: 11 }} tickLine={false} axisLine={false} />
+          <YAxis orientation="right" hide={compact} tickFormatter={(v: number) => axisMoney(v)} tick={{ fill: C.text, fontSize: 11 }} tickLine={false} axisLine={false} width={52} />
           <Tooltip
-            cursor={{ stroke: C.line, strokeWidth: 1 }}
+            cursor={{ stroke: C.cursor, strokeWidth: 1 }}
             content={({ active, payload }) => {
               const p = active && payload?.[0] ? (payload[0].payload as (typeof data)[number]) : null;
               if (!p) return null;
               return (
-                <div className="rounded-8 border border-line bg-raised px-3 py-2 shadow-lg">
+                <div className="rounded-8 border border-line bg-panel px-3 py-2 shadow-md">
                   <div className="type-label text-fg">{hhmmss(p.t)}</div>
-                  <div className="mt-0.5 type-caption text-fg-muted tnum">Booked so far {signedMoney(p.pnl)}</div>
+                  <div className="mt-0.5 type-caption text-fg-subtle tnum">Booked so far {signedMoney(p.pnl)}</div>
                 </div>
               );
             }}
           />
-          <Area type="stepAfter" dataKey="pnl" stroke={color} strokeWidth={2} fill="url(#user-report-fill)" isAnimationActive={false} activeDot={{ r: 4, fill: color, stroke: C.raised, strokeWidth: 2 }} />
+          <Area type="stepAfter" dataKey="pnl" stroke={color} strokeWidth={2} fill={color} fillOpacity={0.1} isAnimationActive={false} activeDot={{ r: 4, fill: color, stroke: C.ring, strokeWidth: 2 }} />
         </AreaChart>
       </ResponsiveContainer>
     </div>
@@ -241,11 +238,11 @@ function Holding({ r }: { r: Report }) {
         <div key={p.id} className="flex items-center gap-4 border-t border-line px-4 py-3">
           <div className="min-w-0 flex-1">
             <div className="type-body-strong text-fg">{p.contract}</div>
-            <div className="mt-0.5 type-caption text-fg-muted tnum">{`${p.qty} qty · avg ${price(p.avg)} · since ${timeOn(p.opened_at, today)} · expires ${shortDate(p.expiry)}`}</div>
+            <div className="mt-0.5 type-caption text-fg-subtle tnum">{`${p.qty} qty · avg ${price(p.avg)} · since ${timeOn(p.opened_at, today)} · expires ${shortDate(p.expiry)}`}</div>
           </div>
           <div className="shrink-0 text-right">
             <div className={`num-medium ${TONE_TEXT[toneOf(p.pnl)]}`}>{p.pnl == null ? '—' : signedMoney(p.pnl)}</div>
-            <div className="type-caption text-fg-muted tnum">{p.ltp == null ? 'No price yet' : `LTP ${price(p.ltp)}`}</div>
+            <div className="type-caption text-fg-subtle tnum">{p.ltp == null ? 'No price yet' : `LTP ${price(p.ltp)}`}</div>
           </div>
         </div>
       ))}
@@ -264,14 +261,14 @@ function Legs({ t, day }: { t: ReportTrade; day: string }) {
       <table className="w-full min-w-[560px] type-caption tnum">
         <thead className="text-fg-muted">
           <tr className="text-left">
-            <th className="pb-1.5 pr-3 font-normal">Time</th>
-            <th className="pb-1.5 pr-3 font-normal">Side</th>
-            <th className="pb-1.5 pr-3 text-right font-normal">Qty</th>
-            <th className="pb-1.5 pr-3 text-right font-normal">Price</th>
-            <th className="pb-1.5 pr-3 text-right font-normal">Value</th>
-            <th className="pb-1.5 pr-3 text-right font-normal">Charges</th>
-            <th className="pb-1.5 pr-3 text-right font-normal">P&amp;L</th>
-            <th className="pb-1.5 font-normal">Reason</th>
+            <th className="pb-1.5 pr-3 type-eyebrow">Time</th>
+            <th className="pb-1.5 pr-3 type-eyebrow">Side</th>
+            <th className="pb-1.5 pr-3 text-right type-eyebrow">Qty</th>
+            <th className="pb-1.5 pr-3 text-right type-eyebrow">Price</th>
+            <th className="pb-1.5 pr-3 text-right type-eyebrow">Value</th>
+            <th className="pb-1.5 pr-3 text-right type-eyebrow">Charges</th>
+            <th className="pb-1.5 pr-3 text-right type-eyebrow">P&amp;L</th>
+            <th className="pb-1.5 type-eyebrow">Reason</th>
           </tr>
         </thead>
         <tbody>
@@ -294,7 +291,7 @@ function Legs({ t, day }: { t: ReportTrade; day: string }) {
           })}
         </tbody>
       </table>
-      {otherDay && <p className="mt-2 type-caption text-fg-muted">Greyed fills are from another day; this day counts only its own sells.</p>}
+      {otherDay && <p className="mt-2 type-caption text-fg-subtle">Greyed fills are from another day; this day counts only its own sells.</p>}
     </div>
   );
 }
@@ -328,17 +325,17 @@ function TradeTable({ d }: { d: ReportDay }) {
       <table className="w-full min-w-[920px] type-caption tnum">
         <thead className="text-fg-muted">
           <tr className="border-b border-line text-left">
-            <th className="py-2 pl-4 pr-3 font-normal">In</th>
-            <th className="py-2 pr-3 font-normal">Out</th>
-            <th className="py-2 pr-3 font-normal">Held</th>
-            <th className="py-2 pr-3 font-normal">Contract</th>
-            <th className="py-2 pr-3 text-right font-normal">Qty</th>
-            <th className="py-2 pr-3 text-right font-normal">Avg buy</th>
-            <th className="py-2 pr-3 text-right font-normal">Avg sell</th>
-            <th className="py-2 pr-3 text-right font-normal">Gross</th>
-            <th className="py-2 pr-3 text-right font-normal">Charges</th>
-            <th className="py-2 pr-3 text-right font-normal">Net</th>
-            <th className="w-8 py-2 pr-4 font-normal">
+            <th className="py-2 pl-4 pr-3 type-eyebrow">In</th>
+            <th className="py-2 pr-3 type-eyebrow">Out</th>
+            <th className="py-2 pr-3 type-eyebrow">Held</th>
+            <th className="py-2 pr-3 type-eyebrow">Contract</th>
+            <th className="py-2 pr-3 text-right type-eyebrow">Qty</th>
+            <th className="py-2 pr-3 text-right type-eyebrow">Avg buy</th>
+            <th className="py-2 pr-3 text-right type-eyebrow">Avg sell</th>
+            <th className="py-2 pr-3 text-right type-eyebrow">Gross</th>
+            <th className="py-2 pr-3 text-right type-eyebrow">Charges</th>
+            <th className="py-2 pr-3 text-right type-eyebrow">Net</th>
+            <th className="w-8 py-2 pr-4 type-eyebrow">
               <span className="sr-only">Fills</span>
             </th>
           </tr>
@@ -410,7 +407,7 @@ function TradeCards({ d }: { d: ReportDay }) {
             <button type="button" aria-expanded={expanded} onClick={() => setOpen(expanded ? null : t.id)} className="flex min-h-14 w-full items-center gap-3 px-4 py-3 text-left">
               <div className="min-w-0 flex-1">
                 <TradeTitle t={t} />
-                <div className="mt-0.5 type-caption text-fg-muted tnum">{[when, t.closed_at ? held(t.held_secs) : null, `${qtyText(t)} qty`].filter(Boolean).join(' · ')}</div>
+                <div className="mt-0.5 type-caption text-fg-subtle tnum">{[when, t.closed_at ? held(t.held_secs) : null, `${qtyText(t)} qty`].filter(Boolean).join(' · ')}</div>
               </div>
               <div className="shrink-0 text-right">
                 <TradeNet t={t} day={d.date} size="num-medium" />
@@ -419,7 +416,7 @@ function TradeCards({ d }: { d: ReportDay }) {
             </button>
             {expanded && (
               <div className="flex flex-col gap-2 px-4 pb-4">
-                <div className="type-caption text-fg-muted tnum">
+                <div className="type-caption text-fg-subtle tnum">
                   {[
                     `avg buy ${t.avg_buy == null ? '—' : price(t.avg_buy)}`,
                     `avg sell ${t.avg_sell == null ? '—' : price(t.avg_sell)}`,
@@ -435,7 +432,7 @@ function TradeCards({ d }: { d: ReportDay }) {
           </div>
         );
       })}
-      <div className="flex items-center justify-between gap-3 px-4 py-3 type-caption text-fg-muted tnum">
+      <div className="flex items-center justify-between gap-3 px-4 py-3 type-caption text-fg-subtle tnum">
         <span>{`Gross ${signedMoney(d.gross)} · charges ${money(d.charges)}`}</span>
         <span className={`num-small ${TONE_TEXT[toneOf(d.net)]}`}>{signedMoney(d.net)}</span>
       </div>
@@ -454,25 +451,25 @@ function DayCard({ d, open, onToggle, desktop }: { d: ReportDay; open: boolean; 
     .filter(Boolean)
     .join(' · ');
   return (
-    <section className="overflow-hidden rounded-12 bg-panel">
-      <button type="button" aria-expanded={open} onClick={onToggle} className="flex w-full items-center gap-4 px-4 py-3.5 text-left hover:bg-raised/30">
+    <section className="overflow-hidden rounded-12 border border-line bg-panel">
+      <button type="button" aria-expanded={open} onClick={onToggle} className="flex w-full items-center gap-4 px-4 py-3.5 text-left transition-colors duration-120 hover:bg-raised/40">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="type-body-strong text-fg">{dayLabel(d.date)}</span>
             {d.expiries.length > 0 && <Chip>{`${d.expiries.map(indexName).join(', ')} expiry`}</Chip>}
           </div>
-          <div className="mt-0.5 type-caption text-fg-muted tnum">{line}</div>
+          <div className="mt-0.5 type-caption text-fg-subtle tnum">{line}</div>
         </div>
         <div className="shrink-0 text-right">
           <div className={`num-medium ${TONE_TEXT[toneOf(d.net)]}`}>{signedMoney(d.net)}</div>
-          {desktop && <div className="type-caption text-fg-muted tnum">{`gross ${signedMoney(d.gross)} · charges ${money(d.charges)}`}</div>}
+          {desktop && <div className="type-caption text-fg-subtle tnum">{`gross ${signedMoney(d.gross)} · charges ${money(d.charges)}`}</div>}
         </div>
         <Chevron size={16} className="shrink-0 text-fg-muted" />
       </button>
       {open && (
         <div className="border-t border-line">
           {d.trades.length > 0 && (desktop ? <TradeTable d={d} /> : <TradeCards d={d} />)}
-          {d.unlisted > 0 && <p className="px-4 py-3 type-caption text-fg-muted">{`${plural(d.unlisted, 'trade')} not listed — pick a shorter range to see them.`}</p>}
+          {d.unlisted > 0 && <p className="px-4 py-3 type-caption text-fg-subtle">{`${plural(d.unlisted, 'trade')} not listed — pick a shorter range to see them.`}</p>}
         </div>
       )}
     </section>
@@ -489,7 +486,7 @@ function DaysTab({ r, desktop }: { r: Report; desktop: boolean }) {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center gap-2">
-        <p className="type-caption text-fg-muted">Each day books its own sells, after charges on both sides. Open a trade to see every fill.</p>
+        <p className="type-caption text-fg-subtle">Each day books its own sells, after charges on both sides. Open a trade to see every fill.</p>
         <Button size="sm" kind="quiet" className="ml-auto" onClick={() => setToggled(Object.fromEntries(r.days.map((d) => [d.date, !allOpen])))}>
           {allOpen ? 'Collapse all' : 'Expand all'}
         </Button>
@@ -510,21 +507,21 @@ function FillsTab({ r, desktop }: { r: Report; desktop: boolean }) {
   const s = r.summary;
   const foot = `${plural(s.buys + s.sells, 'fill')} · turnover ${money(s.turnover)} · charges paid ${money(s.charges_paid)}${r.more_fills > 0 ? ` · the oldest ${r.more_fills} not listed` : ''}`;
   return (
-    <section className="overflow-hidden rounded-12 bg-panel">
+    <section className="overflow-hidden rounded-12 border border-line bg-panel">
       {desktop ? (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[880px] type-caption tnum">
             <thead className="text-fg-muted">
               <tr className="border-b border-line text-left">
-                <th className="py-2 pl-4 pr-3 font-normal">Time</th>
-                <th className="py-2 pr-3 font-normal">Side</th>
-                <th className="py-2 pr-3 font-normal">Contract</th>
-                <th className="py-2 pr-3 text-right font-normal">Qty</th>
-                <th className="py-2 pr-3 text-right font-normal">Price</th>
-                <th className="py-2 pr-3 text-right font-normal">Value</th>
-                <th className="py-2 pr-3 text-right font-normal">Charges</th>
-                <th className="py-2 pr-3 text-right font-normal">P&amp;L</th>
-                <th className="py-2 pr-4 font-normal">Reason</th>
+                <th className="py-2 pl-4 pr-3 type-eyebrow">Time</th>
+                <th className="py-2 pr-3 type-eyebrow">Side</th>
+                <th className="py-2 pr-3 type-eyebrow">Contract</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Qty</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Price</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Value</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Charges</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">P&amp;L</th>
+                <th className="py-2 pr-4 type-eyebrow">Reason</th>
               </tr>
             </thead>
             <tbody>
@@ -563,14 +560,14 @@ function FillsTab({ r, desktop }: { r: Report; desktop: boolean }) {
                   <span className="type-body-strong text-fg">{f.contract}</span>
                   {f.before_reset && <Chip>Before reset</Chip>}
                 </div>
-                <div className="mt-0.5 type-caption text-fg-muted tnum">{[when(f.t), `${f.qty} @ ${price(f.price)}`, `charges ${money(f.charges)}`, reasonLabel(f.reason) || null].filter(Boolean).join(' · ')}</div>
+                <div className="mt-0.5 type-caption text-fg-subtle tnum">{[when(f.t), `${f.qty} @ ${price(f.price)}`, `charges ${money(f.charges)}`, reasonLabel(f.reason) || null].filter(Boolean).join(' · ')}</div>
               </div>
               <div className={`shrink-0 num-medium ${buy ? 'text-fg-muted' : TONE_TEXT[toneOf(f.pnl)]}`}>{buy ? money(f.value) : f.pnl == null ? '—' : signedMoney(f.pnl)}</div>
             </div>
           );
         })
       )}
-      <p className="px-4 py-3 type-caption text-fg-muted tnum">{foot}</p>
+      <p className="px-4 py-3 type-caption text-fg-subtle tnum">{foot}</p>
     </section>
   );
 }
@@ -579,21 +576,21 @@ function ContractsTab({ r, desktop }: { r: Report; desktop: boolean }) {
   if (r.contracts.length === 0) return <Empty>No trades in this range.</Empty>;
   const s = r.summary;
   return (
-    <section className="overflow-hidden rounded-12 bg-panel">
+    <section className="overflow-hidden rounded-12 border border-line bg-panel">
       {desktop ? (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[860px] type-caption tnum">
             <thead className="text-fg-muted">
               <tr className="border-b border-line text-left">
-                <th className="py-2 pl-4 pr-3 font-normal">Contract</th>
-                <th className="py-2 pr-3 text-right font-normal">Trades</th>
-                <th className="py-2 pr-3 text-right font-normal">Bought</th>
-                <th className="py-2 pr-3 text-right font-normal">Avg buy</th>
-                <th className="py-2 pr-3 text-right font-normal">Sold</th>
-                <th className="py-2 pr-3 text-right font-normal">Avg sell</th>
-                <th className="py-2 pr-3 text-right font-normal">Gross</th>
-                <th className="py-2 pr-3 text-right font-normal">Charges</th>
-                <th className="py-2 pr-4 text-right font-normal">Net</th>
+                <th className="py-2 pl-4 pr-3 type-eyebrow">Contract</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Trades</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Bought</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Avg buy</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Sold</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Avg sell</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Gross</th>
+                <th className="py-2 pr-3 text-right type-eyebrow">Charges</th>
+                <th className="py-2 pr-4 text-right type-eyebrow">Net</th>
               </tr>
             </thead>
             <tbody>
@@ -628,7 +625,7 @@ function ContractsTab({ r, desktop }: { r: Report; desktop: boolean }) {
           <div key={c.contract} className="flex items-center gap-3 border-b border-line px-4 py-3">
             <div className="min-w-0 flex-1">
               <div className="type-body-strong text-fg">{c.contract}</div>
-              <div className="mt-0.5 type-caption text-fg-muted tnum">
+              <div className="mt-0.5 type-caption text-fg-subtle tnum">
                 {[plural(c.trades, 'trade'), `bought ${c.buy_qty}${c.avg_buy == null ? '' : ` @ ${price(c.avg_buy)}`}`, `sold ${c.sell_qty}${c.avg_sell == null ? '' : ` @ ${price(c.avg_sell)}`}`, `charges ${money(c.charges)}`].join(' · ')}
               </div>
             </div>
@@ -636,7 +633,7 @@ function ContractsTab({ r, desktop }: { r: Report; desktop: boolean }) {
           </div>
         ))
       )}
-      <p className="px-4 py-3 type-caption text-fg-muted">Bought and sold in the range; net is what its sells booked, after charges.</p>
+      <p className="px-4 py-3 type-caption text-fg-subtle">Bought and sold in the range; net is what its sells booked, after charges.</p>
     </section>
   );
 }
@@ -645,18 +642,18 @@ function TimingTab({ r, desktop }: { r: Report; desktop: boolean }) {
   if (r.hours.length === 0) return <Empty>No trades closed in this range.</Empty>;
   const max = Math.max(1, ...r.hours.map((h) => Math.abs(h.net)));
   return (
-    <section className="overflow-hidden rounded-12 bg-panel">
-      <p className="px-4 pt-3.5 pb-2 type-caption text-fg-muted">Trades closed in the range, by the IST hour they were entered.</p>
+    <section className="overflow-hidden rounded-12 border border-line bg-panel">
+      <p className="px-4 pt-3.5 pb-2 type-caption text-fg-subtle">Trades closed in the range, by the IST hour they were entered.</p>
       {r.hours.map((h) => {
         const tone = toneOf(h.net);
         const hour = String(h.hour).padStart(2, '0');
         return (
           <div key={h.hour} className="flex min-h-12 items-center gap-4 border-t border-line px-4 py-3">
             <span className={`shrink-0 type-body-strong text-fg tnum ${desktop ? 'w-32' : 'w-24'}`}>{`${hour}:00–${String(h.hour + 1).padStart(2, '0')}:00`}</span>
-            <span className={`shrink-0 type-caption text-fg-muted tnum ${desktop ? 'w-44' : 'min-w-0 flex-1 truncate'}`}>{`${plural(h.closed, 'trade')} · ${pct((h.wins / h.closed) * 100)} won`}</span>
+            <span className={`shrink-0 type-caption text-fg-subtle tnum ${desktop ? 'w-44' : 'min-w-0 flex-1 truncate'}`}>{`${plural(h.closed, 'trade')} · ${pct((h.wins / h.closed) * 100)} won`}</span>
             {desktop && (
               <span className="flex-1">
-                <span className={`block h-1 rounded-full ${tone === 'loss' ? 'bg-loss' : 'bg-profit'}`} style={{ width: `${Math.max(2, (Math.abs(h.net) / max) * 100) * 0.6}%`, minWidth: 4 }} />
+                <span className={`block h-1 rounded-full ${tone === 'loss' ? 'bg-loss' : 'bg-profit'}`} style={{ width: `${Math.max(2, (Math.abs(h.net) / max) * 100)}%`, minWidth: 4 }} />
               </span>
             )}
             <span className={`num-medium ${TONE_TEXT[tone]}`}>{signedMoney(h.net)}</span>
@@ -705,17 +702,18 @@ export function UserReport({ serverBase, userId, desktop, onBack }: { serverBase
   const head = (
     <div className="flex flex-col gap-2">
       <div>
-        <Button size={desktop ? 'sm' : 'md'} kind="quiet" icon={<ArrowLeft size={14} />} onClick={onBack} className="-ml-2.5">
+        <button type="button" onClick={onBack} className={`inline-flex items-center gap-1.5 type-label text-fg-muted transition-colors duration-120 hover:text-fg ${desktop ? 'h-7' : 'h-11'}`}>
+          <ArrowLeft size={14} />
           Users
-        </Button>
+        </button>
       </div>
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <h1 className="type-title text-fg">{user ? `${nameOf(user)} · P&L report` : 'P&L report'}</h1>
-        {user && <span className="type-caption text-fg-muted tnum">+91 {formatPhone(user.phone)}</span>}
+        {user && <span className="type-caption text-fg-subtle tnum">+91 {formatPhone(user.phone)}</span>}
         {user && !user.enabled && <Chip kind="loss">Disabled</Chip>}
       </div>
       {user?.paper && (
-        <div className="type-caption text-fg-muted">
+        <div className="type-caption text-fg-subtle">
           <PaperLine p={user.paper} />
         </div>
       )}
@@ -724,14 +722,14 @@ export function UserReport({ serverBase, userId, desktop, onBack }: { serverBase
 
   // Desktop: inline after the presets. Phone: two columns, each caption over its field.
   const field = desktop ? 'flex items-center gap-1.5' : 'flex min-w-0 flex-col gap-1';
-  const input = `${DATE_INPUT} ${desktop ? 'h-8' : 'h-11 w-full'}`;
+  const input = `${DATE_INPUT} ${invalid ? 'border-loss' : 'border-line focus:border-accent'} ${desktop ? 'h-8' : 'h-11 w-full'}`;
   const dates = (
     <div className={desktop ? 'flex items-center gap-3' : 'grid grid-cols-2 gap-2'}>
-      <label className={`${field} type-caption text-fg-muted`}>
+      <label className={`${field} type-label text-fg-muted`}>
         From
         <input type="date" className={input} value={span.from ?? firstDay ?? ''} min={firstDay ?? undefined} max={span.to} onChange={(e) => pickDate('from', e.target.value)} />
       </label>
-      <label className={`${field} type-caption text-fg-muted`}>
+      <label className={`${field} type-label text-fg-muted`}>
         To
         <input type="date" className={input} value={span.to} min={span.from ?? undefined} max={today} onChange={(e) => pickDate('to', e.target.value)} />
       </label>
@@ -748,7 +746,7 @@ export function UserReport({ serverBase, userId, desktop, onBack }: { serverBase
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
       <Segment label="Range" options={PRESETS} value={preset} size="sm" onChange={setPreset} />
       {dates}
-      {r && <span className="type-caption text-fg-muted tnum">{[spanLabel, plural(r.summary.days_traded, 'trading day')].join(' · ')}</span>}
+      {r && <span className="type-caption text-fg-subtle tnum">{[spanLabel, plural(r.summary.days_traded, 'trading day')].join(' · ')}</span>}
       <span className="flex-1" />
       {exportButton}
     </div>
@@ -756,7 +754,7 @@ export function UserReport({ serverBase, userId, desktop, onBack }: { serverBase
     <div className="flex flex-col gap-3">
       <Segment label="Range" options={PRESETS} value={preset} size="lg" stretch onChange={setPreset} />
       {dates}
-      {r && <span className="type-caption text-fg-muted tnum">{[spanLabel, plural(r.summary.days_traded, 'trading day')].join(' · ')}</span>}
+      {r && <span className="type-caption text-fg-subtle tnum">{[spanLabel, plural(r.summary.days_traded, 'trading day')].join(' · ')}</span>}
     </div>
   );
 
@@ -779,7 +777,7 @@ export function UserReport({ serverBase, userId, desktop, onBack }: { serverBase
 
   const nothing = r && r.summary.buys + r.summary.sells === 0;
   const body = !r ? (
-    <p className={`type-body ${report.error ? 'text-loss' : 'text-fg-muted'}`}>{invalid ? 'From must be on or before To.' : report.error ? `Couldn't load the report: ${report.error}` : 'Loading…'}</p>
+    <p className={`type-body ${invalid || report.error ? 'text-loss' : 'text-fg-subtle'}`}>{invalid ? 'From must be on or before To.' : report.error ? `Couldn't load the report: ${report.error}` : 'Loading…'}</p>
   ) : (
     <>
       <Kpis r={r} desktop={desktop} />

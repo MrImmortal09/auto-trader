@@ -194,7 +194,9 @@ pub fn from_upstox(key: &str, q: &upstox_client::Quote, at: i64) -> Option<Quote
         high: positive(ohlc.high),
         low: positive(ohlc.low),
         close,
-        change: q.net_change.or(change),
+        // Upstox's `net_change` reads 0 when it is not sent, so a zero falls
+        // back to the LTP against the previous close (0 too when it truly is).
+        change: Some(q.net_change).filter(|c| c.is_finite() && *c != 0.0).or(change),
         per_change,
         volume: Some(q.volume).filter(|v| *v > 0.0),
         oi: Some(q.oi).filter(|v| *v > 0.0),
