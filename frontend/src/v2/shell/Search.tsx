@@ -42,7 +42,7 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
   const search = useSearch(serverBase, query, open);
   const groups = typed ? (search.answer ? groupsOf(search.answer) : []) : recents.length ? [{ head: 'Recent', rows: recents }] : [];
   const flat = groups.flatMap((g) => g.rows);
-  const quotes = useQuotes(serverBase, flat.map((r) => r.ws_key));
+  const quotes = useQuotes(serverBase, open ? flat.map((r) => r.ws_key) : []);
   const activeRow = flat.find((r) => r.id === active) ?? (typed ? flat[0] : undefined);
 
   // `/` and ⌘K from anywhere outside a field put the cursor in the well.

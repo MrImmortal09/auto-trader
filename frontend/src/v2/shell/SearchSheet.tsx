@@ -95,7 +95,7 @@ export function SearchSheet({ serverBase, open, onClose, onOpen }: {
             </button>
           )}
         </div>
-        <Button size="lg" kind="quiet" onClick={onClose} className="-mr-2">
+        <Button size="lg" kind="quiet" onClick={() => { setQuery(''); onClose(); }} className="-mr-2">
           Cancel
         </Button>
       </div>
