@@ -883,7 +883,7 @@ async fn main() {
     // recorded from here on — before the monitor can place one — and Kotak's
     // order push stream runs only with KOTAK_ORDER_STREAM=on.
     let order_timing = Arc::new(order_timing::OrderTiming::new(order_timing::push_enabled()));
-    tokio::spawn(order_timing::run_recorder(write_tx.clone()));
+    order_timing::start_recorder(Arc::clone(&order_timing), write_tx.clone(), log_tx.clone());
     if order_timing::push_enabled() {
         tokio::spawn(order_timing::run_push_stream(Arc::clone(&order_timing), Arc::clone(&kotak_client_opt), write_tx.clone()));
     } else {

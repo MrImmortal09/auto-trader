@@ -11,7 +11,7 @@ import {
   type Sent,
 } from './api';
 import type { Watchlist, WatchlistAnswer, WatchlistsAnswer } from './types';
-import { seedQuotes } from './useQuotes';
+import { noteServerClock, seedQuotes } from './useQuotes';
 
 // One copy of the signed-in person's watchlists for the whole app (plan
 // Phase 2): the Watchlist screen reads it, the "+" on a search result or an
@@ -77,10 +77,14 @@ export function loadWatchlists(): Promise<void> {
   const forScope = state.scope;
   if (inFlight?.scope === forScope) return inFlight.promise;
   set({ loading: true });
+  const sentAt = Date.now();
   const promise = getWatchlists(serverBase)
     .then(
       (answer) => {
         if (state.scope !== forScope) return;
+        // The rows age their quotes by the server's clock: known before
+        // they first draw, not only after the first quotes poll.
+        noteServerClock(answer.at, sentAt, Date.now());
         seed(answer.watchlists);
         set({ answer, error: null, loading: false });
       },

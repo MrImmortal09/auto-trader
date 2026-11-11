@@ -76,8 +76,9 @@ export function stockChipOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying'
 }
 
 /** How a row is opened: `open` is Enter or a tap on a search result,
- * `ladder` Shift+Enter, `chart` its chart button, `page` a watchlist row's
- * tap. */
+ * `ladder` Shift+Enter, `chart` a chart button (a search result's, a
+ * watchlist row's, the instrument page's Open chart), `page` a watchlist
+ * row's tap. */
 export type OpenHow = 'open' | 'ladder' | 'chart' | 'page';
 
 /**
@@ -88,8 +89,10 @@ export type OpenHow = 'open' | 'ladder' | 'chart' | 'page';
  * Any other row: on the ladder (`ladder`) where it has one — its index at an
  * option's expiry, or while stocks are on its F&O stock — or charted
  * (`chart`; `open` too while stocks are on, the plan's "Enter on any search
- * row opens its chart"), with the stock tab; its instrument page when the
- * Trade screen has nothing to show for it.
+ * row opens its chart"), with the stock tab and the ladder on its underlying
+ * at a contract's expiry (an index option's chart button: its index at its
+ * expiry, as the instrument page's Open chart does); its instrument page when
+ * the Trade screen has nothing to show for it.
  */
 export function targetOf(row: InstrumentRow, how: OpenHow, stocksOn: boolean): { trade: TradeIntent } | { instrument: string } {
   const index = tradeIndexOf(row);

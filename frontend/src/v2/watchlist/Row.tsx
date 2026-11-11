@@ -17,6 +17,8 @@ import { Popover } from '../ui/Popover';
 // close) for moving and removing. Phone: a 56 px
 // row (symbol and chips, then the name; the price stacked at the right) that
 // opens the instrument, and a "⋯" that opens a sheet with the same actions.
+// A key the catalog no longer has (an expired contract) is a dead row: it
+// opens nothing, and its menu and sheet offer Remove alone.
 // Nothing here places an order: Buy opens the ladder on the Trade screen.
 
 /** A live price older than this reads as stale during hours. */
@@ -116,7 +118,9 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
   last: boolean;
   /** Whether a live price can be stale (after hours the close is the price). */
   marketOpen: boolean;
-  /** Unix ms, ticking every few seconds, to age the price against. */
+  /** The server's Unix ms (this browser's clock plus its offset), ticking
+   * every few seconds, to age the price against: a quote's `at` is the
+   * server's. */
   now: number;
   actions: RowActions;
 }) {
@@ -140,6 +144,8 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
     </span>
   );
   const caption = row ? row.name : 'No longer listed — an expired contract, or the catalog is not built yet';
+  // A dead row has nothing to chart, buy or move: Remove is all it offers.
+  const live = row != null;
 
   if (desktop) {
     return (
@@ -154,33 +160,39 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
         </span>
         <span className="flex w-[150px] shrink-0 items-center justify-end gap-1">
           {/* The actions show on hover and on keyboard focus; the menu stays put. */}
-          <span className="flex items-center gap-1 opacity-0 transition-opacity duration-120 group-focus-within:opacity-100 group-hover:opacity-100">
-            <button type="button" aria-label={`Chart ${title}`} title={actions.onChart ? 'Open the chart' : COMING.chart} disabled={!actions.onChart} onClick={actions.onChart ?? undefined} className={ICON_BUTTON}>
-              <ChartLine size={14} />
-            </button>
-            <button type="button" aria-label={`Option chain for ${title}`} title={actions.onChain ? 'Open the option chain' : actions.chainWhy ?? COMING.chain} disabled={!actions.onChain} onClick={actions.onChain ?? undefined} className={ICON_BUTTON}>
-              <Rows3 size={14} />
-            </button>
-            <Button size="sm" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? 'Open the ladder' : COMING.buy} onClick={actions.onBuy ?? undefined} className="w-12">
-              Buy
-            </Button>
-          </span>
+          {live && (
+            <span className="flex items-center gap-1 opacity-0 transition-opacity duration-120 group-focus-within:opacity-100 group-hover:opacity-100">
+              <button type="button" aria-label={`Chart ${title}`} title={actions.onChart ? 'Open the chart' : COMING.chart} disabled={!actions.onChart} onClick={actions.onChart ?? undefined} className={ICON_BUTTON}>
+                <ChartLine size={14} />
+              </button>
+              <button type="button" aria-label={`Option chain for ${title}`} title={actions.onChain ? 'Open the option chain' : actions.chainWhy ?? COMING.chain} disabled={!actions.onChain} onClick={actions.onChain ?? undefined} className={ICON_BUTTON}>
+                <Rows3 size={14} />
+              </button>
+              <Button size="sm" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? 'Open the ladder' : COMING.buy} onClick={actions.onBuy ?? undefined} className="w-12">
+                Buy
+              </Button>
+            </span>
+          )}
           <span className="relative">
-            <button type="button" aria-label={`${title}: move or remove`} aria-expanded={menu} aria-haspopup="menu" onClick={() => setMenu((o) => !o)} className={ICON_BUTTON}>
+            <button type="button" aria-label={live ? `${title}: move or remove` : `${title}: remove`} aria-expanded={menu} aria-haspopup="menu" onClick={() => setMenu((o) => !o)} className={ICON_BUTTON}>
               <Ellipsis size={14} />
             </button>
             <Popover open={menu} onClose={() => setMenu(false)} align="right">
               <Menu label={title}>
-                <button type="button" role="menuitem" className={MENU_ITEM} disabled={first} onClick={() => { setMenu(false); actions.onMove('top'); }}>
-                  <ArrowUpToLine size={14} className="text-fg-muted" /> Move to top
-                </button>
-                <button type="button" role="menuitem" className={MENU_ITEM} disabled={first} onClick={() => { setMenu(false); actions.onMove('up'); }}>
-                  <ArrowUp size={14} className="text-fg-muted" /> Move up
-                </button>
-                <button type="button" role="menuitem" className={MENU_ITEM} disabled={last} onClick={() => { setMenu(false); actions.onMove('down'); }}>
-                  <ArrowDown size={14} className="text-fg-muted" /> Move down
-                </button>
-                <div aria-hidden className="my-1 h-px bg-line" />
+                {live && (
+                  <>
+                    <button type="button" role="menuitem" className={MENU_ITEM} disabled={first} onClick={() => { setMenu(false); actions.onMove('top'); }}>
+                      <ArrowUpToLine size={14} className="text-fg-muted" /> Move to top
+                    </button>
+                    <button type="button" role="menuitem" className={MENU_ITEM} disabled={first} onClick={() => { setMenu(false); actions.onMove('up'); }}>
+                      <ArrowUp size={14} className="text-fg-muted" /> Move up
+                    </button>
+                    <button type="button" role="menuitem" className={MENU_ITEM} disabled={last} onClick={() => { setMenu(false); actions.onMove('down'); }}>
+                      <ArrowDown size={14} className="text-fg-muted" /> Move down
+                    </button>
+                    <div aria-hidden className="my-1 h-px bg-line" />
+                  </>
+                )}
                 <button type="button" role="menuitem" className={`${MENU_ITEM} text-loss hover:bg-loss-subtle`} onClick={() => { setMenu(false); actions.onRemove(); }}>
                   <Trash2 size={14} /> Remove
                 </button>
@@ -214,24 +226,30 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
               </div>
               <Figures quote={quote} identity={`${identity}|sheet`} staleSecs={staleSecs} stacked size="large" />
             </div>
-            <div className="grid grid-cols-3 gap-2">
-              <Button size="lg" icon={<ChartLine size={18} />} disabled={!actions.onChart} title={actions.onChart ? undefined : COMING.chart} onClick={() => { setSheet(false); actions.onChart?.(); }}>
-                Chart
-              </Button>
-              <Button size="lg" icon={<Rows3 size={18} />} disabled={!actions.onChain} title={actions.onChain ? undefined : actions.chainWhy ?? COMING.chain} onClick={() => { setSheet(false); actions.onChain?.(); }}>
-                Chain
-              </Button>
-              <Button size="lg" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? undefined : COMING.buy} onClick={() => { setSheet(false); actions.onBuy?.(); }}>
-                Buy
-              </Button>
-            </div>
+            {live && (
+              <div className="grid grid-cols-3 gap-2">
+                <Button size="lg" icon={<ChartLine size={18} />} disabled={!actions.onChart} title={actions.onChart ? undefined : COMING.chart} onClick={() => { setSheet(false); actions.onChart?.(); }}>
+                  Chart
+                </Button>
+                <Button size="lg" icon={<Rows3 size={18} />} disabled={!actions.onChain} title={actions.onChain ? undefined : actions.chainWhy ?? COMING.chain} onClick={() => { setSheet(false); actions.onChain?.(); }}>
+                  Chain
+                </Button>
+                <Button size="lg" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? undefined : COMING.buy} onClick={() => { setSheet(false); actions.onBuy?.(); }}>
+                  Buy
+                </Button>
+              </div>
+            )}
             <div className="flex flex-col gap-2">
-              <Button size="lg" icon={<ArrowUp size={18} />} disabled={first} onClick={() => { setSheet(false); actions.onMove('up'); }}>
-                Move up
-              </Button>
-              <Button size="lg" icon={<ArrowDown size={18} />} disabled={last} onClick={() => { setSheet(false); actions.onMove('down'); }}>
-                Move down
-              </Button>
+              {live && (
+                <>
+                  <Button size="lg" icon={<ArrowUp size={18} />} disabled={first} onClick={() => { setSheet(false); actions.onMove('up'); }}>
+                    Move up
+                  </Button>
+                  <Button size="lg" icon={<ArrowDown size={18} />} disabled={last} onClick={() => { setSheet(false); actions.onMove('down'); }}>
+                    Move down
+                  </Button>
+                </>
+              )}
               <Button size="lg" kind="loss-outline" icon={<Trash2 size={18} />} onClick={() => { setSheet(false); actions.onRemove(); }}>
                 Remove from the list
               </Button>

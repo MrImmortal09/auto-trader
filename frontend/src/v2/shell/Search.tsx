@@ -5,7 +5,7 @@ import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
 import { Chip } from '../ui/Chip';
-import { derivativeNote, groupsOf, optionId, rowSymbol, rowTitle } from './searchModel';
+import { defaultRow, derivativeNote, groupsOf, optionId, rowSymbol, rowTitle } from './searchModel';
 import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 
 // Spec §13: the global instrument search. A 320 px well in the desktop
@@ -15,12 +15,17 @@ import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 // an index on the Trade screen, and while stocks are on any row the Trade
 // screen can chart (a stock, a future, an option), its instrument page
 // otherwise; Shift+Enter puts it on the ladder (an index; an F&O stock too
-// while stocks are on), the chart button charts it on the Trade screen, `+`
+// while stocks are on), a row's chart button charts it on the Trade screen
+// (an index or an index's option; with stocks on, any row it can chart), `+`
 // adds it to a watchlist (`onAdd`, while watchlists are on), Escape closes.
-// The well is the combobox, the results its listbox.
+// Enter's default comes only once the answer is for what was typed, and is
+// what the query names: a typed contract or future (none when it matched
+// none), else the first row. The well is the combobox, the results its
+// listbox.
 
 /** How a result is opened: Enter / a tap, Shift+Enter for the ladder, or
- * its chart button for the chart (`openInstrument.ts` says where each goes). */
+ * its chart button for the chart (`openInstrument.ts` says where each goes;
+ * `page` is a watchlist row's tap, never a result's). */
 export type OpenHow = Exclude<InstrumentHow, 'page'>;
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
@@ -43,8 +48,10 @@ export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
 }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
-  // The highlighted row's id; nothing highlighted until ↓ (or the first
-  // result of a typed query).
+  // The row picked with ↑/↓ or the pointer; until then the highlight is
+  // Enter's default (`defaultRow`, once the answer to what was typed is in):
+  // the typed contract or future, else the first row, none for a contract or
+  // future that matched none.
   const [active, setActive] = useState<string | null>(null);
   const [recents, setRecents] = useState<InstrumentRow[]>([]);
   const input = useRef<HTMLInputElement>(null);
@@ -55,7 +62,11 @@ export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
   const groups = typed ? (search.answer ? groupsOf(search.answer) : []) : recents.length ? [{ head: 'Recent', rows: recents }] : [];
   const flat = groups.flatMap((g) => g.rows);
   const quotes = useQuotes(serverBase, open ? flat.map((r) => r.ws_key) : []);
-  const activeRow = flat.find((r) => r.id === active) ?? (typed ? flat[0] : undefined);
+  // While a newer query is pending the rows on show are the last answer's:
+  // a row picked with ↑/↓ is still Enter's, but nothing is by default. Once
+  // the answer is in, the default is what the query names (`defaultRow`):
+  // `NIFTY 25600 CE` highlights that contract, not the NIFTY index above it.
+  const activeRow = flat.find((r) => r.id === active) ?? (typed && !search.pending && search.answer ? defaultRow(search.answer) : undefined);
 
   // `/` and ⌘K from anywhere outside a field put the cursor in the well.
   useEffect(() => {

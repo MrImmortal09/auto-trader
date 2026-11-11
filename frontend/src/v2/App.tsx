@@ -22,6 +22,7 @@ import { useEngineErrors, useStatus } from './shell/useStatus';
 import { Banner } from './ui/Banner';
 import { Settings } from './settings/Settings';
 import { UserSettings } from './settings/UserSettings';
+import { Logs } from './system/Logs';
 import { System } from './system/System';
 import { Segment } from './ui/Segment';
 import { useNavHidden } from './lib/layout';
@@ -57,9 +58,14 @@ export default function App() {
   const flags = usePoll(() => getFlags(serverBase), 30_000, serverBase);
   // The instrument search is the admin's switch: off, the well and the tab are gone.
   const searchOn = flags.data?.search === true;
-  // Watchlists too; `null` until the switches are known, so an opened
+  // Watchlists too, and only while the search is on as well: with search
+  // off the server prices no stock or contract (its quote poller skips
+  // every tick), and the search and the instrument page, the only ways to
+  // add one, are gone. Everything below reads this one value: the screen,
+  // the rail and tabs, the "+" on a result or an instrument page, the
+  // picker. `null` until the switches are known, so an opened
   // `/v2/watchlist` waits for them rather than bounce to Desk.
-  const watchlistsOn: boolean | null = flags.data ? flags.data.watchlists === true : null;
+  const watchlistsOn: boolean | null = flags.data ? flags.data.watchlists === true && flags.data.search === true : null;
   // Any stock's chart, ladder and option chain (plan Phase 3): off, every
   // stock control stays hidden and a stock opens its instrument page alone.
   const stocksOn = flags.data?.stock_charts === true;
@@ -181,6 +187,8 @@ export default function App() {
             <Watchlist serverBase={serverBase} desktop={desktop} stocksOn={stocksOn} onOpenTrade={openTrade} onOpenInstrument={(id) => go({ screen: 'instrument', key: id })} />
           ) : screen === 'system' ? (
             <System serverBase={serverBase} desktop={desktop} health={s?.health ?? null} marketOpen={s?.market_open ?? false} />
+          ) : screen === 'logs' ? (
+            <Logs serverBase={serverBase} desktop={desktop} />
           ) : screen === 'admin' ? (
             <Admin serverBase={serverBase} desktop={desktop} />
           ) : canReadOwner ? (

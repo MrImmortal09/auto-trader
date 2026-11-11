@@ -278,7 +278,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // The `stock_charts` switch: null until the switches are known, so a saved
   // stock keeps its place rather than bounce to NIFTY and back.
   const stocksOn: boolean | null = flags.data ? flags.data.stock_charts === true : null;
-  const watchlistsOn = flags.data?.watchlists === true;
+  // Watchlists count as on only while the search is on too, as everywhere
+  // else in the app (App.tsx): with search off nothing prices a stock.
+  const watchlistsOn = flags.data?.watchlists === true && flags.data.search === true;
   // A stock saved as the ladder's underlying streams as NIFTY while stocks
   // are off: the server would answer NIFTY's board for it anyway.
   const ladderIndex = stocksOn === false && !isIndex(saved.index) ? 'NIFTY' : saved.index;

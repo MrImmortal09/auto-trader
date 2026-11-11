@@ -5,7 +5,7 @@
 import { price, signedMoney, todayIst } from '../lib/format';
 import { reasonLabel } from '../lib/labels';
 
-export type LogKind = 'info' | 'order' | 'signal' | 'error';
+export type LogKind = 'info' | 'order' | 'timing' | 'signal' | 'error';
 
 export interface LogLine {
   id: string;
@@ -17,7 +17,7 @@ export interface LogLine {
   raw: string;
 }
 
-export const KIND_LABEL: Record<LogKind, string> = { info: 'Info', order: 'Order', signal: 'Signal', error: 'Error' };
+export const KIND_LABEL: Record<LogKind, string> = { info: 'Info', order: 'Order', timing: 'Timing', signal: 'Signal', error: 'Error' };
 
 type Event = Record<string, unknown>;
 
@@ -73,6 +73,9 @@ export function describe(e: Event): { kind: LogKind; text: string } | null {
       const why = event === 'LIVE_EXIT_PLACED' && e.reason ? ` · ${reasonLabel(str(e.reason))}` : '';
       return { kind: 'order', text: `${ORDER_SENT[event]} · ${e.qty} ${inst}${kind}${why} · order ${str(e.order_id)}` };
     }
+    // One line per LIVE order once it finished: each stage counted from the send.
+    case 'ORDER_TIMING':
+      return { kind: 'timing', text: str(e.message) || fallback(e) };
     case 'MANUAL_BUY_REQUESTED':
       return { kind: 'order', text: `Scalp ${str(e.action).toLowerCase() || 'buy'} · ${e.qty} ${inst}${num(e.ltp) != null ? ` near ${amount(e.ltp)}` : ''}` };
     case 'MANUAL_EXIT_ALL_REQUESTED':

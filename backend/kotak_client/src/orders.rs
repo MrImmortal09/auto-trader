@@ -70,6 +70,48 @@ pub(crate) fn publish_order(order: &OrderRequest, sent_at_ms: i64, result: Resul
 }
 
 // ---------------------------------------------------------------------------
+// The engine's poll tap
+// ---------------------------------------------------------------------------
+
+/// The engine's order-book poll showed an order finished (`complete`,
+/// `rejected` or `cancelled`) for the first time — the moment the engine
+/// learned of it, on this server's clock. It closes the order's timeline:
+/// sent, answered, pushed, seen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BookFinished {
+    pub order_no: String,
+    /// Kotak's word, lower case.
+    pub status: String,
+    pub filled_qty: i64,
+    /// `0.0` when nothing filled.
+    pub avg_price: f64,
+    pub at_ms: i64,
+}
+
+/// Every poll of a day lists that day's earlier orders too, finished ones
+/// included: a listener that just started sees them all at once.
+static BOOK_TAP: LazyLock<broadcast::Sender<BookFinished>> = LazyLock::new(|| broadcast::channel(1024).0);
+
+/// Each order the engine's poll first sees finished, from now on.
+pub fn subscribe_book_finished() -> broadcast::Receiver<BookFinished> {
+    BOOK_TAP.subscribe()
+}
+
+/// Called by the engine's poll for each order it first sees finished; only
+/// while something listens, and never waits on the listener.
+pub fn publish_book_finished(order_no: &str, status: &str, filled_qty: i64, avg_price: f64) {
+    if BOOK_TAP.receiver_count() > 0 {
+        let _ = BOOK_TAP.send(BookFinished {
+            order_no: order_no.to_string(),
+            status: status.trim().to_lowercase(),
+            filled_qty,
+            avg_price,
+            at_ms: now_ms(),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The push stream
 // ---------------------------------------------------------------------------
 
@@ -86,7 +128,13 @@ pub enum FeedEvent {
 
 /// The two ways Kotak documents the login message. Its page says a raw
 /// `{type:cn,Authorization:…,Sid:…,src:WEB}` string ("NOT JSON"); its demo
-/// sends JSON with `source`. Which one works is found on a live session.
+/// sends JSON with `source`.
+///
+/// Raw is the one that works (live session, 2026-11-11): Kotak answers it
+/// with `{"ak":"ok","type":"cn","task":"cn","msg":"connected"}` in ~30 ms,
+/// and its own `hslib.js` sends exactly that — the demo's JSON with the
+/// quotes stripped. The JSON login is refused ("session message format
+/// incorrect") and the socket reset. Json is kept as the fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthStyle {
     Json,
@@ -94,6 +142,9 @@ pub enum AuthStyle {
 }
 
 impl AuthStyle {
+    /// The login tried first.
+    pub const FIRST: AuthStyle = AuthStyle::Raw;
+
     pub fn other(self) -> AuthStyle {
         match self {
             AuthStyle::Json => AuthStyle::Raw,
@@ -118,6 +169,11 @@ impl AuthStyle {
 
 /// How long Kotak has to acknowledge the login.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the connect (TCP, TLS and the upgrade) may take. Right after
+/// Kotak reset a refused login, the next connect was seen to hang with no
+/// answer at all (2026-11-11); unbounded, the stream would wait on it until
+/// the next re-login.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The demo's heartbeat period.
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 /// What an unknown message is cut to for the log.
@@ -196,8 +252,9 @@ pub fn parse_message(text_frame: &str, received_at_ms: i64) -> FeedEvent {
 
 /// Connects to the session's order stream, logs in `style`, and sends every
 /// event to `out` until the socket closes (`Ok`) or fails. Waits at most
-/// [`ACK_TIMEOUT`] for Kotak to acknowledge the login. Read-only: the only
-/// messages sent are the login and the heartbeat.
+/// [`CONNECT_TIMEOUT`] for the connect and [`ACK_TIMEOUT`] for Kotak to
+/// acknowledge the login. Read-only: the only messages sent are the login and
+/// the heartbeat.
 pub async fn stream_order_updates(
     base_url: &str,
     auth_token: &str,
@@ -206,7 +263,10 @@ pub async fn stream_order_updates(
     out: mpsc::Sender<FeedEvent>,
 ) -> Result<(), String> {
     let url = order_feed_url(base_url).ok_or_else(|| format!("no host in base URL {base_url:?}"))?;
-    let (ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.map_err(|e| format!("connect {url}: {e}"))?;
+    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url.as_str()))
+        .await
+        .map_err(|_| format!("connect {url}: no answer in {} s", CONNECT_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("connect {url}: {e}"))?;
     let (mut sink, mut stream) = ws.split();
     sink.send(Message::Text(style.login(auth_token, sid))).await.map_err(|e| format!("login send: {e}"))?;
 
@@ -296,6 +356,8 @@ mod tests {
         assert_eq!((json["type"].as_str(), json["Authorization"].as_str(), json["Sid"].as_str()), (Some("cn"), Some("tok"), Some("sid1")));
         assert_eq!(AuthStyle::Raw.login("tok", "sid1"), "{type:cn,Authorization:tok,Sid:sid1,src:WEB}");
         assert_eq!(AuthStyle::Json.other(), AuthStyle::Raw);
+        // Raw is what Kotak acknowledges; JSON is refused and the socket reset.
+        assert_eq!((AuthStyle::FIRST, AuthStyle::FIRST.other()), (AuthStyle::Raw, AuthStyle::Json));
     }
 
     #[test]

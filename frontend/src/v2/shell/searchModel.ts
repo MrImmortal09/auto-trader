@@ -14,6 +14,33 @@ export function groupsOf(answer: SearchAnswer): { head: string; rows: Instrument
   ].filter((g) => g.rows.length > 0);
 }
 
+/** The strike a contract query names: the number before the side at its end
+ * (`NIFTY 25600 CE`, `nifty 25,600ce`, `M&M NOV 2800 PUT`). */
+function typedStrike(query: string): number | null {
+  const m = query.trim().toUpperCase().match(/(\d[\d,]*(?:\.\d+)?)\s*(?:CE|PE|CALLS?|PUTS?)?$/);
+  const strike = m ? Number(m[1].replace(/,/g, '')) : NaN;
+  return Number.isFinite(strike) && strike > 0 ? strike : null;
+}
+
+/**
+ * The row Enter opens when none is highlighted, for an answer to what was
+ * typed: what the query names. A contract query's contract at the typed
+ * strike (its nearest expiry: the options come by expiry), a future
+ * query's first future; a plain query's first row. A contract or future
+ * query that matched none has no default: its other rows are the
+ * underlying (an index opens the Trade screen) and, for a strike that
+ * isn't listed, the strikes around it — never what was typed, so Enter
+ * opens nothing and ↓ picks a row.
+ */
+export function defaultRow(answer: SearchAnswer): InstrumentRow | undefined {
+  if (answer.parsed === 'contract') {
+    const strike = typedStrike(answer.query);
+    return strike == null ? undefined : answer.options.find((r) => r.strike != null && Math.abs(r.strike - strike) < 1e-6);
+  }
+  if (answer.parsed === 'future') return answer.futures[0];
+  return groupsOf(answer)[0]?.rows[0];
+}
+
 /** The DOM id of a result row, for `aria-activedescendant`. */
 export const optionId = (listId: string, rowId: string) => `${listId}-${rowId.replace(/[^A-Za-z0-9_-]/g, '_')}`;
 
