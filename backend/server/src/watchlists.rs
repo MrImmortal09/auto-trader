@@ -10,15 +10,19 @@
 //! engine, and no row here is ever read by them.
 //!
 //! Writes go straight to the pool in short transactions, as the paper
-//! desk's user tables do, never through the engine's `db_writer`. Every
-//! change is scoped to the caller's user id in the SQL itself, so a list
-//! id that belongs to someone else is simply "not found". The caps are
-//! enforced where the row is written: each insert is conditional on the
-//! count under it, and inserts nothing when the cap is reached
-//! (`rows_affected == 0`), so two requests at once can never add a sixth
-//! list or a fifty-first item between them.
+//! desk's user tables do, never through the engine's `db_writer`. Each one
+//! is a `BEGIN IMMEDIATE` ([`write_tx`]): it takes the database's write
+//! lock first and reads under it, so a transaction that looks before it
+//! writes (the ownership check, a position) waits its turn behind another
+//! connection's write instead of failing with `SQLITE_BUSY` when its read
+//! snapshot has gone stale. Every change is scoped to the caller's user id
+//! in the SQL itself, so a list id that belongs to someone else is simply
+//! "not found". The caps are enforced where the row is written: each
+//! insert is conditional on the count under it, and inserts nothing when
+//! the cap is reached (`rows_affected == 0`), so two requests at once can
+//! never add a sixth list or a fifty-first item between them.
 
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 /// Lists one person may keep.
 pub const MAX_LISTS: usize = 5;
@@ -106,6 +110,18 @@ const INSERT_ITEM: &str = "INSERT INTO user_watchlist_items (watchlist_id, key, 
     WHERE (SELECT COUNT(*) FROM user_watchlist_items WHERE watchlist_id = ?1) < ?4
       AND NOT EXISTS (SELECT 1 FROM user_watchlist_items WHERE watchlist_id = ?1 AND key = ?2)";
 
+/// A write transaction on `pool`: `BEGIN IMMEDIATE`, so the connection
+/// holds the write lock from the start. A deferred transaction (`BEGIN`)
+/// that reads first and writes after can find, on the write, that another
+/// connection of the pool committed in between: SQLite then refuses the
+/// upgrade at once (`SQLITE_BUSY`, "database is locked") without waiting
+/// out `busy_timeout`. Taking the lock up front makes the wait happen at
+/// `BEGIN`, where the busy handler applies, and the reads inside see what
+/// the write will.
+async fn write_tx(pool: &SqlitePool) -> sqlx::Result<Transaction<'static, Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
 /// The keys every person's first list starts with: NIFTY, BANKNIFTY and
 /// SENSEX, under the keys their spot ticks on (`idx|NIFTY 50`, …).
 pub fn default_keys() -> Vec<String> {
@@ -165,7 +181,7 @@ pub async fn items_of(pool: &SqlitePool, user_id: i64, id: i64) -> sqlx::Result<
 /// SQL, so two first calls at once make one list. `true` when it was made
 /// now.
 pub async fn ensure_default(pool: &SqlitePool, user_id: i64, now: &str) -> sqlx::Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = write_tx(pool).await?;
     let made = sqlx::query(
         "INSERT INTO user_watchlists (user_id, name, position, created_at)
          SELECT ?1, ?2, 0, ?3 WHERE NOT EXISTS (SELECT 1 FROM user_watchlists WHERE user_id = ?1)",
@@ -196,7 +212,7 @@ pub async fn ensure_default(pool: &SqlitePool, user_id: i64, now: &str) -> sqlx:
 /// A new list at the end of `user_id`'s, named `name` (checked by the
 /// route). [`Error::TooManyLists`] past [`MAX_LISTS`].
 pub async fn create(pool: &SqlitePool, user_id: i64, name: &str, now: &str) -> Result<ListRow, Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = write_tx(pool).await?;
     let made = sqlx::query(INSERT_LIST)
         .bind(user_id)
         .bind(name)
@@ -220,7 +236,7 @@ pub async fn create(pool: &SqlitePool, user_id: i64, name: &str, now: &str) -> R
 /// their lists (0-based; the others shift). [`Error::NotFound`] for a list
 /// that is not theirs, [`Error::BadPosition`] past their last list.
 pub async fn update(pool: &SqlitePool, user_id: i64, id: i64, name: Option<&str>, position: Option<usize>) -> Result<ListRow, Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = write_tx(pool).await?;
     if let Some(name) = name {
         let done = sqlx::query("UPDATE user_watchlists SET name = ? WHERE id = ? AND user_id = ?")
             .bind(name)
@@ -279,7 +295,7 @@ async fn renumber_lists(tx: &mut SqliteConnection, ids: &[i64]) -> sqlx::Result<
 /// keeps at least one, so "no lists" means "never had one" and
 /// [`ensure_default`] can tell a new person from one who deleted theirs.
 pub async fn delete(pool: &SqlitePool, user_id: i64, id: i64) -> Result<(), Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = write_tx(pool).await?;
     let mut ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM user_watchlists WHERE user_id = ? ORDER BY position, id")
         .bind(user_id)
         .fetch_all(&mut *tx)
@@ -315,7 +331,7 @@ async fn owned(tx: &mut SqliteConnection, user_id: i64, id: i64) -> sqlx::Result
 /// was already in the list keeps its `added_at`. [`Error::TooManyItems`]
 /// past [`MAX_ITEMS`], and nothing is changed then.
 pub async fn replace_items(pool: &SqlitePool, user_id: i64, id: i64, keys: &[String], now: &str) -> Result<(), Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = write_tx(pool).await?;
     if !owned(&mut tx, user_id, id).await? {
         tx.rollback().await?;
         return Err(Error::NotFound);
@@ -347,7 +363,7 @@ pub async fn replace_items(pool: &SqlitePool, user_id: i64, id: i64, keys: &[Str
 /// list already holds it (nothing changes), [`Error::TooManyItems`] when
 /// it is full.
 pub async fn add_item(pool: &SqlitePool, user_id: i64, id: i64, key: &str, now: &str) -> Result<bool, Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = write_tx(pool).await?;
     if !owned(&mut tx, user_id, id).await? {
         tx.rollback().await?;
         return Err(Error::NotFound);
@@ -375,7 +391,7 @@ pub async fn add_item(pool: &SqlitePool, user_id: i64, id: i64, key: &str, now: 
 /// Takes `key` out of list `id` of `user_id` and closes the gap.
 /// `Ok(false)` when the list did not hold it.
 pub async fn remove_item(pool: &SqlitePool, user_id: i64, id: i64, key: &str) -> Result<bool, Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = write_tx(pool).await?;
     if !owned(&mut tx, user_id, id).await? {
         tx.rollback().await?;
         return Err(Error::NotFound);
@@ -584,5 +600,48 @@ mod tests {
         assert_eq!(lists(&pool, 3).await.unwrap().len(), 1, "someone else's stay");
         // A new person given the same id starts over.
         assert!(ensure_default(&pool, 2, LATER).await.unwrap());
+    }
+
+    /// The item writes look (is the list the caller's? where is the key?)
+    /// before they write. On the pool's connections at once, a deferred
+    /// transaction doing that is refused outright (`SQLITE_BUSY`) when
+    /// another one committed between its read and its write; `BEGIN
+    /// IMMEDIATE` queues them instead, so every one of these lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn item_writes_at_once_all_land() {
+        let (_db, pool) = pool("concurrent").await;
+        let list = create(&pool, 7, "Busy", NOW).await.unwrap();
+        let adds: Vec<_> = (1..=20)
+            .map(|i| {
+                let pool = pool.clone();
+                tokio::spawn(async move { add_item(&pool, 7, list.id, &format!("nse_cm|{i}"), NOW).await })
+            })
+            .collect();
+        for add in adds {
+            assert!(add.await.unwrap().unwrap_or_else(|e| panic!("an add at once failed: {e}")), "each key is new");
+        }
+        let rows = items_of(&pool, 7, list.id).await.unwrap();
+        assert_eq!(rows.len(), 20);
+        assert_eq!(positions(&rows), (0..20).collect::<Vec<_>>(), "dense, whatever the order they landed in");
+
+        let removes: Vec<_> = (1..=10)
+            .map(|i| {
+                let pool = pool.clone();
+                tokio::spawn(async move { remove_item(&pool, 7, list.id, &format!("nse_cm|{i}")).await })
+            })
+            .collect();
+        let replace = {
+            let pool = pool.clone();
+            let keep: Vec<String> = (11..=20).map(|i| format!("nse_cm|{i}")).collect();
+            tokio::spawn(async move { replace_items(&pool, 7, list.id, &keep, LATER).await })
+        };
+        for remove in removes {
+            remove.await.unwrap().unwrap_or_else(|e| panic!("a remove at once failed: {e}"));
+        }
+        replace.await.unwrap().unwrap_or_else(|e| panic!("a replace at once failed: {e}"));
+        let rows = items_of(&pool, 7, list.id).await.unwrap();
+        let kept: Vec<String> = (11..=20).map(|i| format!("nse_cm|{i}")).collect();
+        assert_eq!(keys(&rows), kept.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(positions(&rows), (0..10).collect::<Vec<_>>());
     }
 }

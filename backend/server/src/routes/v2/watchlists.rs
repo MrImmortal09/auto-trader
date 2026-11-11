@@ -9,16 +9,19 @@
 //! scoped to the caller's id, so another person's list is a plain 404.
 //! A key is accepted only when the catalog has a row for it, and the row's
 //! own price-map key is what the list keeps; an unknown key is a 400 that
-//! names it, and is never polled. Every key answered is marked wanted on
-//! the hub, so the next call (the front end re-polls every 2 s) finds it
-//! priced; a quote never says whether the feed carries its key
+//! names it, and is never polled. Every key answered that the catalog
+//! still has a row for is marked wanted on the hub, so the next call (the
+//! front end re-polls every 2 s) finds it priced; a kept key the catalog
+//! has dropped (an expired contract) is shown without a row and not
+//! polled. A quote never says whether the feed carries its key
 //! (`QuoteHub::get_at`). Nothing here reaches the feed task, the bridge,
 //! the engine or anyone's positions.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{FromRef, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
@@ -26,7 +29,9 @@ use axum::{
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use shared_domain::FeatureFlags;
 use sqlx::SqlitePool;
+use tokio::sync::RwLock;
 
 use crate::auth::Identity;
 use crate::instruments::{Catalog, SearchRow};
@@ -38,11 +43,35 @@ use crate::AppState;
 const MAX_KEY_CHARS: usize = 64;
 
 /// What the answers are built from; the handlers take them from
-/// `AppState`, the tests build their own.
+/// [`WatchlistState`], the tests build their own.
 pub struct Deps<'a> {
     pub pool: &'a SqlitePool,
     pub catalog: &'a Catalog,
     pub hub: &'a QuoteHub,
+}
+
+/// The part of `AppState` the handlers read: the `watchlists` switch and
+/// the three sources of [`Deps`]. Axum picks it out of the real state on
+/// each request (`FromRef`), so the handlers can also be mounted on a
+/// `Router` over this alone, as the tests do, without the rest of
+/// `AppState`.
+#[derive(Clone)]
+pub(crate) struct WatchlistState {
+    pub flags: Arc<RwLock<FeatureFlags>>,
+    pub pool: SqlitePool,
+    pub catalog: Arc<Catalog>,
+    pub hub: Arc<QuoteHub>,
+}
+
+impl FromRef<AppState> for WatchlistState {
+    fn from_ref(state: &AppState) -> Self {
+        WatchlistState {
+            flags: Arc::clone(&state.flags),
+            pool: state.db_pool.clone(),
+            catalog: Arc::clone(&state.instruments),
+            hub: Arc::clone(&state.quotes),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +194,10 @@ fn stamp(now: DateTime<FixedOffset>) -> String {
 
 /// `lists` with `items` (every item of those lists, in order) grouped
 /// under them, each item with the catalog's row and its quote as of `now`.
-/// Every key is marked wanted on the hub.
+/// Every key the catalog resolved is marked wanted on the hub (the default
+/// `idx|` keys resolve to the index rows); a kept key it has no row for
+/// is answered without one and not wanted, so the poller never asks Kotak
+/// for a contract that is gone.
 async fn priced(deps: &Deps<'_>, lists: Vec<ListRow>, items: Vec<ItemRow>, now: DateTime<FixedOffset>) -> Vec<WatchlistOut> {
     let mut keys: Vec<String> = Vec::new();
     for item in &items {
@@ -188,7 +220,7 @@ async fn priced(deps: &Deps<'_>, lists: Vec<ListRow>, items: Vec<ItemRow>, now: 
             added_at: item.added_at,
         });
     }
-    deps.hub.want(keys);
+    deps.hub.want(keys.into_iter().filter(|key| rows.contains_key(key)));
     lists
         .into_iter()
         .map(|list| WatchlistOut {
@@ -239,8 +271,16 @@ pub fn clean_name(name: &str) -> Result<String, Fail> {
     Ok(name.to_string())
 }
 
+/// The most keys a body may name: a key can be typed as a catalog id or
+/// as a price-map key, so one instrument may arrive twice before
+/// [`resolve`] collapses the two forms; past this the body is refused
+/// before anything is read.
+const MAX_TYPED_KEYS: usize = 2 * MAX_ITEMS;
+
 /// `keys` trimmed, blanks dropped, repeats kept once, in order; none too
-/// long, and at most [`MAX_ITEMS`].
+/// long, and no more than [`MAX_TYPED_KEYS`]. The exact cap,
+/// [`MAX_ITEMS`] instruments, is [`resolve`]'s to check, once an id and
+/// its key have become one.
 pub fn clean_keys(keys: &[String]) -> Result<Vec<String>, Fail> {
     let mut out: Vec<String> = Vec::new();
     for key in keys {
@@ -255,15 +295,23 @@ pub fn clean_keys(keys: &[String]) -> Result<Vec<String>, Fail> {
             out.push(key.to_string());
         }
     }
-    if out.len() > MAX_ITEMS {
-        return Err(Fail::Bad(format!("at most {MAX_ITEMS} instruments in a watchlist ({} given)", out.len())));
+    if out.len() > MAX_TYPED_KEYS {
+        return Err(too_many(out.len()));
     }
     Ok(out)
 }
 
+/// The 400 for a body naming more than [`MAX_ITEMS`] instruments.
+fn too_many(count: usize) -> Fail {
+    Fail::Bad(format!("at most {MAX_ITEMS} instruments in a watchlist ({count} given)"))
+}
+
 /// The price-map key of each of `keys` (a price-map key or a catalog id,
 /// as `clean_keys` left them), in order and distinct; [`Fail::UnknownKeys`]
-/// naming every key the catalog has no row for.
+/// naming every key the catalog has no row for, else [`Fail::Bad`] past
+/// [`MAX_ITEMS`] distinct instruments — counted here, after an id and its
+/// key have collapsed into one, so 51 typed keys naming 50 instruments
+/// are 50.
 async fn resolve(catalog: &Catalog, keys: &[String]) -> Result<Vec<String>, Fail> {
     let rows = catalog.rows_for_keys(keys).await;
     let unknown: Vec<String> = keys.iter().filter(|k| !rows.contains_key(*k)).cloned().collect();
@@ -279,6 +327,9 @@ async fn resolve(catalog: &Catalog, keys: &[String]) -> Result<Vec<String>, Fail
         if !out.contains(ws_key) {
             out.push(ws_key.clone());
         }
+    }
+    if out.len() > MAX_ITEMS {
+        return Err(too_many(out.len()));
     }
     Ok(out)
 }
@@ -368,7 +419,7 @@ fn off_response() -> Response {
 }
 
 /// `Some(404)` while the `watchlists` switch is off.
-async fn gate(state: &AppState) -> Option<Response> {
+async fn gate(state: &WatchlistState) -> Option<Response> {
     if state.flags.read().await.watchlists {
         None
     } else {
@@ -384,14 +435,14 @@ fn caller(identity: &Identity) -> Result<i64, Response> {
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Sign in to keep watchlists" }))).into_response())
 }
 
-fn deps(state: &AppState) -> Deps<'_> {
-    Deps { pool: &state.db_pool, catalog: &state.instruments, hub: &state.quotes }
+fn deps(state: &WatchlistState) -> Deps<'_> {
+    Deps { pool: &state.pool, catalog: &state.catalog, hub: &state.hub }
 }
 
 /// `GET /api/v2/watchlists` — every list of the caller's with its items,
 /// each with the catalog's row and its quote. A first call makes the
 /// default list (`Watchlist 1`: NIFTY, BANKNIFTY, SENSEX).
-pub async fn list_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
+pub async fn list_handler(State(state): State<WatchlistState>, Extension(identity): Extension<Identity>) -> Response {
     if let Some(off) = gate(&state).await {
         return off;
     }
@@ -414,7 +465,7 @@ pub struct NewList {
 
 /// `POST /api/v2/watchlists {name}` — a new, empty list at the end. 201;
 /// 409 at five lists.
-pub async fn create_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Json(body): Json<NewList>) -> Response {
+pub async fn create_handler(State(state): State<WatchlistState>, Extension(identity): Extension<Identity>, Json(body): Json<NewList>) -> Response {
     if let Some(off) = gate(&state).await {
         return off;
     }
@@ -431,7 +482,7 @@ pub async fn create_handler(State(state): State<AppState>, Extension(identity): 
 /// `PATCH /api/v2/watchlists/:id {name?, position?}` — rename and/or
 /// move a list.
 pub async fn patch_handler(
-    State(state): State<AppState>,
+    State(state): State<WatchlistState>,
     Extension(identity): Extension<Identity>,
     Path(id): Path<i64>,
     Json(patch): Json<ListPatch>,
@@ -451,7 +502,7 @@ pub async fn patch_handler(
 
 /// `DELETE /api/v2/watchlists/:id` — a list and its items; 409 for the
 /// caller's only list.
-pub async fn delete_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(id): Path<i64>) -> Response {
+pub async fn delete_handler(State(state): State<WatchlistState>, Extension(identity): Extension<Identity>, Path(id): Path<i64>) -> Response {
     if let Some(off) = gate(&state).await {
         return off;
     }
@@ -475,7 +526,7 @@ pub struct ItemsBody {
 /// `PUT /api/v2/watchlists/:id/items {keys}` — the whole ordered list:
 /// what is left out goes, what is new is added, the rest is reordered.
 pub async fn put_items_handler(
-    State(state): State<AppState>,
+    State(state): State<WatchlistState>,
     Extension(identity): Extension<Identity>,
     Path(id): Path<i64>,
     Json(body): Json<ItemsBody>,
@@ -496,7 +547,7 @@ pub async fn put_items_handler(
 /// `POST /api/v2/watchlists/:id/items/:key` — one key added at the end.
 /// 201 when added, 200 when the list held it already; 409 at fifty.
 pub async fn add_item_handler(
-    State(state): State<AppState>,
+    State(state): State<WatchlistState>,
     Extension(identity): Extension<Identity>,
     Path((id, key)): Path<(i64, String)>,
 ) -> Response {
@@ -517,7 +568,7 @@ pub async fn add_item_handler(
 /// `DELETE /api/v2/watchlists/:id/items/:key` — one key taken out; 404
 /// when the list does not hold it.
 pub async fn remove_item_handler(
-    State(state): State<AppState>,
+    State(state): State<WatchlistState>,
     Extension(identity): Extension<Identity>,
     Path((id, key)): Path<(i64, String)>,
 ) -> Response {
@@ -540,7 +591,7 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::Request;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::Router;
     use chrono::NaiveDate;
     use dashmap::DashMap;
@@ -569,7 +620,7 @@ mod tests {
         _scratch: Scratch,
         pool: SqlitePool,
         catalog: Arc<Catalog>,
-        hub: QuoteHub,
+        hub: Arc<QuoteHub>,
     }
 
     impl World {
@@ -581,12 +632,54 @@ mod tests {
             let catalog = scratch.catalog().await;
             catalog.load_if_changed("test").await.unwrap_or_else(|e| panic!("{e}"));
             let at = tick.timestamp_millis() as f64 / 1000.0;
-            let hub = QuoteHub::with_feed(prices, Box::new(|_: &str| None), Box::new(move |_: &str| Some(at)));
+            let hub = Arc::new(QuoteHub::with_feed(prices, Box::new(|_: &str| None), Box::new(move |_: &str| Some(at))));
             World { _db: db, _scratch: scratch, pool, catalog, hub }
         }
 
         fn deps(&self) -> Deps<'_> {
             Deps { pool: &self.pool, catalog: &self.catalog, hub: &self.hub }
+        }
+
+        /// The real handlers on a `Router`, at the paths `main` mounts them
+        /// on, over this world and `flags`; every request is `identity`'s,
+        /// as the auth middleware would have marked it.
+        fn app(&self, flags: Arc<RwLock<FeatureFlags>>, identity: Identity) -> Router {
+            Router::new()
+                .route("/api/v2/watchlists", get(list_handler).post(create_handler))
+                .route("/api/v2/watchlists/:id", axum::routing::patch(patch_handler).delete(delete_handler))
+                .route("/api/v2/watchlists/:id/items", axum::routing::put(put_items_handler))
+                .route("/api/v2/watchlists/:id/items/:key", post(add_item_handler).delete(remove_item_handler))
+                .layer(Extension(identity))
+                .with_state(WatchlistState { flags, pool: self.pool.clone(), catalog: Arc::clone(&self.catalog), hub: Arc::clone(&self.hub) })
+        }
+
+        /// `n` distinct instruments the catalog has rows for, as price-map
+        /// keys, `nse_cm|2885` first: the fixture's cash rows and indices,
+        /// then its contracts that are live on 2026-11-04.
+        async fn known_keys(&self, n: usize) -> Vec<String> {
+            let mut candidates = vec!["nse_cm|2885".to_string()];
+            candidates.extend(self.catalog.cash_keys());
+            for token in [
+                52001, 52002, 52003, 52004, 52005, 35013, 35014, 44001, 44002, 41222, 41223, 41224, 41225, 41226, 41227, 41228, 41229, 41230, 43001, 43002,
+                45001, 45002, 46001, 46002, 47001, 47002, 48001, 48002, 49001, 50001,
+            ] {
+                candidates.push(format!("nse_fo|{token}"));
+            }
+            for token in [874001, 874002, 874003, 875001] {
+                candidates.push(format!("bse_fo|{token}"));
+            }
+            let rows = self.catalog.rows_for_keys(&candidates).await;
+            let mut known: Vec<String> = Vec::new();
+            for key in &candidates {
+                if let Some(row) = rows.get(key) {
+                    if !known.contains(&row.ws_key) {
+                        known.push(row.ws_key.clone());
+                    }
+                }
+            }
+            assert!(known.len() >= n, "the fixture catalog resolves {} instruments; {n} are needed", known.len());
+            known.truncate(n);
+            known
         }
     }
 
@@ -700,13 +793,14 @@ mod tests {
         assert!(out.watchlist.items[3].instrument.is_none());
         let out = remove_item_answer(&deps, 7, id, "nse_fo|1", noon).await.unwrap();
         assert_eq!(out.watchlist.items.len(), 3);
-        // Only keys answered are polled, never a refused one.
+        // Only keys answered with a catalog row are polled: never a refused
+        // one, nor a kept key the catalog has dropped (`nse_fo|1` above).
         let watched = world.hub.watched_keys();
-        for key in ["idx|SENSEX", "nse_cm|11536", "nse_cm|2885", "nse_fo|1", "nse_fo|41222", "idx|NIFTY 50"] {
+        for key in ["idx|SENSEX", "nse_cm|11536", "nse_cm|2885", "nse_fo|41222", "idx|NIFTY 50"] {
             assert!(watched.iter().any(|k| k == key), "{key} is not wanted");
         }
-        for key in ["nse_fo|999999", "junk", "nse_cm|Nifty 50"] {
-            assert!(!watched.iter().any(|k| k == key), "{key} was refused, yet wanted");
+        for key in ["nse_fo|999999", "junk", "nse_cm|Nifty 50", "nse_fo|1"] {
+            assert!(!watched.iter().any(|k| k == key), "{key} has no catalog row, yet is wanted");
         }
     }
 
@@ -728,11 +822,26 @@ mod tests {
         assert!(matches!(create_answer(&deps, 7, "Sixth", noon).await.unwrap_err(), Fail::Conflict(_)));
         assert_eq!(all_answer(&deps, 7, noon).await.unwrap().watchlists.len(), 5);
 
-        // Items: fifty-one in one PUT is refused before anything is read.
-        let too_many: Vec<String> = (1..=51).map(|i| format!("nse_cm|{i}")).collect();
-        assert!(matches!(put_items_answer(&deps, 7, first, &too_many, noon).await.unwrap_err(), Fail::Bad(m) if m.contains("at most 50")));
+        // Items: a hundred and one typed keys are refused before anything is
+        // read. Fifty-one typed keys naming fifty instruments (one as its
+        // id and as its key) are fifty, and kept; fifty-one instruments are
+        // too many, and nothing changes.
+        let banks = out.watchlist.id;
+        let too_many: Vec<String> = (1..=101).map(|i| format!("nse_cm|{i}")).collect();
+        assert!(matches!(put_items_answer(&deps, 7, banks, &too_many, noon).await.unwrap_err(), Fail::Bad(m) if m.contains("at most 50") && m.contains("101 given")));
+        assert!(matches!(clean_keys(&too_many).unwrap_err(), Fail::Bad(m) if m.contains("101 given")));
         assert!(matches!(clean_keys(&[" x".repeat(40)]).unwrap_err(), Fail::Bad(_)));
         assert_eq!(clean_keys(&["a".into(), " ".into(), "a".into(), "b ".into()]).unwrap(), vec!["a", "b"]);
+        let known = world.known_keys(51).await;
+        assert_eq!(known[0], "nse_cm|2885");
+        let mut fifty_one_typed = vec!["nse_cm:2885".to_string()];
+        fifty_one_typed.extend(known[..50].iter().cloned());
+        assert_eq!((fifty_one_typed.len(), clean_keys(&fifty_one_typed).unwrap().len()), (51, 51), "two forms of one instrument pass the cheap check");
+        let full = put_items_answer(&deps, 7, banks, &fifty_one_typed, noon).await.unwrap();
+        assert_eq!(keys(&full.watchlist), known[..50].iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(matches!(put_items_answer(&deps, 7, banks, &known, noon).await.unwrap_err(), Fail::Bad(m) if m.contains("at most 50") && m.contains("51 given")));
+        assert_eq!(one_answer(&deps, 7, banks, noon).await.unwrap().watchlist.items.len(), 50, "a refused replace changes nothing");
+        assert_eq!(add_item_answer(&deps, 7, banks, &known[50], noon).await.unwrap_err(), Fail::from(Error::TooManyItems), "the fifty-first one at a time is the store's 409");
 
         // Positions: 0 to the last list.
         let out = patch_answer(&deps, 7, out.watchlist.id, &ListPatch { name: None, position: Some(0) }, noon).await.unwrap();
@@ -751,6 +860,64 @@ mod tests {
         assert_eq!((left.len(), left[0].name.as_str(), left[0].position), (1, "Banks", 0));
         assert!(matches!(delete_answer(&deps, 7, left[0].id).await.unwrap_err(), Fail::Conflict(_)));
         assert_eq!(delete_answer(&deps, 7, first).await.unwrap_err(), Fail::NotFound("no such watchlist"));
+    }
+
+    /// The real handlers over a `Router`, as `main` mounts them: while the
+    /// `watchlists` switch is off every route is a 404 naming the switch,
+    /// and nothing is read or made; flipping it needs no restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_switch_gates_every_route_with_a_404() {
+        let noon = ist(2026, 11, 4, 12, 0);
+        let world = World::new("switch", Arc::new(DashMap::new()), noon).await;
+        let flags = Arc::new(RwLock::new(FeatureFlags::default()));
+        assert!(!flags.read().await.watchlists, "off by default");
+        let app = world.app(Arc::clone(&flags), Identity::User { user_id: 7 });
+        let request = |method: &str, uri: &str, body: Option<&str>| {
+            let builder = Request::builder().method(method).uri(uri);
+            match body {
+                Some(json) => builder.header("content-type", "application/json").body(Body::from(json.to_string())).unwrap(),
+                None => builder.body(Body::empty()).unwrap(),
+            }
+        };
+        let get_all = || request("GET", "/api/v2/watchlists", None);
+        let post_one = || request("POST", "/api/v2/watchlists", Some(r#"{"name": "Banks"}"#));
+
+        // Off: 404 with the reason on every route, and no list is made.
+        for (method, uri, body) in [
+            ("GET", "/api/v2/watchlists", None),
+            ("POST", "/api/v2/watchlists", Some(r#"{"name": "Banks"}"#)),
+            ("PATCH", "/api/v2/watchlists/3", Some(r#"{"name": "Banks"}"#)),
+            ("DELETE", "/api/v2/watchlists/3", None),
+            ("PUT", "/api/v2/watchlists/3/items", Some(r#"{"keys": ["nse_cm|2885"]}"#)),
+            ("POST", "/api/v2/watchlists/3/items/nse_cm%7C2885", None),
+            ("DELETE", "/api/v2/watchlists/3/items/nse_cm%7C2885", None),
+        ] {
+            let response = app.clone().oneshot(request(method, uri, body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+            let json = body_json(response).await;
+            assert!(json["error"].as_str().unwrap().contains("`watchlists` switch"), "{method} {uri}: {json}");
+        }
+        assert!(watchlists::lists(&world.pool, 7).await.unwrap().is_empty(), "the gate answered before the default list was made");
+
+        // On: the same requests are answered.
+        flags.write().await.watchlists = true;
+        let response = app.clone().oneshot(get_all()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["watchlists"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["watchlists"][0]["name"], "Watchlist 1");
+        assert_eq!(json["watchlists"][0]["items"][0]["key"], "idx|NIFTY 50");
+        let response = app.clone().oneshot(post_one()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let json = body_json(response).await;
+        assert_eq!((json["watchlist"]["name"].as_str(), json["watchlist"]["position"].as_i64()), (Some("Banks"), Some(1)));
+        assert_eq!(watchlists::lists(&world.pool, 7).await.unwrap().len(), 2);
+
+        // Off again: gone again, and the lists stay as they are.
+        flags.write().await.watchlists = false;
+        assert_eq!(app.clone().oneshot(get_all()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(app.clone().oneshot(post_one()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(watchlists::lists(&world.pool, 7).await.unwrap().len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
