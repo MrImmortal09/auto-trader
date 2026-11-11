@@ -15,10 +15,18 @@
 //! positions snapshot together — taken under the one book lock, so the caps
 //! and the book in memory never drift from the database. The wallet never
 //! goes below zero: a buy's `UPDATE` matches only while the balance covers it.
+//!
+//! A book holds index options and, behind the `stock_paper` switch, stock
+//! options (`resolve` says which contracts a buy may name). Both are the same
+//! `PaperPosition`: `index` is the underlying's symbol (`NIFTY`, `RELIANCE`),
+//! so the ledger's `ticker`, every label and the "by index" grouping work
+//! unchanged, and `underlying_key` names the stock's own cash row on the
+//! feed, where an index has its feed name instead.
 
 pub mod engine;
 pub mod feed;
 pub mod fill;
+pub mod resolve;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -48,9 +56,11 @@ pub const MAX_LOTS_PER_TAP: i32 = crate::routes::execute::MAX_LOTS_PER_TAP;
 /// Activity lines kept per user, in memory only.
 const MAX_ACTIVITY: usize = 100;
 
-/// A listed index option, as the route resolved it from the scrip master.
+/// A listed option — an index's, or a stock's behind `stock_paper` — as
+/// the route resolved it from the scrip master (see [`resolve`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContractRef {
+    /// The underlying's symbol: `NIFTY`, `RELIANCE`.
     pub index: String,
     pub trading_symbol: String,
     pub ws_key: String,
@@ -59,6 +69,13 @@ pub struct ContractRef {
     /// `CE` or `PE`.
     pub option_type: String,
     pub lot_size: i32,
+    /// The feed key of the underlying's cash row (`nse_cm|2885`), for a
+    /// stock; `None` for an index, whose value the feed carries under its
+    /// own name (`kotak_index_feed`).
+    pub underlying_key: Option<String>,
+    /// The F&O segment the contract trades in: `nse_fo`, or `bse_fo` for
+    /// SENSEX and BANKEX.
+    pub segment: String,
 }
 
 /// One open paper position: one contract, bought in one or more taps.
@@ -83,16 +100,50 @@ pub struct PaperPosition {
     /// feed has gone quiet.
     #[serde(default)]
     pub last_ltp: Option<f64>,
+    /// The feed key of the underlying's cash row, for a stock option (its
+    /// chart levels on the stock's price trigger on it); `None` for an
+    /// index option, and for positions saved before stock options existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlying_key: Option<String>,
+    /// The F&O segment (`nse_fo`, `bse_fo`); empty on positions saved before
+    /// it was kept — [`Self::segment`] reads it off the feed key then.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub segment: String,
 }
 
 impl PaperPosition {
-    /// "NIFTY 25000 CE".
+    /// "NIFTY 25000 CE", "RELIANCE 1400 CE".
     pub fn label(&self) -> String {
         contract_label(&self.index, Some(self.strike), Some(&self.option_type))
     }
 
     pub fn lots(&self) -> i32 {
         if self.lot_size > 0 { self.qty / self.lot_size } else { self.qty }
+    }
+
+    /// Whether the underlying is one of the six indices the app has a feed
+    /// name for (as opposed to a stock, or an index it only charts).
+    pub fn is_index(&self) -> bool {
+        shared_domain::kotak_index_feed(&self.index).is_some()
+    }
+
+    /// The price-map key the underlying's value ticks under — an index's
+    /// `idx|NIFTY 50`, a stock's cash row — which chart levels with the
+    /// `index` trigger watch. `None` when there is none to watch (an index
+    /// without a feed name, or a position saved before the key was kept).
+    pub fn underlying_price_key(&self) -> Option<String> {
+        shared_domain::kotak_index_feed(&self.index)
+            .map(|(_, name)| shared_domain::index_price_key(name))
+            .or_else(|| self.underlying_key.clone())
+    }
+
+    /// The F&O segment the contract trades in: as saved, else read off the
+    /// feed key (`nse_fo|51386`) for positions saved before it was kept.
+    pub fn segment(&self) -> &str {
+        if !self.segment.is_empty() {
+            return &self.segment;
+        }
+        self.ws_key.split_once('|').map(|(segment, _)| segment).filter(|s| !s.is_empty()).unwrap_or("nse_fo")
     }
 }
 
@@ -146,7 +197,10 @@ pub struct Filled {
     pub position_id: String,
     /// `BUY` or `SELL`.
     pub action: &'static str,
+    /// "NIFTY 25000 CE", "RELIANCE 1400 CE".
     pub contract: String,
+    /// The underlying's symbol: `NIFTY`, `RELIANCE`.
+    pub index: String,
     pub qty: i32,
     pub price: f64,
     /// What the wallet paid (a buy) or got (a sell), charges included.
@@ -273,12 +327,19 @@ impl PaperDesk {
         book.iter().flat_map(|(user, list)| list.iter().map(|p| (*user, p.clone()))).collect()
     }
 
-    /// The feed keys every held contract ticks on, and the indices they belong
-    /// to — what the feed keeper keeps subscribed.
+    /// The feed keys every held contract ticks on — with each held stock's
+    /// cash row, which its options' levels on the stock's price watch — and
+    /// the indices the index options belong to: what the feed keeper keeps
+    /// subscribed, and what the ladder's band release never drops.
     pub async fn feed_keys(&self) -> (BTreeSet<String>, BTreeSet<String>) {
         let book = self.book.lock().await;
-        let scrips = book.values().flatten().map(|p| p.ws_key.clone()).collect();
-        let indices = book.values().flatten().map(|p| p.index.clone()).collect();
+        let scrips = book
+            .values()
+            .flatten()
+            .flat_map(|p| [Some(p.ws_key.clone()), p.underlying_key.clone()])
+            .flatten()
+            .collect();
+        let indices = book.values().flatten().filter(|p| p.is_index()).map(|p| p.index.clone()).collect();
         (scrips, indices)
     }
 
@@ -348,8 +409,19 @@ impl PaperDesk {
                     "You hold {MAX_OPEN_POSITIONS_PER_USER} contracts already — close one before opening another"
                 )));
             }
-            let symbols: HashSet<&str> = book.values().flatten().map(|p| p.trading_symbol.as_str()).collect();
-            if !symbols.contains(contract.trading_symbol.as_str()) && symbols.len() >= MAX_USER_POSITION_SCRIPS {
+            // Every feed subscription the users' books keep: each held
+            // contract's, and each held stock's cash row (one per stock,
+            // shared by all its options). A new contract needs its own, and
+            // a stock not yet held its cash row's too — both inside the cap.
+            let subscribed: HashSet<&str> = book
+                .values()
+                .flatten()
+                .flat_map(|p| [Some(p.ws_key.as_str()), p.underlying_key.as_deref()])
+                .flatten()
+                .collect();
+            let needed = usize::from(!subscribed.contains(contract.ws_key.as_str()))
+                + usize::from(contract.underlying_key.as_deref().is_some_and(|k| !subscribed.contains(k)));
+            if needed > 0 && subscribed.len() + needed > MAX_USER_POSITION_SCRIPS {
                 return Err(Refusal::conflict(
                     "Paper trading is full right now — too many contracts are held across all accounts. Try again later",
                 ));
@@ -378,6 +450,8 @@ impl PaperDesk {
                     chart: ChartLevels::default(),
                     opened_at: shared_domain::current_ist_timestamp_string(),
                     last_ltp: Some(price),
+                    underlying_key: contract.underlying_key.clone(),
+                    segment: contract.segment.clone(),
                 });
                 next.len() - 1
             }
@@ -402,6 +476,7 @@ impl PaperDesk {
             position_id: pos.id.clone(),
             action: "BUY",
             contract: pos.label(),
+            index: pos.index.clone(),
             qty,
             price,
             net_value,
@@ -559,6 +634,7 @@ impl PaperDesk {
             position_id: pos.id.clone(),
             action: "SELL",
             contract: pos.label(),
+            index: pos.index.clone(),
             qty,
             price,
             net_value,
@@ -580,8 +656,8 @@ impl PaperDesk {
             if !(level.price.is_finite() && level.price > 0.0) {
                 return Err(Refusal::bad_request("a level's price must be a positive number"));
             }
-            if level.trigger == LevelTrigger::Index && shared_domain::kotak_index_feed(&pos.index).is_none() {
-                return Err(Refusal::bad_request(format!("{} has no index feed to trigger on", pos.index)));
+            if level.trigger == LevelTrigger::Index && pos.underlying_price_key().is_none() {
+                return Err(Refusal::bad_request(format!("{} has no underlying feed to trigger on", pos.index)));
             }
         }
         let before = pos.chart.clone();
@@ -595,8 +671,9 @@ impl PaperDesk {
             self.write_snapshot(user_id, &next).await?;
             book.insert(user_id, next);
             drop(book);
+            let on = if pos.is_index() { "the index" } else { "the stock" };
             let describe = |l: &ChartLevel| match l.trigger {
-                LevelTrigger::Index => format!("{} on the index", l.price),
+                LevelTrigger::Index => format!("{} on {on}", l.price),
                 LevelTrigger::Premium => format!("₹{}", l.price),
             };
             let stop = pos.chart.stop.as_ref().map(describe).unwrap_or_else(|| "none".to_string());
@@ -792,6 +869,24 @@ pub(crate) mod tests {
             strike,
             option_type: side.into(),
             lot_size: 75,
+            underlying_key: None,
+            segment: "nse_fo".into(),
+        }
+    }
+
+    /// A RELIANCE monthly option (24 Nov 2026, lot 500), whose stock ticks
+    /// on `nse_cm|2885`.
+    pub(crate) fn reliance(strike: f64, side: &str) -> ContractRef {
+        ContractRef {
+            index: "RELIANCE".into(),
+            trading_symbol: format!("RELIANCE26NOV{strike:.0}{side}"),
+            ws_key: format!("nse_fo|R{strike:.0}{side}"),
+            expiry: NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            strike,
+            option_type: side.into(),
+            lot_size: 500,
+            underlying_key: Some("nse_cm|2885".into()),
+            segment: "nse_fo".into(),
         }
     }
 
@@ -1013,5 +1108,143 @@ pub(crate) mod tests {
         desk.buy(8, &nifty(25_000.0, "CE"), 1, 100.0).await.unwrap();
         assert!(desk.hold_flat(8).await.is_none());
         assert!(desk.hold_flat(9).await.is_some());
+    }
+
+    /// A snapshot exactly as the code before stock options wrote it: no
+    /// `underlying_key`, no `segment`. It must load, or users' open
+    /// positions would vanish at the first restart after a release.
+    const OLD_SNAPSHOT: &str = r#"[{"id":"p-1","index":"NIFTY","trading_symbol":"NIFTY26N0323000CE","ws_key":"nse_fo|51386","expiry":"2026-11-03","strike":23000.0,"option_type":"CE","lot_size":65,"qty":130,"avg_price":101.5,"chart":{"stop":{"price":22900.0,"trigger":"index"},"targets":[{"id":"t1","price":130.0,"trigger":"premium","lots":1}]},"opened_at":"2026-11-02 10:00:00","last_ltp":104.0},{"id":"p-2","index":"SENSEX","trading_symbol":"SENSEX26N0575100PE","ws_key":"bse_fo|874002","expiry":"2026-11-05","strike":75100.0,"option_type":"PE","lot_size":20,"qty":20,"avg_price":300.0,"opened_at":"2026-11-02 10:05:00"}]"#;
+
+    #[tokio::test]
+    async fn a_snapshot_saved_before_stock_options_still_loads() {
+        let db = TempDb::new("paper-old-snapshot");
+        let pool = init_db(&db.url()).await;
+        sqlx::query("INSERT INTO user_positions (user_id, json, updated_at) VALUES (4, ?, '2026-11-02 10:05:00')")
+            .bind(OLD_SNAPSHOT)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let desk = PaperDesk::load(pool.clone(), Arc::new(DashMap::new())).await.unwrap();
+        let open = desk.open(4).await;
+        assert_eq!(open.len(), 2);
+        let (nifty, sensex) = (&open[0], &open[1]);
+        assert_eq!((nifty.underlying_key.as_deref(), nifty.segment.as_str()), (None, ""));
+        // The segment is read off the feed key, the underlying's price off the index's feed name.
+        assert_eq!((nifty.segment(), sensex.segment()), ("nse_fo", "bse_fo"));
+        assert_eq!(nifty.underlying_price_key().as_deref(), Some("idx|NIFTY 50"));
+        assert_eq!(sensex.underlying_price_key().as_deref(), Some("idx|SENSEX"));
+        assert!(nifty.is_index() && sensex.is_index());
+        assert_eq!(nifty.chart.stop.map(|s| s.price), Some(22_900.0));
+        assert_eq!((nifty.qty, nifty.last_ltp, sensex.last_ltp), (130, Some(104.0), None));
+        // The feed keeper asks for exactly what it did before: the contracts and their indices.
+        let (scrips, indices) = desk.feed_keys().await;
+        assert_eq!(scrips.into_iter().collect::<Vec<_>>(), ["bse_fo|874002", "nse_fo|51386"]);
+        assert_eq!(indices.into_iter().collect::<Vec<_>>(), ["NIFTY", "SENSEX"]);
+        // A sell on the old row writes it back in today's shape, and it loads again.
+        desk.sell(4, "p-2", None, "MANUAL_CLOSE", |_| Some(290.0)).await.unwrap();
+        let again = PaperDesk::load(pool, Arc::new(DashMap::new())).await.unwrap();
+        assert_eq!(again.open(4).await, vec![nifty.clone()]);
+        // Today's shape leaves the new fields out while they are empty, so a
+        // rollback to the code before them reads the snapshot too.
+        let json = serde_json::to_string(&open).unwrap();
+        assert!(!json.contains("underlying_key") && !json.contains("segment"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn a_stock_option_is_bought_sold_and_watched_like_an_index_option() {
+        let (_db, desk) = desk("stock").await;
+        let c = reliance(1_400.0, "CE");
+        let buy = desk.buy(3, &c, 2, 42.5).await.unwrap();
+        assert_eq!((buy.qty, buy.held, buy.contract.as_str(), buy.index.as_str()), (1_000, 1_000, "RELIANCE 1400 CE", "RELIANCE"));
+        // NSE option charges: no STT on the buy, STT on the sell.
+        let charges = fill::buy_fill("RELIANCE", 1_000, 42.5);
+        assert!((buy.net_value - charges.net_value).abs() < 1e-6 && charges.stt_charge == 0.0);
+        let open = desk.open(3).await;
+        assert_eq!(open.len(), 1);
+        let p = &open[0];
+        assert_eq!((p.index.as_str(), p.underlying_key.as_deref(), p.segment(), p.lot_size), ("RELIANCE", Some("nse_cm|2885"), "nse_fo", 500));
+        assert!(!p.is_index());
+        assert_eq!(p.underlying_price_key().as_deref(), Some("nse_cm|2885"));
+        assert_eq!(p.label(), "RELIANCE 1400 CE");
+        // A stop on the stock's own price is allowed: the stock ticks on the feed.
+        let stop = LevelsUpdate { stop: Some(Some(ChartLevel { price: 1_380.0, trigger: LevelTrigger::Index })), ..Default::default() };
+        let (set, _) = desk.set_levels(3, &p.id, &stop).await.unwrap();
+        assert_eq!(set.chart.stop.map(|s| s.price), Some(1_380.0));
+        assert_eq!(desk.activity(3)[0].message, "RELIANCE 1400 CE: stop 1380 on the stock, targets none");
+        // The stock's cash row joins the held contract on the feed; no index does.
+        let (scrips, indices) = desk.feed_keys().await;
+        assert_eq!(scrips.into_iter().collect::<Vec<_>>(), ["nse_cm|2885", "nse_fo|R1400CE"]);
+        assert!(indices.is_empty());
+        // Sold one lot by hand, the rest at the expiry square-off; never more than held.
+        let part = desk.sell(3, &p.id, Some(1), "MANUAL_SELL", |_| Some(50.0)).await.unwrap();
+        assert_eq!((part.qty, part.held), (500, 500));
+        assert!(fill::sell_fill("RELIANCE", 500, 50.0).stt_charge > 0.0);
+        assert_eq!(desk.sell(3, &p.id, Some(2), "MANUAL_SELL", |_| Some(50.0)).await.unwrap_err().status, StatusCode::CONFLICT);
+        let rest = desk.settle(3, &p.id, 48.0, "EXPIRY_SQUAREOFF").await.unwrap();
+        assert_eq!((rest.qty, rest.held, rest.reason), (500, 0, Some("EXPIRY_SQUAREOFF")));
+        assert!(desk.open(3).await.is_empty());
+        // The ledger keeps the stock as its ticker, and reads back as one call on RELIANCE.
+        let rows: Vec<(String, String, Option<String>, Option<f64>)> =
+            sqlx::query_as("SELECT ticker, trading_symbol, expiry, strike FROM user_trades WHERE user_id = 3 ORDER BY id")
+                .fetch_all(&desk.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r == &("RELIANCE".to_string(), "RELIANCE26NOV1400CE".to_string(), Some("2026-11-24".to_string()), Some(1_400.0))));
+        let calls = crate::history::calls(crate::history::load_user_legs(&desk.pool, 3, 0).await.unwrap());
+        assert_eq!((calls.len(), calls[0].index.as_str(), calls[0].strike, calls[0].side.as_deref()), (1, "RELIANCE", Some(1_400.0), Some("CE")));
+        assert_eq!(calls[0].expiry.as_deref(), Some("2026-11-24"));
+        assert!(calls[0].closed_at.is_some());
+        let wallet = desk.wallet(3).await.unwrap();
+        assert!((wallet.balance - (INITIAL_WALLET - buy.net_value + part.net_value + rest.net_value)).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn an_index_option_without_an_underlying_feed_cant_watch_the_index() {
+        let (_db, desk) = desk("no-underlying").await;
+        // An index the app only charts: no feed name, no cash row.
+        let mut c = reliance(70_000.0, "CE");
+        c.index = "NIFTYNXT50".into();
+        c.underlying_key = None;
+        let a = desk.buy(5, &c, 1, 300.0).await.unwrap();
+        let on_premium = LevelsUpdate { stop: Some(Some(ChartLevel { price: 250.0, trigger: LevelTrigger::Premium })), ..Default::default() };
+        desk.set_levels(5, &a.position_id, &on_premium).await.unwrap();
+        let on_index = LevelsUpdate { stop: Some(Some(ChartLevel { price: 69_000.0, trigger: LevelTrigger::Index })), ..Default::default() };
+        let refused = desk.set_levels(5, &a.position_id, &on_index).await.unwrap_err();
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.message, "NIFTYNXT50 has no underlying feed to trigger on");
+    }
+
+    #[tokio::test]
+    async fn a_stocks_cash_row_counts_against_the_forty_subscriptions() {
+        let (_db, desk) = desk("stock-caps").await;
+        // 38 index contracts across four users: 38 subscriptions.
+        let mut n = 0;
+        for user in 1..=4 {
+            for _ in 0..MAX_OPEN_POSITIONS_PER_USER {
+                if n == 38 {
+                    break;
+                }
+                desk.buy(user, &nifty(24_000.0 + 50.0 * n as f64, "CE"), 1, 1.0).await.unwrap();
+                n += 1;
+            }
+        }
+        // A first RELIANCE option needs two: its own and the stock's cash row. 40: fits.
+        desk.buy(5, &reliance(1_400.0, "CE"), 1, 1.0).await.unwrap();
+        assert_eq!(desk.feed_keys().await.0.len(), MAX_USER_POSITION_SCRIPS);
+        // A second RELIANCE strike needs one more: full.
+        let full = desk.buy(5, &reliance(1_420.0, "CE"), 1, 1.0).await.unwrap_err();
+        assert!(full.message.starts_with("Paper trading is full"), "{}", full.message);
+        // Another user on the same RELIANCE contract adds nothing: fine. So is an add.
+        desk.buy(6, &reliance(1_400.0, "CE"), 1, 1.0).await.unwrap();
+        desk.buy(5, &reliance(1_400.0, "CE"), 2, 1.0).await.unwrap();
+        // Once the index contracts are gone, the second strike shares the cash row: one more.
+        for user in 1..=4 {
+            for p in desk.open(user).await {
+                desk.settle(user, &p.id, 1.0, "MANUAL_CLOSE").await.unwrap();
+            }
+        }
+        desk.buy(5, &reliance(1_420.0, "CE"), 1, 1.0).await.unwrap();
+        assert_eq!(desk.feed_keys().await.0.len(), 3);
     }
 }

@@ -1,4 +1,7 @@
-//! Keeps every held paper contract, and its index, on the price feed. A
+//! Keeps every held paper contract, and its underlying, on the price feed:
+//! an index option's index by its feed name, a stock option's stock by its
+//! cash row's key (one subscription per stock, however many of its options
+//! are held, counted inside the 40-contract cap by `PaperDesk::buy`). A
 //! contract is bought off the ladder, whose subscriptions the feed drops at
 //! the day's close; a position's own subscription stays, so its chart levels
 //! and its square-off have prices the next day too. The only paper code that
@@ -24,8 +27,8 @@ struct Sent {
     indices: HashSet<String>,
 }
 
-/// Subscribe on `tx` whatever of `scrips` (feed keys) and `indices` (index
-/// names) it hasn't been sent yet.
+/// Subscribe on `tx` whatever of `scrips` (feed keys: contracts and stocks'
+/// cash rows alike) and `indices` (index names) it hasn't been sent yet.
 fn sync(sent: &mut Sent, tx: &mpsc::UnboundedSender<String>, scrips: BTreeSet<String>, indices: BTreeSet<String>) {
     if !sent.channel.as_ref().is_some_and(|c| c.same_channel(tx)) {
         *sent = Sent { channel: Some(tx.clone()), ..Default::default() };
@@ -81,6 +84,10 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), r#"{"action":"subscribe_indices","indices":"nse_cm|Nifty 50"}"#);
         sync(&mut sent, &tx, set(&["nse_fo|1", "nse_fo|2", "nse_fo|3"]), set(&["NIFTY"]));
         assert_eq!(rx.try_recv().unwrap(), r#"{"action":"subscribe","scrips":"nse_fo|3"}"#);
+        assert!(rx.try_recv().is_err());
+        // A stock option brings its stock's cash row along, as a plain scrip.
+        sync(&mut sent, &tx, set(&["nse_fo|1", "nse_fo|2", "nse_fo|3", "nse_fo|41222", "nse_cm|2885"]), set(&["NIFTY"]));
+        assert_eq!(rx.try_recv().unwrap(), r#"{"action":"subscribe","scrips":"nse_cm|2885&nse_fo|41222"}"#);
         assert!(rx.try_recv().is_err());
 
         // A new bridge hears everything again.

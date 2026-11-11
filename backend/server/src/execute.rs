@@ -564,8 +564,8 @@ fn band_keys(strikes: &[ChainStrike], atm: usize, half: usize) -> Vec<String> {
 /// (SENSEX and BANKEX in `bse_fo`, every other index and every stock in
 /// `nse_fo`), expiring on or after `today`. Futures, expired contracts, a
 /// contract in the other exchange's segment and another underlying's rows
-/// are not.
-fn listed_option(record: &ScripRecord, underlying: &str, today: NaiveDate) -> bool {
+/// are not. The users' paper buy (`paper::resolve`) applies the same test.
+pub(crate) fn listed_option(record: &ScripRecord, underlying: &str, today: NaiveDate) -> bool {
     record.symbol_name == underlying
         && record.exchange_segment_code == index_fo_segment(underlying)
         && record.normalized_strike().is_some()
@@ -575,7 +575,7 @@ fn listed_option(record: &ScripRecord, underlying: &str, today: NaiveDate) -> bo
 /// The index `record` is an option of, if it is one the owner's one-tap buy
 /// may trade: [`listed_option`] on one of the six indices. Stocks give
 /// `None` whatever the `stock_charts` switch says.
-fn index_option(record: &ScripRecord, today: NaiveDate) -> Option<&'static str> {
+pub(crate) fn index_option(record: &ScripRecord, today: NaiveDate) -> Option<&'static str> {
     let index = INDEX_NAMES.iter().copied().find(|i| *i == record.symbol_name)?;
     listed_option(record, index, today).then_some(index)
 }

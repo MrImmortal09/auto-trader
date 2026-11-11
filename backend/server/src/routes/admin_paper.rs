@@ -245,6 +245,10 @@ pub struct PositionOut {
     pub user_id: i64,
     pub id: String,
     pub contract: String,
+    /// The underlying's symbol: `NIFTY`, `RELIANCE`.
+    pub index: String,
+    /// The F&O segment the contract trades in: `nse_fo`, or `bse_fo`.
+    pub segment: String,
     /// `YYYY-MM-DD`.
     pub expiry: String,
     pub qty: i32,
@@ -265,6 +269,8 @@ impl PositionOut {
         PositionOut {
             user_id,
             contract: p.label(),
+            index: p.index.clone(),
+            segment: p.segment().to_string(),
             expiry: p.expiry.format("%Y-%m-%d").to_string(),
             qty: p.qty,
             lots: p.lots(),
