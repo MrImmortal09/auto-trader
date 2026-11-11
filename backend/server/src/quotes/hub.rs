@@ -3,20 +3,22 @@
 //!
 //! `get_at(key, now)` answers for a price-map key (`nse_cm|2885`,
 //! `nse_fo|51386`, `idx|NIFTY 50`). The candidates are the feed's tick for
-//! a key the feed carries (read from the shared price map, which only the
-//! feed task writes), the latest Kotak REST read, and Upstox's quote while
-//! Kotak is down during hours; the freshest of them gives the price, a feed
-//! tick of the last ten seconds ahead of any REST read, and the others fill
-//! in the day's figures it lacks. After the close, the 15:35 sweep's row is
-//! served as the day's close instead, until the next day's quotes arrive.
+//! an equity or index the feed carries (read from the shared price map,
+//! which only the feed task writes), the latest Kotak REST read, and
+//! Upstox's quote while Kotak is down during hours; the freshest of them
+//! gives the price, a feed tick of the last ten seconds ahead of any REST
+//! read, and the others fill in the day's figures it lacks. After the
+//! close, the 15:35 sweep's row is served as the day's close instead, until
+//! the next day's quotes arrive.
 //!
 //! What a quote tells a signed-in user is the price and the day's figures,
-//! never where the price came from in a way that names the feed: the feed
-//! carries exactly the contracts the owner's engine, the ladder and the
-//! paper desks subscribed, so a contract answered from the feed before the
-//! REST poller has read it would say the owner holds it. Hence a contract
-//! key's feed tick is used only once the key has a REST read too (so the
-//! first call for any contract is `missing` alike), and `source` is
+//! never anything that names the feed: the feed carries exactly the
+//! contracts the owner's engine, the ladder and the paper desks subscribed.
+//! A contract priced from the feed at any point would say so — before the
+//! first REST read (answered rather than `missing`), and after it too (its
+//! `at` and `ltp` moving with every tick rather than at the 2 s REST reads).
+//! Hence a contract (`*_fo|…`) is priced from REST alone, and the poller
+//! orders contracts with the keys the feed does not carry; `source` is
 //! serialised as `live` for the feed and REST both.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -237,7 +239,8 @@ pub fn merge_live(feed: Option<Quote>, rest: Option<Quote>, upstox: Option<Quote
 }
 
 /// Whether `key` is a derivative's (`nse_fo|…`, `bse_fo|…`): the keys the
-/// feed carries only because someone holds or watches the contract.
+/// feed carries only because someone holds or watches the contract, so
+/// never priced or polled by whether the feed has them.
 fn is_contract_key(key: &str) -> bool {
     key.split_once('|').is_some_and(|(segment, _)| segment.ends_with("_fo"))
 }
@@ -504,16 +507,17 @@ impl QuoteHub {
 
     /// The quote for `key` as of `now` (the routes pass the clock through,
     /// so their tests can set it) — see the module doc for which source
-    /// answers. A contract's feed tick counts only once the key has a REST
-    /// read as well: the feed carries a contract because the owner's
-    /// engine, the ladder or a paper desk subscribed it, and a quote
-    /// answered before the poller's first read would say so. Equities and
-    /// indices are answered from the feed at once (the indices are always
-    /// on it; no equity ever is).
+    /// answers. A contract's feed tick never counts: the feed carries a
+    /// contract because the owner's engine, the ladder or a paper desk
+    /// subscribed it, and a quote that moved with its ticks (or answered
+    /// before the poller's first read) would say so; contracts are priced
+    /// from REST alone, like any contract the feed does not carry.
+    /// Equities and indices are answered from the feed (the indices are
+    /// always on it; no equity ever is).
     pub fn get_at(&self, key: &str, now: DateTime<FixedOffset>) -> Option<Quote> {
         let rest = self.rest.get(key).map(|h| h.quote.clone());
         let upstox = self.upstox.get(key).map(|h| h.quote.clone());
-        let feed = if is_contract_key(key) && rest.is_none() { None } else { self.feed_quote(key) };
+        let feed = if is_contract_key(key) { None } else { self.feed_quote(key) };
         let live = merge_live(feed, rest, upstox, now.timestamp_millis());
         let close = self.snapshot().and_then(|s| s.quote(key).map(|q| (s.day, q)));
         serve(live, close, now)
@@ -616,8 +620,11 @@ impl QuoteHub {
         self.sched.lock().unwrap_or_else(|e| e.into_inner()).reserve(now)
     }
 
-    /// The calls to make now: the wanted keys with a REST form, those the
-    /// feed carries last (their price is live anyway), and the sweep's.
+    /// The calls to make now: the wanted keys with a REST form, the
+    /// equities and indices the feed carries last (their price is live
+    /// anyway), and the sweep's. A contract is never put last for being on
+    /// the feed: its first read coming later than other keys' would say it
+    /// is held, and its price is REST's alone anyway.
     pub(super) fn plan(&self, session_ok: bool, now: Instant) -> Vec<Chunk> {
         *self.session_ok.lock().unwrap_or_else(|e| e.into_inner()) = session_ok;
         let mut wanted: Vec<String> = self
@@ -626,7 +633,8 @@ impl QuoteHub {
             .filter(|k| rest::rest_key(k).is_some())
             .collect();
         wanted.sort();
-        let (on_feed, off_feed): (Vec<String>, Vec<String>) = wanted.into_iter().partition(|k| self.feed_quote(k).is_some());
+        let (on_feed, off_feed): (Vec<String>, Vec<String>) =
+            wanted.into_iter().partition(|k| !is_contract_key(k) && self.feed_quote(k).is_some());
         let wanted: Vec<String> = off_feed.into_iter().chain(on_feed).collect();
 
         let mut sweep = self.sweep.lock().unwrap_or_else(|e| e.into_inner());
@@ -888,16 +896,17 @@ mod tests {
         let hub = hub(Arc::clone(&prices), Arc::clone(&tick_ms));
         let noon = ist(2026, 11, 4, 12, 0);
 
-        // REST alone.
-        hub.put_rest(rest_quote("nse_fo|1", 104.0, noon - chrono::Duration::seconds(1)));
-        let q = hub.get_at("nse_fo|1", noon).unwrap();
+        // REST alone (an equity: never on the real feed, but the hub prices
+        // any non-contract key the feed has).
+        hub.put_rest(rest_quote("nse_cm|1", 104.0, noon - chrono::Duration::seconds(1)));
+        let q = hub.get_at("nse_cm|1", noon).unwrap();
         assert_eq!((q.ltp, q.source), (104.0, Source::Rest));
 
         // The feed ticks 3 s after that read: its price, REST's day, and the
         // change worked out for the feed's price, not copied for REST's.
-        prices.insert("nse_fo|1".into(), 105.5);
+        prices.insert("nse_cm|1".into(), 105.5);
         tick_ms.store(ms(noon) + 2_000, Ordering::Relaxed);
-        let q = hub.get_at("nse_fo|1", noon + chrono::Duration::seconds(3)).unwrap();
+        let q = hub.get_at("nse_cm|1", noon + chrono::Duration::seconds(3)).unwrap();
         assert_eq!((q.ltp, q.source), (105.5, Source::Feed));
         assert_eq!((q.open, q.high, q.low, q.close), (Some(100.0), Some(110.0), Some(95.0), Some(98.0)));
         assert_eq!(q.volume, Some(1_000.0));
@@ -915,22 +924,37 @@ mod tests {
 
         // A REST read later than the tick, with the tick still within 10 s:
         // the feed still gives the price.
-        hub.put_rest(rest_quote("nse_fo|1", 104.5, noon + chrono::Duration::seconds(5)));
-        let q = hub.get_at("nse_fo|1", noon + chrono::Duration::seconds(6)).unwrap();
+        hub.put_rest(rest_quote("nse_cm|1", 104.5, noon + chrono::Duration::seconds(5)));
+        let q = hub.get_at("nse_cm|1", noon + chrono::Duration::seconds(6)).unwrap();
         assert_eq!((q.ltp, q.source), (105.5, Source::Feed));
         // The tick 30 s old and REST newer: REST's price.
-        let q = hub.get_at("nse_fo|1", noon + chrono::Duration::seconds(32)).unwrap();
+        let q = hub.get_at("nse_cm|1", noon + chrono::Duration::seconds(32)).unwrap();
         assert_eq!((q.ltp, q.source), (104.5, Source::Rest));
         // The feed's 0.0 placeholder is no price.
-        prices.insert("nse_fo|2".into(), 0.0);
-        assert_eq!(hub.get_at("nse_fo|2", noon), None);
-        // A contract the feed carries but REST has not read yet is not
-        // answered: that it is on the feed is the owner's business.
+        prices.insert("nse_cm|2".into(), 0.0);
+        assert_eq!(hub.get_at("nse_cm|2", noon), None);
+        // A contract the feed carries is priced from REST alone: before the
+        // poller's first read it is missing, like any contract...
+        tick_ms.store(ms(noon) - 100, Ordering::Relaxed);
         prices.insert("nse_fo|3".into(), 42.0);
         assert_eq!(hub.get_at("nse_fo|3", noon), None, "a held contract looks like any other until polled");
-        hub.put_rest(Quote::bare("nse_fo|3", 41.5, ms(noon) - 500, Source::Rest));
-        let q = hub.get_at("nse_fo|3", noon).unwrap();
-        assert_eq!((q.ltp, q.source), (42.0, Source::Feed), "once polled, the fresher tick gives the price");
+        // ...and after it, a fresher tick moves neither its price nor its
+        // time: both change only at the REST reads, as for a contract the
+        // feed does not carry, so polling it says nothing about the feed.
+        hub.put_rest(rest_quote("nse_fo|3", 41.5, noon - chrono::Duration::seconds(1)));
+        hub.put_rest(rest_quote("nse_fo|4", 7.0, noon - chrono::Duration::seconds(1)));
+        let held = hub.get_at("nse_fo|3", noon).unwrap();
+        let other = hub.get_at("nse_fo|4", noon).unwrap();
+        assert_eq!((held.ltp, held.source, held.at), (41.5, Source::Rest, ms(noon) - 1_000), "the tick never gives a contract's price");
+        assert_eq!((other.source, other.at), (Source::Rest, ms(noon) - 1_000));
+        assert_eq!(held.change, Some(41.5 - 98.0), "REST's own change, for REST's price");
+        prices.insert("nse_fo|3".into(), 43.0);
+        tick_ms.store(ms(noon) + 900, Ordering::Relaxed);
+        let later = hub.get_at("nse_fo|3", noon + chrono::Duration::seconds(1)).unwrap();
+        assert_eq!((later.ltp, later.at), (41.5, ms(noon) - 1_000), "a new tick changes nothing until the next REST read");
+        let a = serde_json::to_value(&later).unwrap();
+        let b = serde_json::to_value(hub.get_at("nse_fo|4", noon + chrono::Duration::seconds(1)).unwrap()).unwrap();
+        assert_eq!((a["source"].clone(), a["at"].clone()), (b["source"].clone(), b["at"].clone()), "held and not held answer alike");
         // Indices are on the feed for everyone: answered at once.
         prices.insert("idx|SENSEX".into(), 80_000.0);
         assert_eq!(hub.get_at("idx|SENSEX", noon).map(|q| q.ltp), Some(80_000.0));
@@ -1054,18 +1078,31 @@ mod tests {
         let prices: Arc<DashMap<String, f64>> = Arc::new(DashMap::new());
         let tick_ms = Arc::new(AtomicI64::new(1));
         let hub = hub(Arc::clone(&prices), tick_ms);
+        // The index and one contract are on the feed: the index goes last
+        // (its price is live anyway), the contract keeps its place among
+        // the keys the feed does not carry, so when its first read comes
+        // says nothing about whether it is held.
+        prices.insert("idx|NIFTY 50".into(), 25_000.0);
         prices.insert("nse_fo|1".into(), 100.0);
-        hub.want(["nse_fo|1".to_string(), "nse_cm|2885".to_string(), "idx|NIFTY 50".to_string(), "idx_close|NIFTY 50".to_string(), "junk".to_string()]);
+        hub.want([
+            "nse_fo|1".to_string(),
+            "nse_fo|2".to_string(),
+            "nse_cm|2885".to_string(),
+            "idx|NIFTY 50".to_string(),
+            "idx_close|NIFTY 50".to_string(),
+            "junk".to_string(),
+        ]);
         let now = Instant::now();
         let chunks = hub.plan(true, now);
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].keys, vec!["idx|NIFTY 50", "nse_cm|2885", "nse_fo|1"]);
+        assert_eq!(chunks[0].keys, vec!["nse_cm|2885", "nse_fo|1", "nse_fo|2", "idx|NIFTY 50"]);
         assert_eq!(
             QuoteHub::rest_keys(&chunks[0]),
             vec![
-                ("nse_cm|Nifty 50".to_string(), "idx|NIFTY 50".to_string()),
                 ("nse_cm|2885".to_string(), "nse_cm|2885".to_string()),
                 ("nse_fo|1".to_string(), "nse_fo|1".to_string()),
+                ("nse_fo|2".to_string(), "nse_fo|2".to_string()),
+                ("nse_cm|Nifty 50".to_string(), "idx|NIFTY 50".to_string()),
             ]
         );
         // A good answer is stored under the price-map key, matched by the REST key, case aside.
@@ -1077,7 +1114,7 @@ mod tests {
         let keys = QuoteHub::rest_keys(&chunks[0]);
         hub.settle_kotak(chunks[0].clone(), &keys, Ok(answer), now);
         let status = hub.status();
-        assert_eq!((status.calls, status.quotes, status.unmatched, status.wanted), (1, 2, 1, 5));
+        assert_eq!((status.calls, status.quotes, status.unmatched, status.wanted), (1, 2, 1, 6));
         assert!(status.paused.is_none());
         // The rate counts the last minute's calls, whatever came of them.
         assert_eq!((status.calls_last_minute, status.upstox_calls_last_minute), (1, 0));
@@ -1137,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn only_derivative_keys_wait_for_a_rest_read() {
+    fn only_derivative_keys_are_priced_from_rest_alone() {
         assert!(is_contract_key("nse_fo|51386"));
         assert!(is_contract_key("bse_fo|874001"));
         assert!(!is_contract_key("nse_cm|2885"));

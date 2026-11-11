@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1277,6 +1277,8 @@ pub(crate) struct OrderBookMemory {
     polls: u64,
     day: Option<chrono::NaiveDate>,
     first_seen: HashMap<String, u64>,
+    /// Orders already reported finished to the timing tap today.
+    finished: HashSet<String>,
 }
 
 impl OrderBookMemory {
@@ -1285,10 +1287,17 @@ impl OrderBookMemory {
         if self.day != Some(today) {
             self.day = Some(today);
             self.first_seen.clear();
+            self.finished.clear();
         }
         self.polls += 1;
         for o in book {
-            self.first_seen.entry(o.order_no.trim().to_string()).or_insert(self.polls);
+            let order_no = o.order_no.trim();
+            self.first_seen.entry(order_no.to_string()).or_insert(self.polls);
+            // Timing only (the admin's order timing): when the engine first
+            // learned an order finished. Nothing here decides anything.
+            if o.is_terminal() && !order_no.is_empty() && self.finished.insert(order_no.to_string()) {
+                kotak_client::orders::publish_book_finished(order_no, &o.status, o.filled_qty() as i64, o.avg_price());
+            }
         }
     }
 
@@ -7245,6 +7254,34 @@ mod tests {
         // After a restart the send's poll is unknown: symbol and quantity
         // alone decide, as they always did.
         assert_eq!(unconfirmed_buy_candidates(&book, SYM, 65, &[], &memory, None).len(), 2);
+    }
+
+    #[test]
+    fn the_poll_reports_each_order_once_the_first_time_it_shows_finished() {
+        // The tap is process-wide: other tests' polls publish to it too, so
+        // only this test's order numbers are counted.
+        let mut tap = kotak_client::orders::subscribe_book_finished();
+        let open = |no: &str| {
+            let mut o = book_order(no, "B", 65);
+            o.status = "open".into();
+            o.filled_quantity = "0".into();
+            o.average_price = "0".into();
+            o
+        };
+        let mut memory = OrderBookMemory::default();
+        memory.record(&[book_order("tap-1", "B", 65), open("tap-2")]);
+        memory.record(&[book_order("tap-1", "B", 65), open("tap-2")]);
+        let mut cancelled = open("tap-2");
+        cancelled.status = "Cancelled".into();
+        memory.record(&[book_order("tap-1", "B", 65), cancelled]);
+
+        let mut told = Vec::new();
+        while let Ok(f) = tap.try_recv() {
+            if f.order_no.starts_with("tap-") {
+                told.push((f.order_no, f.status, f.filled_qty, f.avg_price));
+            }
+        }
+        assert_eq!(told, [("tap-1".to_string(), "complete".to_string(), 65, 100.0), ("tap-2".to_string(), "cancelled".to_string(), 0, 0.0)]);
     }
 
     // ── Chart stops and targets (v2) ─────────────────────────────────── //

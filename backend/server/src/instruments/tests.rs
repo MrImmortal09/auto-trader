@@ -171,6 +171,17 @@ impl Scratch {
         self.write("bse_fo", BSE_FO);
     }
 
+    /// Stamps every segment file on disk as written at `at`, as a download
+    /// at that time would have.
+    fn stamp(&self, at: chrono::DateTime<chrono::FixedOffset>) {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(at.timestamp()).unwrap());
+        for segment in ["nse_cm", "nse_fo", "bse_fo"] {
+            if let Ok(file) = std::fs::File::options().write(true).open(self.files().path(segment)) {
+                file.set_modified(when).unwrap();
+            }
+        }
+    }
+
     fn write_real_shape(&self) {
         self.write("nse_cm", REAL_NSE_CM);
         self.write("nse_fo", REAL_NSE_FO);
@@ -210,6 +221,7 @@ fn loaded(outcome: Result<LoadOutcome, LoadError>) -> LoadReport {
     match outcome {
         Ok(LoadOutcome::Loaded(report)) => report,
         Ok(LoadOutcome::Unchanged) => panic!("expected a build, the catalog said unchanged"),
+        Ok(LoadOutcome::SameDay) => panic!("expected a build, the catalog waited for the close"),
         Err(e) => panic!("expected a build: {e}"),
     }
 }
@@ -387,6 +399,51 @@ async fn a_restart_restores_the_search_list_without_a_build() {
     assert_eq!(answer.stocks[0].id, "nse_cm:2885");
     assert_eq!(symbols(&answer.futures), vec!["RELIANCE26NOVFUT", "RELIANCE26DECFUT"]);
     assert!(matches!(catalog.load_if_changed("unchanged").await, Ok(LoadOutcome::Unchanged)));
+}
+
+/// IST wall-clock time.
+fn ist(y: i32, m: u32, day: u32, h: u32, min: u32) -> chrono::DateTime<chrono::FixedOffset> {
+    d(y, m, day).and_hms_opt(h, min, 0).unwrap().and_local_timezone(shared_domain::ist_offset()).single().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relogin_download_during_hours_is_not_built_again() {
+    // The calendar's special sessions are process-wide: none while this runs.
+    let _sessions = shared_domain::special_sessions_test_guard();
+    let scratch = Scratch::new("same-day");
+    let catalog = scratch.catalog().await;
+    // 2026-11-04 is a Wednesday. The morning login's download (no bse_fo
+    // that day) is built during hours: the catalog has nothing of the day.
+    scratch.write("nse_cm", NSE_CM);
+    scratch.write("nse_fo", NSE_FO);
+    scratch.stamp(ist(2026, 11, 4, 9, 20));
+    loaded(catalog.load_if_changed_at("login", ist(2026, 11, 4, 9, 21)).await);
+    assert_eq!(catalog.status().day.as_deref(), Some("2026-11-04"));
+    // A relogin brings a segment the build lacked: built.
+    scratch.write_all();
+    scratch.stamp(ist(2026, 11, 4, 11, 0));
+    loaded(catalog.load_if_changed_at("relogin", ist(2026, 11, 4, 11, 1)).await);
+    let built = catalog.status();
+    assert_eq!(built.rows.get("bse_fo"), Some(&4));
+    // The next relogin writes the same day's files again, newer mtimes and
+    // all: not built while the market is open.
+    scratch.write_all();
+    scratch.stamp(ist(2026, 11, 4, 13, 0));
+    assert!(matches!(catalog.load_if_changed_at("relogin", ist(2026, 11, 4, 13, 1)).await, Ok(LoadOutcome::SameDay)));
+    let after = catalog.status();
+    assert_eq!((after.loaded_at, after.rows, after.loading), (built.loaded_at.clone(), built.rows.clone(), false));
+    // Once the market is shut the same files are built, and then unchanged.
+    loaded(catalog.load_if_changed_at("after the close", ist(2026, 11, 4, 15, 45)).await);
+    assert!(matches!(catalog.load_if_changed_at("again", ist(2026, 11, 4, 15, 46)).await, Ok(LoadOutcome::Unchanged)));
+    // The next day's first download is built during hours.
+    scratch.write_all();
+    scratch.stamp(ist(2026, 11, 5, 9, 20));
+    loaded(catalog.load_if_changed_at("next day", ist(2026, 11, 5, 9, 30)).await);
+    assert_eq!(catalog.status().day.as_deref(), Some("2026-11-05"));
+    // Without a clock (`load_if_changed`), a change is always built.
+    scratch.write_all();
+    scratch.stamp(ist(2026, 11, 5, 11, 0));
+    loaded(catalog.load_if_changed("unconditional").await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

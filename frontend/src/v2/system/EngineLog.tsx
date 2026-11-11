@@ -10,6 +10,7 @@ type Filter = 'all' | Exclude<LogKind, 'info'>;
 const FILTERS: { value: Filter; label: string }[] = [
   { value: 'all', label: 'All' },
   { value: 'order', label: 'Orders' },
+  { value: 'timing', label: 'Timing' },
   { value: 'signal', label: 'Signals' },
   { value: 'error', label: 'Errors' },
 ];
@@ -19,6 +20,7 @@ const FILTERS: { value: Filter; label: string }[] = [
 const LOOK: Record<LogKind, string> = {
   info: 'border border-line-strong/50 text-fg-muted',
   order: 'bg-raised text-fg',
+  timing: 'border border-line-strong/50 text-fg',
   signal: 'border border-line-strong text-fg',
   error: 'bg-loss-subtle text-loss',
 };
@@ -73,15 +75,17 @@ export function LogPreview({ lines, count }: { lines: LogLine[]; count: number }
 }
 
 /**
- * The engine log: newest first, filtered to orders, signals or errors and
- * searched. With Follow off it holds still, and says how much has arrived.
+ * The engine log: newest first, filtered to orders, order timing, signals or
+ * errors and searched. With Follow off it holds still, and says how much has arrived.
  */
-export function EngineLog({ lines, connected, compact, maxHeight }: {
+export function EngineLog({ lines, connected, compact, maxHeight, fill }: {
   lines: LogLine[];
   connected: boolean | null;
   compact: boolean;
   /** Scroll inside this height instead of growing the page. */
   maxHeight?: number;
+  /** Fill the parent's height (a flex column) and scroll inside it. */
+  fill?: boolean;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
@@ -115,7 +119,7 @@ export function EngineLog({ lines, connected, compact, maxHeight }: {
   );
 
   return (
-    <div className="flex min-w-0 flex-col">
+    <div className={`flex min-w-0 flex-col ${fill ? 'min-h-0 flex-1' : ''}`}>
       {compact ? (
         <div className="flex flex-col gap-2">
           <Segment label="Show" stretch value={filter} onChange={setFilter} options={FILTERS} />
@@ -146,7 +150,7 @@ export function EngineLog({ lines, connected, compact, maxHeight }: {
       {shown.length === 0 ? (
         <p className="py-6 type-body text-fg-subtle">{source.length === 0 ? 'Waiting for engine events…' : 'Nothing matches.'}</p>
       ) : (
-        <ul className="mt-2 overflow-y-auto" style={maxHeight ? { maxHeight } : undefined}>
+        <ul className={`mt-2 overflow-y-auto ${fill ? 'min-h-0 flex-1' : ''}`} style={maxHeight ? { maxHeight } : undefined}>
           {shown.map((l) => (
             <Row key={l.id} line={l} today={today} compact={compact} />
           ))}
