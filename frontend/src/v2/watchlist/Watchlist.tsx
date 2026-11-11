@@ -2,8 +2,8 @@ import { useEffect, useState } from 'react';
 import { readStored, writeStored } from '../../lib/execute';
 import type { Sent } from '../lib/api';
 import { dayLabel, plural, price, signedPct, signedPrice, toneOf } from '../lib/format';
-import { chartOf, targetOf, tradeIndexOf, type TradeIntent } from '../lib/openInstrument';
-import type { InstrumentRow, Quote, Watchlist as WatchlistData, WatchlistAnswer } from '../lib/types';
+import { chartOffWhy, chartSymOf, ladderOf, stockChipOf, targetOf, type TradeIntent } from '../lib/openInstrument';
+import type { Quote, Watchlist as WatchlistData, WatchlistAnswer } from '../lib/types';
 import { useQuotes } from '../lib/useQuotes';
 import { useTickFlash } from '../lib/useTickFlash';
 import { useWatchlists, watchlistActions } from '../lib/useWatchlists';
@@ -76,19 +76,13 @@ function IndexTile({ index, quote, desktop, onOpen }: { index: string; quote: Qu
   );
 }
 
-/** The ladder an instrument can open: its index, with a contract's expiry. */
-function ladderOf(row: InstrumentRow): { index: string; expiry?: string | null } | null {
-  const index = tradeIndexOf(row);
-  if (!index) return null;
-  const derivative = row.kind === 'FUT' || row.kind === 'CE' || row.kind === 'PE';
-  return { index, expiry: derivative ? row.expiry : null };
-}
-
 type Dialog = { kind: 'new' } | { kind: 'rename'; list: WatchlistData } | { kind: 'delete'; list: WatchlistData };
 
-export function Watchlist({ serverBase, desktop, onOpenTrade, onOpenInstrument }: {
+export function Watchlist({ serverBase, desktop, stocksOn = false, onOpenTrade, onOpenInstrument }: {
   serverBase: string;
   desktop: boolean;
+  /** The `stock_charts` switch: a stock's Chart and Chain light up. */
+  stocksOn?: boolean;
   /** Open the Trade screen on a chart and/or the ladder. */
   onOpenTrade: (intent: TradeIntent) => void;
   /** Open an instrument's page by its catalog id. */
@@ -211,8 +205,11 @@ export function Watchlist({ serverBase, desktop, onOpenTrade, onOpenInstrument }
               ) : (
                 items.map((item, n) => {
                   const row = item.instrument;
-                  const ladder = row ? ladderOf(row) : null;
-                  const chart = row ? chartOf(row) : null;
+                  const ladder = row ? ladderOf(row, stocksOn) : null;
+                  const chart = row ? chartSymOf(row, stocksOn) : null;
+                  const chip = row ? stockChipOf(row) : undefined;
+                  // Buy stays an index's until Phase 4; a stock's ladder is read-only.
+                  const indexLadder = ladder && !chip ? ladder : null;
                   const title = row ? rowTitle(row) : item.key;
                   return (
                     <Row
@@ -227,12 +224,15 @@ export function Watchlist({ serverBase, desktop, onOpenTrade, onOpenInstrument }
                       actions={{
                         onOpen: () => {
                           if (!row) return;
-                          const target = targetOf(row, 'open');
+                          const target = targetOf(row, 'page', stocksOn);
                           if ('trade' in target) onOpenTrade(target.trade);
                           else onOpenInstrument(target.instrument);
                         },
-                        onChart: chart ? () => onOpenTrade({ chart, ladder: ladder ?? undefined }) : null,
-                        onBuy: ladder ? () => onOpenTrade({ ladder }) : null,
+                        onChart: chart ? () => onOpenTrade({ chart, ladder: ladder ?? undefined, stock: chip }) : null,
+                        chartWhy: row && !chart ? chartOffWhy(row, stocksOn) : undefined,
+                        onChain: ladder ? () => onOpenTrade({ ladder, stock: chip }) : null,
+                        chainWhy: stocksOn && row && !row.has_fo ? 'No options listed for this stock' : undefined,
+                        onBuy: indexLadder ? () => onOpenTrade({ ladder: indexLadder }) : null,
                         onMove: (to) => move(item.key, to),
                         onRemove: () => void act(`Couldn't remove ${title}`, () => watchlistActions.removeItem(list.id, item.key)),
                       }}

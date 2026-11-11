@@ -8,10 +8,16 @@ import type { Bar, Tf } from './model';
 
 export const PROVIDER = 'at';
 
-/** Vela reads `EXCHANGE:` as a provider prefix, so the candle service's
- * `NIFTY:2026-10-27:25100:CE` travels as `at:NIFTY_2026-10-27_25100_CE`. */
-export const velaSymbol = (symbol: string) => `${PROVIDER}:${symbol.replace(/:/g, '_')}`;
-export const apiSymbol = (ticker: string) => ticker.replace(/_/g, ':');
+/**
+ * Vela reads `EXCHANGE:` as a provider prefix (`/^([A-Za-z0-9_.]+):/`), so
+ * the candle service's `NIFTY:2026-10-27:25100:CE` travels as
+ * `at:NIFTY_2026-10-27_25100_CE`. A stock's own `_` (the scrip master
+ * allows `&`, `-` and `_` in a name: `M&M`, `BAJAJ-AUTO`) goes as `~`,
+ * which no symbol carries, so the swap reads back exactly; `&`, `-` and
+ * the `@` of `RELIANCE@BSE` are not special to Vela and travel as they are.
+ */
+export const velaSymbol = (symbol: string) => `${PROVIDER}:${symbol.replace(/_/g, '~').replace(/:/g, '_')}`;
+export const apiSymbol = (ticker: string) => ticker.replace(/_/g, ':').replace(/~/g, '_');
 
 export const toOhlcv = (b: Bar): OHLCV => ({ time: b.t, open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v ?? undefined });
 

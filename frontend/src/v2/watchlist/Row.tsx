@@ -27,16 +27,24 @@ const STALE_MS = 30_000;
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg-muted' } as const;
 
 const COMING = {
-  chart: 'Charts for stocks come in Phase 3',
-  chain: 'Option chains come in Phase 3',
-  buy: 'Stock options on the ladder come in Phase 4',
+  chart: 'Stock charts are switched off',
+  chain: 'Stock charts are switched off',
+  noFo: 'No options listed for this stock',
+  buy: 'Stock options on paper come in Phase 4',
 } as const;
 
-/** Where a row's actions go; `null` means "coming" (disabled, with the reason). */
+/** Where a row's actions go; `null` means it can't (disabled, with the reason). */
 export interface RowActions {
   /** The row itself: the instrument page, or the Trade screen for an index. */
   onOpen: () => void;
   onChart: (() => void) | null;
+  /** Why there is no chart, when there is none. */
+  chartWhy?: string;
+  /** The option chain: the ladder on the Trade screen, for an index or an
+   * F&O stock while stocks are on. */
+  onChain: (() => void) | null;
+  /** Why there is no chain, when there is none. */
+  chainWhy?: string;
   onBuy: (() => void) | null;
   onMove: (to: 'top' | 'up' | 'down') => void;
   onRemove: () => void;
@@ -156,10 +164,10 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
           {/* The actions show on hover and on keyboard focus; the menu stays put. */}
           {live && (
             <span className="flex items-center gap-1 opacity-0 transition-opacity duration-120 group-focus-within:opacity-100 group-hover:opacity-100">
-              <button type="button" aria-label={`Chart ${title}`} title={actions.onChart ? 'Open the chart' : COMING.chart} disabled={!actions.onChart} onClick={actions.onChart ?? undefined} className={ICON_BUTTON}>
+              <button type="button" aria-label={`Chart ${title}`} title={actions.onChart ? 'Open the chart' : actions.chartWhy ?? COMING.chart} disabled={!actions.onChart} onClick={actions.onChart ?? undefined} className={ICON_BUTTON}>
                 <ChartLine size={14} />
               </button>
-              <button type="button" aria-label={`Option chain for ${title}`} title={COMING.chain} disabled className={ICON_BUTTON}>
+              <button type="button" aria-label={`Option chain for ${title}`} title={actions.onChain ? 'Open the option chain' : actions.chainWhy ?? COMING.chain} disabled={!actions.onChain} onClick={actions.onChain ?? undefined} className={ICON_BUTTON}>
                 <Rows3 size={14} />
               </button>
               <Button size="sm" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? 'Open the ladder' : COMING.buy} onClick={actions.onBuy ?? undefined} className="w-12">
@@ -222,10 +230,10 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
             </div>
             {live && (
               <div className="grid grid-cols-3 gap-2">
-                <Button size="lg" icon={<ChartLine size={18} />} disabled={!actions.onChart} title={actions.onChart ? undefined : COMING.chart} onClick={() => { setSheet(false); actions.onChart?.(); }}>
+                <Button size="lg" icon={<ChartLine size={18} />} disabled={!actions.onChart} title={actions.onChart ? undefined : actions.chartWhy ?? COMING.chart} onClick={() => { setSheet(false); actions.onChart?.(); }}>
                   Chart
                 </Button>
-                <Button size="lg" icon={<Rows3 size={18} />} disabled title={COMING.chain}>
+                <Button size="lg" icon={<Rows3 size={18} />} disabled={!actions.onChain} title={actions.onChain ? undefined : actions.chainWhy ?? COMING.chain} onClick={() => { setSheet(false); actions.onChain?.(); }}>
                   Chain
                 </Button>
                 <Button size="lg" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? undefined : COMING.buy} onClick={() => { setSheet(false); actions.onBuy?.(); }}>

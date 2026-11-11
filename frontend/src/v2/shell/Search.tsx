@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { ChartLine, Plus, Search as SearchIcon, X } from 'lucide-react';
-import { chartOf, type OpenHow as InstrumentHow } from '../lib/openInstrument';
+import { chartOffWhy, chartSymOf, type OpenHow as InstrumentHow } from '../lib/openInstrument';
 import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
@@ -11,18 +11,22 @@ import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 // Spec §13: the global instrument search. A 320 px well in the desktop
 // status bar; focus, `/` anywhere outside an input, or ⌘/Ctrl K opens the
 // results under it, grouped Indices / Stocks / Futures / Options, each row
-// priced and ticking. ↑/↓ move the highlight, Enter opens the instrument
-// (an index opens the Trade screen on it), Shift+Enter puts an index on the
-// ladder, a row's chart button charts it on the Trade screen (an index or an
-// index's option), `+` adds it to a watchlist (`onAdd`, while watchlists are
-// on), Escape closes. Enter's default comes only once the answer is for what
-// was typed, and is what the query names: a typed contract or future (none
-// when it matched none), else the first row. The well is the combobox, the
-// results its listbox.
+// priced and ticking. ↑/↓ move the highlight, Enter opens the instrument:
+// an index on the Trade screen, and while stocks are on any row the Trade
+// screen can chart (a stock, a future, an option), its instrument page
+// otherwise; Shift+Enter puts it on the ladder (an index; an F&O stock too
+// while stocks are on), a row's chart button charts it on the Trade screen
+// (an index or an index's option; with stocks on, any row it can chart), `+`
+// adds it to a watchlist (`onAdd`, while watchlists are on), Escape closes.
+// Enter's default comes only once the answer is for what was typed, and is
+// what the query names: a typed contract or future (none when it matched
+// none), else the first row. The well is the combobox, the results its
+// listbox.
 
 /** How a result is opened: Enter / a tap, Shift+Enter for the ladder, or
- * its chart button for the chart (`openInstrument.ts` says where each goes). */
-export type OpenHow = InstrumentHow;
+ * its chart button for the chart (`openInstrument.ts` says where each goes;
+ * `page` is a watchlist row's tap, never a result's). */
+export type OpenHow = Exclude<InstrumentHow, 'page'>;
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 
@@ -34,11 +38,13 @@ function inField(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
-export function Search({ serverBase, onOpen, onAdd }: {
+export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
   serverBase: string;
   onOpen: (row: InstrumentRow, how: OpenHow) => void;
   /** Add a result to a watchlist; left out while watchlists are off. */
   onAdd?: (row: InstrumentRow) => void;
+  /** The `stock_charts` switch: a stock's chart button lights up. */
+  stocksOn?: boolean;
 }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
@@ -215,7 +221,7 @@ export function Search({ serverBase, onOpen, onAdd }: {
                 </div>
                 {g.rows.map((row) => {
                   const on = activeRow?.id === row.id;
-                  const chart = chartOf(row);
+                  const chart = chartSymOf(row, stocksOn);
                   const extra = derivativeNote(row);
                   return (
                     <div
@@ -249,7 +255,7 @@ export function Search({ serverBase, onOpen, onAdd }: {
                           type="button"
                           tabIndex={-1}
                           aria-label={chart ? `Chart ${rowTitle(row)}` : 'Chart'}
-                          title={chart ? 'Open the chart' : 'Charts for stocks come in Phase 3'}
+                          title={chart ? 'Open the chart' : chartOffWhy(row, stocksOn)}
                           disabled={!chart}
                           onClick={(e) => {
                             e.stopPropagation();

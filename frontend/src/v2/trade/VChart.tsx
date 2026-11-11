@@ -9,7 +9,7 @@ import { editable } from './chartKeymap';
 import { C, FONT, PIVOT_ORANGE, type MarkerData } from './chartSetup';
 import { keepList, pruneExpired, VELA_DRAWINGS, type DrawApi } from './drawings';
 import type { ChartLine, ChartProps } from './KChart';
-import { barAt, futureName, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
+import { barAt, daySummary, futureFor, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
 import { pivotLines, pivotsByDay } from './pivots';
 import { DrawHistory } from './undoHistory';
 import { CandleProvider, PROVIDER, velaSymbol, type Feed } from './velaProvider';
@@ -145,7 +145,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
   const provider = useRef<CandleProvider | null>(null);
   const feed = useRef<Feed>({ onBar: null });
   const symbol = symbolName(sym);
-  const future = sym.kind === 'index' ? futureName(sym.index) : null;
+  const future = futureFor(sym);
   const key = `${serverBase}|${symbol}|${tf}`;
   // Bars, the future's bars, the load state and an error, each for the market they belong to.
   const [barsAt, setBarsAt] = useState<Keyed<Bar[]> | null>(null);
@@ -690,7 +690,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
   }, [serverBase, symbol, future, tf, key]);
 
   useEffect(() => {
-    onState?.({ loading: !loaded && !error, error, last: bars?.[bars.length - 1] ?? null });
+    onState?.({ loading: !loaded && !error, error, last: bars?.[bars.length - 1] ?? null, day: daySummary(bars) });
   }, [loaded, error, bars, onState]);
 
   useEffect(() => {

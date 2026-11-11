@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChartCandlestick, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Columns2, Columns3, Square } from 'lucide-react';
-import type { ChartLevel, ChartTarget, ExecutePosition, IndexHeadline } from '../../types';
+import type { ChartLevel, ChartTarget, ExecutePosition } from '../../types';
 import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
-import { buyBlockedReason, contractLabel, INDEX_ORDER, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
+import { buyBlockedReason, contractLabel, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
 import { useIdentity } from '../auth/identity';
 import {
   cancelPosition,
@@ -33,11 +33,14 @@ import {
   type PaperFill,
   type Sent,
 } from '../lib/api';
-import { MINUS, money, price, signedPct, toneOf, todayIst } from '../lib/format';
+import { money, price, todayIst } from '../lib/format';
+import { chartSymOf, ladderOf, stockChipOf, type StockChip } from '../lib/openInstrument';
 import { usePoll } from '../lib/usePoll';
-import type { ChainAnswer, ExpiriesAnswer } from '../lib/types';
-import { useTickFlash } from '../lib/useTickFlash';
+import type { ChainAnswer, ExpiriesAnswer, InstrumentRow } from '../lib/types';
+import { useQuotes } from '../lib/useQuotes';
+import { useWatchlists } from '../lib/useWatchlists';
 import { TRADE_KEY, useDeskRemoved } from '../lib/layout';
+import { rowTitle } from '../shell/searchModel';
 import { useGuard } from '../shell/useGuard';
 import { ResizeHandle } from '../ui/ResizeHandle';
 import { Segment } from '../ui/Segment';
@@ -47,9 +50,11 @@ import { ChartPanel, type LotsPick } from './ChartPanel';
 import { CrosshairBus } from './bus';
 import { ExpiryPicker } from './ExpiryPicker';
 import type { Placing } from './KChart';
+import { HeaderSwitch, HeaderTabs, HeaderTicker, ListPicker } from './header';
+import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from './headerModel';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
-import { approxMoney, CHART_LIBS, istClock, levelCrossed, levelPnl, optionOf, sameSym, symbolLabel, toTick, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { approxMoney, boardKind, CHART_LIBS, isIndex, isTicker, istClock, levelCrossed, levelPnl, optionOf, parseChartSym, sameSym, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
@@ -57,8 +62,6 @@ import { SplitHandle } from './SplitHandle';
 import { TradingPanel } from './panel/TradingPanel';
 import { knownStudies } from './studies';
 import { PositionSheet, ScalpBar, type PaperAccount, type PositionHandlers } from './Positions';
-
-const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 
 interface Slot {
   sym: ChartSym;
@@ -70,7 +73,17 @@ interface Slot {
 interface Saved {
   layout: 1 | 2 | 3;
   slots: Slot[];
+  /** The ladder's underlying: an index, or, behind the `stock_charts`
+   * switch, an F&O stock. */
   index: string;
+  /** The stock shown as a seventh tab beside the six indices: the one last
+   * chosen from a search, a watchlist row or an instrument page. */
+  stock: StockChip | null;
+  /** What the header shows: the index tabs, or a watchlist's rows (the
+   * owner's "both ways" for the plan's question 7). */
+  header: HeaderMode;
+  /** Which watchlist, when the header shows one; null is the first. */
+  headerList: number | null;
   lots: Record<string, number>;
   /** Phone: the chart folded away, the whole ladder shown instead. */
   chartHidden: boolean;
@@ -104,25 +117,51 @@ const STORE_KEY = TRADE_KEY;
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', stock: null, header: 'indices', headerList: null, lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false };
 
-/** The saved layout, with any option that has since expired back on its
- * index, and any chosen expiry that has passed back to the nearest. */
+/** An option or a dated future that has expired goes back to its
+ * underlying's own chart (the server refuses an expired future's name; a
+ * later month's is another contract, never charted in its place). */
+function unexpired(sym: ChartSym, today: string): ChartSym {
+  const expiry = symExpiry(sym);
+  if (expiry == null || expiry >= today) return sym;
+  const name = underlyingOf(sym);
+  return isIndex(name) ? { kind: 'index', index: name } : { kind: 'equity', symbol: name, exchange: 'NSE' };
+}
+
+/** The saved stock tab, if it reads as one. */
+function savedStock(raw: unknown): StockChip | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const s = raw as Record<string, unknown>;
+  if (!isTicker(s.symbol) || isIndex(s.symbol)) return null;
+  return { symbol: s.symbol, key: typeof s.key === 'string' && s.key ? s.key : null, fo: s.fo !== false };
+}
+
+/** The saved layout, with any shape this build doesn't know (a layout saved
+ * by another, or edited by hand) back on NIFTY, any option that has since
+ * expired back on its underlying, and any chosen expiry that has passed back
+ * to the nearest. A stock as the ladder's underlying or on a chart is kept:
+ * whether it can be served is the `stock_charts` switch's call when the
+ * screen opens. */
 function loadSaved(): Saved {
   const saved = readStored<Partial<Saved>>(STORE_KEY, readStored<Partial<Saved>>(OLD_STORE_KEY, {}));
   const today = todayIst();
   const slots = DEFAULTS.slots.map((d, i) => {
     const s = saved.slots?.[i];
-    if (!s?.sym) return d;
-    const sym = s.sym.kind === 'option' && s.sym.expiry < today ? { kind: 'index' as const, index: s.sym.index } : s.sym;
+    const sym = s?.sym ? parseChartSym(s.sym) : null;
+    if (!s || !sym) return d;
     const style: CandleStyle = s.style === 'bars' || s.style === 'area' ? s.style : 'candles';
-    return { sym, tf: s.tf ?? '5m', layers: { ...DEFAULT_LAYERS, ...s.layers, studies: knownStudies(s.layers?.studies) }, style };
+    const tf: Tf = s.tf === '1m' || s.tf === '15m' ? s.tf : '5m';
+    return { sym: unexpired(sym, today), tf, layers: { ...DEFAULT_LAYERS, ...s.layers, studies: knownStudies(s.layers?.studies) }, style };
   });
-  const expiry = Object.fromEntries(Object.entries(saved.expiry ?? {}).filter(([index, date]) => INDEX_ORDER.includes(index) && typeof date === 'string' && date >= today));
+  const expiry = Object.fromEntries(Object.entries(saved.expiry ?? {}).filter(([index, date]) => isTicker(index) && typeof date === 'string' && date >= today));
   return {
     layout: saved.layout === 1 || saved.layout === 3 ? saved.layout : 2,
     slots,
-    index: INDEX_ORDER.includes(saved.index ?? '') ? saved.index! : 'NIFTY',
+    index: isTicker(saved.index) ? saved.index : 'NIFTY',
+    stock: savedStock(saved.stock),
+    header: saved.header === 'watchlist' ? 'watchlist' : 'indices',
+    headerList: typeof saved.headerList === 'number' ? saved.headerList : null,
     lots: saved.lots ?? {},
     chartHidden: saved.chartHidden === true,
     phoneChartHeight: typeof saved.phoneChartHeight === 'number' && saved.phoneChartHeight > 0 ? saved.phoneChartHeight : null,
@@ -178,137 +217,18 @@ function withPending(p: ExecutePosition, pending: Record<string, Pending>, now: 
   return { ...p, chart: { stop, targets } };
 }
 
-/** Figma "Index tab": the index, its value (flashing its tint as it ticks)
- * and the day's change. A white tile; the selected one is outlined and
- * tinted in accent. */
-function IndexTab({ index, spot, changePct, on, onSelect }: { index: string; spot: number | null; changePct: number | null; on: boolean; onSelect: () => void }) {
-  const flash = useTickFlash(spot, true, index);
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={on}
-      onClick={onSelect}
-      className={`flex min-w-[124px] shrink-0 flex-col rounded-8 border px-3 py-2 text-left transition-colors duration-120 ${on ? 'border-accent bg-accent-subtle' : 'border-line bg-panel hover:bg-raised/40'}`}
-    >
-      <span className="type-caption text-fg-muted">{index}</span>
-      <span className="flex items-baseline gap-1.5">
-        <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium text-fg ${flash.className}`}>
-          {spot == null ? '—' : price(spot)}
-        </span>
-        {changePct != null && <span className={`num-small ${TONE_TEXT[toneOf(changePct)]}`}>{signedPct(changePct)}</span>}
-      </span>
-    </button>
-  );
-}
-
-function IndexTabs({ indices, selected, onSelect }: { indices: { index: string; spot: number | null; change_pct: number | null }[]; selected: string; onSelect: (i: string) => void }) {
-  const by = new Map(indices.map((i) => [i.index, i]));
-  return (
-    <div role="tablist" aria-label="Index" className="flex min-w-0 gap-2 overflow-x-auto">
-      {INDEX_ORDER.map((index) => {
-        const i = by.get(index);
-        return <IndexTab key={index} index={index} spot={i?.spot ?? null} changePct={i?.change_pct ?? null} on={index === selected} onSelect={() => onSelect(index)} />;
-      })}
-    </div>
-  );
-}
-
-/** The day's move in points: "−43.95". From the previous close, or worked
- * back from the percent when the server sends none (an older one). */
-function signedPoints(spot: number, prevClose: number | null, changePct: number): string {
-  const d = prevClose != null && prevClose > 0 ? spot - prevClose : spot - spot / (1 + changePct / 100);
-  const v = Math.abs(d) < 0.005 ? 0 : d;
-  return `${v > 0 ? '+' : v < 0 ? MINUS : ''}${price(Math.abs(v))}`;
-}
-
-/** The indices the ticker gives the day's points as well as the percent
- * whenever the bar has room for them; the others only on a wide window. */
-const TICKER_POINTS = new Set(['NIFTY', 'BANKNIFTY', 'SENSEX']);
-
-/** One index on the desktop ticker: "NIFTY 24,986.40 −43.95 (−0.18%)", or
- * "−0.18%" alone where room is short (see `TICKER_POINTS`), the value
- * flashing as it ticks; the selected one is underlined in accent. */
-function TickerItem({ index, spot, prevClose, changePct, on, onSelect }: { index: string; spot: number | null; prevClose: number | null; changePct: number | null; on: boolean; onSelect: () => void }) {
-  const flash = useTickFlash(spot, true, index);
-  // All six with points need about 98rem; the three with points, the rest
-  // with the percent, about 70rem (a 1440 px window with the nav rail).
-  const points = TICKER_POINTS.has(index) ? 'hidden @[70rem]:inline' : 'hidden @[98rem]:inline';
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={on}
-      onClick={onSelect}
-      className={`relative flex shrink-0 items-center gap-1.5 px-3 whitespace-nowrap transition-colors duration-120 hover:bg-raised/40 ${on ? 'after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:bg-accent' : ''}`}
-    >
-      <span className={`type-label ${on ? 'text-fg' : 'text-fg-muted'}`}>{index}</span>
-      <span key={flash.key} className={`-mx-0.5 rounded-4 px-0.5 num-small text-fg ${flash.className}`}>
-        {spot == null ? '—' : price(spot)}
-      </span>
-      {spot != null && changePct != null && (
-        <span className={`num-small ${TONE_TEXT[toneOf(changePct)]}`}>
-          <span className={points}>{signedPoints(spot, prevClose, changePct)} (</span>
-          {signedPct(changePct)}
-          <span className={points}>)</span>
-        </span>
-      )}
-    </button>
-  );
-}
-
-/** The desktop index bar: every index on one slim line, scrolling sideways
- * when the window is too narrow for all of them — with the mouse wheel too,
- * and always to keep the selected one in view. */
-function IndexTicker({ indices, selected, onSelect }: { indices: IndexHeadline[]; selected: string; onSelect: (i: string) => void }) {
-  const by = new Map(indices.map((i) => [i.index, i]));
-  const box = useRef<HTMLDivElement>(null);
-  // On a new pick, and whenever the tabs change width (their prices arriving
-  // can push the selected one out of view).
-  useEffect(() => {
-    const el = box.current;
-    if (!el) return;
-    const keepInView = () => {
-      const tab = el.querySelector<HTMLElement>('[aria-selected="true"]');
-      if (!tab) return;
-      // This bar only: scrollIntoView could move the page around it too.
-      const left = tab.offsetLeft;
-      const right = left + tab.offsetWidth;
-      if (left < el.scrollLeft) el.scrollLeft = left;
-      else if (right > el.scrollLeft + el.clientWidth) el.scrollLeft = right - el.clientWidth;
-    };
-    keepInView();
-    const ro = new ResizeObserver(keepInView);
-    for (const tab of el.children) ro.observe(tab);
-    return () => ro.disconnect();
-  }, [selected]);
-  return (
-    <div
-      ref={box}
-      role="tablist"
-      aria-label="Index"
-      onWheel={(e) => {
-        if (e.deltaY !== 0 && e.deltaX === 0) e.currentTarget.scrollLeft += e.deltaY;
-      }}
-      className="@container relative flex min-w-0 flex-1 items-stretch overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-    >
-      {INDEX_ORDER.map((index) => {
-        const i = by.get(index);
-        return <TickerItem key={index} index={index} spot={i?.spot ?? null} prevClose={i?.prev_close ?? null} changePct={i?.change_pct ?? null} on={index === selected} onSelect={() => onSelect(index)} />;
-      })}
-    </div>
-  );
-}
-
 /** `NIFTY:2026-11-03`: how a chain other than an index's nearest is keyed. */
 const chainKeyOf = (index: string, expiry: string) => `${index}:${expiry}`;
 
 /**
- * Trade: up to three charts (an index or any of its options, 1m/5m/15m)
+ * Trade: up to three charts (an index or any of its options, 1m/5m/15m; a
+ * stock, its future or its options too behind the `stock_charts` switch)
  * with each manual trade's position line, stop and target — dragged to
  * move, behind `chart_stops` — the ladder of any listed expiry, every
- * strike (one tap = market buy), and the trades themselves with −1 lot,
- * Exit and a held Exit all.
+ * strike (one tap = market buy; a stock's rows are read-only until Phase
+ * 4), and the trades themselves with −1 lot, Exit and a held Exit all.
+ * The header is the six index tabs plus one for the current stock, or a
+ * watchlist's rows in their place.
  */
 export function Trade({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
   const [saved, setSaved] = useState<Saved>(loadSaved);
@@ -327,7 +247,11 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [fullscreenSlot, setFullscreenSlot] = useState<number | null>(null);
   const guard = useGuard();
   const toast = useToast();
-  const { canReadOwner } = useIdentity();
+  const { canReadOwner, user } = useIdentity();
+  // A confirmed sign-in (`/api/auth/me`): only that has watchlists. Without
+  // one (a visitor, or a sign-in whose check is out or failed) the header is
+  // the index tabs and offers no switch.
+  const signedIn = user != null;
   // Whose desk a tap trades on: the owner's engine for the admin, a user's
   // own paper portfolio otherwise (`/api/v2/me/*`, filled at once).
   const scope = canReadOwner ? 'admin' : 'user';
@@ -358,8 +282,26 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     useCallback((phoneChartHeight: number) => save((s) => ({ ...s, phoneChartHeight })), [save]),
   );
 
-  // Each index on screen: its listed expiries, before the stream opens.
-  const shownSlots = desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1);
+  const flags = usePoll(() => getFlags(serverBase), 15_000, serverBase);
+  // The `stock_charts` switch: null until the switches are known, so a saved
+  // stock keeps its place rather than bounce to NIFTY and back.
+  const stocksOn: boolean | null = flags.data ? flags.data.stock_charts === true : null;
+  // Watchlists count as on only while the search is on too, as everywhere
+  // else in the app (App.tsx): with search off nothing prices a stock.
+  const watchlistsOn = flags.data?.watchlists === true && flags.data.search === true;
+  // A stock saved as the ladder's underlying streams as NIFTY while stocks
+  // are off: the server would answer NIFTY's board for it anyway.
+  const ladderIndex = stocksOn === false && !isIndex(saved.index) ? 'NIFTY' : saved.index;
+  // A stock's chart saved while the switch is off shows NIFTY instead, and
+  // an index's future its index (futures are charted behind the switch too).
+  const shownAs = (slot: Slot): Slot => {
+    if (stocksOn !== false) return slot;
+    const name = underlyingOf(slot.sym);
+    if (!isIndex(name)) return indexSlot('NIFTY');
+    return slot.sym.kind === 'future' ? { ...slot, sym: { kind: 'index', index: name } } : slot;
+  };
+  // Each underlying on screen: its listed expiries, before the stream opens.
+  const shownSlots = (desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1)).map(shownAs);
 
   const toggleFullscreen = useCallback((slot: number, on: boolean) => {
     if (on) {
@@ -382,7 +324,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   }, []);
 
   const activeFullscreenSlot = fullscreenSlot !== null && fullscreenSlot < shownSlots.length ? fullscreenSlot : null;
-  const expiryIndices = [...new Set([saved.index, ...shownSlots.map((s) => s.sym.index)])].sort();
+  const expiryIndices = [...new Set([ladderIndex, ...shownSlots.map((s) => underlyingOf(s.sym))])].sort();
   const expiriesPoll = usePoll(
     async () => {
       const got = await Promise.all(expiryIndices.map((i) => getExpiries(serverBase, i).catch(() => undefined)));
@@ -392,14 +334,13 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     `exp|${serverBase}|${expiryIndices.join(',')}`,
   );
   const expiries = expiriesPoll.data ?? {};
-  // The chosen expiry, while the index's list still has it; else the nearest.
-  const listedExpiries = expiries[saved.index]?.expiries;
-  const chosenExpiry = saved.expiry[saved.index] ?? null;
+  // The chosen expiry, while the underlying's list still has it; else the nearest.
+  const listedExpiries = expiries[ladderIndex]?.expiries;
+  const chosenExpiry = saved.expiry[ladderIndex] ?? null;
   const ladderExpiry = chosenExpiry && (!listedExpiries || listedExpiries.some((e) => e.date === chosenExpiry)) ? chosenExpiry : null;
-  const ladderKey = `${saved.index}:${ladderExpiry ?? ''}`;
+  const ladderKey = `${ladderIndex}:${ladderExpiry ?? ''}`;
   const centre = centreAt?.key === ladderKey ? centreAt.strike : null;
-  const { frame, stale, now } = useExecuteStream(serverBase, saved.index, ladderExpiry, centre, streamToken());
-  const flags = usePoll(() => getFlags(serverBase), 15_000, serverBase);
+  const { frame, stale, now } = useExecuteStream(serverBase, ladderIndex, ladderExpiry, centre, streamToken());
   // Whose figures the screen shows: the owner's desk for the admin, a user's
   // own paper portfolio otherwise.
   const viewer = `${serverBase}|${paper ? 'paper' : 'owner'}`;
@@ -419,10 +360,34 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   const scalps = useMemo(() => (frame?.positions ?? []).filter((p) => p.manual).map((p) => withPending(p, pending, now)), [frame, pending, now]);
   const activeScalps = useMemo(() => scalps.filter((p) => !p.placing), [scalps]);
-  const board = frame?.board && frame.board.index === saved.index ? frame.board : null;
+  const board = frame?.board && frame.board.index === ladderIndex ? frame.board : null;
+  // The stock tab, with its price from the quote hub (its cash row's key)
+  // and the watchlist the header shows, while it does.
+  const stock = stocksOn ? saved.stock : null;
+  const headerWatchlist = stocksOn === true && watchlistsOn && signedIn && saved.header === 'watchlist';
+  const lists = useWatchlists(serverBase, { enabled: headerWatchlist, poll: headerWatchlist });
+  const headerList = headerWatchlist ? lists.lists.find((l) => l.id === saved.headerList) ?? lists.lists[0] ?? null : null;
+  const headerItems = headerList?.items.filter((i) => i.instrument != null) ?? [];
+  // What the watchlist header says while it has no tiles: still loading,
+  // the read's failure, no list at all, or a list with nothing it can show.
+  const headerNote: HeaderNote | null = !headerWatchlist
+    ? null
+    : !lists.answer
+      ? lists.error
+        ? { text: `Couldn't load your watchlists: ${lists.error}`, tone: 'loss' }
+        : { text: 'Loading your watchlists…', tone: 'muted' }
+      : !headerList
+        ? { text: 'No watchlist yet — make one on the Watchlist screen.', tone: 'muted' }
+        : headerList.items.length > 0
+          ? { text: 'Only expired contracts on this watchlist — remove them on the Watchlist screen.', tone: 'muted' }
+          : { text: 'Nothing on this watchlist yet — add instruments from a search or an instrument page.', tone: 'muted' };
+  const quotes = useQuotes(serverBase, [stock?.key, ...headerItems.map((i) => i.key)]);
+  // A stock's ladder is read-only: on paper until Phase 4, never from the
+  // owner's desk (`POST /api/execute/buy` resolves index options only).
+  const readOnly = board && boardKind(board) === 'stock' ? (paper ? 'Stock options on paper come in Phase 4' : "Stock options can't be bought from the owner's desk") : null;
 
-  // Each index in use: its nearest chain (deltas, tick size).
-  const wantedIndices = [...new Set([saved.index, ...shownSlots.map((s) => s.sym.index), ...scalps.map((p) => p.index)])].sort();
+  // Each underlying in use: its nearest chain (deltas, tick size).
+  const wantedIndices = [...new Set([ladderIndex, ...shownSlots.map((s) => underlyingOf(s.sym)), ...scalps.map((p) => p.index)])].sort();
   const indicesKey = `${serverBase}|${wantedIndices.join(',')}`;
   const chainsPoll = usePoll(
     async () => {
@@ -439,7 +404,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const extraKeys = [
     ...new Set([
       ...(board ? [chainKeyOf(board.index, board.expiry)] : []),
-      ...(ladderExpiry ? [chainKeyOf(saved.index, ladderExpiry)] : []),
+      ...(ladderExpiry ? [chainKeyOf(ladderIndex, ladderExpiry)] : []),
       ...shownSlots.flatMap((s) => (s.sym.kind === 'option' ? [chainKeyOf(s.sym.index, s.sym.expiry)] : [])),
       ...scalps.flatMap((p) => (p.expiry ? [chainKeyOf(p.index, p.expiry)] : [])),
       ...Object.keys(asked),
@@ -482,9 +447,14 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   const spot: Record<string, number | null> = Object.fromEntries((frame?.indices ?? []).map((i) => [i.index, i.spot]));
   const change: Record<string, number | null> = Object.fromEntries((frame?.indices ?? []).map((i) => [i.index, i.change_pct]));
+  // A stock's value: its ladder's spot, else the quote hub's price for the tab.
+  const stockQuote = stock?.key ? quotes.get(stock.key) : null;
+  if (board && boardKind(board) === 'stock') spot[board.index] = board.spot;
+  if (stock && spot[stock.symbol] == null && stockQuote) spot[stock.symbol] = stockQuote.ltp;
+  if (stock && stockQuote?.per_change != null) change[stock.symbol] = stockQuote.per_change;
   const held = new Map(scalps.map((p) => [p.symbol, p]));
   const blocked = buyBlockedReason(frame, stale);
-  const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[saved.index] ?? 1));
+  const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[ladderIndex] ?? 1));
 
   // Escape drops a "+ Stop" that hasn't been placed yet.
   useEffect(() => {
@@ -707,34 +677,105 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const showChart = (shown: boolean) => save((s) => ({ ...s, chartHidden: !shown }));
   const chartHidden = !desktop && saved.chartHidden;
 
-  /** A price tapped on the ladder: chart that contract where its index is. */
+  /** A price tapped on the ladder: chart that contract where its underlying is. */
   function chartContract(strike: number, side: 'CE' | 'PE') {
     if (!board) return;
     const sym: ChartSym = { kind: 'option', index: board.index, expiry: board.expiry, strike, side };
-    const at = shownSlots.findIndex((s) => s.sym.index === board.index);
+    const at = shownSlots.findIndex((s) => underlyingOf(s.sym) === board.index);
     setSlot(at >= 0 ? at : 0, { sym });
     if (!desktop) showChart(true);
   }
 
-  function selectIndex(index: string) {
+  /** An underlying's own chart: the index, or the stock's cash price. */
+  const ownChart = (name: string): ChartSym => (isIndex(name) ? { kind: 'index', index: name } : { kind: 'equity', symbol: name, exchange: 'NSE' });
+
+  /** Put the ladder on `index` (an index or an F&O stock), on `expiry` when
+   * given (null: the nearest). */
+  function selectUnderlying(index: string, expiry: string | null = null) {
     save((s) => {
       const next = { ...s, index };
+      if (expiry) next.expiry = { ...s.expiry, [index]: expiry };
       // The first chart follows the pick, unless a chart on screen already
-      // shows this index or one of its options (the phone shows one chart).
+      // shows this underlying or one of its contracts (the phone shows one chart).
       const shown = s.slots.slice(0, desktop ? s.layout : 1);
-      if (!shown.some((slot) => slot.sym.index === index)) next.slots = s.slots.map((slot, n) => (n === 0 ? { ...slot, sym: { kind: 'index', index } } : slot));
+      if (!shown.some((slot) => underlyingOf(slot.sym) === index)) next.slots = s.slots.map((slot, n) => (n === 0 ? { ...slot, sym: ownChart(index) } : slot));
       return next;
     });
+  }
+
+  /** Chart `sym` in slot 1 (the phone's one chart), and make its stock the
+   * stock tab when it has one. */
+  function chartInFirst(sym: ChartSym, chip?: StockChip) {
+    save((s) => ({ ...s, stock: chip ?? s.stock, slots: s.slots.map((slot, n) => (n === 0 ? { ...slot, sym } : slot)) }));
+    if (!desktop) showChart(true);
+  }
+
+  /** A chart's instrument picked from the picker's search (`row`), or its
+   * index grid and strike list. A stock's row makes it the stock tab too. */
+  function pickSym(i: number, sym: ChartSym, row?: InstrumentRow) {
+    const chip = row ? stockChipOf(row) : undefined;
+    save((s) => ({ ...s, stock: chip ?? s.stock, slots: s.slots.map((slot, n) => (n === i ? { ...slot, sym } : slot)) }));
   }
 
   /** The ladder's expiry: null is the nearest, which the server picks. */
   const selectExpiry = (date: string | null) =>
     save((s) => {
       const expiry = { ...s.expiry };
-      if (date) expiry[s.index] = date;
-      else delete expiry[s.index];
+      if (date) expiry[ladderIndex] = date;
+      else delete expiry[ladderIndex];
       return { ...s, expiry };
     });
+
+  // The header's tiles: the six indices and the stock tab, or a watchlist's rows.
+  const tiles: HeaderTile[] = headerWatchlist
+    ? headerItems.map((item) => {
+        const row = item.instrument!;
+        const q = quotes.get(item.key) ?? item.quote;
+        const sym = chartSymOf(row, true);
+        const ladder = ladderOf(row, true);
+        const chip = stockChipOf(row);
+        return {
+          id: item.key,
+          label: rowTitle(row),
+          spot: q?.ltp ?? null,
+          prevClose: q?.close ?? null,
+          changePct: q?.per_change ?? (q?.close ? ((q.ltp - q.close) / q.close) * 100 : null),
+          on: sym != null && sameSym(sym, shownSlots[0].sym),
+          onSelect: () => sym && chartInFirst(sym, chip),
+          onAlt: ladder
+            ? () => {
+                save((s) => ({ ...s, stock: chip ?? s.stock }));
+                selectUnderlying(ladder.index, ladder.expiry ?? null);
+              }
+            : undefined,
+          title: ladder ? (desktop ? 'Click: chart · Shift+click: ladder' : 'Tap: chart · hold: ladder') : 'Chart',
+          points: 'wide',
+        };
+      })
+    : [
+        ...indexTiles(frame?.indices ?? [], ladderIndex, (index) => selectUnderlying(index)),
+        ...(stock
+          ? [
+              {
+                id: `stock:${stock.symbol}`,
+                label: stock.symbol,
+                spot: spot[stock.symbol] ?? null,
+                prevClose: stockQuote?.close ?? null,
+                changePct: change[stock.symbol] ?? null,
+                on: ladderIndex === stock.symbol,
+                onSelect: () => (stock.fo ? selectUnderlying(stock.symbol) : chartInFirst(ownChart(stock.symbol))),
+                // Off the bar; a ladder that was on the stock goes back to NIFTY (the charts stay).
+                onRemove: () => save((s) => ({ ...s, stock: null, index: s.index === stock.symbol ? DEFAULTS.index : s.index })),
+                title: stock.fo ? undefined : `${stock.symbol} has no options listed: its chart only`,
+                points: 'wide' as const,
+              },
+            ]
+          : []),
+      ];
+  const headerLabel = headerWatchlist ? 'Watchlist' : 'Index';
+  const setHeader = (header: HeaderMode) => save((s) => ({ ...s, header }));
+  const headerSwitch = stocksOn === true && watchlistsOn && signedIn ? <HeaderSwitch mode={saved.header} onChange={setHeader} compact={!desktop} /> : null;
+  const listPicker = headerWatchlist ? <ListPicker lists={lists.lists} selected={headerList?.id ?? null} onSelect={(id) => save((s) => ({ ...s, headerList: id }))} compact={!desktop} /> : null;
 
   // How the shown charts share their row (desktop), as dragged or saved.
   const sharesKey = String(shownSlots.length) as '2' | '3';
@@ -753,7 +794,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       layers: slot.layers,
       actions: actions(i),
     };
-    const index = slot.sym.index;
+    const index = underlyingOf(slot.sym);
     return (
       <div
         key={i}
@@ -771,7 +812,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           serverBase={serverBase}
           sym={slot.sym}
           tf={slot.tf}
-          onSym={(sym) => setSlot(i, { sym })}
+          onSym={(sym, row) => pickSym(i, sym, row)}
           onTf={(tf) => setSlot(i, { tf })}
           layers={slot.layers}
           onLayers={(layers) => setSlot(i, { layers })}
@@ -794,6 +835,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           onHide={desktop ? undefined : () => showChart(false)}
           fullscreen={isFullscreen}
           onFullscreen={(on) => toggleFullscreen(i, on)}
+          stocksOn={stocksOn === true}
         />
         {isFullscreen && activeScalps.length > 0 && (
           <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />
@@ -803,7 +845,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   });
 
   const expiryPicker = (size: 'sm' | 'lg', short = false) => (
-    <ExpiryPicker expiries={expiries[saved.index]?.expiries} value={board?.expiry ?? ladderExpiry} onChange={selectExpiry} size={size} align={size === 'lg' && !short ? 'left' : 'right'} short={short} />
+    <ExpiryPicker expiries={expiries[ladderIndex]?.expiries} value={board?.expiry ?? ladderExpiry} onChange={selectExpiry} size={size} align={size === 'lg' && !short ? 'left' : 'right'} short={short} />
   );
 
   const ladder = board ? (
@@ -812,8 +854,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       chain={chainAt(board.index, board.expiry)}
       held={held}
       lots={lots}
-      onLots={(n) => save((s) => ({ ...s, lots: { ...s.lots, [s.index]: n } }))}
+      onLots={(n) => save((s) => ({ ...s, lots: { ...s.lots, [ladderIndex]: n } }))}
       blocked={blocked}
+      readOnly={readOnly}
+      marketOpen={frame?.market_open ?? true}
       sending={sending}
       onBuy={(sym, label) => void buy(sym, label)}
       onChart={chartContract}
@@ -822,7 +866,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       header={desktop ? undefined : expiryPicker('lg', true)}
     />
   ) : (
-    <p className="px-4 py-6 type-body text-fg-subtle">{frame?.board_error ?? (frame ? 'No option chain yet — it loads after the Kotak login.' : 'Connecting…')}</p>
+    <p className="px-4 py-6 type-body text-fg-subtle">
+      {frame?.board_error ?? (frame?.board && frame.board.index !== ladderIndex ? `${ladderIndex} has no option chain the server can show.` : frame ? 'No option chain yet — it loads after the Kotak login.' : 'Connecting…')}
+    </p>
   );
 
   const sheetEl = sheet && (
@@ -845,7 +891,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       onAdd={(p, kind) => {
         setSheet(false);
         const targetSlot = activeFullscreenSlot ?? 0;
-        if (saved.slots[targetSlot].sym.index !== p.index || saved.slots[targetSlot].sym.kind !== 'index') setSlot(targetSlot, { sym: { kind: 'index', index: p.index } });
+        if (underlyingOf(saved.slots[targetSlot].sym) !== p.index || saved.slots[targetSlot].sym.kind !== 'index') setSlot(targetSlot, { sym: { kind: 'index', index: p.index } });
         if (!desktop) showChart(true);
         startPlacing(targetSlot, p, kind, 'index');
       }}
@@ -857,8 +903,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   if (!desktop) {
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <div className="shrink-0 px-4 pt-3 pb-2">
-          <IndexTabs indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
+        <div className="flex shrink-0 items-center gap-2 px-4 pt-3 pb-2">
+          {listPicker}
+          <HeaderTabs tiles={tiles} label={headerLabel} note={headerNote} />
+          {headerSwitch}
         </div>
         {/* The chart and the ladder share this box: the chart is never so tall
             that the ladder loses its lots row and its first strikes. */}
@@ -869,7 +917,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
                 <ChartCandlestick size={16} className="text-fg-muted" />
                 <span className="type-label text-fg">Show chart</span>
                 <span className="min-w-0 flex-1 truncate type-caption text-fg-subtle">
-                  {symbolLabel(saved.slots[0].sym)} · {saved.slots[0].tf}
+                  {symbolLabel(shownSlots[0].sym)} · {shownSlots[0].tf}
                 </span>
                 <ChevronDown size={16} className="text-fg-muted" />
               </button>
@@ -941,8 +989,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         </button>
       ) : (
         <div className="flex h-9 shrink-0 items-stretch border-b border-line">
-          <IndexTicker indices={frame?.indices ?? []} selected={saved.index} onSelect={selectIndex} />
+          {listPicker && <div className="flex shrink-0 items-center border-r border-line pl-1 pr-1">{listPicker}</div>}
+          <HeaderTicker tiles={tiles} label={headerLabel} note={headerNote} />
           <div className="flex shrink-0 items-center gap-2 border-l border-line pr-1 pl-2">
+            {headerSwitch}
             <Segment label="Chart library" size="xs" value={saved.chartLib} onChange={setLib} options={CHART_LIBS} />
             <div role="tablist" aria-label="Charts" className="flex gap-0.5 rounded-6 border border-line bg-inset p-0.5">
               {layouts.map(({ n, icon: Icon, label }) => (
@@ -971,8 +1021,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           <button
             type="button"
             onClick={() => save((s) => ({ ...s, ladderHidden: false }))}
-            aria-label={`Show the ${saved.index} options`}
-            title={`Show the ${saved.index} options`}
+            aria-label={`Show the ${ladderIndex} options`}
+            title={`Show the ${ladderIndex} options`}
             className="flex w-5 shrink-0 items-center justify-center border-l border-line text-fg-muted hover:bg-raised hover:text-fg"
           >
             <ChevronLeft size={14} />
@@ -980,7 +1030,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         ) : (
           <>
             <ResizeHandle
-              label={`Resize the ${saved.index} options`}
+              label={`Resize the ${ladderIndex} options`}
               grows="left"
               value={ladderWidth}
               min={MIN_LADDER_WIDTH}
@@ -997,13 +1047,16 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             />
             <aside style={{ width: ladderWidth }} className="flex shrink-0 flex-col">
               <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line pr-1 pl-3">
-                <h2 className="type-body-strong text-fg">{saved.index} options</h2>
-                <span className="ml-auto">{expiryPicker('sm')}</span>
+                <h2 className="min-w-0 truncate type-body-strong text-fg" title={`${ladderIndex} options`}>
+                  {ladderIndex} options
+                </h2>
+                {/* A stock's ladder (RELIANCE, BAJAJ-AUTO) leaves the expiry its short form; the six indices keep the long one. */}
+                <span className="ml-auto shrink-0">{expiryPicker('sm', !isIndex(ladderIndex))}</span>
                 <button
                   type="button"
                   onClick={() => save((s) => ({ ...s, ladderHidden: true }))}
-                  aria-label={`Hide the ${saved.index} options`}
-                  title={`Hide the ${saved.index} options`}
+                  aria-label={`Hide the ${ladderIndex} options`}
+                  title={`Hide the ${ladderIndex} options`}
                   className="grid size-8 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg"
                 >
                   <ChevronRight size={16} />

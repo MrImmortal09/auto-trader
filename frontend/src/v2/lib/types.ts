@@ -619,13 +619,18 @@ export interface Flags {
    * result or an instrument page are hidden. The app counts them as on only
    * while `search` is on too (no prices, no way to add one without it). */
   watchlists: boolean;
+  /** Any F&O stock's chart, ladder and option chain (plan Phase 3), on top
+   * of `search`; while off the charts and ladders are the six indices' and
+   * every stock control is hidden. Missing from a server older than it. */
+  stock_charts?: boolean;
 }
 
 export interface ChainSide {
   /** The broker's trading symbol — what a Buy sends. */
   symbol: string;
-  /** Signed (a put's is negative); `assumed` when Upstox had none. */
-  delta: { value: number; assumed: boolean };
+  /** Signed (a put's is negative); `assumed` when Upstox had none. On a
+   * stock's chain, Upstox's or `null` — never the assumed ±0.50. */
+  delta: { value: number; assumed: boolean } | null;
 }
 
 /** `GET /api/positions`: the engine's own rows, the few fields the Trade panel's Orders tab reads. */
@@ -645,9 +650,15 @@ export interface RawPosition {
   sl_order_trigger?: number;
 }
 
-/** `GET /api/v2/expiries?index=`: every expiry the index's options are listed for, earliest first. */
+/** `GET /api/v2/expiries?index=`: every expiry the underlying's options are
+ * listed for, earliest first. The underlying is an index, or with the
+ * `stock_charts` switch on any F&O stock the catalog lists. */
 export interface ExpiriesAnswer {
+  /** The underlying, under its older name. */
   index: string;
+  /** The same as `index`; missing from a server older than stock charts. */
+  underlying?: string;
+  kind?: 'index' | 'stock';
   /** `YYYY-MM-DD`, IST. */
   today: string;
   expiries: { date: string; days_to_expiry: number; lot_size: number }[];
@@ -655,7 +666,11 @@ export interface ExpiriesAnswer {
 
 /** `GET /api/v2/chain?index=&expiry=`: one expiry's strikes (the nearest by default), as the Execute screen trades them. */
 export interface ChainAnswer {
+  /** The underlying, under its older name. */
   index: string;
+  /** The same as `index`; missing from a server older than stock charts. */
+  underlying?: string;
+  kind?: 'index' | 'stock';
   expiry: string;
   lot_size: number;
   tick_size: number;
