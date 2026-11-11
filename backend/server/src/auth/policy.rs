@@ -52,7 +52,9 @@ const RULES: &[Rule] = &[
     rule(On::Write, "/api/auth/otp/verify", Access::Public),
     rule(On::Read, "/api/auth/me", Access::Public),
     rule(On::Read, "/api/auth/session", Access::Public),
-    // Market data, for anyone signed in.
+    // Market data, for anyone signed in. The expiries, chain, candles and
+    // ladder stream take any catalog F&O underlying behind the
+    // `stock_charts` switch (Phase 3) — the same routes, no new ones.
     rule(On::Read, "/api/v2/expiries", Access::SignedIn),
     rule(On::Read, "/api/v2/chain", Access::SignedIn),
     rule(On::Read, "/api/v2/flags", Access::SignedIn),
@@ -61,6 +63,18 @@ const RULES: &[Rule] = &[
     rule(On::Read, "/api/v2/status", Access::SignedIn),
     rule(On::Read, "/api/execute/stream", Access::SignedIn),
     rule(On::Read, "/api/market/*", Access::SignedIn),
+    // The instrument search and its quotes (behind the `search` flag). The
+    // status page is the owner's: it carries the hub's error text, call
+    // times and the catalog's paths — diagnostics, not market data.
+    rule(On::Read, "/api/v2/search", Access::SignedIn),
+    rule(On::Read, "/api/v2/quotes", Access::SignedIn),
+    rule(On::Read, "/api/v2/instruments/status", Access::Admin),
+    rule(On::Read, "/api/v2/instruments/*", Access::SignedIn),
+    // Each signed-in person's own watchlists (behind the `watchlists`
+    // flag), the admin's included: they are keyed by user id in the
+    // routes, and `PhoneUser` would refuse the admin.
+    rule(On::Any, "/api/v2/watchlists", Access::SignedIn),
+    rule(On::Any, "/api/v2/watchlists/*", Access::SignedIn),
     // A user's own paper portfolio.
     rule(On::Any, "/api/v2/me/*", Access::PhoneUser),
 ];
@@ -210,6 +224,18 @@ mod tests {
         (GET, "/api/v2/mode-check", Access::Admin),
         (GET, "/api/v2/candles", Access::SignedIn),
         (GET, "/api/v2/candles/stream", Access::SignedIn),
+        (GET, "/api/v2/search", Access::SignedIn),
+        (GET, "/api/v2/quotes", Access::SignedIn),
+        (GET, "/api/v2/instruments/status", Access::Admin),
+        (GET, "/api/v2/instruments/nse_cm:2885", Access::SignedIn),
+        (GET, "/api/v2/instruments/nse_cm:Nifty%2050", Access::SignedIn),
+        (GET, "/api/v2/watchlists", Access::SignedIn),
+        (POST, "/api/v2/watchlists", Access::SignedIn),
+        (PATCH, "/api/v2/watchlists/3", Access::SignedIn),
+        (DELETE, "/api/v2/watchlists/3", Access::SignedIn),
+        (PUT, "/api/v2/watchlists/3/items", Access::SignedIn),
+        (POST, "/api/v2/watchlists/3/items/nse_cm%7C2885", Access::SignedIn),
+        (DELETE, "/api/v2/watchlists/3/items/idx%7CNIFTY%2050", Access::SignedIn),
         (GET, "/api/v2/me/desk", Access::PhoneUser),
         (GET, "/api/v2/me/history", Access::PhoneUser),
         (GET, "/api/v2/me/marks", Access::PhoneUser),
@@ -230,6 +256,20 @@ mod tests {
         }
     }
 
+    /// Phase 3 widened what these routes accept (any catalog F&O
+    /// underlying behind `stock_charts`), not who may call them; and the
+    /// buys that place or fill orders stay exactly as they were.
+    #[test]
+    fn the_stock_chart_routes_stay_signed_in_and_the_buys_stay_put() {
+        for path in ["/api/v2/expiries", "/api/v2/chain", "/api/v2/candles", "/api/v2/candles/stream", "/api/execute/stream", "/api/v2/flags"] {
+            assert_eq!(required(&GET, path), Access::SignedIn, "{path}");
+            assert_eq!(required(&POST, path), Access::Admin, "{path}");
+        }
+        assert_eq!(required(&PUT, "/api/v2/flags"), Access::Admin);
+        assert_eq!(required(&POST, "/api/execute/buy"), Access::Admin);
+        assert_eq!(required(&POST, "/api/v2/me/buy"), Access::PhoneUser);
+    }
+
     #[test]
     fn anything_unlisted_is_the_admins() {
         assert_eq!(required(&GET, "/api/zzz"), Access::Admin);
@@ -238,6 +278,12 @@ mod tests {
         // A prefix rule never matches the bare prefix or an unrelated sibling.
         assert_eq!(required(&GET, "/api/market"), Access::Admin);
         assert_eq!(required(&GET, "/api/v2/me"), Access::Admin);
+        assert_eq!(required(&GET, "/api/v2/instruments"), Access::Admin);
+        assert_eq!(required(&GET, "/api/v2/watchlistsx"), Access::Admin);
+        // The search routes are read-only: a write to them is nobody's.
+        assert_eq!(required(&POST, "/api/v2/search"), Access::Admin);
+        assert_eq!(required(&PUT, "/api/v2/quotes"), Access::Admin);
+        assert_eq!(required(&DELETE, "/api/v2/instruments/status"), Access::Admin);
         assert_eq!(required(&Method::OPTIONS, "/api/execute/buy"), Access::Public);
     }
 

@@ -581,13 +581,18 @@ pub fn expiring_today(positions: &[MonitoredPosition], today: NaiveDate) -> Vec<
     expiring(by_index, today)
 }
 
-/// [`expiring_today`] for a user's paper positions.
+/// [`expiring_today`] for a user's paper positions. A stock option is
+/// always a monthly: stocks list no weeklies, whatever the calendar says.
 pub fn paper_expiring_today(positions: &[PaperPosition], today: NaiveDate) -> Vec<Expiring> {
     let mut by_index: BTreeMap<String, usize> = BTreeMap::new();
     for p in positions.iter().filter(|p| p.expiry == today && p.qty > 0) {
         *by_index.entry(p.index.trim().to_uppercase()).or_default() += 1;
     }
-    expiring(by_index, today)
+    let mut rows = expiring(by_index, today);
+    for row in rows.iter_mut().filter(|r| !shared_domain::INDEX_NAMES.contains(&r.index.as_str())) {
+        row.series = "monthly";
+    }
+    rows
 }
 
 fn expiring(by_index: BTreeMap<String, usize>, today: NaiveDate) -> Vec<Expiring> {
@@ -679,6 +684,7 @@ mod tests {
             chat_title: Some("Options Pro".into()),
             option_type: Some("CE".into()),
             strike: Some(25000.0),
+            expiry: None,
         }
     }
 

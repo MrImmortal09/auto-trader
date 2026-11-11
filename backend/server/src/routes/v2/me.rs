@@ -6,8 +6,10 @@
 //!
 //! Nothing here touches the owner's engine, positions or tables. Fills are
 //! booked at once at the live price, checked the way the owner's Execute
-//! buys are: market hours, a live feed, a listed index option, and a price
-//! of its own from the last 10 s.
+//! buys are: market hours, a live feed, a listed option (an index's; a
+//! stock's too behind the `stock_paper` switch — `paper::resolve`), and a
+//! price of its own from the last 10 s. No REST quote ever fills a paper
+//! order: the price is the contract's own feed tick or nothing.
 
 use axum::{
     extract::{Path, Query, State},
@@ -22,8 +24,8 @@ use crate::auth::Identity;
 use crate::desk::{self, DeskPosition};
 use crate::execute;
 use crate::history::{self, Call, GroupBy, Range};
-use crate::paper::{self, ContractRef, PaperPosition, Refusal};
-use crate::routes::v2::desk::{index_ltp, ClosedCall, DeskAnswer, Wallet};
+use crate::paper::{self, PaperPosition, Refusal};
+use crate::routes::v2::desk::{ClosedCall, DeskAnswer, Wallet};
 use crate::routes::v2::history::{range_and_group, Answer};
 use crate::routes::v2::positions::{sells_now, LevelsUpdate};
 use crate::AppState;
@@ -57,8 +59,14 @@ async fn calls_of(state: &AppState, user_id: i64) -> Result<(paper::Wallet, Vec<
     Ok((wallet, history::calls(legs)))
 }
 
+/// The underlying's live value: the index's feed value, or the stock's cash
+/// row, whichever the position watches (however old).
+fn underlying_ltp(state: &AppState, p: &PaperPosition) -> Option<f64> {
+    p.underlying_price_key().and_then(|key| state.paper.price(&key))
+}
+
 fn desk_row(state: &AppState, p: &PaperPosition) -> DeskPosition {
-    DeskPosition::of_paper(p, state.paper.price(&p.ws_key), index_ltp(state, &p.index))
+    DeskPosition::of_paper(p, state.paper.price(&p.ws_key), underlying_ltp(state, p))
 }
 
 /// A held contract's price, while it is recent enough to trade on.
@@ -217,7 +225,14 @@ pub struct BuyReq {
 
 /// `POST /api/v2/me/buy {trading_symbol, lots}` — buy at the live price: a
 /// new position, or an add to the one on the same contract. Answers with
-/// the fill.
+/// the fill. `trading_symbol` is an index option's, or — behind the
+/// `stock_paper` switch — an NSE stock's CE/PE (`RELIANCE26NOV1400CE`),
+/// resolved by `paper::resolve`; a future, a stock, an expired contract or an
+/// option on an index the app only charts is refused there, and a stock
+/// option is a 409 while the instrument catalog (which names the stock's cash
+/// row) isn't built. Every gate is the same for both: the market window and
+/// the entry cutoff, a fresh feed, the contract's own tick from the last 10 s,
+/// not being squared off, and the desk's caps and wallet.
 pub async fn buy_handler(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
@@ -236,40 +251,27 @@ pub async fn buy_handler(
     if !execute::feed_fresh() {
         return refuse(StatusCode::CONFLICT, "Price feed is stale — not buying blind");
     }
-    let Some((index, _, record)) = state.execute.find_contract(&state, &req.trading_symbol).await else {
-        return refuse(
-            StatusCode::BAD_REQUEST,
-            format!("{} is not a listed index option", req.trading_symbol.trim()),
-        );
+    let contract = match paper::resolve::find_paper_contract(&state, &req.trading_symbol).await {
+        Ok(contract) => contract,
+        Err(r) => return r.into_response(),
     };
-    let ws_key = record.ws_key();
-    let Some(ltp) = execute::price(&state, &ws_key) else {
-        return refuse(StatusCode::CONFLICT, format!("No live price for {} yet", record.trading_symbol));
+    // The contract's own feed tick, and a recent one: the feed being alive
+    // says nothing about this contract, and a REST quote never fills.
+    let Some(ltp) = execute::price(&state, &contract.ws_key) else {
+        return refuse(StatusCode::CONFLICT, format!("No live price for {} yet", contract.trading_symbol));
     };
-    if execute::contract_age_secs(&ws_key).is_none_or(|age| age > execute::MAX_CONTRACT_AGE_SECS) {
-        return refuse(
-            StatusCode::CONFLICT,
-            format!("{}'s price hasn't updated in over {:.0} s — not buying blind", record.trading_symbol, execute::MAX_CONTRACT_AGE_SECS),
-        );
-    }
-    let Some(strike) = record.normalized_strike() else {
-        return refuse(StatusCode::BAD_REQUEST, format!("Can't read the strike of {}", record.trading_symbol));
-    };
-    if paper::engine::squaring_off(record.expiry_date, shared_domain::now_ist()) {
+    if execute::contract_age_secs(&contract.ws_key).is_none_or(|age| age > execute::MAX_CONTRACT_AGE_SECS) {
         return refuse(
             StatusCode::CONFLICT,
-            format!("{} expires today and is being squared off — pick a later expiry", record.trading_symbol),
+            format!("{}'s price hasn't updated in over {:.0} s — not buying blind", contract.trading_symbol, execute::MAX_CONTRACT_AGE_SECS),
         );
     }
-    let contract = ContractRef {
-        index,
-        trading_symbol: record.trading_symbol.clone(),
-        ws_key,
-        expiry: record.expiry_date,
-        strike,
-        option_type: record.option_type.clone(),
-        lot_size: record.lot_size as i32,
-    };
+    if paper::engine::squaring_off(contract.expiry, shared_domain::now_ist()) {
+        return refuse(
+            StatusCode::CONFLICT,
+            format!("{} expires today and is being squared off — pick a later expiry", contract.trading_symbol),
+        );
+    }
     match state.paper.buy(user_id, &contract, req.lots, ltp).await {
         Ok(filled) => Json(filled).into_response(),
         Err(r) => r.into_response(),
@@ -338,7 +340,8 @@ pub async fn exit_all_handler(State(state): State<AppState>, Extension(identity)
 /// `PATCH /api/v2/me/positions/:id {stop?, set_target?, remove_target?}` —
 /// a position's chart stop and targets, as `/api/v2/positions/:id` does for
 /// the owner's scalps: `{price, trigger}` with `trigger` `"premium"` or
-/// `"index"`, a target with its `lots` (`null` = all left). One already
+/// `"index"` (the underlying: an index option's index, a stock option's
+/// stock price), a target with its `lots` (`null` = all left). One already
 /// crossed sells on the watch loop's next pass (within half a second, at a
 /// fresh price) — everything for the stop, a target's lots for a target:
 /// `sells_now` and `sells_lots` say so.
@@ -357,7 +360,7 @@ pub async fn patch_levels_handler(
         Err(r) => return r.into_response(),
     };
     let premium = state.paper.price(&pos.ws_key);
-    let index = index_ltp(&state, &pos.index);
+    let index = underlying_ltp(&state, &pos);
     let hit = shared_domain::chart_hit(Some(&pos.option_type), &pos.chart, premium, index, pos.lots());
     let (sells, sells_lots) = sells_now(hit.as_ref());
     Json(json!({ "id": id, "chart": pos.chart, "sells_now": sells, "sells_lots": sells_lots, "target_id": target_id })).into_response()
