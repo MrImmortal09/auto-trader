@@ -36,8 +36,10 @@ function inField(target: EventTarget | null): boolean {
 export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (row: InstrumentRow, how: OpenHow) => void }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
-  // The highlighted row's id; nothing highlighted until ↓ (or the first
-  // result of a typed query, once its answer is in).
+  // The row picked with ↑/↓ or the pointer; until then the highlight is
+  // Enter's default (`defaultRow`, once the answer to what was typed is in):
+  // the typed contract or future, else the first row, none for a contract or
+  // future that matched none.
   const [active, setActive] = useState<string | null>(null);
   const [recents, setRecents] = useState<InstrumentRow[]>([]);
   const input = useRef<HTMLInputElement>(null);
