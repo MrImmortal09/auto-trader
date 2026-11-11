@@ -36,6 +36,13 @@ export interface HeaderTile {
   points: 'always' | 'wide';
 }
 
+/** What the header says in place of tiles while it has none: a watchlist
+ * still loading, a read that failed (`loss`), no list, or an empty one. */
+export interface HeaderNote {
+  text: string;
+  tone: 'muted' | 'loss';
+}
+
 /** The indices the ticker gives the day's points as well as the percent
  * whenever the bar has room for them; the others only on a wide window. */
 const TICKER_POINTS = new Set(['NIFTY', 'BANKNIFTY', 'SENSEX']);

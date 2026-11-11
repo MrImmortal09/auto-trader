@@ -5,7 +5,7 @@ import type { Watchlist } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
 import { Popover } from '../ui/Popover';
 import { Segment } from '../ui/Segment';
-import { HEADER_MODES, type HeaderMode, type HeaderTile } from './headerModel';
+import { HEADER_MODES, type HeaderMode, type HeaderNote, type HeaderTile } from './headerModel';
 
 // The Trade screen's header: the six index tabs (and the stock tab beside
 // them, behind the `stock_charts` switch), or — the owner's "both ways" for
@@ -143,8 +143,20 @@ function useKeepInView(box: React.RefObject<HTMLDivElement | null>, selected: st
   }, [box, selected, count]);
 }
 
-/** The phone's strip of tiles, scrolled to keep the selected one in view. */
-export function HeaderTabs({ tiles, label }: { tiles: HeaderTile[]; label: string }) {
+const NOTE_TONE = { muted: 'text-fg-subtle', loss: 'text-loss' } as const;
+
+/** The header's words while it has no tiles (`HeaderNote`). */
+function Note({ note, compact }: { note: HeaderNote; compact: boolean }) {
+  return (
+    <span className={`flex items-center type-caption ${compact ? 'min-h-11 px-1' : 'px-3'} ${NOTE_TONE[note.tone]}`}>
+      {note.text}
+    </span>
+  );
+}
+
+/** The phone's strip of tiles, scrolled to keep the selected one in view;
+ * `note` stands in while there are none. */
+export function HeaderTabs({ tiles, label, note = null }: { tiles: HeaderTile[]; label: string; note?: HeaderNote | null }) {
   const box = useRef<HTMLDivElement>(null);
   useKeepInView(box, tiles.find((t) => t.on)?.id ?? null, tiles.length);
   return (
@@ -152,6 +164,7 @@ export function HeaderTabs({ tiles, label }: { tiles: HeaderTile[]; label: strin
       {tiles.map((t) => (
         <Tile key={t.id} tile={t} />
       ))}
+      {tiles.length === 0 && note && <Note note={note} compact />}
     </div>
   );
 }
@@ -204,8 +217,9 @@ function TickerItem({ tile }: { tile: HeaderTile }) {
 
 /** The desktop bar: every tile on one slim line, scrolling sideways when
  * the window is too narrow for all of them — with the mouse wheel too, and
- * always to keep the selected one in view. */
-export function HeaderTicker({ tiles, label }: { tiles: HeaderTile[]; label: string }) {
+ * always to keep the selected one in view; `note` stands in while there are
+ * none. */
+export function HeaderTicker({ tiles, label, note = null }: { tiles: HeaderTile[]; label: string; note?: HeaderNote | null }) {
   const box = useRef<HTMLDivElement>(null);
   useKeepInView(box, tiles.find((t) => t.on)?.id ?? null, tiles.length);
   return (
@@ -221,7 +235,7 @@ export function HeaderTicker({ tiles, label }: { tiles: HeaderTile[]; label: str
       {tiles.map((t) => (
         <TickerItem key={t.id} tile={t} />
       ))}
-      {tiles.length === 0 && <span className="flex items-center px-3 type-caption text-fg-subtle">Nothing on this watchlist yet — add instruments from a search or an instrument page.</span>}
+      {tiles.length === 0 && note && <Note note={note} compact={false} />}
     </div>
   );
 }

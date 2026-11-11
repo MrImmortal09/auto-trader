@@ -4,7 +4,7 @@ import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
 import { Button } from '../ui/Button';
-import { derivativeNote, groupsOf, rowSymbol, rowTitle } from './searchModel';
+import { defaultRow, derivativeNote, groupsOf, rowSymbol, rowTitle } from './searchModel';
 import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 import type { OpenHow } from './Search';
 
@@ -12,7 +12,10 @@ import type { OpenHow } from './Search';
 // well with the keyboard up, Cancel, and the same groups as the desktop
 // popover in 56 px rows (symbol and chips on the first line, name and the
 // price on the second). A tap opens the instrument; the "+" at the end of a
-// row adds it to a watchlist (`onAdd`, while watchlists are on).
+// row adds it to a watchlist (`onAdd`, while watchlists are on); the
+// keyboard's search key, once the answer is for what was typed, opens what
+// it names: the typed contract or future (nothing when it matched none), else
+// the first row.
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 
@@ -36,15 +39,22 @@ export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd }: {
   const groups = typed ? (search.answer ? groupsOf(search.answer) : []) : recents.length ? [{ head: 'Recent', rows: recents }] : [];
   const flat = groups.flatMap((g) => g.rows);
   const quotes = useQuotes(serverBase, open ? flat.map((r) => r.ws_key) : []);
+  // The caller's latest `onClose`, for the Escape listener: a new function
+  // on every render of the caller must not re-run the effect below, which
+  // would pull the keyboard back up on each status poll.
+  const closeRef = useRef(onClose);
+  useEffect(() => {
+    closeRef.current = onClose;
+  });
 
-  // Opened: the keyboard comes up on the well.
+  // Opened: the keyboard comes up on the well, once.
   useEffect(() => {
     if (!open) return;
     input.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && closeRef.current();
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
@@ -80,7 +90,13 @@ export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd }: {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && flat[0]) pick(flat[0]);
+              // What the answer to what was typed names (`defaultRow`): the
+              // typed contract or future, else its first row; never a row of
+              // an earlier query's answer still on show while this one is
+              // pending, nor a recent when nothing is typed.
+              if (e.key !== 'Enter' || !typed || search.pending || !search.answer) return;
+              const first = defaultRow(search.answer);
+              if (first) pick(first);
             }}
             className="min-w-0 flex-1 bg-transparent type-body text-ellipsis text-fg outline-none placeholder:text-fg-subtle [&::-webkit-search-cancel-button]:hidden"
           />

@@ -3,7 +3,7 @@ import { readStored, writeStored } from '../../lib/execute';
 import { useIdentity } from '../auth/identity';
 import type { Sent } from '../lib/api';
 import { dayLabel, plural, price, signedPct, signedPrice, toneOf } from '../lib/format';
-import { chartSymOf, ladderOf, stockChipOf, targetOf, type TradeIntent } from '../lib/openInstrument';
+import { chartOffWhy, chartSymOf, ladderOf, stockChipOf, targetOf, type TradeIntent } from '../lib/openInstrument';
 import type { Quote, Watchlist as WatchlistData, WatchlistAnswer } from '../lib/types';
 import { useQuotes } from '../lib/useQuotes';
 import { useTickFlash } from '../lib/useTickFlash';
@@ -106,7 +106,9 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, stockPaperOn 
   // The strip's three and the open list's rows, one poll for all of them.
   const quotes = useQuotes(serverBase, [...STRIP.map((s) => s.key), ...items.map((i) => i.key)]);
   const marketOpen = quotes.marketOpen ?? data.answer?.market_open ?? true;
-  const now = useNow(5000);
+  // The server's time: a quote's `at` is its clock's, and this browser's may
+  // run fast (every row grey) or slow (a stale row looking fresh).
+  const now = useNow(5000) + quotes.clockOffset;
   const closedAsOf = !marketOpen ? [...STRIP.map((s) => quotes.get(s.key)?.as_of), ...items.map((i) => quotes.get(i.key)?.as_of ?? i.quote?.as_of)].find((s) => !!s) ?? null : null;
 
   function select(id: number) {
@@ -114,11 +116,12 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, stockPaperOn 
     writeStored(STORE_KEY, { selected: id });
   }
 
-  /** Send a change; a refusal is a toast titled `failTitle`. */
-  async function act(failTitle: string, run: () => Promise<Sent>): Promise<Sent> {
+  /** Send a change; a refusal is a toast titled `failTitle`, its body what
+   * `explain` makes of it or else the server's reason. */
+  async function act(failTitle: string, run: () => Promise<Sent>, explain?: (sent: Sent) => string | null): Promise<Sent> {
     const sent = await run();
     // A 401 already dropped the sign-in, which brings back the sign-in page (see lib/api).
-    if (!sent.ok && sent.status !== 401) toast({ tone: 'loss', title: failTitle, body: sent.error ?? 'The server refused it.' });
+    if (!sent.ok && sent.status !== 401) toast({ tone: 'loss', title: failTitle, body: explain?.(sent) ?? sent.error ?? 'The server refused it.' });
     return sent;
   }
 
@@ -139,7 +142,13 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, stockPaperOn 
     if (next < 0 || next >= keys.length || next === at) return;
     keys.splice(at, 1);
     keys.splice(next, 0, key);
-    void act("Couldn't move it", () => watchlistActions.setItems(list.id, keys));
+    // The server keeps the keys a list holds as they are, so an expired
+    // contract in it never blocks a reorder; a server from before that
+    // refuses the whole list (400, "unknown keys") while it holds one.
+    const dead = items.filter((i) => !i.instrument).length;
+    void act("Couldn't move it", () => watchlistActions.setItems(list.id, keys), (sent) =>
+      dead > 0 && sent.status === 400 ? `This list holds ${dead === 1 ? 'an expired contract' : `${dead} expired contracts`} the server can't reorder around. Remove the expired ${dead === 1 ? 'row' : 'rows'} (No longer listed) first, then move it again.` : null,
+    );
   }
 
   const pad = desktop ? 'px-6 py-5' : 'px-4 py-4';
@@ -230,6 +239,7 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, stockPaperOn 
                           else onOpenInstrument(target.instrument);
                         },
                         onChart: chart ? () => onOpenTrade({ chart, ladder: ladder ?? undefined, stock: chip }) : null,
+                        chartWhy: row && !chart ? chartOffWhy(row, stocksOn) : undefined,
                         onChain: ladder ? () => onOpenTrade({ ladder, stock: chip }) : null,
                         chainWhy: stocksOn && row && !row.has_fo ? 'No options listed for this stock' : undefined,
                         onBuy: buyLadder ? () => onOpenTrade({ ladder: buyLadder, stock: chip }) : null,

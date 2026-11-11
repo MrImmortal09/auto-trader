@@ -51,10 +51,10 @@ import { CrosshairBus } from './bus';
 import { ExpiryPicker } from './ExpiryPicker';
 import type { Placing } from './KChart';
 import { HeaderSwitch, HeaderTabs, HeaderTicker, ListPicker } from './header';
-import { indexTiles, type HeaderMode, type HeaderTile } from './headerModel';
+import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from './headerModel';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
-import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isTicker, istClock, levelCrossed, levelPnl, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isTicker, istClock, levelCrossed, levelPnl, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
@@ -119,10 +119,13 @@ const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
 const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', stock: null, header: 'indices', headerList: null, lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false };
 
-/** An option that has expired goes back to its underlying's own chart. */
+/** An option or a dated future that has expired goes back to its
+ * underlying's own chart (the server refuses an expired future's name; a
+ * later month's is another contract, never charted in its place). */
 function unexpired(sym: ChartSym, today: string): ChartSym {
-  if (sym.kind !== 'option' || sym.expiry >= today) return sym;
-  return ownChartOf(sym.index);
+  const expiry = symExpiry(sym);
+  if (expiry == null || expiry >= today) return sym;
+  return ownChartOf(underlyingOf(sym));
 }
 
 /** The saved stock tab, if it reads as one. */
@@ -244,7 +247,11 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [fullscreenSlot, setFullscreenSlot] = useState<number | null>(null);
   const guard = useGuard();
   const toast = useToast();
-  const { canReadOwner } = useIdentity();
+  const { canReadOwner, user } = useIdentity();
+  // A confirmed sign-in (`/api/auth/me`): only that has watchlists. Without
+  // one (a visitor, or a sign-in whose check is out or failed) the header is
+  // the index tabs and offers no switch.
+  const signedIn = user != null;
   // Whose desk a tap trades on: the owner's engine for the admin, a user's
   // own paper portfolio otherwise (`/api/v2/me/*`, filled at once).
   const scope = canReadOwner ? 'admin' : 'user';
@@ -279,12 +286,20 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // The `stock_charts` switch: null until the switches are known, so a saved
   // stock keeps its place rather than bounce to NIFTY and back.
   const stocksOn: boolean | null = flags.data ? flags.data.stock_charts === true : null;
-  const watchlistsOn = flags.data?.watchlists === true;
+  // Watchlists count as on only while the search is on too, as everywhere
+  // else in the app (App.tsx): with search off nothing prices a stock.
+  const watchlistsOn = flags.data?.watchlists === true && flags.data.search === true;
   // A stock saved as the ladder's underlying streams as NIFTY while stocks
   // are off: the server would answer NIFTY's board for it anyway.
   const ladderIndex = stocksOn === false && !isIndex(saved.index) ? 'NIFTY' : saved.index;
-  // A stock's chart saved while the switch is off shows its index instead.
-  const shownAs = (slot: Slot): Slot => (stocksOn === false && !isIndex(underlyingOf(slot.sym)) ? indexSlot('NIFTY') : slot);
+  // A stock's chart saved while the switch is off shows NIFTY instead, and
+  // an index's future its index (futures are charted behind the switch too).
+  const shownAs = (slot: Slot): Slot => {
+    if (stocksOn !== false) return slot;
+    const name = underlyingOf(slot.sym);
+    if (!isIndex(name)) return indexSlot('NIFTY');
+    return slot.sym.kind === 'future' ? { ...slot, sym: { kind: 'index', index: name } } : slot;
+  };
   // Each underlying on screen: its listed expiries, before the stream opens.
   const shownSlots = (desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1)).map(shownAs);
 
@@ -349,10 +364,23 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // The stock tab, with its price from the quote hub (its cash row's key)
   // and the watchlist the header shows, while it does.
   const stock = stocksOn ? saved.stock : null;
-  const headerWatchlist = stocksOn === true && watchlistsOn && saved.header === 'watchlist';
+  const headerWatchlist = stocksOn === true && watchlistsOn && signedIn && saved.header === 'watchlist';
   const lists = useWatchlists(serverBase, { enabled: headerWatchlist, poll: headerWatchlist });
   const headerList = headerWatchlist ? lists.lists.find((l) => l.id === saved.headerList) ?? lists.lists[0] ?? null : null;
   const headerItems = headerList?.items.filter((i) => i.instrument != null) ?? [];
+  // What the watchlist header says while it has no tiles: still loading,
+  // the read's failure, no list at all, or a list with nothing it can show.
+  const headerNote: HeaderNote | null = !headerWatchlist
+    ? null
+    : !lists.answer
+      ? lists.error
+        ? { text: `Couldn't load your watchlists: ${lists.error}`, tone: 'loss' }
+        : { text: 'Loading your watchlists…', tone: 'muted' }
+      : !headerList
+        ? { text: 'No watchlist yet — make one on the Watchlist screen.', tone: 'muted' }
+        : headerList.items.length > 0
+          ? { text: 'Only expired contracts on this watchlist — remove them on the Watchlist screen.', tone: 'muted' }
+          : { text: 'Nothing on this watchlist yet — add instruments from a search or an instrument page.', tone: 'muted' };
   const quotes = useQuotes(serverBase, [stock?.key, ...headerItems.map((i) => i.key)]);
   // A stock's ladder: a user's paper book buys from it behind the server's
   // `stock_paper` switch, one tap as an index option; the owner's desk never
@@ -770,7 +798,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       ];
   const headerLabel = headerWatchlist ? 'Watchlist' : 'Index';
   const setHeader = (header: HeaderMode) => save((s) => ({ ...s, header }));
-  const headerSwitch = stocksOn === true && watchlistsOn ? <HeaderSwitch mode={saved.header} onChange={setHeader} compact={!desktop} /> : null;
+  const headerSwitch = stocksOn === true && watchlistsOn && signedIn ? <HeaderSwitch mode={saved.header} onChange={setHeader} compact={!desktop} /> : null;
   const listPicker = headerWatchlist ? <ListPicker lists={lists.lists} selected={headerList?.id ?? null} onSelect={(id) => save((s) => ({ ...s, headerList: id }))} compact={!desktop} /> : null;
 
   // How the shown charts share their row (desktop), as dragged or saved.
@@ -853,6 +881,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       onLots={(n) => save((s) => ({ ...s, lots: { ...s.lots, [ladderIndex]: n } }))}
       blocked={blocked}
       readOnly={readOnly}
+      marketOpen={frame?.market_open ?? true}
       sending={sending}
       onBuy={(sym, label) => void buy(sym, label)}
       onChart={chartContract}
@@ -901,7 +930,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       <div className="flex h-full min-h-0 flex-col">
         <div className="flex shrink-0 items-center gap-2 px-4 pt-3 pb-2">
           {listPicker}
-          <HeaderTabs tiles={tiles} label={headerLabel} />
+          <HeaderTabs tiles={tiles} label={headerLabel} note={headerNote} />
           {headerSwitch}
         </div>
         {/* The chart and the ladder share this box: the chart is never so tall
@@ -986,7 +1015,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       ) : (
         <div className="flex h-9 shrink-0 items-stretch border-b border-line">
           {listPicker && <div className="flex shrink-0 items-center border-r border-line pl-1 pr-1">{listPicker}</div>}
-          <HeaderTicker tiles={tiles} label={headerLabel} />
+          <HeaderTicker tiles={tiles} label={headerLabel} note={headerNote} />
           <div className="flex shrink-0 items-center gap-2 border-l border-line pr-1 pl-2">
             {headerSwitch}
             <Segment label="Chart library" size="xs" value={saved.chartLib} onChange={setLib} options={CHART_LIBS} />
