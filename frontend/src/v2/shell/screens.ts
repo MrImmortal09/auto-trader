@@ -1,12 +1,13 @@
-import { Activity, Gauge, LayoutDashboard, Settings, ShieldCheck, Zap, type LucideIcon } from 'lucide-react';
+import { Activity, Gauge, LayoutDashboard, ScrollText, Settings, ShieldCheck, Zap, type LucideIcon } from 'lucide-react';
 import type { Role } from '../lib/types';
 
-export type ScreenId = 'desk' | 'trade' | 'market' | 'system' | 'settings' | 'admin';
+export type ScreenId = 'desk' | 'trade' | 'market' | 'logs' | 'system' | 'settings' | 'admin';
 
 export const SCREENS: { id: ScreenId; label: string; icon: LucideIcon }[] = [
   { id: 'desk', label: 'Desk', icon: LayoutDashboard },
   { id: 'trade', label: 'Trade', icon: Zap },
   { id: 'market', label: 'Market', icon: Gauge },
+  { id: 'logs', label: 'Logs', icon: ScrollText },
   { id: 'system', label: 'System', icon: Activity },
   { id: 'settings', label: 'Settings', icon: Settings },
   { id: 'admin', label: 'Admin', icon: ShieldCheck },
@@ -16,9 +17,9 @@ export const SCREENS: { id: ScreenId; label: string; icon: LucideIcon }[] = [
 export const TAB_SCREENS: ScreenId[] = ['desk', 'trade', 'market'];
 
 /** The screens `role` may open: users get the public ones and a small
- * Settings; the admin gets everything. */
+ * Settings; the admin gets everything, the engine log (Logs) included. */
 export function visibleScreens(role: Role): ScreenId[] {
-  return role === 'admin' ? ['desk', 'trade', 'market', 'system', 'settings', 'admin'] : ['desk', 'trade', 'market', 'settings'];
+  return role === 'admin' ? ['desk', 'trade', 'market', 'logs', 'system', 'settings', 'admin'] : ['desk', 'trade', 'market', 'settings'];
 }
 
 /** Screens with no button anywhere: they open from their address alone
