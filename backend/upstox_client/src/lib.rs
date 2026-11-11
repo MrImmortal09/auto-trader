@@ -19,9 +19,10 @@
 //! The instruments files are a few MB gzipped and tens of MB decompressed.
 //! They are never materialised: every caller stream-filters the rows it
 //! wants in `spawn_blocking`. With [`UpstoxClient::with_instruments_cache`]
-//! set, the gzipped bytes are kept on disk per IST day, so a second
-//! underlying asked for on the same day reads the file instead of
-//! downloading it again.
+//! set, the gzipped bytes are kept on disk per instruments day (see
+//! [`instruments_day`]: it starts at 07:00 IST, after Upstox publishes the
+//! day's file), so a second underlying asked for that day reads the file
+//! instead of downloading it again.
 
 pub mod feed;
 
@@ -31,7 +32,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::de::{DeserializeOwned, DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use shared_domain::telemetry;
@@ -44,6 +45,20 @@ const API_V3: &str = "https://api.upstox.com/v3";
 const API_TIMEOUT: Duration = Duration::from_secs(20);
 /// Budget for downloading a multi-MB gzipped instruments file.
 const INSTRUMENTS_TIMEOUT: Duration = Duration::from_secs(180);
+/// The hour (IST) an instruments day starts: Upstox rebuilds its
+/// instruments files early each morning (about 06:00 IST), so a file fetched
+/// before this belongs to the day before and is never served after it.
+pub const INSTRUMENTS_DAY_STARTS_AT_HOUR: i64 = 7;
+
+/// The instruments day `now` falls in: the IST date, rolled at
+/// [`INSTRUMENTS_DAY_STARTS_AT_HOUR`] instead of midnight. A file fetched
+/// at 02:00 IST is the previous day's (Upstox has not refreshed it yet), so
+/// it is cached, and kept in memory, under that day and fetched afresh from
+/// 07:00 — contracts listed that morning (a new weekly series, a new
+/// far-month future) are never missing all day.
+pub fn instruments_day(now: DateTime<FixedOffset>) -> NaiveDate {
+    (now.with_timezone(&shared_domain::ist_offset()) - chrono::Duration::hours(INSTRUMENTS_DAY_STARTS_AT_HOUR)).date_naive()
+}
 /// Sent on every request. `assets.upstox.com` (the instruments files) sits
 /// behind Cloudflare and answers 403 to a request with no User-Agent, which is
 /// what reqwest sends by default — that silently emptied the futures map and
@@ -314,9 +329,10 @@ impl UpstoxClient {
     }
 
     /// Keep each downloaded instruments file (its gzipped bytes, a few MB)
-    /// under `dir/<IST day>/<file>` and read it from there for the rest of
-    /// that day; older days' directories are removed as a new one is
-    /// written. Without this, every call downloads the file again.
+    /// under `dir/<instruments day>/<file>` and read it from there for the
+    /// rest of that day ([`instruments_day`]: 07:00 IST to 07:00 IST); older
+    /// days' directories are removed as a new one is written. Without this,
+    /// every call downloads the file again.
     pub fn with_instruments_cache(mut self, dir: impl Into<PathBuf>) -> Self {
         self.instruments_cache = Some(dir.into());
         self
@@ -503,9 +519,10 @@ impl UpstoxClient {
 
     /// Run `filter` (a stream filter over the gzipped bytes of an
     /// instruments file, a few MB; the rows are decompressed and read one at
-    /// a time, never materialised) on a blocking thread, against today's
-    /// copy from the cache directory when one is set and holds it, else a
-    /// download, which is then written there for the rest of the IST day.
+    /// a time, never materialised) on a blocking thread, against the
+    /// instruments day's copy from the cache directory when one is set and
+    /// holds it, else a download, which is then written there for the rest
+    /// of that day ([`instruments_day`]).
     ///
     /// A cached file the filter cannot decode (a corrupt gzip or JSON) is
     /// removed and the file downloaded once more, so a bad write never
@@ -516,8 +533,17 @@ impl UpstoxClient {
         T: Send + 'static,
         F: Fn(&[u8]) -> Result<T, UpstoxError> + Send + Sync + 'static,
     {
+        self.filter_instruments_at(instruments_url, filter, shared_domain::now_ist()).await
+    }
+
+    /// [`Self::filter_instruments`] as of `now`.
+    async fn filter_instruments_at<T, F>(&self, instruments_url: &str, filter: F, now: DateTime<FixedOffset>) -> Result<T, UpstoxError>
+    where
+        T: Send + 'static,
+        F: Fn(&[u8]) -> Result<T, UpstoxError> + Send + Sync + 'static,
+    {
         let filter = std::sync::Arc::new(filter);
-        let today = shared_domain::today_ist();
+        let today = instruments_day(now);
         let cached = self.instruments_cache.as_ref().map(|dir| instruments_cache_path(dir, today, instruments_url));
         if let Some(path) = &cached {
             if let Some(bytes) = read_cached_instruments(path).await {
@@ -539,7 +565,7 @@ impl UpstoxClient {
             let target = path.clone();
             let stored = tokio::task::spawn_blocking(move || store_instruments(&dir, &target, &copy, today)).await;
             match stored {
-                Ok(Ok(())) => tracing::info!(path = %path.display(), bytes = bytes.len(), "Upstox instruments file cached for today"),
+                Ok(Ok(())) => tracing::info!(path = %path.display(), bytes = bytes.len(), "Upstox instruments file cached for the instruments day"),
                 Ok(Err(e)) => tracing::warn!(path = %path.display(), error = %e, "Upstox instruments file could not be cached"),
                 Err(e) => tracing::warn!(error = %e, "Upstox instruments cache write did not finish"),
             }
@@ -571,7 +597,7 @@ where
 // Instruments cache on disk
 // ---------------------------------------------------------------------------
 
-/// Today's cached instruments file, when `path` holds one: `None` for no
+/// The day's cached instruments file, when `path` holds one: `None` for no
 /// file, an empty one or one that cannot be read (logged), and the download
 /// goes ahead.
 async fn read_cached_instruments(path: &Path) -> Option<bytes::Bytes> {
@@ -990,7 +1016,7 @@ mod tests {
     async fn todays_cached_file_is_read_instead_of_downloaded_and_old_days_are_pruned() {
         let dir = std::env::temp_dir().join(format!("upstox-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let today = shared_domain::today_ist();
+        let today = instruments_day(shared_domain::now_ist());
         // A URL reqwest refuses before opening a socket (not http/https): a
         // download attempt fails without any network, so a result proves
         // the cache answered.
@@ -1015,11 +1041,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn ist(m: u32, d: u32, h: u32, min: u32) -> DateTime<FixedOffset> {
+        NaiveDate::from_ymd_opt(2026, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+            .and_local_timezone(shared_domain::ist_offset())
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_instruments_day_starts_at_seven_ist() {
+        let (nov11, nov12) = (NaiveDate::from_ymd_opt(2026, 11, 11).unwrap(), NaiveDate::from_ymd_opt(2026, 11, 12).unwrap());
+        // Before Upstox's morning refresh, the file is the day before's.
+        assert_eq!(instruments_day(ist(11, 12, 0, 5)), nov11);
+        assert_eq!(instruments_day(ist(11, 12, 6, 59)), nov11);
+        assert_eq!(instruments_day(ist(11, 12, 7, 0)), nov12);
+        assert_eq!(instruments_day(ist(11, 12, 15, 50)), nov12);
+        assert_eq!(instruments_day(ist(11, 12, 23, 59)), nov12);
+        // The same instant in UTC is read in IST: 01:00 UTC is 06:30 IST.
+        let utc = ist(11, 12, 6, 30).with_timezone(&FixedOffset::east_opt(0).unwrap());
+        assert_eq!(instruments_day(utc), nov11);
+    }
+
+    #[tokio::test]
+    async fn a_file_cached_before_the_morning_refresh_is_not_served_after_it() {
+        let dir = std::env::temp_dir().join(format!("upstox-cache-morning-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A URL no download can reach (see above): a result is the cache's.
+        let url = "nope://upstox.test/NSE.json.gz";
+        let client = UpstoxClient::new("test-token").unwrap().with_instruments_cache(&dir);
+        let count = |gz: &[u8]| filter_derivatives(gz, &["RELIANCE".to_string()]).map(|d| d.len());
+
+        // Fetched at 02:00 on the 12th: stored as the 11th's file.
+        let night = ist(11, 12, 2, 0);
+        let path = instruments_cache_path(&dir, instruments_day(night), url);
+        assert!(path.to_string_lossy().contains("2026-11-11"));
+        store_instruments(&dir, &path, &stock_instruments_gz(), instruments_day(night)).unwrap();
+        assert_eq!(client.filter_instruments_at(url, count, night).await.unwrap(), 3);
+        assert_eq!(client.filter_instruments_at(url, count, ist(11, 12, 6, 59)).await.unwrap(), 3);
+        // From 07:00 the 12th's file is wanted: not on disk, so a download,
+        // which here cannot happen — the night's file is never served.
+        assert!(client.filter_instruments_at(url, count, ist(11, 12, 7, 0)).await.is_err());
+        assert!(client.filter_instruments_at(url, count, ist(11, 12, 12, 0)).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_corrupt_cached_file_is_removed_and_downloaded_again() {
         let dir = std::env::temp_dir().join(format!("upstox-cache-corrupt-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let today = shared_domain::today_ist();
+        let today = instruments_day(shared_domain::now_ist());
         let url = "nope://upstox.test/NSE.json.gz";
         let path = instruments_cache_path(&dir, today, url);
         let client = UpstoxClient::new("test-token").unwrap().with_instruments_cache(&dir);

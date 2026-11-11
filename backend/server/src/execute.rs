@@ -56,6 +56,14 @@ const MAX_BAND_SCRIPS: usize = 180;
 /// Signed-in users' ladders add strikes only while the total is under this
 /// (two bands), so the owner always has room for four more of their own.
 const MAX_PUBLIC_BAND_SCRIPS: usize = 60;
+/// Users' chart keys stay on the feed until the close (a band key is
+/// released once no ladder wants it), so they get a fixed slice of the
+/// users' share and users' bands always keep the rest: one user browsing
+/// sixty stock charts can never leave every user's index ladder without
+/// band strikes (and every paper buy refused) for the rest of the day. A
+/// user's chart past it is `polled`: Upstox's minutes. The owner's charts
+/// draw on the owner's budget as before.
+const MAX_PUBLIC_CHART_SCRIPS: usize = 10;
 /// Upstox's option chain for a stock is read at most this often per expiry,
 /// for the deltas the chain route shows.
 const STOCK_DELTAS_EVERY: Duration = Duration::from_secs(60);
@@ -154,9 +162,10 @@ struct Subscriptions {
     band: HashMap<String, Instant>,
     /// Every stock chart's subscription (`"ladder": true` on the bridge:
     /// dropped at the close, never released before it), with when it was
-    /// sent. Counted with `band` against the one budget, and never taken
-    /// off by the band sweep.
-    chart: HashMap<String, Instant>,
+    /// sent and whose share reserved it. Counted with `band` against the
+    /// one budget, never taken off by the band sweep; the users' are capped
+    /// at [`MAX_PUBLIC_CHART_SCRIPS`] besides.
+    chart: HashMap<String, (Instant, SubPool)>,
     indices_sent: bool,
     /// When the "band full" warning was last logged.
     warned_at: Option<Instant>,
@@ -171,6 +180,11 @@ impl Subscriptions {
     /// How many more keys `pool` may put on the feed.
     fn room(&self, pool: SubPool) -> usize {
         pool.budget().saturating_sub(self.used())
+    }
+
+    /// Chart keys the users' share reserved.
+    fn public_charts(&self) -> usize {
+        self.chart.values().filter(|(_, p)| *p == SubPool::Public).count()
     }
 
     /// Start over: a fresh bridge knows none of these, and the feed drops
@@ -374,9 +388,11 @@ impl ExecuteBoard {
     /// Put one stock chart's feed key on the feed out of `pool`'s share of
     /// the ladder budget (`"ladder": true`: the bridge drops it at the close
     /// and the band sweep never releases it). `true` when it is on the feed
-    /// (now or already); `false` when the budget is full or nothing can be
-    /// sent, and the chart then has no Kotak ticks — the candle service
-    /// falls back to Upstox's minutes. A visitor's pool subscribes nothing.
+    /// (now or already); `false` when the budget is full — for a user, also
+    /// once the users' charts hold [`MAX_PUBLIC_CHART_SCRIPS`] keys — or
+    /// nothing can be sent, and the chart then has no Kotak ticks: the
+    /// candle service falls back to Upstox's minutes. A visitor's pool
+    /// subscribes nothing.
     pub async fn reserve_chart(&self, ws_tx: &Mutex<Option<mpsc::UnboundedSender<String>>>, key: &str, pool: SubPool) -> bool {
         if pool == SubPool::None {
             return false;
@@ -391,13 +407,25 @@ impl ExecuteBoard {
         if subs.chart.contains_key(key) {
             return true;
         }
+        // The users' charts have their slice. Checked before a band strike
+        // is taken over too: that turns a key the sweep would release into
+        // one held until the close.
+        if pool == SubPool::Public && subs.public_charts() >= MAX_PUBLIC_CHART_SCRIPS {
+            if subs.warned_at.map_or(true, |t| now.duration_since(t) >= BAND_WARN_EVERY) {
+                subs.warned_at = Some(now);
+                tracing::warn!(
+                    "Users' chart keys at their cap ({MAX_PUBLIC_CHART_SCRIPS}): the chart for {key} gets no Kotak ticks today"
+                );
+            }
+            return false;
+        }
         // A strike some ladder's band already streams: it becomes the
         // chart's for the day (the band sweep must not release it), and the
         // count does not change.
         if subs.band.remove(key).is_some() {
             let msg = serde_json::json!({ "action": "subscribe", "scrips": key, "ladder": true });
             let _ = tx.send(msg.to_string());
-            subs.chart.insert(key.to_string(), now);
+            subs.chart.insert(key.to_string(), (now, pool));
             return true;
         }
         if subs.room(pool) == 0 {
@@ -415,7 +443,7 @@ impl ExecuteBoard {
         if tx.send(msg.to_string()).is_err() {
             return false;
         }
-        subs.chart.insert(key.to_string(), now);
+        subs.chart.insert(key.to_string(), (now, pool));
         true
     }
 
@@ -1296,35 +1324,45 @@ mod tests {
             assert_eq!(subs.room(SubPool::Public), MAX_PUBLIC_BAND_SCRIPS - 1);
         }
 
-        // Users' charts fill their share; the next one is refused and sends nothing.
-        for i in 1..MAX_PUBLIC_BAND_SCRIPS {
+        // Users' charts take their slice of the users' share; the next one
+        // is refused and sends nothing, though the share has room.
+        for i in 0..MAX_PUBLIC_CHART_SCRIPS {
             assert!(board.reserve_chart(&ws_tx, &format!("nse_cm|{i}"), SubPool::Public).await, "{i}");
         }
         assert!(!board.reserve_chart(&ws_tx, "nse_cm|refused", SubPool::Public).await);
-        assert_eq!(drain(&mut rx).len(), MAX_PUBLIC_BAND_SCRIPS - 1);
-        assert!(!board.subs.lock().await.chart.contains_key("nse_cm|refused"));
+        assert_eq!(drain(&mut rx).len(), MAX_PUBLIC_CHART_SCRIPS);
+        {
+            let subs = board.subs.lock().await;
+            assert!(!subs.chart.contains_key("nse_cm|refused"));
+            assert!(subs.room(SubPool::Public) > 0);
+        }
         // The owner still has room, and a visitor never subscribes.
         assert!(board.reserve_chart(&ws_tx, "nse_cm|owner", SubPool::Owner).await);
         assert!(!board.reserve_chart(&ws_tx, "nse_cm|visitor", SubPool::None).await);
         assert_eq!(drain(&mut rx).len(), 1);
 
-        // A band asked for next counts the chart keys: with the users' share
-        // used up, a user's band gets nothing, and the owner's band is cut
-        // to what is left of the total.
+        // A band asked for next counts the chart keys: the users' bands get
+        // what the users' share has left, the owner's what the total has.
         let chain: Vec<ChainStrike> = (0..60).map(|i| priced(24000.0 + 50.0 * i as f64, 1000 + 2 * i)).collect();
         let keys = band_keys(&chain, 30, BAND_HALF);
+        let used_before = board.subs.lock().await.used();
+        assert_eq!(used_before, 1 + MAX_PUBLIC_CHART_SCRIPS + 1);
         board.ensure_subscribed(&ws_tx, &keys, SubPool::Public).await;
         // The first band of the day also puts the six indices on the feed.
         let sent = drain(&mut rx);
-        assert_eq!(sent.len(), 1, "no room in the users' share: only the indices go out");
+        assert_eq!(sent.len(), 2, "the indices, then the band");
         assert_eq!(sent[0]["action"], serde_json::json!("subscribe_indices"));
-        let used_before = board.subs.lock().await.used();
-        board.ensure_subscribed(&ws_tx, &keys, SubPool::Owner).await;
+        assert_eq!(sent[1]["band"], serde_json::json!(true));
+        let public_band = keys.len().min(MAX_PUBLIC_BAND_SCRIPS - used_before);
+        assert_eq!(sent[1]["scrips"].as_str().unwrap().split('&').count(), public_band);
+        let other: Vec<ChainStrike> = (0..60).map(|i| priced(24000.0 + 50.0 * i as f64, 5000 + 2 * i)).collect();
+        let owner_keys = band_keys(&other, 30, BAND_HALF);
+        board.ensure_subscribed(&ws_tx, &owner_keys, SubPool::Owner).await;
         let sent = drain(&mut rx);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["band"], serde_json::json!(true));
         let subs = board.subs.lock().await;
-        assert_eq!(subs.band.len(), keys.len().min(MAX_BAND_SCRIPS - used_before));
+        assert_eq!(subs.band.len(), public_band + owner_keys.len().min(MAX_BAND_SCRIPS - used_before - public_band));
         assert!(subs.used() <= MAX_BAND_SCRIPS);
         // Chart keys are never among what the band sweep releases.
         let held = HashSet::new();
@@ -1332,6 +1370,51 @@ mod tests {
         let stale = unwanted_band_keys(&subs.band, &held, later);
         assert!(stale.iter().all(|k| !subs.chart.contains_key(k)));
         assert!(stale.iter().all(|k| k.starts_with("nse_fo|")));
+    }
+
+    #[tokio::test]
+    async fn users_charts_never_take_the_users_bands() {
+        let board = ExecuteBoard::new();
+        let (ws_tx, mut rx) = bridge();
+        // One user browses sixty stock charts: only the users' slice goes on
+        // the feed (for the day); the rest are `polled`.
+        let mut on_feed = 0;
+        for i in 0..60 {
+            if board.reserve_chart(&ws_tx, &format!("nse_cm|{i}"), SubPool::Public).await {
+                on_feed += 1;
+            }
+        }
+        assert_eq!(on_feed, MAX_PUBLIC_CHART_SCRIPS);
+        assert_eq!(drain(&mut rx).len(), MAX_PUBLIC_CHART_SCRIPS);
+
+        // Every user's index ladder still gets its whole band, so a paper
+        // buy still has a feed price to read.
+        assert!(MAX_PUBLIC_CHART_SCRIPS + 2 * (2 * BAND_HALF + 1) <= MAX_PUBLIC_BAND_SCRIPS, "a full band fits beside the charts");
+        let chain: Vec<ChainStrike> = (0..60).map(|i| priced(24000.0 + 50.0 * i as f64, 1000 + 2 * i)).collect();
+        let keys = band_keys(&chain, 30, BAND_HALF);
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Public).await;
+        assert_eq!(drain(&mut rx).len(), 2, "the indices and the whole band");
+        assert_eq!(board.subs.lock().await.band.len(), keys.len());
+
+        // Past the cap, a user's chart of a band strike leaves it a band key
+        // (released once no ladder wants it), never one held until the close.
+        let shared = keys[0].clone();
+        assert!(!board.reserve_chart(&ws_tx, &shared, SubPool::Public).await);
+        assert!(drain(&mut rx).is_empty());
+        {
+            let subs = board.subs.lock().await;
+            assert!(subs.band.contains_key(&shared) && !subs.chart.contains_key(&shared));
+        }
+        // The owner's charts are not the users' slice.
+        assert!(board.reserve_chart(&ws_tx, &shared, SubPool::Owner).await);
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|owner", SubPool::Owner).await);
+        assert_eq!(drain(&mut rx).len(), 2);
+        // A key the feed already streams is a user's chart's at no cost.
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|owner", SubPool::Public).await);
+        assert!(drain(&mut rx).is_empty());
+        let subs = board.subs.lock().await;
+        assert_eq!(subs.public_charts(), MAX_PUBLIC_CHART_SCRIPS);
+        assert_eq!(subs.chart.len(), MAX_PUBLIC_CHART_SCRIPS + 2);
     }
 
     #[tokio::test]

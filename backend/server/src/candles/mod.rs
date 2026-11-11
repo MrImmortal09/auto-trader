@@ -9,22 +9,25 @@
 //! from Upstox and are not kept. Once nothing has asked for ten minutes it
 //! stops, so with no v2 client open it holds nothing and taps nothing.
 //!
-//! An index, its future or its options subscribe to Kotak's feed as they
+//! An index, its futures or its options subscribe to Kotak's feed as they
 //! always have. A stock, or a stock's contract (behind `stock_charts`), is
 //! put on the feed through the Execute board's ladder budget
 //! (`ExecuteBoard::reserve_chart`), so charts and ladders share the one
-//! daily allowance and positions' ticks keep their room; past the budget,
-//! or when the feed sends no tick within 15 s of subscribing, the chart is
-//! `polled`: its bars come from Upstox's official minutes alone.
+//! daily allowance and positions' ticks keep their room; past the budget
+//! (for users, past their ten chart keys), or when the feed sends no tick
+//! within 15 s of subscribing, the chart is `polled`: its bars come from
+//! Upstox's official minutes alone. A refused key is asked for again when
+//! a caller whose share has room asks for the chart.
 
 pub mod archive;
 pub mod bars;
 pub mod symbols;
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Datelike, NaiveDate};
 use serde::Serialize;
@@ -59,6 +62,11 @@ const LAG_WARN_EVERY: Duration = Duration::from_secs(60);
 /// A Kotak subscription that has not ticked this long after it was sent is
 /// taken as refused (the feed only logs a refusal): the chart is `polled`.
 const FEED_TICK_WAIT_MS: i64 = 15_000;
+/// An Upstox instruments file that could not be had (a failed download, or
+/// a file that would not decode) is not asked for again for this long: while
+/// Upstox is down, each new contract chart would otherwise wait out the
+/// download's timeout again.
+const DERIVATIVES_RETRY: Duration = Duration::from_secs(60);
 
 /// Upstox's instruments file for each exchange, and the indices whose
 /// derivatives it lists.
@@ -145,6 +153,25 @@ impl Tracked {
     fn polled(&self, now: i64) -> bool {
         is_polled(self.tracking.kotak.is_some(), self.kotak_on_feed, self.kotak_ticked, self.subscribed_at_ms, now)
     }
+
+    /// The stock key the ladder budget refused, to ask again with `pool`'s
+    /// share: `None` once it is on the feed, for an index's subscription
+    /// (never budgeted), and for a visitor, whose share is none.
+    fn refused_key(&self, pool: SubPool) -> Option<String> {
+        match &self.kotak_sub {
+            KotakSub::Budgeted { key, .. } if !self.kotak_on_feed && pool != SubPool::None => Some(key.clone()),
+            _ => None,
+        }
+    }
+
+    /// The budget took `key` on `pool`'s share: the chart waits for its
+    /// first tick from `now`, and a fresh bridge asks that share again.
+    fn put_on_feed(&mut self, key: String, pool: SubPool, now: i64) {
+        self.kotak_sub = KotakSub::Budgeted { key, pool };
+        self.kotak_on_feed = true;
+        self.subscribed_at_ms = Some(now);
+        self.kotak_ticked = false;
+    }
 }
 
 /// Whether a symbol's bars are Upstox's alone — see [`Tracking::polled`].
@@ -161,8 +188,11 @@ fn is_polled(has_kotak: bool, on_feed: bool, ticked: bool, subscribed_at_ms: Opt
 struct State {
     day_start: i64,
     tracked: HashMap<String, Tracked>,
-    /// Kotak or Upstox feed key → symbol name.
-    by_key: HashMap<String, String>,
+    /// Kotak or Upstox feed key → the names tracked on it. Usually one; two
+    /// when a future is charted both bare and by its expiry (`NIFTY:FUT`
+    /// and `NIFTY:FUT:2026-11-24` while November's is the nearest): each
+    /// keeps its own bars from the same ticks.
+    by_key: HashMap<String, Vec<String>>,
     /// The bridge channel the Kotak subscriptions went out on. A re-login
     /// starts a fresh bridge that knows none of them.
     kotak_channel: Option<mpsc::UnboundedSender<String>>,
@@ -247,11 +277,11 @@ pub struct Running {
     execute: Option<Arc<ExecuteBoard>>,
     state: StdMutex<State>,
     /// Upstox's futures and options by underlying, each list loaded once
-    /// per IST day on the first contract asked for: the six indices
+    /// per instruments day on the first contract asked for: the six indices
     /// together from both exchanges' files, a stock on its own from NSE's
     /// (the day's file is cached on disk by the client, so a second stock
     /// filters the file again without downloading it).
-    derivatives: Mutex<HashMap<String, (NaiveDate, Arc<Vec<Derivative>>)>>,
+    derivatives: DerivativeLists,
     changes: broadcast::Sender<Change>,
     /// The Upstox keys the fallback feed should stream.
     upstox_keys: watch::Sender<BTreeSet<String>>,
@@ -280,7 +310,7 @@ impl Running {
                 kotak_channel: None,
                 last_error: HashMap::new(),
             }),
-            derivatives: Mutex::new(HashMap::new()),
+            derivatives: DerivativeLists::default(),
             changes: broadcast::channel(CHANGES_CAPACITY).0,
             upstox_keys: watch::channel(BTreeSet::new()).0,
             open_streams: AtomicUsize::new(0),
@@ -309,21 +339,42 @@ impl Running {
         let name = symbol.name();
         let now = now_ms();
         self.last_used_ms.store(now, Ordering::Release);
-        {
+        let refused_key = {
             let mut st = self.state();
             if self.stopped.load(Ordering::Acquire) {
                 return Err(TrackError::Stopped);
             }
+            match st.tracked.get_mut(&name) {
+                Some(t) => {
+                    t.last_used_ms = now;
+                    match t.refused_key(pool) {
+                        Some(key) => Some(key),
+                        None => return Ok(t.tracking_at(now)),
+                    }
+                }
+                None => None,
+            }
+        };
+        // Tracked already, but the budget refused its stock key to whoever
+        // asked first: this caller's share may have room theirs lacked (the
+        // admin opening a chart a full users' share left `polled`).
+        if let Some(key) = refused_key {
+            let on_feed = self.reserve_chart(&key, pool).await;
+            let now = now_ms();
+            let mut st = self.state();
             if let Some(t) = st.tracked.get_mut(&name) {
-                t.last_used_ms = now;
+                if on_feed {
+                    t.put_on_feed(key, pool, now);
+                }
                 return Ok(t.tracking_at(now));
             }
-        }
-        if symbol.refusal().is_some() {
-            return Err(TrackError::NotFound);
+            // Dropped meanwhile (a new day): tracked afresh below.
         }
 
         let today = shared_domain::today_ist();
+        if symbol.refusal(today).is_some() {
+            return Err(TrackError::NotFound);
+        }
         // A stock's cash row: its feed key, and Upstox's key by ISIN.
         let equity_key = match &symbol {
             Symbol::Equity { symbol, .. } => self.catalog.as_ref().and_then(|c| c.spot_key(symbol)),
@@ -333,7 +384,7 @@ impl Running {
             _ if self.upstox.is_none() => None,
             Symbol::Index(index) => symbols::upstox_index_key(index).map(str::to_string),
             Symbol::Equity { .. } => equity_key.as_deref().and_then(|key| self.catalog.as_ref()?.upstox_key(key)),
-            _ => match self.derivatives_for(symbol.underlying(), today).await {
+            _ => match self.derivatives_for(symbol.underlying()).await {
                 Some(list) => symbols::find_upstox(&symbol, &list, today).map(|d| d.instrument_key.clone()),
                 None => None,
             },
@@ -393,7 +444,10 @@ impl Running {
                 return Err(TrackError::Stopped);
             }
             for key in tracking.kotak.iter().chain(tracking.upstox.iter()) {
-                st.by_key.insert(key.clone(), name.clone());
+                let names = st.by_key.entry(key.clone()).or_default();
+                if !names.contains(&name) {
+                    names.push(name.clone());
+                }
             }
             st.tracked.entry(name.clone()).or_insert(Tracked {
                 tracking: tracking.clone(),
@@ -486,23 +540,29 @@ impl Running {
         StreamGuard { running: Arc::clone(self) }
     }
 
-    /// Fold one price into the symbol `key` belongs to, if it is tracked.
+    /// Fold one price into every tracked symbol `key` belongs to.
     fn apply_tick(&self, key: &str, at_ms: i64, price: f64) {
         let mut st = self.state();
-        let Some(name) = st.by_key.get(key).cloned() else { return };
-        let Some(t) = st.tracked.get_mut(&name) else { return };
-        if t.tracking.kotak.as_deref() == Some(key) {
-            t.kotak_ticked = true;
-        }
-        let Some(minute) = t.day.tick(at_ms, price) else { return };
-        // The minute before just closed: cache it unless Upstox already has it.
-        let closed = t.forming.filter(|m| *m != minute).filter(|m| !t.day.has_official(*m));
-        t.forming = Some(minute);
-        if let Some(bar) = closed.and_then(|m| t.day.ticked_minute(m)) {
-            let _ = self.db_tx.try_send(candle_minute(&name, bar, "ticks"));
+        let Some(names) = st.by_key.get(key).cloned() else { return };
+        let mut changed: Vec<(String, i64)> = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(t) = st.tracked.get_mut(&name) else { continue };
+            if t.tracking.kotak.as_deref() == Some(key) {
+                t.kotak_ticked = true;
+            }
+            let Some(minute) = t.day.tick(at_ms, price) else { continue };
+            // The minute before just closed: cache it unless Upstox already has it.
+            let closed = t.forming.filter(|m| *m != minute).filter(|m| !t.day.has_official(*m));
+            t.forming = Some(minute);
+            if let Some(bar) = closed.and_then(|m| t.day.ticked_minute(m)) {
+                let _ = self.db_tx.try_send(candle_minute(&name, bar, "ticks"));
+            }
+            changed.push((name, minute));
         }
         drop(st);
-        let _ = self.changes.send(Change { symbol: name.into(), minute });
+        for (name, minute) in changed {
+            let _ = self.changes.send(Change { symbol: name.into(), minute });
+        }
     }
 
     /// Ask the bridge to stream one symbol. Which channel already has every
@@ -546,48 +606,14 @@ impl Running {
         }
     }
 
-    /// Upstox's futures and options on `underlying` for `today`, loaded on
-    /// first use: the six indices' lists together (both exchanges' files), a
-    /// stock's from NSE's file on its own.
-    async fn derivatives_for(&self, underlying: &str, today: NaiveDate) -> Option<Arc<Vec<Derivative>>> {
+    /// Upstox's futures and options on `underlying`, for the instruments
+    /// day (`upstox_client::instruments_day`: it starts at 07:00 IST, once
+    /// Upstox has published the day's file, so a list read before that is
+    /// not kept past it) — see [`DerivativeLists::get_or_load`].
+    async fn derivatives_for(&self, underlying: &str) -> Option<Arc<Vec<Derivative>>> {
         let client = self.upstox.as_ref()?;
-        let mut cache = self.derivatives.lock().await;
-        if let Some((day, list)) = cache.get(underlying) {
-            if *day == today {
-                return Some(Arc::clone(list));
-            }
-        }
-        cache.retain(|_, (day, _)| *day == today);
-        if shared_domain::INDEX_NAMES.contains(&underlying) {
-            let mut all: Vec<Derivative> = Vec::new();
-            for (url, wanted) in UPSTOX_INDEX_FILES {
-                match client.derivatives(url, wanted).await {
-                    Ok(rows) => all.extend(rows),
-                    Err(e) => {
-                        tracing::warn!(error = %e, url, "Upstox instruments download failed — futures and options charts have no Upstox data until it works");
-                        return None;
-                    }
-                }
-            }
-            tracing::info!(contracts = all.len(), "Upstox index derivatives loaded for the charts");
-            for index in shared_domain::INDEX_NAMES {
-                let list: Vec<Derivative> = all.iter().filter(|d| d.underlying == *index).cloned().collect();
-                cache.insert(index.to_string(), (today, Arc::new(list)));
-            }
-        } else {
-            // NSE only: a stock's contracts trade there (question 3).
-            match client.derivatives(upstox_client::NSE_INSTRUMENTS_URL, &[underlying]).await {
-                Ok(rows) => {
-                    tracing::info!(underlying, contracts = rows.len(), "Upstox derivatives loaded for a stock's charts");
-                    cache.insert(underlying.to_string(), (today, Arc::new(rows)));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, underlying, "Upstox instruments download failed — this stock's futures and options charts have no Upstox data until it works");
-                    return None;
-                }
-            }
-        }
-        cache.get(underlying).map(|(_, list)| Arc::clone(list))
+        let day = upstox_client::instruments_day(shared_domain::now_ist());
+        self.derivatives.get_or_load(underlying, day, || load_derivatives(client, underlying)).await
     }
 
     /// Pull Upstox's official minutes for one symbol and keep the finished ones.
@@ -743,7 +769,13 @@ impl Running {
         for name in &idle {
             if let Some(t) = st.tracked.remove(name) {
                 for key in t.tracking.kotak.iter().chain(t.tracking.upstox.iter()) {
-                    st.by_key.remove(key);
+                    // Another name on the same contract keeps its ticks.
+                    if let Some(names) = st.by_key.get_mut(key) {
+                        names.retain(|n| n != name);
+                        if names.is_empty() {
+                            st.by_key.remove(key);
+                        }
+                    }
                 }
                 st.last_error.remove(name);
             }
@@ -762,11 +794,9 @@ impl Running {
         self.stopped.store(true, Ordering::Release);
         st.by_key.clear();
         drop(st);
-        // The contract lists are the biggest thing held; nothing loads them
-        // while stopped, so a busy lock just means they go with the service.
-        if let Ok(mut derivatives) = self.derivatives.try_lock() {
-            derivatives.clear();
-        }
+        // The contract lists are the biggest thing held; nothing asks for
+        // them while stopped (a load still under way goes with the service).
+        self.derivatives.clear();
         tracing::info!("Candle service stopped — no chart has asked for anything in 10 minutes");
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
         for task in tasks {
@@ -774,6 +804,152 @@ impl Running {
             task.abort();
         }
         true
+    }
+}
+
+/// Upstox's contract lists, by underlying, for one instruments day each.
+///
+/// A list already in memory is answered from a lock nothing holds across a
+/// download or a decompress, so an index chart never waits on a stock's
+/// load. Loads run one at a time: each is a download (a 180 s timeout) or a
+/// stream-decompress of the cached file, seconds of the VM's two cores, and
+/// a caller waiting on the same list finds it loaded when its turn comes
+/// instead of loading it again. A file that could not be had is not asked
+/// for again for [`DERIVATIVES_RETRY`]: every list that needs it is then
+/// answered at once with nothing, rather than queueing behind one more
+/// download that times out.
+#[derive(Default)]
+struct DerivativeLists {
+    state: StdMutex<DerivativeState>,
+    loading: Mutex<()>,
+}
+
+#[derive(Default)]
+struct DerivativeState {
+    /// Underlying → the instruments day its list was read for, and the list.
+    lists: HashMap<String, (NaiveDate, Arc<Vec<Derivative>>)>,
+    /// Instruments file (its URL) → when it last could not be had.
+    failed: HashMap<&'static str, Instant>,
+}
+
+/// What the lists hold for one underlying.
+enum Cached {
+    Hit(Arc<Vec<Derivative>>),
+    /// A file its list is read from failed under [`DERIVATIVES_RETRY`] ago.
+    Failed,
+    Missing,
+}
+
+/// The instruments files `underlying`'s list is read from: both
+/// exchanges' for the six indices (they load together), NSE's for a stock.
+fn list_files(underlying: &str) -> &'static [&'static str] {
+    const INDEX_FILES: [&str; 2] = [UPSTOX_INDEX_FILES[0].0, UPSTOX_INDEX_FILES[1].0];
+    const STOCK_FILES: [&str; 1] = [upstox_client::NSE_INSTRUMENTS_URL];
+    if shared_domain::INDEX_NAMES.contains(&underlying) { &INDEX_FILES } else { &STOCK_FILES }
+}
+
+impl DerivativeState {
+    fn cached(&self, underlying: &str, day: NaiveDate, now: Instant) -> Cached {
+        if let Some((d, list)) = self.lists.get(underlying) {
+            if *d == day {
+                return Cached::Hit(Arc::clone(list));
+            }
+        }
+        let failed = list_files(underlying)
+            .iter()
+            .any(|file| self.failed.get(file).is_some_and(|at| now.saturating_duration_since(*at) < DERIVATIVES_RETRY));
+        if failed { Cached::Failed } else { Cached::Missing }
+    }
+}
+
+impl DerivativeLists {
+    fn state(&self) -> MutexGuard<'_, DerivativeState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `underlying`'s list for the instruments `day`: from memory when it is
+    /// there, else `load` brings it (every underlying that load lists), or
+    /// names the file it could not have (logged by `load`). Meanwhile, and
+    /// for [`DERIVATIVES_RETRY`] after such a failure, the chart has no
+    /// Upstox data.
+    async fn get_or_load<F, Fut>(&self, underlying: &str, day: NaiveDate, load: F) -> Option<Arc<Vec<Derivative>>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<(String, Vec<Derivative>)>, &'static str>>,
+    {
+        let cached = self.state().cached(underlying, day, Instant::now());
+        match cached {
+            Cached::Hit(list) => return Some(list),
+            Cached::Failed => return None,
+            Cached::Missing => {}
+        }
+        let _one_at_a_time = self.loading.lock().await;
+        // Loaded, or failed, by the caller this one waited behind.
+        let cached = self.state().cached(underlying, day, Instant::now());
+        match cached {
+            Cached::Hit(list) => return Some(list),
+            Cached::Failed => return None,
+            Cached::Missing => {}
+        }
+        let loaded = load().await;
+        let mut st = self.state();
+        // An older day's lists are never read again.
+        st.lists.retain(|_, (d, _)| *d == day);
+        match loaded {
+            Ok(lists) => {
+                for file in list_files(underlying) {
+                    st.failed.remove(file);
+                }
+                for (u, list) in lists {
+                    st.lists.insert(u, (day, Arc::new(list)));
+                }
+                st.lists.get(underlying).map(|(_, list)| Arc::clone(list))
+            }
+            Err(file) => {
+                st.failed.insert(file, Instant::now());
+                None
+            }
+        }
+    }
+
+    fn clear(&self) {
+        *self.state() = DerivativeState::default();
+    }
+}
+
+/// Every list `underlying`'s load brings from Upstox: the six indices'
+/// (both exchanges' files), or one stock's from NSE's file. `Err` names the
+/// file that could not be had, logged here.
+async fn load_derivatives(client: &UpstoxClient, underlying: &str) -> Result<Vec<(String, Vec<Derivative>)>, &'static str> {
+    if shared_domain::INDEX_NAMES.contains(&underlying) {
+        let mut all: Vec<Derivative> = Vec::new();
+        for (url, wanted) in UPSTOX_INDEX_FILES {
+            match client.derivatives(url, wanted).await {
+                Ok(rows) => all.extend(rows),
+                Err(e) => {
+                    tracing::warn!(error = %e, url, "Upstox instruments download failed — futures and options charts have no Upstox data for a minute, then it is tried again");
+                    return Err(url);
+                }
+            }
+        }
+        tracing::info!(contracts = all.len(), "Upstox index derivatives loaded for the charts");
+        Ok(shared_domain::INDEX_NAMES
+            .iter()
+            .map(|index| (index.to_string(), all.iter().filter(|d| d.underlying == *index).cloned().collect()))
+            .collect())
+    } else {
+        // NSE only: a stock's contracts trade there (question 3).
+        let url = upstox_client::NSE_INSTRUMENTS_URL;
+        match client.derivatives(url, &[underlying]).await {
+            Ok(rows) => {
+                tracing::info!(underlying, contracts = rows.len(), "Upstox derivatives loaded for a stock's charts");
+                Ok(vec![(underlying.to_string(), rows)])
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, underlying, "Upstox instruments download failed — stocks' futures and options charts have no Upstox data for a minute, then it is tried again");
+                Err(url)
+            }
+        }
     }
 }
 
@@ -854,6 +1030,17 @@ mod tests {
 
     /// A service with no Upstox client and no Kotak bridge, on its own DB.
     async fn service(name: &str) -> (Arc<Running>, TempDb, mpsc::Receiver<DbWriteMessage>) {
+        service_with(name, None, None, None).await
+    }
+
+    /// A service with no Upstox client, on its own DB, with this scrip
+    /// master, bridge channel and Execute board.
+    async fn service_with(
+        name: &str,
+        store: Option<ScripStore>,
+        bridge: Option<mpsc::UnboundedSender<String>>,
+        execute: Option<Arc<ExecuteBoard>>,
+    ) -> (Arc<Running>, TempDb, mpsc::Receiver<DbWriteMessage>) {
         let db = TempDb::new(name);
         let pool = crate::db::init_db(&format!("sqlite://{}", db.0.display())).await;
         let (db_tx, db_rx) = mpsc::channel(64);
@@ -861,10 +1048,10 @@ mod tests {
             upstox: None,
             db_tx,
             pool,
-            scrip_store: Arc::new(RwLock::new(None)),
-            ws_tx: Arc::new(Mutex::new(None)),
+            scrip_store: Arc::new(RwLock::new(store)),
+            ws_tx: Arc::new(Mutex::new(bridge)),
             catalog: None,
-            execute: None,
+            execute,
         })
         .await;
         (running, db, db_rx)
@@ -934,7 +1121,8 @@ mod tests {
         // No catalog here: neither broker's key is known.
         assert!(matches!(running.track(nse, SubPool::Owner).await, Err(TrackError::NotFound)));
         assert!(matches!(running.track(bse, SubPool::Owner).await, Err(TrackError::NotFound)));
-        assert!(matches!(running.track(Symbol::Future("RELIANCE".into()), SubPool::Owner).await, Err(TrackError::NotFound)));
+        let future = Symbol::Future { underlying: "RELIANCE".into(), expiry: None };
+        assert!(matches!(running.track(future, SubPool::Owner).await, Err(TrackError::NotFound)));
         assert!(running.tracking("RELIANCE").is_none());
     }
 
@@ -952,5 +1140,235 @@ mod tests {
         assert!(!is_polled(true, true, true, Some(at), at + 10 * FEED_TICK_WAIT_MS));
         // On the feed but never stamped: nothing to wait on.
         assert!(is_polled(true, true, false, None, at));
+    }
+
+    fn future_record(name: &str, token: &str, expiry: NaiveDate) -> trading_engine::ScripRecord {
+        trading_engine::ScripRecord {
+            instrument_token: token.into(),
+            trading_symbol: format!("{name}{}FUT", expiry.format("%y%b").to_string().to_uppercase()),
+            symbol_name: name.into(),
+            exchange_segment_code: "nse_fo".into(),
+            strike_price: 0.0,
+            option_type: "XX".into(),
+            expiry_date: expiry,
+            lot_size: 65,
+            tick_size: 0.05,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_future_charted_bare_and_by_its_expiry_keeps_both_charts_ticking() {
+        let today = shared_domain::today_ist();
+        let (near, next) = (today + chrono::Days::new(10), today + chrono::Days::new(40));
+        let yesterday = today - chrono::Days::new(1);
+        let mut store = ScripStore::default();
+        store.records.insert("NIFTY".into(), vec![
+            future_record("NIFTY", "48700", yesterday),
+            future_record("NIFTY", "48704", near),
+            future_record("NIFTY", "48705", next),
+        ]);
+        let (running, _db, _db_rx) = service_with("dated", Some(store), None, None).await;
+        let bare = Symbol::Future { underlying: "NIFTY".into(), expiry: None };
+        let dated = Symbol::Future { underlying: "NIFTY".into(), expiry: Some(near) };
+        let later = Symbol::Future { underlying: "NIFTY".into(), expiry: Some(next) };
+
+        // The bare form is the nearest; the dated one names that contract,
+        // and the later month is its own, never the nearest.
+        let a = running.track(bare.clone(), SubPool::Owner).await.unwrap();
+        let b = running.track(dated.clone(), SubPool::Owner).await.unwrap();
+        let c = running.track(later.clone(), SubPool::Owner).await.unwrap();
+        assert_eq!((a.name.as_str(), a.kotak.as_deref()), ("NIFTY:FUT", Some("nse_fo|48704")));
+        assert_eq!(b.name, symbols::dated_future_name("NIFTY", near));
+        assert_eq!(b.kotak.as_deref(), Some("nse_fo|48704"));
+        assert_eq!(c.kotak.as_deref(), Some("nse_fo|48705"));
+        // A date nothing expires on is not a contract (a 404); an expired
+        // future is refused, though the scrip master still lists it.
+        let nothing = Symbol::Future { underlying: "NIFTY".into(), expiry: Some(today + chrono::Days::new(11)) };
+        assert!(matches!(running.track(nothing, SubPool::Owner).await, Err(TrackError::NotFound)));
+        let expired = Symbol::Future { underlying: "NIFTY".into(), expiry: Some(yesterday) };
+        assert!(matches!(running.track(expired, SubPool::Owner).await, Err(TrackError::NotFound)));
+
+        // One tick of the shared contract builds both charts' bars.
+        let t = today_at(9, 20);
+        let mut changes = running.subscribe_changes();
+        running.apply_tick("nse_fo|48704", t + 1_000, 24_100.0);
+        assert_eq!(running.today("NIFTY:FUT", Tf::M1).len(), 1);
+        assert_eq!(running.today(&b.name, Tf::M1).len(), 1);
+        assert!(running.today(&c.name, Tf::M1).is_empty(), "another month's ticks are its own");
+        let mut changed: Vec<String> = std::iter::from_fn(|| changes.try_recv().ok()).map(|c| c.symbol.to_string()).collect();
+        changed.sort();
+        assert_eq!(changed, ["NIFTY:FUT".to_string(), b.name.clone()]);
+
+        // The bare chart lapses; the dated one keeps its ticks.
+        running.state().tracked.get_mut("NIFTY:FUT").unwrap().last_used_ms -= 2 * IDLE_MS;
+        assert!(!running.sweep(now_ms()));
+        assert!(running.tracking("NIFTY:FUT").is_none());
+        running.apply_tick("nse_fo|48704", t + MINUTE_MS + 1_000, 24_120.0);
+        assert_eq!(running.today(&b.name, Tf::M1).len(), 2);
+        assert_eq!(running.state().by_key.get("nse_fo|48704").unwrap(), &[b.name.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_stock_key_is_asked_for_again_with_the_next_callers_share() {
+        let today = shared_domain::today_ist();
+        let expiry = today + chrono::Days::new(10);
+        let mut store = ScripStore::default();
+        store.records.insert("RELIANCE".into(), vec![future_record("RELIANCE", "43001", expiry)]);
+        let board = Arc::new(ExecuteBoard::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (running, _db, _db_rx) = service_with("retry", Some(store), Some(tx), Some(Arc::clone(&board))).await;
+        let symbol = Symbol::Future { underlying: "RELIANCE".into(), expiry: None };
+        let name = symbol.name();
+        let key = "nse_fo|43001".to_string();
+
+        // Tracked as a user's chart the budget refused (Upstox, here left
+        // out, would draw it): `polled`, nothing sent.
+        let now = now_ms();
+        running.state().tracked.insert(name.clone(), Tracked {
+            tracking: Tracking { name: name.clone(), kotak: Some(key.clone()), upstox: Some("NSE_FO|35001".into()), polled: true },
+            kotak_sub: KotakSub::Budgeted { key: key.clone(), pool: SubPool::Public },
+            kotak_on_feed: false,
+            subscribed_at_ms: None,
+            kotak_ticked: false,
+            day: DaySeries::default(),
+            forming: None,
+            last_used_ms: now,
+        });
+        running.state().by_key.insert(key.clone(), vec![name.clone()]);
+
+        // A visitor's share is none: still polled, nothing sent.
+        assert!(running.track(symbol.clone(), SubPool::None).await.unwrap().polled);
+        assert!(rx.try_recv().is_err());
+        // The admin's share has room: the key goes out, and the chart waits
+        // for the feed's first tick instead of staying polled.
+        let tracking = running.track(symbol.clone(), SubPool::Owner).await.unwrap();
+        assert!(!tracking.polled);
+        let sent: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(sent, serde_json::json!({ "action": "subscribe", "scrips": key, "ladder": true }));
+        {
+            let st = running.state();
+            let t = st.tracked.get(&name).unwrap();
+            assert!(t.kotak_on_feed && t.subscribed_at_ms.is_some());
+            assert!(matches!(&t.kotak_sub, KotakSub::Budgeted { pool: SubPool::Owner, .. }), "a fresh bridge asks the share that had room");
+        }
+        // On the feed now: asked again, nothing more is sent.
+        assert!(!running.track(symbol, SubPool::Public).await.unwrap().polled);
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn contracts(underlying: &str, n: usize) -> Vec<(String, Vec<Derivative>)> {
+        let list = (0..n)
+            .map(|i| Derivative {
+                underlying: underlying.into(),
+                kind: "FUT".into(),
+                expiry: NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+                strike: 0.0,
+                instrument_key: format!("NSE_FO|{i}"),
+                lot_size: 1,
+            })
+            .collect();
+        vec![(underlying.to_string(), list)]
+    }
+
+    #[tokio::test]
+    async fn a_contract_list_in_memory_never_waits_on_another_ones_load() {
+        let lists = Arc::new(DerivativeLists::default());
+        let day = NaiveDate::from_ymd_opt(2026, 11, 11).unwrap();
+        let indices: Vec<(String, Vec<Derivative>)> =
+            shared_domain::INDEX_NAMES.iter().flat_map(|i| contracts(i, 2)).collect();
+        assert_eq!(lists.get_or_load("NIFTY", day, || async { Ok(indices) }).await.unwrap().len(), 2);
+
+        // A stock's load hangs (a slow download)...
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let slow = {
+            let (lists, loads) = (Arc::clone(&lists), Arc::clone(&loads));
+            tokio::spawn(async move {
+                lists
+                    .get_or_load("RELIANCE", day, || async move {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        let _ = wait.await;
+                        Ok(contracts("RELIANCE", 3))
+                    })
+                    .await
+            })
+        };
+        while loads.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // ...and an index list already loaded is answered at once, the
+        // other indices' too (they load together), without loading.
+        for index in ["NIFTY", "SENSEX"] {
+            let quick = lists.get_or_load(index, day, || async { panic!("{index} is in memory") });
+            let found = tokio::time::timeout(Duration::from_secs(1), quick).await.expect("not held up by the stock's load");
+            assert_eq!(found.unwrap().len(), 2);
+        }
+        // A second chart of the same stock waits for that load and finds
+        // its list, instead of loading it again.
+        let again = {
+            let (lists, loads) = (Arc::clone(&lists), Arc::clone(&loads));
+            tokio::spawn(async move {
+                lists
+                    .get_or_load("RELIANCE", day, || async move {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        Ok(contracts("RELIANCE", 3))
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        assert_eq!(slow.await.unwrap().unwrap().len(), 3);
+        assert_eq!(again.await.unwrap().unwrap().len(), 3);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        // The next instruments day loads afresh, and drops the old day's lists.
+        let next = day.succ_opt().unwrap();
+        assert_eq!(lists.get_or_load("RELIANCE", next, || async { Ok(contracts("RELIANCE", 4)) }).await.unwrap().len(), 4);
+        assert!(matches!(lists.state().cached("NIFTY", next, Instant::now()), Cached::Missing));
+    }
+
+    #[tokio::test]
+    async fn a_file_that_could_not_be_had_is_not_asked_for_again_for_a_minute() {
+        let lists = DerivativeLists::default();
+        let day = NaiveDate::from_ymd_opt(2026, 11, 11).unwrap();
+        let (nse, bse) = (upstox_client::NSE_INSTRUMENTS_URL, upstox_client::BSE_INSTRUMENTS_URL);
+        let loads = AtomicUsize::new(0);
+        let fails_on = |file: &'static str| {
+            let loads = &loads;
+            move || async move {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Err(file)
+            }
+        };
+
+        // BSE's file fails: the indices' lists (which need it) wait a
+        // minute; a stock's, from NSE's file alone, still loads.
+        assert!(lists.get_or_load("SENSEX", day, fails_on(bse)).await.is_none());
+        assert!(lists.get_or_load("NIFTY", day, fails_on(bse)).await.is_none());
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(lists.get_or_load("TCS", day, || async { Ok(contracts("TCS", 1)) }).await.unwrap().len(), 1);
+
+        // NSE's file fails: every stock not yet loaded, and the indices, are
+        // answered at once with nothing — no download to queue behind.
+        assert!(lists.get_or_load("RELIANCE", day, fails_on(nse)).await.is_none());
+        assert!(lists.get_or_load("RELIANCE", day, fails_on(nse)).await.is_none());
+        assert!(lists.get_or_load("INFY", day, fails_on(nse)).await.is_none());
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        // A list already in memory is still answered.
+        assert_eq!(lists.get_or_load("TCS", day, fails_on(nse)).await.unwrap().len(), 1);
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+
+        // A minute on, each file is asked for again.
+        let now = Instant::now();
+        let st = lists.state();
+        assert!(matches!(st.cached("RELIANCE", day, now), Cached::Failed));
+        let later = now + DERIVATIVES_RETRY + Duration::from_secs(1);
+        assert!(matches!(st.cached("RELIANCE", day, later), Cached::Missing));
+        assert!(matches!(st.cached("SENSEX", day, later), Cached::Missing));
+        drop(st);
+        lists.state().failed.values_mut().for_each(|at| *at = now - DERIVATIVES_RETRY - Duration::from_secs(1));
+        assert_eq!(lists.get_or_load("RELIANCE", day, || async { Ok(contracts("RELIANCE", 2)) }).await.unwrap().len(), 2);
+        assert!(!lists.state().failed.contains_key(nse), "a load that worked clears its file's failure");
     }
 }
