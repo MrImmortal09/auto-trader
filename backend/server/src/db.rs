@@ -1484,7 +1484,14 @@ pub(crate) mod test_support {
     pub(crate) struct TempDb(std::path::PathBuf);
 
     impl TempDb {
+        /// `name` must be unique in the crate: the file is named after it and
+        /// the process id only, and every test in a run shares that process,
+        /// so two tests with one name delete each other's live database. A
+        /// name taken twice panics here, whatever order the tests run in.
         pub(crate) fn new(name: &str) -> Self {
+            static TAKEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+            let fresh = TAKEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(name.to_string());
+            assert!(fresh, "TempDb name {name:?} is used by two tests; give each its own");
             let path = std::env::temp_dir().join(format!("auto-trader-{name}-{}.db", std::process::id()));
             let db = TempDb(path);
             db.remove();
@@ -1511,6 +1518,13 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             self.remove();
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "used by two tests")]
+    fn a_name_taken_twice_panics() {
+        let _first = TempDb::new("taken-twice");
+        let _second = TempDb::new("taken-twice");
     }
 }
 

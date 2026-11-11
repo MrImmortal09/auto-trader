@@ -113,7 +113,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_buy_that_brings_a_new_stock_wakes_the_keeper_at_once() {
-        let (_db, desk) = desk("feed-wake").await;
+        let (_db, desk) = desk("feed-keeper-wake").await;
         let desk = Arc::new(desk);
         desk.buy(1, &nifty(25_000.0, "CE"), 1, 100.0).await.unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
