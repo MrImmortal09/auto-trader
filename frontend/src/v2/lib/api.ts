@@ -21,12 +21,16 @@ import type {
   GroupId,
   HistoryAnswer,
   IndicatorAnswer,
+  Instrument,
+  InstrumentsStatus,
   KotakState,
   MarketIndex,
   MarketLive,
   MarksAnswer,
   PaperActivity,
   MeAnswer,
+  QuoteAnswer,
+  SearchAnswer,
   ModeCheck,
   OptionChainAnswer,
   RangeId,
@@ -123,6 +127,20 @@ export const getVersion = (base: string) => getJson<{ version: string }>(base, '
 /** `symbol`'s bars at `tf` from one IST day to another (`YYYY-MM-DD`), both included. */
 export const getCandles = (base: string, symbol: string, tf: Tf, from: string, to: string) =>
   getJson<{ bars: Bar[] }>(base, `/api/v2/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&from=${from}&to=${to}`);
+
+// ── Instrument search (behind the `search` switch: a 404 while it is off) ── //
+
+/** Everything `q` matches — a symbol, a name, an ISIN, `BANKNIFTY 52000 CE`
+ * or `TATA FUT` — grouped Indices / Stocks / Futures / Options, at most
+ * `limit` (1–8) rows each, each with its quote when the hub has one. */
+export const searchInstruments = (base: string, q: string, limit?: number) =>
+  getJson<SearchAnswer>(base, `/api/v2/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`);
+/** The quotes for up to 60 price-map keys; a key asked for is polled for the next 15 s. */
+export const getQuotes = (base: string, keys: string[]) => getJson<QuoteAnswer>(base, `/api/v2/quotes?keys=${encodeURIComponent(keys.join(','))}`);
+/** One instrument by its id (`nse_cm:2885`), with its quote and its underlying's. */
+export const getInstrument = (base: string, id: string) => getJson<Instrument>(base, `/api/v2/instruments/${encodeURIComponent(id)}`);
+/** The catalog's and the quote hub's state — the admin's. */
+export const getInstrumentsStatus = (base: string) => getJson<InstrumentsStatus>(base, '/api/v2/instruments/status');
 
 export const getIndicator = (base: string) => getJson<IndicatorAnswer>(base, '/api/market/indicator');
 export const getMarketLive = (base: string) => getJson<MarketLive>(base, '/api/market/live');
