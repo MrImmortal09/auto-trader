@@ -37,10 +37,12 @@ export function tradeIndexOf(row: Pick<InstrumentRow, 'kind' | 'symbol' | 'under
 type RowFacts = Pick<InstrumentRow, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike' | 'exchange' | 'has_fo' | 'ws_key'>;
 
 /**
- * The chart the Trade screen can draw for `row`: an index or an index's
- * option always; with `stocksOn`, a stock, a stock's future or option too.
- * `null` for an index's future (no row of the six has one in the catalog
- * the ladder knows) and for a stock while the switch is off.
+ * The chart the Trade screen can draw for `row`: an index, an index's
+ * future or option always; with `stocksOn`, a stock, a stock's future or
+ * option too. A future is named by its expiry (`RELIANCE:FUT:2026-12-29`),
+ * so a later month's row charts that contract, never the nearest one; a row
+ * without an expiry (none in the catalog) is the nearest. `null` for a
+ * stock while the switch is off.
  */
 export function chartSymOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike' | 'exchange'>, stocksOn: boolean): ChartSym | null {
   const index = tradeIndexOf(row);
@@ -48,19 +50,14 @@ export function chartSymOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying' 
   const underlying = index ?? (stocksOn ? row.underlying : null);
   if (!underlying) return null;
   if (row.kind === 'EQ') return stocksOn ? { kind: 'equity', symbol: row.symbol, exchange: row.exchange === 'BSE' ? 'BSE' : 'NSE' } : null;
-  if (row.kind === 'FUT') return { kind: 'future', index: underlying };
+  if (row.kind === 'FUT') return row.expiry ? { kind: 'future', index: underlying, expiry: row.expiry } : { kind: 'future', index: underlying };
   if ((row.kind === 'CE' || row.kind === 'PE') && row.expiry && row.strike != null) return { kind: 'option', index: underlying, expiry: row.expiry, strike: row.strike, side: row.kind };
   return null;
 }
 
-/** The chart for `row` as the screens knew it before stock charts: an
- * index or an index's option. */
-export function chartOf(row: Pick<InstrumentRow, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike'>): ChartSym | null {
-  return chartSymOf({ ...row, exchange: 'NSE' }, false);
-}
-
 /** The ladder `row` can open: its index, or with `stocksOn` its F&O stock,
- * on a contract's own expiry. */
+ * on a contract's own expiry (a future's too, so the ladder and the chart
+ * are on one month). */
 export function ladderOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'has_fo'>, stocksOn: boolean): { index: string; expiry?: string | null } | null {
   const index = tradeIndexOf(row) ?? (stocksOn && row.has_fo ? row.underlying : null);
   if (!index) return null;

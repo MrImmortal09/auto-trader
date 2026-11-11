@@ -19,7 +19,7 @@ import { useDrawing, useDrawPrefs, type DrawApi, type DrawTool } from './drawing
 import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type ChartState, type Placing } from './KChart';
 import type { Layers } from './lines';
-import { CANDLE_STYLES, CHART_LIBS, hasVolume, sameSym, symbolLabel, symbolName, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, sameSym, symbolLabel, symbolName, symExpiry, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { QuoteStrip } from './QuoteStrip';
 import { drawableStudies, STUDIES } from './studies';
 
@@ -64,10 +64,11 @@ function LotsStepper({ lots }: { lots: LotsPick }) {
 /**
  * The symbol picker's search row (behind the `stock_charts` switch): any
  * stock, future or option the catalog lists, typed and picked for this
- * chart. Mounted only while the picker is open, so a query never outlives
- * it.
+ * chart. A future is named with its month ("RELIANCE DEC FUT"), since a
+ * stock lists several; the row this chart shows (`current`) is marked.
+ * Mounted only while the picker is open, so a query never outlives it.
  */
-function PickerSearch({ serverBase, compact, onPick }: { serverBase: string; compact: boolean; onPick: (row: InstrumentRow) => void }) {
+function PickerSearch({ serverBase, compact, current, onPick }: { serverBase: string; compact: boolean; current: ChartSym; onPick: (row: InstrumentRow) => void }) {
   const [query, setQuery] = useState('');
   const typed = query.trim();
   const search = useSearch(serverBase, query, true);
@@ -90,21 +91,25 @@ function PickerSearch({ serverBase, compact, onPick }: { serverBase: string; com
       </div>
       {typed && (
         <div role="listbox" aria-label="Instruments" className="mt-1 max-h-56 overflow-y-auto">
-          {rows.slice(0, 12).map((r) => (
-            <button
-              key={r.id}
-              type="button"
-              role="option"
-              aria-selected={false}
-              title={rowTitle(r)}
-              onClick={() => onPick(r)}
-              className={`flex w-full items-center gap-2 rounded-6 px-2 text-left text-fg-muted hover:bg-raised hover:text-fg ${row}`}
-            >
-              <span className="shrink-0 whitespace-nowrap type-label text-fg">{rowSymbol(r)}</span>
-              <KindChips row={r} />
-              <span className="min-w-0 truncate type-caption">{derivativeNote(r) ?? r.name}</span>
-            </button>
-          ))}
+          {rows.slice(0, 12).map((r) => {
+            const sym = chartSymOf(r, true);
+            const on = sym != null && sameSym(sym, current);
+            return (
+              <button
+                key={r.id}
+                type="button"
+                role="option"
+                aria-selected={on}
+                title={rowTitle(r)}
+                onClick={() => onPick(r)}
+                className={`flex w-full items-center gap-2 rounded-6 px-2 text-left ${on ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'} ${row}`}
+              >
+                <span className={`shrink-0 whitespace-nowrap type-label ${on ? 'text-accent' : 'text-fg'}`}>{r.kind === 'FUT' ? rowTitle(r) : rowSymbol(r)}</span>
+                <KindChips row={r} />
+                <span className="min-w-0 truncate type-caption">{derivativeNote(r) ?? r.name}</span>
+              </button>
+            );
+          })}
           {search.pending && <p className="px-2 py-1 type-caption text-fg-subtle">Searching…</p>}
           {!search.pending && search.answer && rows.length === 0 && <p className="px-2 py-1 type-caption text-fg-subtle">No match for '{typed}'</p>}
           {search.error && <p className="px-2 py-1 type-caption text-loss">{search.error}</p>}
@@ -211,8 +216,13 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   }, [menu]);
 
   const underlying = underlyingOf(sym);
-  const symbolKey = sym.kind === 'option' ? `${underlying}:${sym.expiry}` : underlying;
-  const pickExpiry = picked?.on === symbolKey ? picked.expiry : sym.kind === 'option' ? sym.expiry : null;
+  // The charted contract's own expiry: an option's, or a dated future's
+  // while its underlying lists options on it (a stock's futures and options
+  // share their monthly expiry), so the strikes open on that month.
+  const ownExpiry = symExpiry(sym);
+  const symbolKey = ownExpiry ? `${underlying}:${ownExpiry}` : underlying;
+  const listsOwn = ownExpiry != null && (sym.kind === 'option' || !expiries || expiries.some((e) => e.date === ownExpiry));
+  const pickExpiry = picked?.on === symbolKey ? picked.expiry : listsOwn ? ownExpiry : null;
   const setPickExpiry = (expiry: string | null) => setPicked({ on: symbolKey, expiry });
   useEffect(() => {
     if (menu === 'pick') onNeedChain(pickExpiry);
@@ -296,6 +306,12 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                   {sym.strike} {sym.side}
                 </span>
               </span>
+            ) : sym.kind === 'future' && sym.expiry ? (
+              // The same for a future: its month ("DEC FUT") is what tells it from the others.
+              <span className="flex min-w-0 flex-col">
+                <span className="truncate type-caption leading-none text-fg-muted">{underlying}</span>
+                <span className="truncate type-body-strong leading-tight">{expiryMonth(sym.expiry)} FUT</span>
+              </span>
             ) : (
               <span className="truncate type-body-strong">{symbolLabel(sym)}</span>
             )}
@@ -306,6 +322,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
               <PickerSearch
                 serverBase={serverBase}
                 compact={compact}
+                current={sym}
                 onPick={(row) => {
                   const picked = chartSymOf(row, true);
                   if (picked) onSym(picked, row);

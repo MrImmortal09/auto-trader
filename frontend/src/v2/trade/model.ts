@@ -3,7 +3,7 @@
 
 import type { ChartLevel, ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
 import { INDEX_ORDER } from '../../lib/execute';
-import { level, signedMoney } from '../lib/format';
+import { level, shortDate, signedMoney } from '../lib/format';
 
 export type Tf = '1m' | '5m' | '15m';
 /** Which library draws the charts: KLineChart (the default) or Vela. */
@@ -28,16 +28,22 @@ export const TF_DAYS: Record<Tf, number> = { '1m': 2, '5m': 5, '15m': 10 };
 export type Exchange = 'NSE' | 'BSE';
 
 /**
- * What a chart shows: an index or a stock, its nearest future, or one of
+ * What a chart shows: an index or a stock, one of its futures, or one of
  * its options. `index` names the underlying on a future or an option — an
  * index or, behind the `stock_charts` switch, any F&O stock — under the
- * name it has had since charts were index-only, so saved layouts load.
+ * name it has had since charts were index-only, so saved layouts load. A
+ * future carries its `expiry` (`YYYY-MM-DD`) once picked from a catalog row:
+ * the candle service charts that contract and no other (#74's
+ * `RELIANCE:FUT:2026-12-29`). Without one it is the nearest future still
+ * trading (`RELIANCE:FUT`), as every future saved before futures had a date.
  */
 export type ChartSym =
   | { kind: 'index'; index: string }
   | { kind: 'equity'; symbol: string; exchange: Exchange }
-  | { kind: 'future'; index: string }
+  | { kind: 'future'; index: string; expiry?: string }
   | { kind: 'option'; index: string; expiry: string; strike: number; side: 'CE' | 'PE' };
+
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
 /** One of the six indices the app has a feed name for. */
 export function isIndex(name: string): boolean {
@@ -56,7 +62,8 @@ export function underlyingOf(s: ChartSym): string {
 }
 
 /** The candle service's name for it: `NIFTY`, `RELIANCE` (`RELIANCE@BSE`
- * for a BSE listing), `NIFTY:FUT`, `NIFTY:2026-10-27:25100:CE`. */
+ * for a BSE listing), `RELIANCE:FUT:2026-12-29` (a future by its expiry;
+ * `NIFTY:FUT`, the nearest, without one), `NIFTY:2026-10-27:25100:CE`. */
 export function symbolName(s: ChartSym): string {
   switch (s.kind) {
     case 'index':
@@ -64,7 +71,7 @@ export function symbolName(s: ChartSym): string {
     case 'equity':
       return s.exchange === 'NSE' ? s.symbol : `${s.symbol}@${s.exchange}`;
     case 'future':
-      return futureName(s.index);
+      return s.expiry ? `${futureName(s.index)}:${s.expiry}` : futureName(s.index);
     case 'option':
       return `${s.index}:${s.expiry}:${s.strike}:${s.side}`;
   }
@@ -86,13 +93,20 @@ export function hasVolume(s: ChartSym): boolean {
   return s.kind !== 'index';
 }
 
-/** "NIFTY 50", "BANKNIFTY", "RELIANCE", "RELIANCE · BSE", "RELIANCE FUT", "NIFTY 25100 CE". */
+/** A contract's expiry month as the market names its futures: "DEC". */
+export function expiryMonth(expiry: string): string {
+  return shortDate(expiry).split(' ')[1].toUpperCase();
+}
+
+/** "NIFTY 50", "BANKNIFTY", "RELIANCE", "RELIANCE · BSE", "RELIANCE DEC FUT"
+ * ("RELIANCE FUT": the nearest, a future saved without its expiry),
+ * "NIFTY 25100 CE". */
 export function symbolLabel(s: ChartSym): string {
   switch (s.kind) {
     case 'option':
       return `${s.index} ${s.strike} ${s.side}`;
     case 'future':
-      return `${s.index} FUT`;
+      return s.expiry ? `${s.index} ${expiryMonth(s.expiry)} FUT` : `${s.index} FUT`;
     case 'equity':
       return s.exchange === 'NSE' ? s.symbol : `${s.symbol} · ${s.exchange}`;
     case 'index':
@@ -112,13 +126,18 @@ export function parseChartSym(raw: unknown): ChartSym | null {
   const s = raw as Record<string, unknown>;
   const index = isTicker(s.index) ? s.index : null;
   if (s.kind === 'index') return index && isIndex(index) ? { kind: 'index', index } : null;
-  if (s.kind === 'future') return index ? { kind: 'future', index } : null;
+  // A future saved before futures had a date loads as the nearest one.
+  if (s.kind === 'future') {
+    if (!index) return null;
+    if (s.expiry == null) return { kind: 'future', index };
+    return typeof s.expiry === 'string' && DAY.test(s.expiry) ? { kind: 'future', index, expiry: s.expiry } : null;
+  }
   if (s.kind === 'equity') {
     if (!isTicker(s.symbol) || isIndex(s.symbol)) return null;
     return { kind: 'equity', symbol: s.symbol, exchange: s.exchange === 'BSE' ? 'BSE' : 'NSE' };
   }
   if (s.kind === 'option') {
-    const ok = index && typeof s.expiry === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.expiry) && typeof s.strike === 'number' && Number.isFinite(s.strike) && s.strike > 0 && (s.side === 'CE' || s.side === 'PE');
+    const ok = index && typeof s.expiry === 'string' && DAY.test(s.expiry) && typeof s.strike === 'number' && Number.isFinite(s.strike) && s.strike > 0 && (s.side === 'CE' || s.side === 'PE');
     return ok ? { kind: 'option', index, expiry: s.expiry as string, strike: s.strike as number, side: s.side as 'CE' | 'PE' } : null;
   }
   return null;
@@ -135,6 +154,30 @@ export function boardKind(board: Pick<ExecuteBoard, 'index'> & { kind?: string }
  * feed's: the strike is past the feed budget. No buy route accepts it. */
 export function quotePolled(q: ExecuteQuote & { polled?: boolean }): boolean {
   return q.polled === true;
+}
+
+/** "<1 s", "12 s", "4 min", "3 h", "2 d": how old a polled price is, in the
+ * largest unit that fits; '' without an age. */
+export function fmtAge(ms: number | null): string {
+  if (ms == null) return '';
+  if (ms < 1000) return '<1 s';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s} s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h} h` : `${Math.floor(h / 24)} d`;
+}
+
+/**
+ * The marker under a polled price: "polled", with its age once that is
+ * worth seeing (10 s and more) while the market is open. Closed (after
+ * hours, before the open, a weekend), the hub's price is the last session's
+ * close snapshot and its age only counts the hours since: it says "close".
+ */
+export function polledMarker(ageMs: number | null, marketOpen: boolean): string {
+  if (!marketOpen) return 'polled · close';
+  return ageMs != null && ageMs >= 10_000 ? `polled · ${fmtAge(ageMs)}` : 'polled';
 }
 
 /** The charted instrument's day so far, from its bars: the latest IST day's
@@ -173,8 +216,16 @@ export function daySummary(bars: Bar[] | null): DaySummary | null {
   return { open, high, low, close: last.c, volume, prevClose };
 }
 
+/** The same instrument: its candle name, so two futures of one stock (or
+ * a dated future and the bare nearest one) are told apart. */
 export function sameSym(a: ChartSym, b: ChartSym): boolean {
   return symbolName(a) === symbolName(b);
+}
+
+/** The expiry a chart's contract trades to: an option's, a dated future's;
+ * null for anything else (the bare future included: the server picks it). */
+export function symExpiry(s: ChartSym): string | null {
+  return s.kind === 'option' ? s.expiry : s.kind === 'future' ? (s.expiry ?? null) : null;
 }
 
 /** A scalp's option, as a chart symbol, on `expiry` (its own). */

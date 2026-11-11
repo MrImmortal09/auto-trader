@@ -6,7 +6,7 @@ import type { ChainAnswer } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
 import { Button } from '../ui/Button';
 import { LotsStepper } from '../ui/LotsStepper';
-import { quotePolled } from './model';
+import { fmtAge, polledMarker, quotePolled } from './model';
 
 /** Why one side of a row can't be bought now, or null. */
 function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: number): string | null {
@@ -17,12 +17,6 @@ function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: 
   if (quotePolled(q)) return 'Polled price — this strike is past the feed budget, so it can’t be bought yet';
   if (q.age_ms != null && q.age_ms > maxAgeMs) return `This contract's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}`;
   return null;
-}
-
-/** "2 s", "<1 s": how old a polled price is. */
-function fmtAge(ms: number | null): string {
-  if (ms == null) return '';
-  return ms < 1000 ? '<1 s' : `${Math.round(ms / 1000)} s`;
 }
 
 /** How long the ladder rests after a scroll before asking for prices there. */
@@ -57,19 +51,25 @@ function ladderRows(chain: ChainAnswer | undefined, board: ExecuteBoard): Ladder
  * held, the quantity and its P&L. The price flashes its tint as it ticks —
  * only near ATM and on held strikes: a 40-row chain at 09:15 would strobe.
  */
-function Quote({ q, kind, label, position, flashes, onChart }: {
+function Quote({ q, kind, label, position, flashes, marketOpen, onChart }: {
   q: ExecuteQuote | null;
   kind: 'CE' | 'PE';
   label: string;
   position: ExecutePosition | undefined;
   flashes: boolean;
+  /** Closed, a polled price is the last session's close (`polledMarker`). */
+  marketOpen: boolean;
   onChart: () => void;
 }) {
   const flash = useTickFlash(q?.ltp, flashes, q?.sym);
   const polled = q != null && quotePolled(q);
   // A price past the feed budget is the quote hub's, read every ~2 s; the
   // marker says so, and how long ago it was read once that is worth seeing.
-  const title = polled ? `Chart ${label} · polled: Kotak's REST quote, read ${fmtAge(q.age_ms) || 'just now'} ago (this strike is past the feed budget)` : `Chart ${label}`;
+  const title = !polled
+    ? `Chart ${label}`
+    : marketOpen
+      ? `Chart ${label} · polled: Kotak's REST quote, read ${fmtAge(q.age_ms) || 'just now'} ago (this strike is past the feed budget)`
+      : `Chart ${label} · polled: Kotak's REST quote at the last session's close (this strike is past the feed budget)`;
   return (
     <button type="button" disabled={!q} onClick={onChart} title={title} className={`flex min-w-0 flex-1 flex-col justify-center ${kind === 'CE' ? 'items-end text-right' : 'items-start text-left'}`}>
       <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium ${q?.ltp == null ? 'text-fg-muted' : 'text-fg'} ${flash.className}`}>
@@ -80,7 +80,7 @@ function Quote({ q, kind, label, position, flashes, onChart }: {
           {position.qty} · {position.pnl == null ? '—' : signedMoney(position.pnl, 0)}
         </span>
       ) : (
-        polled && <span className="type-caption text-fg-muted tnum">{q.age_ms != null && q.age_ms >= 10_000 ? `polled · ${fmtAge(q.age_ms)}` : 'polled'}</span>
+        polled && <span className="type-caption text-fg-muted tnum">{polledMarker(q.age_ms, marketOpen)}</span>
       )}
     </button>
   );
@@ -93,7 +93,7 @@ function Quote({ q, kind, label, position, flashes, onChart }: {
  * ATM; scrolling away asks the stream to follow, so any strike can be bought
  * once its price shows.
  */
-export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = null, sending, onBuy, onChart, onCentre, desktop, header }: {
+export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = null, marketOpen = true, sending, onBuy, onChart, onCentre, desktop, header }: {
   board: ExecuteBoard;
   /** The full strike list of the board's expiry, once loaded. */
   chain: ChainAnswer | undefined;
@@ -107,6 +107,9 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
    * until Phase 4, never from the owner's desk — or null. Every Buy is
    * disabled with it as its title; the prices still chart. */
   readOnly?: string | null;
+  /** The market is open (the stream's `market_open`): closed, a polled row's
+   * price is the last close, and its marker says so. */
+  marketOpen?: boolean;
   /** Symbols with a buy in flight. */
   sending: Record<string, boolean>;
   onBuy: (sym: string, label: string) => void;
@@ -209,7 +212,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
         {position ? 'Add' : 'Buy'}
       </Button>
     );
-    const quote = <Quote q={q} kind={kind} label={label} position={position} flashes={near || position != null} onChart={() => onChart(strike, kind)} />;
+    const quote = <Quote q={q} kind={kind} label={label} position={position} flashes={near || position != null} marketOpen={marketOpen} onChart={() => onChart(strike, kind)} />;
     // A held contract is tinted profit; one in the money is shaded.
     const shade = position ? 'bg-profit-subtle' : itm ? 'bg-itm' : '';
     return (
