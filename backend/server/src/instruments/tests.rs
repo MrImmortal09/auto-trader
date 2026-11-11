@@ -768,6 +768,44 @@ async fn the_quote_route_checks_its_keys_against_the_catalog() {
     assert_eq!(catalog.spot_key("nope"), None);
 }
 
+/// The watchlists' lookup: a row for each key that names one, by price-map
+/// key or id; and a failed lookup is an error, never "no such rows".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rows_for_keys_names_rows_and_reports_a_failed_lookup() {
+    let scratch = Scratch::new("rows-for-keys");
+    let catalog = scratch.catalog().await;
+    // An empty catalog has no rows, and that is not an error.
+    assert!(catalog.rows_for_keys(&["nse_fo|51386".to_string()]).await.unwrap().is_empty());
+    scratch.write_all();
+    loaded(catalog.load_if_changed("test").await);
+
+    let keys: Vec<String> = ["nse_cm|2885", "nse_cm:2885", "nse_fo|51386", "nse_fo:51386", "idx|NIFTY 50", "nse_cm|Nifty 50", "nse_fo|999999", "junk"]
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
+    let rows = catalog.rows_for_keys(&keys).await.unwrap();
+    let mut named: Vec<(&str, &str)> = rows.iter().map(|(k, r)| (k.as_str(), r.ws_key.as_str())).collect();
+    named.sort();
+    assert_eq!(
+        named,
+        vec![
+            ("idx|NIFTY 50", "idx|NIFTY 50"),
+            ("nse_cm:2885", "nse_cm|2885"),
+            ("nse_cm|2885", "nse_cm|2885"),
+            ("nse_fo:51386", "nse_fo|51386"),
+            ("nse_fo|51386", "nse_fo|51386"),
+        ]
+    );
+
+    // The catalog database breaks: a lookup that reaches it is an error;
+    // keys answered from the search list in memory alone still have rows.
+    catalog.close_db_for_tests().await;
+    assert!(catalog.rows_for_keys(&["nse_cm|2885".to_string(), "nse_fo|51386".to_string()]).await.is_err());
+    assert!(catalog.rows_for_keys(&["nse_fo:51386".to_string()]).await.is_err(), "an id is looked up in the database");
+    let cash = catalog.rows_for_keys(&["nse_cm|2885".to_string(), "idx|NIFTY 50".to_string()]).await.unwrap();
+    assert_eq!(cash.len(), 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_instrument_page_row_carries_its_underlying_and_nearest_expiry() {
     let scratch = Scratch::new("instrument");
