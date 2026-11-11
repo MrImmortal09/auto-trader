@@ -14,6 +14,9 @@ import type { Quote } from './types';
 const EVERY_MS = 2000;
 /** Keys one `/api/v2/quotes` call may ask for (the server's cap). */
 const MAX_KEYS = 60;
+/** How far the clock offset may drift before it is news: a request's own
+ * round trip moves it by a few hundred ms every time. */
+const CLOCK_SLACK_MS = 1000;
 
 const quotes = new Map<string, Quote>();
 /** How many consumers want each key right now. */
@@ -40,8 +43,10 @@ interface Snapshot {
   /** Unix ms of the last answer, and whether the market was open then. */
   at: number | null;
   marketOpen: boolean | null;
+  /** The server's clock less this browser's, ms (see `noteServerClock`). */
+  clockOffset: number;
 }
-let snapshot: Snapshot = { version: 0, at: null, marketOpen: null };
+let snapshot: Snapshot = { version: 0, at: null, marketOpen: null, clockOffset: 0 };
 
 function notify(patch: Partial<Snapshot> = {}) {
   snapshot = { ...snapshot, ...patch, version: snapshot.version + 1 };
@@ -49,19 +54,36 @@ function notify(patch: Partial<Snapshot> = {}) {
 }
 
 /** Keep `incoming` where it is newer than what is held; `true` when
- * anything changed (and every subscriber was told). */
+ * anything changed (and every subscriber was told). A quote's `at` is when
+ * the server read that price, so one read again is a later `at`; the same
+ * `at` is the quote already held, coming back from a poll that found
+ * nothing new, and is not a change. */
 export function seedQuotes(incoming: (Quote | null | undefined)[], patch: Partial<Snapshot> = {}): boolean {
   let changed = false;
   for (const q of incoming) {
     if (!q) continue;
     const held = quotes.get(q.key);
-    if (!held || q.at >= held.at) {
+    if (!held || q.at > held.at) {
       quotes.set(q.key, q);
       changed = true;
     }
   }
   if (changed) notify(patch);
   return changed;
+}
+
+/**
+ * Note the server's clock from an answer made at its `at` (server ms),
+ * asked at `sentAt` and back at `receivedAt` (this browser's ms): the
+ * answer was made somewhere in between, so the offset is `at` less the
+ * midpoint. A quote's `at` is the server's time, so its age is measured
+ * against `Date.now() + clockOffset`, never the browser's clock alone,
+ * which may run fast or slow. Only a move past `CLOCK_SLACK_MS` is news.
+ */
+export function noteServerClock(at: number, sentAt: number, receivedAt: number) {
+  if (!Number.isFinite(at)) return;
+  const offset = Math.round(at - (sentAt + receivedAt) / 2);
+  if (Math.abs(offset - snapshot.clockOffset) > CLOCK_SLACK_MS) notify({ clockOffset: offset });
 }
 
 async function poll() {
@@ -71,7 +93,9 @@ async function poll() {
   inFlight = true;
   try {
     for (let i = 0; i < keys.length; i += MAX_KEYS) {
+      const sentAt = Date.now();
       const answer = await getQuotes(serverBase, keys.slice(i, i + MAX_KEYS));
+      noteServerClock(answer.at, sentAt, Date.now());
       const patch = { at: answer.at, marketOpen: answer.market_open };
       if (!seedQuotes(answer.quotes, patch)) {
         // The market opening or closing is news even when no price moved;
@@ -141,11 +165,13 @@ function subscribe(l: () => void) {
 }
 
 /** The quotes held: `get(key)` the newest, `at` when the last answer came,
- * `marketOpen` what it said. */
+ * `marketOpen` what it said, `clockOffset` the server's clock less this
+ * browser's (ms): age a quote against `Date.now() + clockOffset`. */
 export interface Quotes {
   get: (key: string | null | undefined) => Quote | null;
   at: number | null;
   marketOpen: boolean | null;
+  clockOffset: number;
 }
 
 /**
@@ -162,7 +188,7 @@ export function useQuotes(base: string, keys: (string | null | undefined)[]): Qu
       bound = true;
       serverBase = base;
       quotes.clear();
-      notify({ at: null, marketOpen: null });
+      notify({ at: null, marketOpen: null, clockOffset: 0 });
     }
     const mine = signature ? signature.split(',') : [];
     want(mine);
@@ -170,7 +196,7 @@ export function useQuotes(base: string, keys: (string | null | undefined)[]): Qu
   }, [base, signature]);
   const snap = useSyncExternalStore(subscribe, () => snapshot, () => snapshot);
   // Built from the snapshot, so it is a new object on every change.
-  return { get: (key) => (key ? quotes.get(key) ?? null : null), at: snap.at, marketOpen: snap.marketOpen };
+  return { get: (key) => (key ? quotes.get(key) ?? null : null), at: snap.at, marketOpen: snap.marketOpen, clockOffset: snap.clockOffset };
 }
 
 /** One key's quote, polled with everything else on screen. */

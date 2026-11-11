@@ -616,7 +616,8 @@ export interface Flags {
   search: boolean;
   /** Watchlists (`/api/v2/watchlists`) for anyone signed in; while off they
    * answer 404 and the Watchlist screen, its tab and the "+" on a search
-   * result or an instrument page are hidden. */
+   * result or an instrument page are hidden. The app counts them as on only
+   * while `search` is on too (no prices, no way to add one without it). */
   watchlists: boolean;
 }
 

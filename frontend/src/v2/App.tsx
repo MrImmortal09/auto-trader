@@ -58,9 +58,14 @@ export default function App() {
   const flags = usePoll(() => getFlags(serverBase), 30_000, serverBase);
   // The instrument search is the admin's switch: off, the well and the tab are gone.
   const searchOn = flags.data?.search === true;
-  // Watchlists too; `null` until the switches are known, so an opened
+  // Watchlists too, and only while the search is on as well: with search
+  // off the server prices no stock or contract (its quote poller skips
+  // every tick), and the search and the instrument page, the only ways to
+  // add one, are gone. Everything below reads this one value: the screen,
+  // the rail and tabs, the "+" on a result or an instrument page, the
+  // picker. `null` until the switches are known, so an opened
   // `/v2/watchlist` waits for them rather than bounce to Desk.
-  const watchlistsOn: boolean | null = flags.data ? flags.data.watchlists === true : null;
+  const watchlistsOn: boolean | null = flags.data ? flags.data.watchlists === true && flags.data.search === true : null;
   const screens = visibleScreens(role, watchlistsOn !== false);
   const nav = navScreens(role, watchlistsOn === true);
   // Phone: the tabs with a place of their own (a user's start with Watchlist once it is on).

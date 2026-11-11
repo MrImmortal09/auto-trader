@@ -77,7 +77,14 @@ export function IdentityProvider({ children }: { children: ReactNode }) {
         // Unreachable server: keep what the token says, and say so.
         if (cancelled) return;
         setFailed({ token: userToken, error: e instanceof Error ? e.message : 'Could not reach the server' });
-        retry = window.setTimeout(() => void check(), RETRY_MS);
+        // One retry pending at most: the interval's check failing while a
+        // retry waits replaces it rather than start a second chain, so an
+        // outage asks once every 15 s however long it lasts.
+        if (retry != null) window.clearTimeout(retry);
+        retry = window.setTimeout(() => {
+          retry = null;
+          void check();
+        }, RETRY_MS);
       }
     };
     void check();

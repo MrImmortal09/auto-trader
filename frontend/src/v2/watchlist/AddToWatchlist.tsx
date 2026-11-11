@@ -45,6 +45,7 @@ export function useAddToWatchlist(serverBase: string, enabled: boolean): { add: 
   }
 
   async function add(row: InstrumentRow) {
+    if (!enabled) return;
     if (!currentWatchlists()) await loadWatchlists();
     const answer = currentWatchlists();
     if (!answer) {
@@ -69,7 +70,8 @@ export function useAddToWatchlist(serverBase: string, enabled: boolean): { add: 
 
   const lists = data.lists;
   const max = data.answer?.max_items ?? 50;
-  const picker = picking && (
+  // Gone with the switch, even while open: a list it would write to has no screen.
+  const picker = enabled && picking && (
     <Modal open onClose={() => setPicking(null)} label={`Add ${rowTitle(picking)} to a watchlist`} width="lg:max-w-[400px]">
       <div className="flex flex-col gap-4 p-6">
         <div>
