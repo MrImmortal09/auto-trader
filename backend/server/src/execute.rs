@@ -444,6 +444,12 @@ impl ExecuteBoard {
         }
         let mut wanted = Vec::new();
         for key in keys {
+            // A strike a stock chart streams (`"ladder": true`, kept for the
+            // day) is already on the feed and counted once, as the chart's:
+            // sending it again as a band would count it twice.
+            if subs.chart.contains_key(key) {
+                continue;
+            }
             match subs.band.get_mut(key) {
                 Some(at) => *at = now,
                 None => wanted.push(key.clone()),
@@ -1345,14 +1351,59 @@ mod tests {
         let sent = drain(&mut rx);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0], serde_json::json!({ "action": "subscribe", "scrips": shared, "ladder": true }));
+        {
+            let subs = board.subs.lock().await;
+            assert_eq!(subs.used(), used);
+            assert!(subs.chart.contains_key(&shared) && !subs.band.contains_key(&shared));
+            // The band sweep leaves it alone once no ladder wants the band.
+            let later = Instant::now() + BAND_GRACE + Duration::from_secs(1);
+            let stale = unwanted_band_keys(&subs.band, &HashSet::new(), later);
+            assert_eq!(stale.len(), keys.len() - 1);
+            assert!(!stale.contains(&shared));
+        }
+
+        // The ladder asks for its band again: the strike the chart took is
+        // on the feed already, so nothing is sent and nothing is counted
+        // twice — neither for the shared key alone nor for the whole band.
+        board.ensure_subscribed(&ws_tx, std::slice::from_ref(&shared), SubPool::Owner).await;
+        assert!(drain(&mut rx).is_empty(), "the shared strike is not sent again");
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Owner).await;
+        assert!(drain(&mut rx).is_empty(), "the band is already on the feed");
         let subs = board.subs.lock().await;
         assert_eq!(subs.used(), used);
+        assert_eq!(subs.band.len(), keys.len() - 1);
         assert!(subs.chart.contains_key(&shared) && !subs.band.contains_key(&shared));
-        // The band sweep leaves it alone once no ladder wants the band.
-        let later = Instant::now() + BAND_GRACE + Duration::from_secs(1);
-        let stale = unwanted_band_keys(&subs.band, &HashSet::new(), later);
-        assert_eq!(stale.len(), keys.len() - 1);
-        assert!(!stale.contains(&shared));
+    }
+
+    #[tokio::test]
+    async fn a_band_leaves_out_a_strike_a_chart_already_streams() {
+        let board = ExecuteBoard::new();
+        let (ws_tx, mut rx) = bridge();
+        let chain: Vec<ChainStrike> = (0..20).map(|i| priced(24000.0 + 50.0 * i as f64, 1000 + 2 * i)).collect();
+        let keys = band_keys(&chain, 10, BAND_HALF);
+
+        // The chart comes first, then a ladder whose band includes its strike.
+        let shared = keys[3].clone();
+        assert!(board.reserve_chart(&ws_tx, &shared, SubPool::Owner).await);
+        assert_eq!(drain(&mut rx).len(), 1);
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Owner).await;
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 2, "the indices and the band");
+        assert_eq!(sent[1]["band"], serde_json::json!(true));
+        let scrips = sent[1]["scrips"].as_str().unwrap();
+        let band_sent: Vec<&str> = scrips.split('&').collect();
+        assert_eq!(band_sent.len(), keys.len() - 1);
+        assert!(!band_sent.contains(&shared.as_str()), "the chart's strike is not sent as a band");
+        {
+            let subs = board.subs.lock().await;
+            assert_eq!(subs.used(), keys.len(), "each strike counted once");
+            assert_eq!((subs.band.len(), subs.chart.len()), (keys.len() - 1, 1));
+            assert!(!subs.band.contains_key(&shared));
+        }
+        // Asked again, the band is already there: nothing sent, nothing added.
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Owner).await;
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(board.subs.lock().await.used(), keys.len());
     }
 
     #[tokio::test]

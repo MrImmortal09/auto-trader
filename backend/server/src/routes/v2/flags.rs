@@ -19,6 +19,10 @@ static SAVE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// `PUT /api/v2/flags` body: only the switches being changed. One left out
 /// keeps its value, so a stale tab can't turn off a switch it never showed;
 /// an unknown name is rejected (422) rather than silently doing nothing.
+///
+/// `stock_charts` depends on `search` (the catalog and the quote hub run
+/// only while it is on); the save goes through either way, and the log
+/// says so when they are left inconsistent.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlagsUpdate {
@@ -56,6 +60,22 @@ fn apply_update(before: FeatureFlags, update: &FlagsUpdate) -> (FeatureFlags, Ve
         .map(|(now, _)| now)
         .collect();
     (after, changes)
+}
+
+/// Why `flags` will not do what they say while `search` is off: the
+/// instrument catalog is built, and the quote hub polled, only while it is
+/// on, and `stock_charts` and `watchlists` rest on both. `None` when
+/// nothing depends on it or it is on.
+fn needs_search(flags: &FeatureFlags) -> Option<&'static str> {
+    if flags.search {
+        return None;
+    }
+    match (flags.stock_charts, flags.watchlists) {
+        (true, true) => Some("stock_charts and watchlists are on with search off: no stock is recognised and nothing is priced until search is turned on"),
+        (true, false) => Some("stock_charts is on with search off: no stock is recognised and no ladder row is priced until search is turned on"),
+        (false, true) => Some("watchlists is on with search off: keys are not recognised and nothing is priced until search is turned on"),
+        (false, false) => None,
+    }
 }
 
 /// `GET /api/v2/flags` — every switch.
@@ -106,6 +126,16 @@ pub async fn put_flags_handler(
         "flags": after,
     }))
     .await;
+    if let Some(why) = needs_search(&after) {
+        tracing::warn!(why, "Feature flags left inconsistent");
+        send_log(&state.db_tx, &state.log_tx, "WARN", serde_json::json!({
+            "event": "FLAGS_INCONSISTENT",
+            "level": "WARN",
+            "message": why,
+            "flags": after,
+        }))
+        .await;
+    }
 
     (StatusCode::OK, Json(after)).into_response()
 }
@@ -154,5 +184,17 @@ mod tests {
         );
         let update: FlagsUpdate = serde_json::from_str(r#"{"stock_charts": true}"#).unwrap();
         assert_eq!(update.stock_charts, Some(true));
+    }
+
+    #[test]
+    fn stock_charts_and_watchlists_without_search_are_called_out() {
+        let off = FeatureFlags::default();
+        assert_eq!(needs_search(&off), None);
+        assert_eq!(needs_search(&FeatureFlags { search: true, stock_charts: true, watchlists: true, ..off }), None);
+        assert!(needs_search(&FeatureFlags { stock_charts: true, ..off }).unwrap().starts_with("stock_charts is on with search off"));
+        assert!(needs_search(&FeatureFlags { watchlists: true, ..off }).unwrap().starts_with("watchlists is on with search off"));
+        assert!(needs_search(&FeatureFlags { stock_charts: true, watchlists: true, ..off }).unwrap().starts_with("stock_charts and watchlists"));
+        // The engine's own switches never depend on search.
+        assert_eq!(needs_search(&FeatureFlags { index_options_only: true, chart_stops: true, ..off }), None);
     }
 }

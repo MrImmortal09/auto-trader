@@ -466,19 +466,9 @@ impl UpstoxClient {
         wanted: &[&str],
         today: NaiveDate,
     ) -> Result<HashMap<String, FutureContract>, UpstoxError> {
-        let gz = self.instruments_gz(instruments_url).await?;
         let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
-
-        tokio::task::spawn_blocking(move || {
-            let reader = BufReader::new(flate2::read::GzDecoder::new(&gz[..]));
-            let mut de = serde_json::Deserializer::from_reader(reader);
-            let rows = FutFilter { wanted: &wanted }
-                .deserialize(&mut de)
-                .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))?;
-            Ok(pick_nearest_futures(rows, today))
-        })
-        .await
-        .map_err(|e| UpstoxError::Decode(e.to_string()))?
+        self.filter_instruments(instruments_url, move |gz| Ok(pick_nearest_futures(filter_futures(gz, &wanted)?, today)))
+            .await
     }
 
     /// Every future and option on the `wanted` underlyings — an index
@@ -489,12 +479,8 @@ impl UpstoxClient {
     /// indices that is about 8,000 contracts across the NSE and BSE files;
     /// a stock has a few hundred.
     pub async fn derivatives(&self, instruments_url: &str, wanted: &[&str]) -> Result<Vec<Derivative>, UpstoxError> {
-        let gz = self.instruments_gz(instruments_url).await?;
         let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
-
-        tokio::task::spawn_blocking(move || filter_derivatives(&gz, &wanted))
-            .await
-            .map_err(|e| UpstoxError::Decode(e.to_string()))?
+        self.filter_instruments(instruments_url, move |gz| filter_derivatives(gz, &wanted)).await
     }
 
     /// [`Self::derivatives`] under its older name, for the six indices.
@@ -510,37 +496,41 @@ impl UpstoxClient {
     /// near, next and far months — stream-filtered the same way as
     /// [`Self::nearest_index_futures`].
     pub async fn index_futures(&self, instruments_url: &str, wanted: &[&str]) -> Result<Vec<Derivative>, UpstoxError> {
-        let gz = self.instruments_gz(instruments_url).await?;
         let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
-
-        tokio::task::spawn_blocking(move || {
-            let reader = BufReader::new(flate2::read::GzDecoder::new(&gz[..]));
-            let mut de = serde_json::Deserializer::from_reader(reader);
-            let rows = FutFilter { wanted: &wanted }
-                .deserialize(&mut de)
-                .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))?;
-            Ok(rows.iter().filter_map(to_derivative).collect())
-        })
-        .await
-        .map_err(|e| UpstoxError::Decode(e.to_string()))?
+        self.filter_instruments(instruments_url, move |gz| Ok(filter_futures(gz, &wanted)?.iter().filter_map(to_derivative).collect()))
+            .await
     }
 
-    /// The gzipped bytes of an instruments file (a few MB; the rows are
-    /// decompressed and filtered as a stream by the callers): today's copy
-    /// from the cache directory when one is set and holds it, else a
+    /// Run `filter` (a stream filter over the gzipped bytes of an
+    /// instruments file, a few MB; the rows are decompressed and read one at
+    /// a time, never materialised) on a blocking thread, against today's
+    /// copy from the cache directory when one is set and holds it, else a
     /// download, which is then written there for the rest of the IST day.
-    async fn instruments_gz(&self, instruments_url: &str) -> Result<bytes::Bytes, UpstoxError> {
+    ///
+    /// A cached file the filter cannot decode (a corrupt gzip or JSON) is
+    /// removed and the file downloaded once more, so a bad write never
+    /// serves "no derivatives" for a whole day. A decode error on the
+    /// download itself is returned as it is.
+    async fn filter_instruments<T, F>(&self, instruments_url: &str, filter: F) -> Result<T, UpstoxError>
+    where
+        T: Send + 'static,
+        F: Fn(&[u8]) -> Result<T, UpstoxError> + Send + Sync + 'static,
+    {
+        let filter = std::sync::Arc::new(filter);
         let today = shared_domain::today_ist();
         let cached = self.instruments_cache.as_ref().map(|dir| instruments_cache_path(dir, today, instruments_url));
         if let Some(path) = &cached {
-            match tokio::fs::read(path).await {
-                Ok(bytes) if !bytes.is_empty() => {
-                    tracing::debug!(path = %path.display(), "Upstox instruments file read from today's cache");
-                    return Ok(bytes.into());
+            if let Some(bytes) = read_cached_instruments(path).await {
+                let run = std::sync::Arc::clone(&filter);
+                match run_filter(move || run(&bytes)).await {
+                    Err(UpstoxError::Decode(e)) => {
+                        tracing::warn!(path = %path.display(), error = %e, "Upstox instruments cache is corrupt — removed, downloading");
+                        if let Err(e) = tokio::fs::remove_file(path).await {
+                            tracing::warn!(path = %path.display(), error = %e, "Corrupt Upstox instruments cache could not be removed");
+                        }
+                    }
+                    other => return other,
                 }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(path = %path.display(), error = %e, "Upstox instruments cache unreadable — downloading"),
             }
         }
         let bytes = self.download_instruments(instruments_url).await?;
@@ -554,7 +544,7 @@ impl UpstoxClient {
                 Err(e) => tracing::warn!(error = %e, "Upstox instruments cache write did not finish"),
             }
         }
-        Ok(bytes)
+        run_filter(move || filter(&bytes)).await
     }
 
     async fn download_instruments(&self, instruments_url: &str) -> Result<bytes::Bytes, UpstoxError> {
@@ -567,9 +557,37 @@ impl UpstoxClient {
     }
 }
 
+/// `filter` on a blocking thread; a thread that did not finish is a
+/// `Decode` error, like a file it could not read.
+async fn run_filter<T, F>(filter: F) -> Result<T, UpstoxError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, UpstoxError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(filter).await.map_err(|e| UpstoxError::Decode(e.to_string()))?
+}
+
 // ---------------------------------------------------------------------------
 // Instruments cache on disk
 // ---------------------------------------------------------------------------
+
+/// Today's cached instruments file, when `path` holds one: `None` for no
+/// file, an empty one or one that cannot be read (logged), and the download
+/// goes ahead.
+async fn read_cached_instruments(path: &Path) -> Option<bytes::Bytes> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) if !bytes.is_empty() => {
+            tracing::debug!(path = %path.display(), "Upstox instruments file read from today's cache");
+            Some(bytes.into())
+        }
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "Upstox instruments cache unreadable — downloading");
+            None
+        }
+    }
+}
 
 /// `dir/<YYYY-MM-DD>/<file>` for an instruments URL: the file is the URL's
 /// last path segment with anything but letters, digits, `.`, `-` and `_`
@@ -586,13 +604,17 @@ fn instruments_cache_path(dir: &Path, day: NaiveDate, instruments_url: &str) -> 
     dir.join(day.format("%Y-%m-%d").to_string()).join(name)
 }
 
-/// Write `bytes` to `path` whole (a temp file renamed over it, so a reader
-/// never sees a half file) and drop every other day's directory under `dir`.
+/// Write `bytes` to `path` whole (a temp file of its own — the process id
+/// and a counter, so two writes of the same file at once never share one —
+/// renamed over it, so a reader never sees a half file) and drop every other
+/// day's directory under `dir`.
 fn store_instruments(dir: &Path, path: &Path, bytes: &[u8], today: NaiveDate) -> std::io::Result<()> {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
     std::fs::write(&temp, bytes)?;
     std::fs::rename(&temp, path)?;
     prune_instruments_cache(dir, today);
@@ -614,6 +636,16 @@ fn prune_instruments_cache(dir: &Path, today: NaiveDate) {
             }
         }
     }
+}
+
+/// The futures on `wanted` in a gzipped instruments file, decompressed and
+/// filtered as a stream.
+fn filter_futures(gz: &[u8], wanted: &[String]) -> Result<Vec<InstrumentRow>, UpstoxError> {
+    let reader = BufReader::new(flate2::read::GzDecoder::new(gz));
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    FutFilter { wanted }
+        .deserialize(&mut de)
+        .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))
 }
 
 /// The futures and options on `wanted` in a gzipped instruments file,
@@ -959,8 +991,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("upstox-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let today = shared_domain::today_ist();
-        // An unreachable URL: a download attempt would fail, so a result proves the cache answered.
-        let url = "http://127.0.0.1:9/NSE.json.gz";
+        // A URL reqwest refuses before opening a socket (not http/https): a
+        // download attempt fails without any network, so a result proves
+        // the cache answered.
+        let url = "nope://upstox.test/NSE.json.gz";
         let path = instruments_cache_path(&dir, today, url);
         let old_day = dir.join("2000-01-01");
         std::fs::create_dir_all(&old_day).unwrap();
@@ -978,6 +1012,34 @@ mod tests {
         // Without the cache the same call has to download, and this URL answers nothing.
         let bare = UpstoxClient::new("test-token").unwrap();
         assert!(bare.derivatives(url, &["RELIANCE"]).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_cached_file_is_removed_and_downloaded_again() {
+        let dir = std::env::temp_dir().join(format!("upstox-cache-corrupt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let today = shared_domain::today_ist();
+        let url = "nope://upstox.test/NSE.json.gz";
+        let path = instruments_cache_path(&dir, today, url);
+        let client = UpstoxClient::new("test-token").unwrap().with_instruments_cache(&dir);
+
+        // Today's file is there but not gzip: it is not served for the day.
+        // The download it falls back to cannot happen here, so the call
+        // fails — toward no derivatives, never an empty list — and the bad
+        // file is gone, so the next call downloads afresh.
+        store_instruments(&dir, &path, b"not gzip", today).unwrap();
+        assert!(path.is_file());
+        assert!(client.derivatives(url, &["RELIANCE"]).await.is_err());
+        assert!(!path.exists(), "the corrupt file is removed");
+
+        // Two writes of the same file at once never share a temp name, so a
+        // good copy written next is read whole.
+        let a = store_instruments(&dir, &path, &stock_instruments_gz(), today);
+        let b = store_instruments(&dir, &path, &stock_instruments_gz(), today);
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1, "no temp file is left behind");
+        assert_eq!(client.derivatives(url, &["RELIANCE"]).await.unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

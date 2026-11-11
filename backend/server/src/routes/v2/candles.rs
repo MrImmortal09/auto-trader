@@ -74,14 +74,16 @@ impl Grammar {
     }
 
     /// `raw` as a symbol, or why not (a 400). With the switch off this is
-    /// `Symbol::parse`, the index-only grammar, exactly as before.
-    fn parse(&self, state: &AppState, raw: &str) -> Result<Symbol, Response> {
+    /// `Symbol::parse`, the index-only grammar, exactly as before. The help
+    /// is bare for a route that takes one symbol, and `named` — `raw` in
+    /// front of it — for a list, where it says which one was refused.
+    fn parse(&self, state: &AppState, raw: &str, named: bool) -> Result<Symbol, Response> {
         let parsed = if self.stocks {
             Symbol::parse_with(raw, &|name: &str| state.instruments.underlying(name).is_some())
         } else {
             Symbol::parse(raw)
         };
-        let symbol = parsed.ok_or_else(|| bad_request(format!("{}: {}", raw.trim(), self.help())))?;
+        let symbol = parsed.ok_or_else(|| if named { bad_request(format!("{raw}: {}", self.help())) } else { bad_request(self.help()) })?;
         match symbol.refusal() {
             Some(why) => Err(bad_request(why)),
             None => Ok(symbol),
@@ -142,7 +144,7 @@ pub struct CandlesQuery {
 /// switch on (see `candles::symbols`).
 pub async fn candles_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Query(q): Query<CandlesQuery>) -> Response {
     let grammar = Grammar::load(&state).await;
-    let symbol = match grammar.parse(&state, &q.symbol) {
+    let symbol = match grammar.parse(&state, &q.symbol, false) {
         Ok(symbol) => symbol,
         Err(response) => return response,
     };
@@ -311,7 +313,7 @@ pub async fn candles_stream_handler(State(state): State<AppState>, Extension(ide
     let grammar = Grammar::load(&state).await;
     let mut symbols: Vec<Symbol> = Vec::new();
     for raw in q.symbols.split(',').filter(|s| !s.trim().is_empty()) {
-        let symbol = match grammar.parse(&state, raw) {
+        let symbol = match grammar.parse(&state, raw, true) {
             Ok(symbol) => symbol,
             Err(response) => return response,
         };

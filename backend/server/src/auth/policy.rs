@@ -263,7 +263,7 @@ mod tests {
     fn the_stock_chart_routes_stay_signed_in_and_the_buys_stay_put() {
         for path in ["/api/v2/expiries", "/api/v2/chain", "/api/v2/candles", "/api/v2/candles/stream", "/api/execute/stream", "/api/v2/flags"] {
             assert_eq!(required(&GET, path), Access::SignedIn, "{path}");
-            assert_eq!(required(&POST, path), if path == "/api/v2/flags" { Access::Admin } else { Access::Admin }, "{path}");
+            assert_eq!(required(&POST, path), Access::Admin, "{path}");
         }
         assert_eq!(required(&PUT, "/api/v2/flags"), Access::Admin);
         assert_eq!(required(&POST, "/api/execute/buy"), Access::Admin);

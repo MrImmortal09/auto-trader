@@ -433,6 +433,13 @@ pub struct FeatureFlags {
     /// off, those routes accept the six indices exactly as before. Nothing
     /// in the engine reads it, and the owner's live buy
     /// (`POST /api/execute/buy`) stays index-only whatever it says.
+    ///
+    /// It needs [`Self::search`] on as well: the instrument catalog a
+    /// stock's name is resolved against is built, and the quote hub that
+    /// prices a ladder's polled rows, a stock's spot fallback and the close
+    /// snapshot is polled, only while `search` is on. With `search` off a
+    /// stock is not recognised (or, from an earlier build, shows no price);
+    /// nothing is ever shown wrong.
     #[serde(default)]
     pub stock_charts: bool,
 }
