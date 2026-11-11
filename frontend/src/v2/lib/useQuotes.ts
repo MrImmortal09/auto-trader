@@ -21,7 +21,8 @@ const wanted = new Map<string, number>();
 const listeners = new Set<() => void>();
 /** The server the keys are asked of: `''` is this site (same origin). */
 let serverBase = '';
-/** Whether a hook has bound the server yet. */
+/** Whether a hook has bound the server yet: `''` is a server too, so the
+ * base alone can't say. */
 let bound = false;
 let timer: number | null = null;
 /** A poll promised for the next tick of the event loop: new keys wanted. */

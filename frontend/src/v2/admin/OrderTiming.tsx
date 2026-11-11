@@ -56,6 +56,10 @@ function lines(o: OrderTimingRow, pushOn: boolean): string[] {
     o.filled_at_ms != null ? `filled ${after(o.filled_at_ms)}${o.avg_price ? ` at ${price(o.avg_price)}` : ''}` : null,
     o.filled_qty != null && o.qty ? `${o.filled_qty}/${o.qty} filled` : null,
     o.reject_reason ? `reason: ${o.reject_reason}` : null,
+    o.seen_at_ms != null ? `poll saw it ${after(o.seen_at_ms)}` : null,
+    o.filled_at_ms != null && o.seen_at_ms != null
+      ? `first: ${o.filled_at_ms <= o.seen_at_ms ? 'push' : 'poll'}, ${span(Math.abs(o.seen_at_ms - o.filled_at_ms))} ahead`
+      : null,
   ].filter(Boolean);
   if (stages.length) out.push(stages.join(' · '));
   else if (!o.error && o.order_no) out.push(pushOn ? 'No update from Kotak yet' : 'Fill time needs the push stream');
@@ -97,6 +101,7 @@ export function OrderTiming({ serverBase }: { serverBase: string }) {
   const orders = d?.orders ?? [];
   const answeredIn = median(orders.flatMap((o) => (o.sent_at_ms != null && o.replied_at_ms != null && !o.error ? [o.replied_at_ms - o.sent_at_ms] : [])));
   const filledIn = median(orders.flatMap((o) => (o.sent_at_ms != null && o.filled_at_ms != null ? [o.filled_at_ms - o.sent_at_ms] : [])));
+  const seenIn = median(orders.flatMap((o) => (o.sent_at_ms != null && o.seen_at_ms != null ? [o.seen_at_ms - o.sent_at_ms] : [])));
 
   return (
     <Section
@@ -114,7 +119,15 @@ export function OrderTiming({ serverBase }: { serverBase: string }) {
             <>
               <Row
                 title={`${plural(orders.length, 'order')} today`}
-                caption={[answeredIn != null ? `Kotak answered in ${span(answeredIn)} (median)` : null, filledIn != null ? `filled ${span(filledIn)} after sending (median)` : null].filter(Boolean).join(' · ') || undefined}
+                caption={
+                  [
+                    answeredIn != null ? `Kotak answered in ${span(answeredIn)} (median)` : null,
+                    filledIn != null ? `filled ${span(filledIn)} after sending (median)` : null,
+                    seenIn != null ? `the engine's poll saw it ${span(seenIn)} after sending (median)` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ') || undefined
+                }
               />
               {orders.map((o, i) => {
                 const chip = statusChip(o);

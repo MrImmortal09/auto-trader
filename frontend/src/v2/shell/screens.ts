@@ -1,7 +1,7 @@
-import { Activity, Gauge, LayoutDashboard, Settings, ShieldCheck, Star, Zap, type LucideIcon } from 'lucide-react';
+import { Activity, Gauge, LayoutDashboard, ScrollText, Settings, ShieldCheck, Star, Zap, type LucideIcon } from 'lucide-react';
 import type { Role } from '../lib/types';
 
-export type ScreenId = 'desk' | 'trade' | 'market' | 'watchlist' | 'system' | 'settings' | 'admin' | 'instrument';
+export type ScreenId = 'desk' | 'trade' | 'market' | 'watchlist' | 'logs' | 'system' | 'settings' | 'admin' | 'instrument';
 
 /** Where the app is: a screen, and for `instrument` which one (`/v2/i/<key>`,
  * the catalog id: `nse_cm:2885`). */
@@ -16,6 +16,7 @@ export const SCREENS: { id: ScreenId; label: string; icon: LucideIcon }[] = [
   { id: 'trade', label: 'Trade', icon: Zap },
   { id: 'market', label: 'Market', icon: Gauge },
   { id: 'watchlist', label: 'Watchlist', icon: Star },
+  { id: 'logs', label: 'Logs', icon: ScrollText },
   { id: 'system', label: 'System', icon: Activity },
   { id: 'settings', label: 'Settings', icon: Settings },
   { id: 'admin', label: 'Admin', icon: ShieldCheck },
@@ -33,10 +34,14 @@ export function tabScreens(role: Role, watchlists: boolean): ScreenId[] {
 }
 
 /** The screens `role` may open: users get the public ones and a small
- * Settings; the admin gets everything. An instrument page is anyone's; the
- * Watchlist screen is anyone's while `watchlists` (the admin's switch) is on. */
+ * Settings; the admin gets everything, the engine log (Logs) included. An
+ * instrument page is anyone's; the Watchlist screen is anyone's while
+ * `watchlists` (the admin's switch) is on. */
 export function visibleScreens(role: Role, watchlists: boolean): ScreenId[] {
-  const all: ScreenId[] = role === 'admin' ? ['desk', 'trade', 'market', 'watchlist', 'system', 'settings', 'admin', 'instrument'] : ['desk', 'trade', 'market', 'watchlist', 'settings', 'instrument'];
+  const all: ScreenId[] =
+    role === 'admin'
+      ? ['desk', 'trade', 'market', 'watchlist', 'logs', 'system', 'settings', 'admin', 'instrument']
+      : ['desk', 'trade', 'market', 'watchlist', 'settings', 'instrument'];
   return watchlists ? all : all.filter((id) => id !== 'watchlist');
 }
 

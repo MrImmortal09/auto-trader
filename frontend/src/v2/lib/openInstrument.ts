@@ -30,10 +30,16 @@ export function chartOf(row: Pick<InstrumentRow, 'kind' | 'symbol' | 'underlying
   return null;
 }
 
-/** Where `row` opens: the Trade screen for an index (Enter) or for an index
- * put on the ladder (Shift+Enter, also from an index option, on its expiry);
- * its instrument page otherwise. */
-export function targetOf(row: InstrumentRow, how: 'open' | 'ladder'): { trade: TradeIntent } | { instrument: string } {
+/** How a row is opened: `open` is Enter or a tap, `ladder` Shift+Enter,
+ * `chart` a result row's chart button. */
+export type OpenHow = 'open' | 'ladder' | 'chart';
+
+/** Where `row` opens: the Trade screen for an index (Enter, the chart
+ * button) or for an index put on the ladder (Shift+Enter, also from an
+ * index option, on its expiry); an index option's chart button charts it
+ * there, with the ladder on its index at its expiry (as the instrument
+ * page's Open chart does); its instrument page otherwise. */
+export function targetOf(row: InstrumentRow, how: OpenHow): { trade: TradeIntent } | { instrument: string } {
   const index = tradeIndexOf(row);
   if (index && row.kind === 'INDEX') {
     return { trade: how === 'ladder' ? { ladder: { index } } : { chart: { kind: 'index', index }, ladder: { index } } };
@@ -41,6 +47,8 @@ export function targetOf(row: InstrumentRow, how: 'open' | 'ladder'): { trade: T
   if (index && how === 'ladder' && (row.kind === 'CE' || row.kind === 'PE')) {
     return { trade: { ladder: { index, expiry: row.expiry } } };
   }
+  const chart = how === 'chart' ? chartOf(row) : null;
+  if (index && chart) return { trade: { chart, ladder: { index, expiry: row.expiry } } };
   return { instrument: row.id };
 }
 
