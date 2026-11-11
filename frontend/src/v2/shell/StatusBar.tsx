@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { ChevronDown, CircleAlert } from 'lucide-react';
+import { useState, type ReactNode } from 'react';
+import { ChevronDown, ChevronRight, CircleAlert } from 'lucide-react';
 import { AccountChip, AccountRow } from '../auth/AccountChip';
 import { signedMoney, toneOf } from '../lib/format';
 import { useIstClock } from '../lib/hooks';
@@ -9,6 +9,7 @@ import { useTickFlash } from '../lib/useTickFlash';
 import { Button } from '../ui/Button';
 import { Chip } from '../ui/Chip';
 import { HealthDot } from '../ui/Health';
+import { SCREENS, type ScreenId } from './screens';
 
 // Figma "Status bar / Desktop" and "/ Phone". Always visible: Paper or LIVE,
 // the health dots, the day's net P&L, write access and the kill switch —
@@ -48,11 +49,13 @@ function dotOf(status: StatusAnswer | null, unreachable: boolean, key: keyof Hea
   return status?.health?.[key] ?? { level: 'off', label: 'Waiting for the first reading' };
 }
 
-export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
+export function DesktopStatusBar({ status, unreachable, role, onKillSwitch, search }: {
   status: StatusAnswer | null;
   unreachable: boolean;
   role: Role;
   onKillSwitch: () => void;
+  /** The instrument search's well (`shell/Search.tsx`), while the search is on. */
+  search?: ReactNode;
 }) {
   const clock = useIstClock();
   // Paper and LIVE are different figures, not a tick.
@@ -74,9 +77,12 @@ export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
         >
           <ModeChip mode={status?.mode} />
         </button>
-        <span className="num-small text-fg">{clock} IST</span>
-        <span className="truncate type-caption text-fg-subtle">{status?.market ?? ''}</span>
+        <span className="whitespace-nowrap num-small text-fg">{clock} IST</span>
+        {/* Beside the search well the market phrase needs a wide window; below it, it would only truncate. */}
+        <span className={`truncate type-caption text-fg-subtle ${search ? 'hidden min-[1400px]:inline' : ''}`}>{status?.market ?? ''}</span>
       </div>
+      {/* The search well sits in the centre; the health dots move right of it. */}
+      {search}
       <div className="flex items-center gap-4">
         {dotsFor(role).map((d) => {
           const h = dotOf(status, unreachable, d.key);
@@ -92,7 +98,7 @@ export function DesktopStatusBar({ status, unreachable, role, onKillSwitch }: {
         {role !== 'anon' && (
           <>
             <span className="type-label text-fg-muted">Day</span>
-            <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]} ${flash.className}`}>
+            <span key={flash.key} className={`-mx-1 whitespace-nowrap rounded-4 px-1 num-medium ${TONE_TEXT[toneOf(status?.day_pnl)]} ${flash.className}`}>
               {status ? signedMoney(status.day_pnl) : '—'}
             </span>
             <span aria-hidden className="h-5 w-px bg-line" />
@@ -122,11 +128,14 @@ function summary(dots: { name: string; level: Level }[], unreachable: boolean): 
   return down.length === 1 ? `${down[0].name} down` : `${down.length} down`;
 }
 
-export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
+export function PhoneStatusBar({ status, unreachable, role, onKillSwitch, more }: {
   status: StatusAnswer | null;
   unreachable: boolean;
   role: Role;
   onKillSwitch: () => void;
+  /** The screens with no tab of their own (Settings, Admin) while the Search
+   * tab has More's place: rows in the dropdown, over the account row. */
+  more?: { screens: ScreenId[]; screen: ScreenId; onSelect: (s: ScreenId) => void };
 }) {
   const [open, setOpen] = useState(false);
   // Paper and LIVE are different figures, not a tick.
@@ -134,6 +143,7 @@ export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
   const ownerView = role === 'admin';
   const dots = dotsFor(role).map((d) => ({ ...d, ...dotOf(status, unreachable, d.key) }));
   const worst: Level = dots.some((d) => d.level === 'down') ? 'down' : dots.every((d) => d.level === 'off') ? 'off' : 'ok';
+  const moreScreens = more ? SCREENS.filter((s) => more.screens.includes(s.id)) : [];
   return (
     <header className={`relative z-30 shrink-0 border-b border-line pt-safe ${barLook(status?.mode)}`}>
       <div className="flex h-11 items-center gap-2 px-4">
@@ -180,6 +190,31 @@ export function PhoneStatusBar({ status, unreachable, role, onKillSwitch }: {
               <span className="ml-auto type-caption text-fg-subtle">{d.label}</span>
             </div>
           ))}
+          {more && moreScreens.length > 0 && (
+            <nav aria-label="More screens" className="mt-1 border-t border-line pt-1">
+              {moreScreens.map(({ id, label, icon: Icon }) => {
+                const selected = id === more.screen;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    aria-current={selected ? 'page' : undefined}
+                    onClick={() => {
+                      setOpen(false);
+                      more.onSelect(id);
+                    }}
+                    className={`-mx-2 flex h-11 w-[calc(100%+16px)] items-center gap-2.5 rounded-8 px-2 text-left type-body-strong transition-colors duration-120 ${
+                      selected ? 'bg-accent-subtle text-accent' : 'text-fg hover:bg-raised/40'
+                    }`}
+                  >
+                    <Icon size={18} strokeWidth={1.75} className={selected ? 'text-accent' : 'text-fg-muted'} />
+                    <span className="flex-1">{label}</span>
+                    <ChevronRight size={16} className="text-fg-muted" />
+                  </button>
+                );
+              })}
+            </nav>
+          )}
           <div className="mt-1">
             <AccountRow />
           </div>
