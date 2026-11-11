@@ -1,0 +1,205 @@
+import { useEffect, useSyncExternalStore } from 'react';
+import { getQuotes } from './api';
+import type { Quote } from './types';
+
+// One poll of `/api/v2/quotes` for every key on screen — search rows, the
+// instrument page, later the watchlist — every 2 s while the tab is
+// visible, so a price never needs more than one request a tick however many
+// rows show it. Each consumer asks for its keys with `useQuote`; the store
+// keeps the newest quote per key and tells every subscriber when anything
+// changed. A search answer seeds the store with the quotes it carries, so a
+// row's tick flash compares against the same baseline the poll continues.
+
+/** How often the wanted keys are asked for. */
+const EVERY_MS = 2000;
+/** Keys one `/api/v2/quotes` call may ask for (the server's cap). */
+const MAX_KEYS = 60;
+/** How far the clock offset may drift before it is news: a request's own
+ * round trip moves it by a few hundred ms every time. */
+const CLOCK_SLACK_MS = 1000;
+
+const quotes = new Map<string, Quote>();
+/** How many consumers want each key right now. */
+const wanted = new Map<string, number>();
+const listeners = new Set<() => void>();
+/** The server the keys are asked of: `''` is this site (same origin). */
+let serverBase = '';
+/** Whether a hook has bound the server yet: `''` is a server too, so the
+ * base alone can't say. */
+let bound = false;
+let timer: number | null = null;
+/** A poll promised for the next tick of the event loop: new keys wanted. */
+let soon: number | null = null;
+let inFlight = false;
+
+/** What a render reads: a new object on every change (`notify`), so a
+ * consumer's memoised output (the React Compiler's) is invalidated by it —
+ * the map itself is mutable module state the compiler cannot see change.
+ * Only `at` is ever written in place, by an answer that changed nothing a
+ * row shows: a new object then would make `useSyncExternalStore` re-render
+ * every consumer for it on their next render anyway. */
+interface Snapshot {
+  version: number;
+  /** Unix ms of the last answer, and whether the market was open then. */
+  at: number | null;
+  marketOpen: boolean | null;
+  /** The server's clock less this browser's, ms (see `noteServerClock`). */
+  clockOffset: number;
+}
+let snapshot: Snapshot = { version: 0, at: null, marketOpen: null, clockOffset: 0 };
+
+function notify(patch: Partial<Snapshot> = {}) {
+  snapshot = { ...snapshot, ...patch, version: snapshot.version + 1 };
+  for (const l of listeners) l();
+}
+
+/** Keep `incoming` where it is newer than what is held; `true` when
+ * anything changed (and every subscriber was told). A quote's `at` is when
+ * the server read that price, so one read again is a later `at`; the same
+ * `at` is the quote already held, coming back from a poll that found
+ * nothing new, and is not a change. */
+export function seedQuotes(incoming: (Quote | null | undefined)[], patch: Partial<Snapshot> = {}): boolean {
+  let changed = false;
+  for (const q of incoming) {
+    if (!q) continue;
+    const held = quotes.get(q.key);
+    if (!held || q.at > held.at) {
+      quotes.set(q.key, q);
+      changed = true;
+    }
+  }
+  if (changed) notify(patch);
+  return changed;
+}
+
+/**
+ * Note the server's clock from an answer made at its `at` (server ms),
+ * asked at `sentAt` and back at `receivedAt` (this browser's ms): the
+ * answer was made somewhere in between, so the offset is `at` less the
+ * midpoint. A quote's `at` is the server's time, so its age is measured
+ * against `Date.now() + clockOffset`, never the browser's clock alone,
+ * which may run fast or slow. Only a move past `CLOCK_SLACK_MS` is news.
+ */
+export function noteServerClock(at: number, sentAt: number, receivedAt: number) {
+  if (!Number.isFinite(at)) return;
+  const offset = Math.round(at - (sentAt + receivedAt) / 2);
+  if (Math.abs(offset - snapshot.clockOffset) > CLOCK_SLACK_MS) notify({ clockOffset: offset });
+}
+
+async function poll() {
+  if (inFlight || !bound || document.visibilityState !== 'visible') return;
+  const keys = [...wanted.keys()];
+  if (keys.length === 0) return;
+  inFlight = true;
+  try {
+    for (let i = 0; i < keys.length; i += MAX_KEYS) {
+      const sentAt = Date.now();
+      const answer = await getQuotes(serverBase, keys.slice(i, i + MAX_KEYS));
+      noteServerClock(answer.at, sentAt, Date.now());
+      const patch = { at: answer.at, marketOpen: answer.market_open };
+      if (!seedQuotes(answer.quotes, patch)) {
+        // The market opening or closing is news even when no price moved;
+        // the answer's time alone is not, so it is noted without a word.
+        if (snapshot.marketOpen !== answer.market_open) notify(patch);
+        else snapshot.at = answer.at;
+      }
+    }
+  } catch {
+    // The next tick tries again; the rows keep their last price.
+  } finally {
+    inFlight = false;
+  }
+}
+
+function pollSoon() {
+  if (soon != null) return;
+  soon = window.setTimeout(() => {
+    soon = null;
+    void poll();
+  }, 0);
+}
+
+function start() {
+  if (timer != null) return;
+  timer = window.setInterval(() => void poll(), EVERY_MS);
+  document.addEventListener('visibilitychange', onVisible);
+}
+
+function stop() {
+  if (timer == null) return;
+  window.clearInterval(timer);
+  timer = null;
+  document.removeEventListener('visibilitychange', onVisible);
+}
+
+/** Shown again after being hidden: catch up at once. */
+function onVisible() {
+  if (document.visibilityState === 'visible') pollSoon();
+}
+
+function want(keys: string[]) {
+  let fresh = false;
+  for (const key of keys) {
+    const n = wanted.get(key) ?? 0;
+    wanted.set(key, n + 1);
+    if (n === 0) fresh = true;
+  }
+  if (wanted.size > 0) start();
+  if (fresh) pollSoon();
+}
+
+function drop(keys: string[]) {
+  for (const key of keys) {
+    const n = wanted.get(key) ?? 0;
+    if (n <= 1) wanted.delete(key);
+    else wanted.set(key, n - 1);
+  }
+  if (wanted.size === 0) stop();
+}
+
+function subscribe(l: () => void) {
+  listeners.add(l);
+  return () => {
+    listeners.delete(l);
+  };
+}
+
+/** The quotes held: `get(key)` the newest, `at` when the last answer came,
+ * `marketOpen` what it said, `clockOffset` the server's clock less this
+ * browser's (ms): age a quote against `Date.now() + clockOffset`. */
+export interface Quotes {
+  get: (key: string | null | undefined) => Quote | null;
+  at: number | null;
+  marketOpen: boolean | null;
+  clockOffset: number;
+}
+
+/**
+ * The quotes for `keys`, polled every 2 s while any component wants them
+ * (one request for every key on screen). Re-renders when any quote changes.
+ * A new `serverBase` starts over.
+ */
+export function useQuotes(base: string, keys: (string | null | undefined)[]): Quotes {
+  const asked = keys.filter((k): k is string => typeof k === 'string' && k.length > 0);
+  // Keyed by content, so a re-render with the same keys asks for nothing new.
+  const signature = asked.join(',');
+  useEffect(() => {
+    if (!bound || serverBase !== base) {
+      bound = true;
+      serverBase = base;
+      quotes.clear();
+      notify({ at: null, marketOpen: null, clockOffset: 0 });
+    }
+    const mine = signature ? signature.split(',') : [];
+    want(mine);
+    return () => drop(mine);
+  }, [base, signature]);
+  const snap = useSyncExternalStore(subscribe, () => snapshot, () => snapshot);
+  // Built from the snapshot, so it is a new object on every change.
+  return { get: (key) => (key ? quotes.get(key) ?? null : null), at: snap.at, marketOpen: snap.marketOpen, clockOffset: snap.clockOffset };
+}
+
+/** One key's quote, polled with everything else on screen. */
+export function useQuote(base: string, key: string | null | undefined): Quote | null {
+  return useQuotes(base, [key]).get(key);
+}

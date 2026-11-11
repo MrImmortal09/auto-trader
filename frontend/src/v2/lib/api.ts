@@ -21,12 +21,16 @@ import type {
   GroupId,
   HistoryAnswer,
   IndicatorAnswer,
+  Instrument,
+  InstrumentsStatus,
   KotakState,
   MarketIndex,
   MarketLive,
   MarksAnswer,
   PaperActivity,
   MeAnswer,
+  QuoteAnswer,
+  SearchAnswer,
   ModeCheck,
   OptionChainAnswer,
   RangeId,
@@ -39,6 +43,7 @@ import type {
   TelegramState,
   TrendAnswer,
   UserReport,
+  WatchlistsAnswer,
 } from './types';
 
 export class ApiError extends Error {
@@ -123,6 +128,45 @@ export const getVersion = (base: string) => getJson<{ version: string }>(base, '
 /** `symbol`'s bars at `tf` from one IST day to another (`YYYY-MM-DD`), both included. */
 export const getCandles = (base: string, symbol: string, tf: Tf, from: string, to: string) =>
   getJson<{ bars: Bar[] }>(base, `/api/v2/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&from=${from}&to=${to}`);
+
+// ── Instrument search (behind the `search` switch: a 404 while it is off) ── //
+
+/** Everything `q` matches — a symbol, a name, an ISIN, `BANKNIFTY 52000 CE`
+ * or `TATA FUT` — grouped Indices / Stocks / Futures / Options, at most
+ * `limit` (1–8) rows each, each with its quote when the hub has one. */
+export const searchInstruments = (base: string, q: string, limit?: number) =>
+  getJson<SearchAnswer>(base, `/api/v2/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`);
+/** The quotes for up to 60 price-map keys; a key asked for is polled for the next 15 s. */
+export const getQuotes = (base: string, keys: string[]) => getJson<QuoteAnswer>(base, `/api/v2/quotes?keys=${encodeURIComponent(keys.join(','))}`);
+/** One instrument by its id (`nse_cm:2885`), with its quote and its underlying's. */
+export const getInstrument = (base: string, id: string) => getJson<Instrument>(base, `/api/v2/instruments/${encodeURIComponent(id)}`);
+/** The catalog's and the quote hub's state — the admin's. */
+export const getInstrumentsStatus = (base: string) => getJson<InstrumentsStatus>(base, '/api/v2/instruments/status');
+
+// ── Watchlists (behind the `watchlists` switch: a 404 while it is off) ──── //
+// Anyone signed in, each their own: the admin's are the admin's. Every
+// change answers the list it was about (`WatchlistAnswer`) in `Sent.body`.
+
+/** Every list of the signed-in person's with its items, each with the
+ * catalog's row and its quote; a first call makes "Watchlist 1". */
+export const getWatchlists = (base: string) => getJson<WatchlistsAnswer>(base, '/api/v2/watchlists');
+const watchlistPath = (id: number) => `/api/v2/watchlists/${id}`;
+/** A key in the path: `idx|NIFTY 50` → `idx%7CNIFTY%2050`. */
+const watchlistItemPath = (id: number, key: string) => `${watchlistPath(id)}/items/${encodeURIComponent(key)}`;
+/** A new, empty list at the end (201); 409 at five lists. */
+export const createWatchlist = (base: string, name: string) => send(base, '/api/v2/watchlists', 'POST', { name });
+/** Rename and/or move a list; a field left out is unchanged. */
+export const patchWatchlist = (base: string, id: number, patch: { name?: string; position?: number }) => send(base, watchlistPath(id), 'PATCH', patch);
+/** A list and its items; 409 for the person's only list. */
+export const deleteWatchlist = (base: string, id: number) => send(base, watchlistPath(id), 'DELETE');
+/** The whole ordered list of price-map keys (or catalog ids): what is left
+ * out goes, what is new is added, the rest is reordered. */
+export const putWatchlistItems = (base: string, id: number, keys: string[]) => send(base, `${watchlistPath(id)}/items`, 'PUT', { keys });
+/** One key added at the end: 201 when added, 200 when the list held it
+ * already; 409 at fifty. */
+export const addWatchlistItem = (base: string, id: number, key: string) => send(base, watchlistItemPath(id, key), 'POST');
+/** One key taken out; 404 when the list does not hold it. */
+export const removeWatchlistItem = (base: string, id: number, key: string) => send(base, watchlistItemPath(id, key), 'DELETE');
 
 export const getIndicator = (base: string) => getJson<IndicatorAnswer>(base, '/api/market/indicator');
 export const getMarketLive = (base: string) => getJson<MarketLive>(base, '/api/market/live');

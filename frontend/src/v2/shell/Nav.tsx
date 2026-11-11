@@ -1,6 +1,6 @@
-import { Ellipsis } from 'lucide-react';
+import { Ellipsis, Search } from 'lucide-react';
 import { Mark } from './Mark';
-import { SCREENS, TAB_SCREENS, type ScreenId } from './screens';
+import { SCREENS, type ScreenId } from './screens';
 
 // Figma "Nav item" (desktop rail) and "Tab item" (phone tab bar). `screens`
 // is what this person may open — see `visibleScreens`. Blue marks where you
@@ -32,10 +32,24 @@ export function NavRail({ screens, screen, onSelect }: { screens: ScreenId[]; sc
   );
 }
 
-/** Phone: Desk, Trade, Market, and More (whatever else this person may open). */
-export function TabBar({ screens, screen, onSelect }: { screens: ScreenId[]; screen: ScreenId; onSelect: (s: ScreenId) => void }) {
-  const tabs = SCREENS.filter((s) => TAB_SCREENS.includes(s.id) && screens.includes(s.id));
-  const rest = screens.filter((s) => !TAB_SCREENS.includes(s));
+/**
+ * Phone: three tabs of their own (`tabs`, in order — see `tabScreens`), and a
+ * fourth — Search, while the search is on (`search` given: the rest of the
+ * screens then sit under the account menu), else More (whatever else this
+ * person may open).
+ */
+export function TabBar({ screens, tabs: tabIds, screen, onSelect, search }: {
+  /** What this person may open. */
+  screens: ScreenId[];
+  /** The tabs with a place of their own, in order. */
+  tabs: ScreenId[];
+  screen: ScreenId;
+  onSelect: (s: ScreenId) => void;
+  /** The Search tab: whether its sheet is open, and how to open it. */
+  search?: { open: boolean; onOpen: () => void };
+}) {
+  const tabs = tabIds.flatMap((id) => (screens.includes(id) ? SCREENS.filter((s) => s.id === id) : []));
+  const rest = screens.filter((s) => !tabIds.includes(s));
   const more = rest.includes(screen);
   const tab = (selected: boolean) =>
     `flex flex-1 flex-col items-center justify-center gap-1 type-caption transition-colors duration-120 ${selected ? 'text-accent' : 'text-fg-muted'}`;
@@ -48,11 +62,18 @@ export function TabBar({ screens, screen, onSelect }: { screens: ScreenId[]; scr
             {label}
           </button>
         ))}
-        {rest.length > 0 && (
-          <button type="button" aria-current={more ? 'page' : undefined} onClick={() => onSelect(more ? screen : rest[0])} className={tab(more)}>
-            <Ellipsis size={22} strokeWidth={1.75} />
-            More
+        {search ? (
+          <button type="button" aria-pressed={search.open} aria-haspopup="dialog" onClick={search.onOpen} className={tab(search.open)}>
+            <Search size={22} strokeWidth={1.75} />
+            Search
           </button>
+        ) : (
+          rest.length > 0 && (
+            <button type="button" aria-current={more ? 'page' : undefined} onClick={() => onSelect(more ? screen : rest[0])} className={tab(more)}>
+              <Ellipsis size={22} strokeWidth={1.75} />
+              More
+            </button>
+          )
         )}
       </div>
     </nav>
