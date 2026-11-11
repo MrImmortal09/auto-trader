@@ -2,11 +2,13 @@
 //! resolved against the scrip master. An index option on one of the six
 //! indices always (exactly what the owner's one-tap buy resolves, through
 //! the same `execute::index_option` test); behind the `stock_paper` switch,
-//! any other F&O underlying's CE or PE as well — a stock's, or an index the
-//! app only charts — in NSE's F&O segment, with a readable strike, expiring
-//! today or later. Never a future, a stock itself, an expired contract or a
-//! BSE stock option. Nothing here places an order or reads a price: the
-//! route still demands the contract's own fresh tick before it fills.
+//! an NSE stock's CE or PE as well — with a readable strike, expiring today
+//! or later, and the stock's cash row named by the instrument catalog, so
+//! its price is on the feed for a level on it to trigger. Never a future, a
+//! stock itself, an expired contract, a BSE stock option or an option on an
+//! index the app only charts (no feed name and no cash row: nothing to
+//! watch). Nothing here places an order or reads a price: the route still
+//! demands the contract's own fresh tick before it fills.
 //!
 //! The owner's live buy (`POST /api/execute/buy`) does not use this: it
 //! keeps `ExecuteBoard::find_contract`, index-only, whatever the switch says.
@@ -20,28 +22,35 @@ use crate::execute::{index_option, listed_option};
 use crate::AppState;
 
 /// The contract `trading_symbol` names, if a paper buy may take it. The
-/// scrip master must be loaded (it is, after the Kotak login); a stock's
-/// cash-row feed key comes from the instrument catalog, which is built only
-/// while `search` is on — without it the position has no underlying price
-/// to set a level on, and says so when one is tried.
+/// scrip master must be loaded (it is, after the Kotak login). A stock
+/// option needs the instrument catalog as well, which names the stock's
+/// cash row on the feed; it is built only while `search` is on, so with
+/// that switch off, or before its first build, a stock option is a 409 —
+/// never a position with no underlying price to watch — and an index option
+/// resolves as ever.
 pub async fn find_paper_contract(state: &AppState, trading_symbol: &str) -> Result<ContractRef, Refusal> {
-    let stock_paper = state.flags.read().await.stock_paper;
+    let flags = *state.flags.read().await;
+    let catalog_ready = flags.search && state.instruments.is_built();
     let today = shared_domain::today_ist();
     let store = state.scrip_store.read().await;
     let Some(store) = store.as_ref() else {
         return Err(Refusal::conflict("Scrip master isn't loaded yet — try again after the Kotak login"));
     };
-    resolve(store, trading_symbol, today, stock_paper, &|underlying| state.instruments.spot_key(underlying))
+    resolve(store, trading_symbol, today, flags.stock_paper, catalog_ready, &|underlying| state.instruments.spot_key(underlying))
 }
 
-/// [`find_paper_contract`] on `store` as of `today`. `spot_key` gives an
-/// underlying's cash-row feed key (`nse_cm|2885`), or `None` when the
-/// catalog has none for it.
+/// [`find_paper_contract`] on `store` as of `today`. `catalog_ready` says
+/// the instrument catalog is built (and `search` on); `spot_key` then gives
+/// an underlying's cash-row feed key from it (`nse_cm|2885`), or `None` for
+/// one with no cash row — an index the app only charts. Neither is consulted
+/// for an index option, or for anything refused before a stock option is
+/// found.
 pub fn resolve(
     store: &ScripStore,
     trading_symbol: &str,
     today: NaiveDate,
     stock_paper: bool,
+    catalog_ready: bool,
     spot_key: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ContractRef, Refusal> {
     let needle = trading_symbol.trim();
@@ -73,7 +82,20 @@ pub fn resolve(
         let Some(rows) = store.records.get(underlying) else { continue };
         for record in rows.iter().filter(|r| r.trading_symbol.trim() == needle) {
             if listed_option(record, underlying, today) {
-                return Ok(contract(underlying, record, spot_key(underlying)));
+                // The stock's own price must be on the feed, for a level on
+                // it to trigger: its cash row, which only the catalog names.
+                // Without that, no position — not one with nothing to watch.
+                if !catalog_ready {
+                    return Err(Refusal::conflict(format!(
+                        "{needle} can't be bought yet — the instrument catalog, which names {underlying}'s cash row on the feed, isn't built (it needs the `search` switch on)"
+                    )));
+                }
+                let Some(underlying_key) = spot_key(underlying) else {
+                    return Err(Refusal::bad_request(format!(
+                        "{needle} is an option on {underlying}, which has no cash row on the feed — only stock options are bought on paper"
+                    )));
+                };
+                return Ok(contract(underlying, record, Some(underlying_key)));
             }
             seen.get_or_insert(record);
         }
@@ -155,8 +177,15 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
+    /// The catalog's cash rows: RELIANCE, M&M and M&MFIN; nothing for an
+    /// index the app only charts (NIFTYNXT50), or for WEIRD.
     fn spot(underlying: &str) -> Option<String> {
-        (underlying == "RELIANCE").then(|| "nse_cm|2885".to_string())
+        match underlying {
+            "RELIANCE" => Some("nse_cm|2885".to_string()),
+            "M&M" => Some("nse_cm|2031".to_string()),
+            "M&MFIN" => Some("nse_cm|13285".to_string()),
+            _ => None,
+        }
     }
 
     fn err(result: Result<ContractRef, Refusal>) -> (StatusCode, String) {
@@ -169,15 +198,15 @@ mod tests {
         let store = store();
         let today = d(2026, 11, 10);
         for stock_paper in [false, true] {
-            let c = resolve(&store, " NIFTY26NOV23000CE ", today, stock_paper, &spot).unwrap();
+            let c = resolve(&store, " NIFTY26NOV23000CE ", today, stock_paper, true, &spot).unwrap();
             assert_eq!((c.index.as_str(), c.strike, c.option_type.as_str(), c.lot_size), ("NIFTY", 23_000.0, "CE", 65));
             assert_eq!((c.ws_key.as_str(), c.segment.as_str(), c.underlying_key, c.expiry), ("nse_fo|52001", "nse_fo", None, d(2026, 11, 24)));
-            let s = resolve(&store, "SENSEX26N2675100PE", today, stock_paper, &spot).unwrap();
+            let s = resolve(&store, "SENSEX26N2675100PE", today, stock_paper, true, &spot).unwrap();
             assert_eq!((s.index.as_str(), s.segment.as_str(), s.underlying_key, s.expiry), ("SENSEX", "bse_fo", None, d(2026, 11, 26)));
             // An index future, and an index option that has expired, never.
-            let (status, msg) = err(resolve(&store, "NIFTY26NOVFUT", today, stock_paper, &spot));
+            let (status, msg) = err(resolve(&store, "NIFTY26NOVFUT", today, stock_paper, true, &spot));
             assert_eq!((status, msg.as_str()), (StatusCode::BAD_REQUEST, "NIFTY26NOVFUT is a future, not an option — only options are bought on paper"));
-            assert_eq!(err(resolve(&store, "NIFTY26N0323000CE", today, stock_paper, &spot)).1, "NIFTY26N0323000CE expired on 03 Nov 2026");
+            assert_eq!(err(resolve(&store, "NIFTY26N0323000CE", today, stock_paper, true, &spot)).1, "NIFTY26N0323000CE expired on 03 Nov 2026");
         }
     }
 
@@ -185,32 +214,59 @@ mod tests {
     fn a_stock_option_resolves_only_with_the_switch_on() {
         let store = store();
         let today = d(2026, 11, 10);
-        let (status, msg) = err(resolve(&store, "RELIANCE26NOV1400CE", today, false, &spot));
+        let (status, msg) = err(resolve(&store, "RELIANCE26NOV1400CE", today, false, true, &spot));
         assert_eq!((status, msg.as_str()), (StatusCode::BAD_REQUEST, "RELIANCE26NOV1400CE is not a listed index option"));
 
-        let c = resolve(&store, "RELIANCE26NOV1400CE", today, true, &spot).unwrap();
+        let c = resolve(&store, "RELIANCE26NOV1400CE", today, true, true, &spot).unwrap();
         assert_eq!((c.index.as_str(), c.trading_symbol.as_str(), c.strike, c.option_type.as_str()), ("RELIANCE", "RELIANCE26NOV1400CE", 1_400.0, "CE"));
         assert_eq!((c.ws_key.as_str(), c.lot_size, c.expiry, c.segment.as_str()), ("nse_fo|41222", 500, d(2026, 11, 24), "nse_fo"));
         assert_eq!(c.underlying_key.as_deref(), Some("nse_cm|2885"));
-        let p = resolve(&store, "RELIANCE26NOV1400PE", today, true, &spot).unwrap();
+        let p = resolve(&store, "RELIANCE26NOV1400PE", today, true, true, &spot).unwrap();
         assert_eq!((p.option_type.as_str(), p.ws_key.as_str()), ("PE", "nse_fo|41223"));
         // On its expiry day it still resolves (the route refuses it from 15:38 by `squaring_off`).
-        assert!(resolve(&store, "RELIANCE26NOV1400CE", d(2026, 11, 24), true, &spot).is_ok());
-        // An index the app only charts: an option on it, with no cash row to watch.
-        let nxt = resolve(&store, "NIFTYNXT5026NOV70000CE", today, true, &spot).unwrap();
-        assert_eq!((nxt.index.as_str(), nxt.strike, nxt.underlying_key), ("NIFTYNXT50", 70_000.0, None));
+        assert!(resolve(&store, "RELIANCE26NOV1400CE", d(2026, 11, 24), true, true, &spot).is_ok());
+    }
+
+    #[test]
+    fn an_option_on_an_index_the_app_only_charts_is_refused() {
+        // NIFTYNXT50 is in nse_fo but has no feed name and no cash row: a
+        // level on its value could never trigger, so the option isn't bought.
+        let (status, msg) = err(resolve(&store(), "NIFTYNXT5026NOV70000CE", d(2026, 11, 10), true, true, &spot));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(msg, "NIFTYNXT5026NOV70000CE is an option on NIFTYNXT50, which has no cash row on the feed — only stock options are bought on paper");
+    }
+
+    #[test]
+    fn a_stock_option_waits_for_the_catalog_an_index_option_never_did() {
+        let store = store();
+        let today = d(2026, 11, 10);
+        // `search` off, or no build finished yet: the stock's cash row is
+        // unknown, so no stock option — a 409 to try again, never a position
+        // saved with nothing to watch for the rest of its life.
+        let (status, msg) = err(resolve(&store, "RELIANCE26NOV1400CE", today, true, false, &spot));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(msg, "RELIANCE26NOV1400CE can't be bought yet — the instrument catalog, which names RELIANCE's cash row on the feed, isn't built (it needs the `search` switch on)");
+        // Index options resolve without the catalog, as they always have.
+        assert!(resolve(&store, "NIFTY26NOV23000CE", today, true, false, &spot).is_ok());
+        assert!(resolve(&store, "SENSEX26N2675100PE", today, false, false, &spot).is_ok());
+        // So does every refusal that comes before a stock option is found.
+        assert_eq!(err(resolve(&store, "RELIANCE26NOVFUT", today, true, false, &spot)).0, StatusCode::BAD_REQUEST);
+        assert_eq!(err(resolve(&store, "RELIANCE26OCT1400CE", today, true, false, &spot)).0, StatusCode::BAD_REQUEST);
+        // Built, but today's cash file has no row for the stock: still no.
+        let none = |_: &str| None;
+        assert_eq!(err(resolve(&store, "RELIANCE26NOV1400CE", today, true, true, &none)).0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn never_a_future_a_stock_an_expired_or_a_bse_contract() {
         let store = store();
         let today = d(2026, 11, 10);
-        let refused = |symbol: &str| err(resolve(&store, symbol, today, true, &spot));
+        let refused = |symbol: &str| err(resolve(&store, symbol, today, true, true, &spot));
         assert_eq!(refused("RELIANCE26NOVFUT").1, "RELIANCE26NOVFUT is a future, not an option — only options are bought on paper");
         assert_eq!(refused("RELIANCE-EQ").1, "RELIANCE-EQ is a stock, not an option — only options are bought on paper");
         assert_eq!(refused("RELIANCE26OCT1400CE").1, "RELIANCE26OCT1400CE expired on 27 Oct 2026");
         // Surrounding spaces are trimmed, as the owner's buy trims them.
-        assert!(resolve(&store, "RELIANCE26NOV1400CE  ", today, true, &spot).is_ok());
+        assert!(resolve(&store, "RELIANCE26NOV1400CE  ", today, true, true, &spot).is_ok());
         // A stock option listed on BSE only: NSE only.
         assert_eq!(refused("TCS26NOV3000CE").1, "TCS26NOV3000CE trades on BSE — only NSE stock options are bought on paper");
         // The strike heuristic reads nothing sensible: refused, not guessed.
@@ -219,18 +275,18 @@ mod tests {
         assert_eq!(refused("TATAMOTORS26NOV700CE").1, "TATAMOTORS26NOV700CE is not a listed option");
         assert_eq!(refused("   ").1, "trading_symbol is required");
         // The day after its expiry, yesterday's contract is gone.
-        assert_eq!(err(resolve(&store, "RELIANCE26NOV1400CE", d(2026, 11, 25), true, &spot)).1, "RELIANCE26NOV1400CE expired on 24 Nov 2026");
+        assert_eq!(err(resolve(&store, "RELIANCE26NOV1400CE", d(2026, 11, 25), true, true, &spot)).1, "RELIANCE26NOV1400CE expired on 24 Nov 2026");
     }
 
     #[test]
     fn the_longest_underlying_name_wins_and_ampersands_are_fine() {
         let store = store();
         let today = d(2026, 11, 10);
-        let mm = resolve(&store, "M&M26NOV2800CE", today, true, &spot).unwrap();
+        let mm = resolve(&store, "M&M26NOV2800CE", today, true, true, &spot).unwrap();
         assert_eq!((mm.index.as_str(), mm.strike, mm.lot_size), ("M&M", 2_800.0, 350));
-        let fin = resolve(&store, "M&MFIN26NOV300CE", today, true, &spot).unwrap();
+        let fin = resolve(&store, "M&MFIN26NOV300CE", today, true, true, &spot).unwrap();
         assert_eq!((fin.index.as_str(), fin.strike, fin.lot_size), ("M&MFIN", 300.0, 2_000));
-        // No cash row in the catalog for them: no underlying to watch, the premium still is.
-        assert_eq!((mm.underlying_key, fin.underlying_key), (None, None));
+        // Each carries its own stock's cash row, never the other's.
+        assert_eq!((mm.underlying_key.as_deref(), fin.underlying_key.as_deref()), (Some("nse_cm|2031"), Some("nse_cm|13285")));
     }
 }

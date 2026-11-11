@@ -226,9 +226,11 @@ pub struct BuyReq {
 /// `POST /api/v2/me/buy {trading_symbol, lots}` — buy at the live price: a
 /// new position, or an add to the one on the same contract. Answers with
 /// the fill. `trading_symbol` is an index option's, or — behind the
-/// `stock_paper` switch — any NSE F&O underlying's CE/PE (`RELIANCE26NOV1400CE`),
-/// resolved by `paper::resolve`; a future, a stock or an expired contract is
-/// refused there. Every gate is the same for both: the market window and
+/// `stock_paper` switch — an NSE stock's CE/PE (`RELIANCE26NOV1400CE`),
+/// resolved by `paper::resolve`; a future, a stock, an expired contract or an
+/// option on an index the app only charts is refused there, and a stock
+/// option is a 409 while the instrument catalog (which names the stock's cash
+/// row) isn't built. Every gate is the same for both: the market window and
 /// the entry cutoff, a fresh feed, the contract's own tick from the last 10 s,
 /// not being squared off, and the desk's caps and wallet.
 pub async fn buy_handler(

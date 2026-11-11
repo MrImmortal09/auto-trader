@@ -1200,9 +1200,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_index_option_without_an_underlying_feed_cant_watch_the_index() {
+    async fn a_position_without_an_underlying_feed_cant_watch_the_underlying() {
         let (_db, desk) = desk("no-underlying").await;
-        // An index the app only charts: no feed name, no cash row.
+        // A contract with no underlying price on the feed: `resolve` makes
+        // none now (an option on an index the app only charts is refused),
+        // but the desk guards the level on its own, snapshot or not.
         let mut c = reliance(70_000.0, "CE");
         c.index = "NIFTYNXT50".into();
         c.underlying_key = None;

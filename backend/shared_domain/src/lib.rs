@@ -443,15 +443,19 @@ pub struct FeatureFlags {
     #[serde(default)]
     pub stock_charts: bool,
     /// Stock options on users' paper books: `POST /api/v2/me/buy` resolves
-    /// any CE/PE of an NSE F&O underlying in the catalog, not only the six
-    /// indices' options. While off, index options are bought exactly as
-    /// before and a stock's contract is refused. Nothing in the engine
-    /// reads it, and the owner's live buy (`POST /api/execute/buy`) stays
-    /// index-only whatever it says. A position already held keeps being
-    /// watched, sold and squared off when it is turned off.
+    /// an NSE stock's CE/PE, beside the six indices' options. While off,
+    /// index options are bought exactly as before and a stock's contract is
+    /// refused. Nothing in the engine reads it, and the owner's live buy
+    /// (`POST /api/execute/buy`) stays index-only whatever it says. A
+    /// position already held keeps being watched, sold and squared off when
+    /// it is turned off.
     ///
-    /// It needs [`Self::search`] on as well (the instrument catalog names
-    /// the stock and its cash row's feed key), and in practice
+    /// It needs [`Self::search`] on as well: the instrument catalog, built
+    /// only while that is on, names the stock's cash row on the feed, which
+    /// a level on the stock's price triggers on. With `search` off, or
+    /// before the catalog's first build, a stock option is a 409 (index
+    /// options are unaffected); an option on an index the app only charts,
+    /// which has no cash row, is never bought. In practice it also needs
     /// [`Self::stock_charts`], which shows the ladder a stock option is
     /// bought from.
     #[serde(default)]
