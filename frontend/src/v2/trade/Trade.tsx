@@ -635,11 +635,29 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     save((s) => ({ ...s, slots: s.slots.map((slot, n) => (n === i ? { ...slot, ...change } : slot)) }));
   const setLib = (chartLib: ChartLib) => save((s) => ({ ...s, chartLib }));
 
+  /** Whether `p`'s level can be placed on a chart now. A stock position's
+   * levels go on the stock's own chart (or its option's); while the
+   * `stock_charts` switch is off that chart can't show — `shownAs` renders
+   * its slot as NIFTY — so nothing is placed, and a toast says why: a tap on
+   * the index's chart would set the stock's level ~25,000 points past its
+   * price and sell the whole holding at market on the engine's next tick. */
+  function levelChartShows(p: ExecutePosition, kind: LevelKind): boolean {
+    if (stocksOn !== false || isIndex(p.index)) return true;
+    toast({
+      tone: 'neutral',
+      title: `${contractLabel(p.index, p.strike, p.option_type)}: no ${kind} placed`,
+      body: `Its ${kind} is set on ${p.index}'s own chart, and stock charts are switched off right now.`,
+      key: `stock-charts-off-${p.id}-${kind}`,
+    });
+    return false;
+  }
+
   /** "+ Stop" from the positions panel: placed on the chart showing the
    * trade's option (a premium level), else its underlying — the index, or
    * the stock's own price (an index level) — the first chart is put on the
    * underlying when none shows either. */
   function placeFromPanel(p: ExecutePosition, kind: LevelKind) {
+    if (!levelChartShows(p, kind)) return;
     const option = p.expiry ? optionOf(p, p.expiry) : null;
     const onOption = option ? shownSlots.findIndex((s) => sameSym(s.sym, option)) : -1;
     if (onOption >= 0) return startPlacing(onOption, p, kind, 'premium');
@@ -867,6 +885,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       onRemove={clearLevel}
       onAdd={(p, kind) => {
         setSheet(false);
+        if (!levelChartShows(p, kind)) return;
         const targetSlot = activeFullscreenSlot ?? 0;
         if (!isOwnChart(saved.slots[targetSlot].sym, p.index)) setSlot(targetSlot, { sym: ownChartOf(p.index) });
         if (!desktop) showChart(true);
