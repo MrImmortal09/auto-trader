@@ -13,13 +13,22 @@
 //! - `GET /v3/historical-candle/intraday/…` — today's OHLCV candles
 //! - `GET /v3/feed/market-data-feed/authorize` — the live feed's WebSocket URL
 //!   (see [`feed`])
-//! - instruments JSON (gzip)        — index futures and options by contract
+//! - instruments JSON (gzip)        — futures and options by contract, for
+//!   any underlying (the indices, or a stock such as `RELIANCE`)
+//!
+//! The instruments files are a few MB gzipped and tens of MB decompressed.
+//! They are never materialised: every caller stream-filters the rows it
+//! wants in `spawn_blocking`. With [`UpstoxClient::with_instruments_cache`]
+//! set, the gzipped bytes are kept on disk per IST day, so a second
+//! underlying asked for on the same day reads the file instead of
+//! downloading it again.
 
 pub mod feed;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate};
@@ -288,6 +297,9 @@ pub struct Derivative {
 pub struct UpstoxClient {
     http: reqwest::Client,
     token: String,
+    /// Where the instruments files are kept for the IST day, when set —
+    /// see [`Self::with_instruments_cache`].
+    instruments_cache: Option<PathBuf>,
 }
 
 impl UpstoxClient {
@@ -298,7 +310,16 @@ impl UpstoxClient {
             .connect_timeout(Duration::from_secs(10))
             .user_agent(USER_AGENT)
             .build()?;
-        Ok(Self { http, token: analytics_token.into() })
+        Ok(Self { http, token: analytics_token.into(), instruments_cache: None })
+    }
+
+    /// Keep each downloaded instruments file (its gzipped bytes, a few MB)
+    /// under `dir/<IST day>/<file>` and read it from there for the rest of
+    /// that day; older days' directories are removed as a new one is
+    /// written. Without this, every call downloads the file again.
+    pub fn with_instruments_cache(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.instruments_cache = Some(dir.into());
+        self
     }
 
     async fn get_json<T: DeserializeOwned>(
@@ -437,15 +458,15 @@ impl UpstoxClient {
     /// `today` (IST) still counts: it trades until the close.
     ///
     /// The decompressed file is tens of MB, and the production VM has under
-    /// 1 GB of RAM with no swap, so it is stream-filtered row by row instead of
-    /// being materialised.
+    /// 1 GB of RAM, so it is stream-filtered row by row instead of being
+    /// materialised.
     pub async fn nearest_index_futures(
         &self,
         instruments_url: &str,
         wanted: &[&str],
         today: NaiveDate,
     ) -> Result<HashMap<String, FutureContract>, UpstoxError> {
-        let gz = self.download_instruments(instruments_url).await?;
+        let gz = self.instruments_gz(instruments_url).await?;
         let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
 
         tokio::task::spawn_blocking(move || {
@@ -460,36 +481,36 @@ impl UpstoxClient {
         .map_err(|e| UpstoxError::Decode(e.to_string()))?
     }
 
-    /// Every future and option on the `wanted` underlyings (`NIFTY`,
-    /// `SENSEX`, …) in an instruments file, stream-filtered the same way as
-    /// [`Self::nearest_index_futures`]. For the six indices that is about
-    /// 8,000 contracts across the NSE and BSE files.
+    /// Every future and option on the `wanted` underlyings — an index
+    /// (`NIFTY`, `SENSEX`) or a stock (`RELIANCE`) by its
+    /// `underlying_symbol` — in an instruments file, stream-filtered the
+    /// same way as [`Self::nearest_index_futures`] and read from the day's
+    /// cached file when [`Self::with_instruments_cache`] is set. For the six
+    /// indices that is about 8,000 contracts across the NSE and BSE files;
+    /// a stock has a few hundred.
+    pub async fn derivatives(&self, instruments_url: &str, wanted: &[&str]) -> Result<Vec<Derivative>, UpstoxError> {
+        let gz = self.instruments_gz(instruments_url).await?;
+        let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
+
+        tokio::task::spawn_blocking(move || filter_derivatives(&gz, &wanted))
+            .await
+            .map_err(|e| UpstoxError::Decode(e.to_string()))?
+    }
+
+    /// [`Self::derivatives`] under its older name, for the six indices.
     pub async fn index_derivatives(
         &self,
         instruments_url: &str,
         wanted: &[&str],
     ) -> Result<Vec<Derivative>, UpstoxError> {
-        let gz = self.download_instruments(instruments_url).await?;
-        let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
-
-        tokio::task::spawn_blocking(move || {
-            let reader = BufReader::new(flate2::read::GzDecoder::new(&gz[..]));
-            let mut de = serde_json::Deserializer::from_reader(reader);
-            let keep = |r: &InstrumentRow| is_index_derivative(r, &wanted);
-            let rows = RowFilter { keep: &keep }
-                .deserialize(&mut de)
-                .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))?;
-            Ok(rows.iter().filter_map(to_derivative).collect())
-        })
-        .await
-        .map_err(|e| UpstoxError::Decode(e.to_string()))?
+        self.derivatives(instruments_url, wanted).await
     }
 
     /// Every future on the `wanted` underlyings in an instruments file — the
     /// near, next and far months — stream-filtered the same way as
     /// [`Self::nearest_index_futures`].
     pub async fn index_futures(&self, instruments_url: &str, wanted: &[&str]) -> Result<Vec<Derivative>, UpstoxError> {
-        let gz = self.download_instruments(instruments_url).await?;
+        let gz = self.instruments_gz(instruments_url).await?;
         let wanted: Vec<String> = wanted.iter().map(|s| s.to_string()).collect();
 
         tokio::task::spawn_blocking(move || {
@@ -505,7 +526,37 @@ impl UpstoxClient {
     }
 
     /// The gzipped bytes of an instruments file (a few MB; the rows are
-    /// decompressed and filtered as a stream by the callers).
+    /// decompressed and filtered as a stream by the callers): today's copy
+    /// from the cache directory when one is set and holds it, else a
+    /// download, which is then written there for the rest of the IST day.
+    async fn instruments_gz(&self, instruments_url: &str) -> Result<bytes::Bytes, UpstoxError> {
+        let today = shared_domain::today_ist();
+        let cached = self.instruments_cache.as_ref().map(|dir| instruments_cache_path(dir, today, instruments_url));
+        if let Some(path) = &cached {
+            match tokio::fs::read(path).await {
+                Ok(bytes) if !bytes.is_empty() => {
+                    tracing::debug!(path = %path.display(), "Upstox instruments file read from today's cache");
+                    return Ok(bytes.into());
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "Upstox instruments cache unreadable — downloading"),
+            }
+        }
+        let bytes = self.download_instruments(instruments_url).await?;
+        if let (Some(dir), Some(path)) = (self.instruments_cache.clone(), cached) {
+            let copy = bytes.clone();
+            let target = path.clone();
+            let stored = tokio::task::spawn_blocking(move || store_instruments(&dir, &target, &copy, today)).await;
+            match stored {
+                Ok(Ok(())) => tracing::info!(path = %path.display(), bytes = bytes.len(), "Upstox instruments file cached for today"),
+                Ok(Err(e)) => tracing::warn!(path = %path.display(), error = %e, "Upstox instruments file could not be cached"),
+                Err(e) => tracing::warn!(error = %e, "Upstox instruments cache write did not finish"),
+            }
+        }
+        Ok(bytes)
+    }
+
     async fn download_instruments(&self, instruments_url: &str) -> Result<bytes::Bytes, UpstoxError> {
         let resp = self.http.get(instruments_url).timeout(INSTRUMENTS_TIMEOUT).send().await?;
         let status = resp.status();
@@ -514,6 +565,67 @@ impl UpstoxClient {
         }
         Ok(resp.bytes().await?)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Instruments cache on disk
+// ---------------------------------------------------------------------------
+
+/// `dir/<YYYY-MM-DD>/<file>` for an instruments URL: the file is the URL's
+/// last path segment with anything but letters, digits, `.`, `-` and `_`
+/// replaced, so a URL can never name a path outside the day's directory.
+fn instruments_cache_path(dir: &Path, day: NaiveDate, instruments_url: &str) -> PathBuf {
+    let raw = instruments_url.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let mut name: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    if name.trim_matches('.').is_empty() {
+        name = "instruments.json.gz".to_string();
+    }
+    dir.join(day.format("%Y-%m-%d").to_string()).join(name)
+}
+
+/// Write `bytes` to `path` whole (a temp file renamed over it, so a reader
+/// never sees a half file) and drop every other day's directory under `dir`.
+fn store_instruments(dir: &Path, path: &Path, bytes: &[u8], today: NaiveDate) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(&temp, path)?;
+    prune_instruments_cache(dir, today);
+    Ok(())
+}
+
+/// Remove every day directory under `dir` but `today`'s. Anything that is
+/// not a `YYYY-MM-DD` directory is left alone.
+fn prune_instruments_cache(dir: &Path, today: NaiveDate) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let keep = today.format("%Y-%m-%d").to_string();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_day = NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok();
+        if is_day && name != keep && entry.path().is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(path = %entry.path().display(), error = %e, "Old Upstox instruments cache not removed");
+            }
+        }
+    }
+}
+
+/// The futures and options on `wanted` in a gzipped instruments file,
+/// decompressed and filtered as a stream.
+fn filter_derivatives(gz: &[u8], wanted: &[String]) -> Result<Vec<Derivative>, UpstoxError> {
+    let reader = BufReader::new(flate2::read::GzDecoder::new(gz));
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    let keep = |r: &InstrumentRow| is_derivative_of(r, wanted);
+    let rows = RowFilter { keep: &keep }
+        .deserialize(&mut de)
+        .map_err(|e| UpstoxError::Decode(format!("instruments: {e}")))?;
+    Ok(rows.iter().filter_map(to_derivative).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -540,8 +652,9 @@ struct InstrumentRow {
     lot_size: f64,
 }
 
-/// A future or option on one of `wanted`, in an F&O segment.
-fn is_index_derivative(row: &InstrumentRow, wanted: &[String]) -> bool {
+/// A future or option on one of `wanted` (its `underlying_symbol`: `NIFTY`,
+/// `RELIANCE`), in an F&O segment.
+fn is_derivative_of(row: &InstrumentRow, wanted: &[String]) -> bool {
     matches!(row.instrument_type.as_str(), "FUT" | "CE" | "PE")
         && row.segment.ends_with("_FO")
         && wanted.iter().any(|w| *w == row.underlying_symbol)
@@ -770,7 +883,7 @@ mod tests {
             {"segment":"NSE_EQ","instrument_type":"EQ","instrument_key":"NSE_EQ|INE002A01018"}
         ]"#;
         let wanted = vec!["MIDCPNIFTY".to_string(), "BANKNIFTY".to_string()];
-        let keep = |r: &InstrumentRow| is_index_derivative(r, &wanted);
+        let keep = |r: &InstrumentRow| is_derivative_of(r, &wanted);
         let mut de = serde_json::Deserializer::from_str(json);
         let rows = RowFilter { keep: &keep }.deserialize(&mut de).unwrap();
         let found: Vec<Derivative> = rows.iter().filter_map(to_derivative).collect();
@@ -794,5 +907,77 @@ mod tests {
                 lot_size: 30,
             },
         ]);
+    }
+
+    /// Rows of NSE.json.gz as they appear for a stock, gzipped as the file is.
+    fn stock_instruments_gz() -> Vec<u8> {
+        use std::io::Write as _;
+        let json = r#"[
+            {"segment":"NSE_EQ","instrument_type":"EQ","instrument_key":"NSE_EQ|INE002A01018","trading_symbol":"RELIANCE","name":"RELIANCE INDUSTRIES LTD"},
+            {"segment":"NSE_FO","instrument_type":"FUT","underlying_symbol":"RELIANCE","instrument_key":"NSE_FO|35001","lot_size":500,"strike_price":0,"expiry":1795478399000},
+            {"segment":"NSE_FO","instrument_type":"CE","underlying_symbol":"RELIANCE","instrument_key":"NSE_FO|35002","lot_size":500,"strike_price":1400,"expiry":1795478399000},
+            {"segment":"NSE_FO","instrument_type":"PE","underlying_symbol":"RELIANCE","instrument_key":"NSE_FO|35003","lot_size":500,"strike_price":1400,"expiry":1795478399000},
+            {"segment":"NSE_FO","instrument_type":"CE","underlying_symbol":"NIFTY","instrument_key":"NSE_FO|50918","lot_size":65,"strike_price":25000,"expiry":1795478399000},
+            {"segment":"NSE_FO","instrument_type":"CE","underlying_symbol":"RELIANCEX","instrument_key":"NSE_FO|9","lot_size":1,"strike_price":1,"expiry":1795478399000}
+        ]"#;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(json.as_bytes()).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn derivatives_of_a_stock_come_from_the_same_stream_filter() {
+        let gz = stock_instruments_gz();
+        let found = filter_derivatives(&gz, &["RELIANCE".to_string()]).unwrap();
+        let nov24 = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let keys: Vec<&str> = found.iter().map(|d| d.instrument_key.as_str()).collect();
+        assert_eq!(keys, ["NSE_FO|35001", "NSE_FO|35002", "NSE_FO|35003"]);
+        assert!(found.iter().all(|d| d.underlying == "RELIANCE" && d.expiry == nov24 && d.lot_size == 500));
+        assert_eq!(found[0].kind, "FUT");
+        assert_eq!((found[1].kind.as_str(), found[1].strike), ("CE", 1400.0));
+        // The equity row is not a derivative; another symbol's rows are not RELIANCE's.
+        assert!(filter_derivatives(&gz, &["TCS".to_string()]).unwrap().is_empty());
+        // A corrupt file is an error, never an empty list taken as "nothing listed".
+        assert!(filter_derivatives(b"not gzip", &["RELIANCE".to_string()]).is_err());
+    }
+
+    #[test]
+    fn the_cache_path_is_one_file_under_the_days_directory() {
+        let dir = Path::new("/tmp/upstox");
+        let day = NaiveDate::from_ymd_opt(2026, 11, 11).unwrap();
+        assert_eq!(instruments_cache_path(dir, day, NSE_INSTRUMENTS_URL), Path::new("/tmp/upstox/2026-11-11/NSE.json.gz"));
+        assert_eq!(instruments_cache_path(dir, day, BSE_INSTRUMENTS_URL), Path::new("/tmp/upstox/2026-11-11/BSE.json.gz"));
+        // A URL can never climb out of the day's directory.
+        assert_eq!(instruments_cache_path(dir, day, "https://x/../../etc/passwd"), Path::new("/tmp/upstox/2026-11-11/passwd"));
+        assert_eq!(instruments_cache_path(dir, day, "https://x/a%2F..%2Fb"), Path::new("/tmp/upstox/2026-11-11/a_2F.._2Fb"));
+        assert_eq!(instruments_cache_path(dir, day, "https://x/.."), Path::new("/tmp/upstox/2026-11-11/instruments.json.gz"));
+        assert_eq!(instruments_cache_path(dir, day, ""), Path::new("/tmp/upstox/2026-11-11/instruments.json.gz"));
+    }
+
+    #[tokio::test]
+    async fn todays_cached_file_is_read_instead_of_downloaded_and_old_days_are_pruned() {
+        let dir = std::env::temp_dir().join(format!("upstox-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let today = shared_domain::today_ist();
+        // An unreachable URL: a download attempt would fail, so a result proves the cache answered.
+        let url = "http://127.0.0.1:9/NSE.json.gz";
+        let path = instruments_cache_path(&dir, today, url);
+        let old_day = dir.join("2000-01-01");
+        std::fs::create_dir_all(&old_day).unwrap();
+        std::fs::write(old_day.join("NSE.json.gz"), b"stale").unwrap();
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+
+        store_instruments(&dir, &path, &stock_instruments_gz(), today).unwrap();
+        assert!(path.is_file());
+        assert!(!old_day.exists(), "yesterday's directory is pruned when today's is written");
+        assert!(dir.join("notes").is_dir(), "only day directories are pruned");
+
+        let client = UpstoxClient::new("test-token").unwrap().with_instruments_cache(&dir);
+        let found = client.derivatives(url, &["RELIANCE"]).await.unwrap();
+        assert_eq!(found.len(), 3);
+        // Without the cache the same call has to download, and this URL answers nothing.
+        let bare = UpstoxClient::new("test-token").unwrap();
+        assert!(bare.derivatives(url, &["RELIANCE"]).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

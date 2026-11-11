@@ -1,6 +1,15 @@
-//! What a v2 chart can draw — an index, its nearest future, or one of its
-//! option contracts — named in a form neither broker owns, and found in each
-//! broker's contract list by what it is: underlying, expiry, strike and side.
+//! What a v2 chart can draw — an index or a stock, its nearest future, or
+//! one of its option contracts — named in a form neither broker owns, and
+//! found in each broker's contract list by what it is: underlying, expiry,
+//! strike and side.
+//!
+//! The grammar: `NIFTY` or `RELIANCE` (the spot; `RELIANCE@BSE` names a BSE
+//! listing, which is read but refused while the catalog is NSE-only),
+//! `NIFTY:FUT` / `RELIANCE:FUT` (the nearest future still trading) and
+//! `NIFTY:2026-10-27:22750:CE` / `RELIANCE:2026-11-24:1400:CE`. The six
+//! indices always parse; any other name only when the caller's `known`
+//! check accepts it, which the routes answer from the instrument catalog
+//! behind the `stock_charts` switch.
 
 use chrono::NaiveDate;
 use shared_domain::INDEX_NAMES;
@@ -22,26 +31,87 @@ impl Side {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A stock's listing. The catalog is NSE-only (question 3), so a BSE
+/// listing parses but is refused — see [`Symbol::refusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exchange {
+    Nse,
+    Bse,
+}
+
+impl Exchange {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Exchange::Nse => "NSE",
+            Exchange::Bse => "BSE",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "NSE" => Some(Exchange::Nse),
+            "BSE" => Some(Exchange::Bse),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Symbol {
     /// `NIFTY`: the index's spot value.
-    Index(&'static str),
-    /// `NIFTY:FUT`: the nearest future still trading.
-    Future(&'static str),
-    /// `NIFTY:2026-10-27:22750:CE`.
-    Option { index: &'static str, expiry: NaiveDate, strike: f64, side: Side },
+    Index(String),
+    /// `RELIANCE` (NSE) or `RELIANCE@BSE`: a stock's cash price.
+    Equity { symbol: String, exchange: Exchange },
+    /// `NIFTY:FUT`, `RELIANCE:FUT`: the nearest future still trading.
+    Future(String),
+    /// `NIFTY:2026-10-27:22750:CE`, `RELIANCE:2026-11-24:1400:CE`.
+    Option { underlying: String, expiry: NaiveDate, strike: f64, side: Side },
+}
+
+/// An underlying's name as the scrip master spells it: letters, digits and
+/// the `&`, `-` and `_` some stocks carry (`M&M`, `BAJAJ-AUTO`).
+fn is_ticker(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '&' | '-' | '_'))
 }
 
 impl Symbol {
+    /// The six indices' forms only — what every chart could name before the
+    /// catalog existed, and all the routes accept while the `stock_charts`
+    /// switch is off.
     pub fn parse(raw: &str) -> Option<Symbol> {
+        Self::parse_with(raw, &|_| false)
+    }
+
+    /// Reads `raw`; a name that is not one of the six indices is taken as a
+    /// stock only when `known` says the catalog lists it.
+    pub fn parse_with(raw: &str, known: &dyn Fn(&str) -> bool) -> Option<Symbol> {
         let upper = raw.trim().to_ascii_uppercase();
         let mut parts = upper.split(':');
-        let name = parts.next()?;
-        let index = INDEX_NAMES.iter().copied().find(|i| *i == name)?;
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (None, ..) => Some(Symbol::Index(index)),
-            (Some("FUT"), None, ..) => Some(Symbol::Future(index)),
-            (Some(expiry), Some(strike), Some(side), None) => {
+        let first = parts.next()?;
+        let rest = (parts.next(), parts.next(), parts.next(), parts.next());
+
+        // `NAME@EXCHANGE` names a listing: a stock's spot only.
+        let (name, exchange) = match first.split_once('@') {
+            Some((name, exchange)) => (name, Some(Exchange::parse(exchange)?)),
+            None => (first, None),
+        };
+        let underlying = if INDEX_NAMES.contains(&name) {
+            if exchange.is_some() {
+                return None;
+            }
+            Underlying::Index(name.to_string())
+        } else if is_ticker(name) && known(name) {
+            Underlying::Stock(name.to_string())
+        } else {
+            return None;
+        };
+
+        match (underlying, rest) {
+            (Underlying::Index(index), (None, ..)) => Some(Symbol::Index(index)),
+            (Underlying::Stock(symbol), (None, ..)) => Some(Symbol::Equity { symbol, exchange: exchange.unwrap_or(Exchange::Nse) }),
+            (_, (Some(_), ..)) if exchange.is_some() => None,
+            (u, (Some("FUT"), None, ..)) => Some(Symbol::Future(u.into_name())),
+            (u, (Some(expiry), Some(strike), Some(side), None)) => {
                 let expiry = NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok()?;
                 let strike = strike.parse::<f64>().ok().filter(|s| s.is_finite() && *s > 0.0)?;
                 let side = match side {
@@ -49,28 +119,70 @@ impl Symbol {
                     "PE" => Side::Pe,
                     _ => return None,
                 };
-                Some(Symbol::Option { index, expiry, strike, side })
+                Some(Symbol::Option { underlying: u.into_name(), expiry, strike, side })
             }
             _ => None,
         }
     }
 
-    /// The canonical spelling, which [`Symbol::parse`] reads back.
+    /// The canonical spelling, which [`Symbol::parse_with`] reads back. An
+    /// NSE listing is spelt bare (`RELIANCE`), so saved layouts and chart
+    /// names never change when the exchange is the default.
     pub fn name(&self) -> String {
         match self {
             Symbol::Index(index) => index.to_string(),
-            Symbol::Future(index) => format!("{index}:FUT"),
-            Symbol::Option { index, expiry, strike, side } => {
-                format!("{index}:{}:{strike}:{}", expiry.format("%Y-%m-%d"), side.as_str())
+            Symbol::Equity { symbol, exchange: Exchange::Nse } => symbol.to_string(),
+            Symbol::Equity { symbol, exchange } => format!("{symbol}@{}", exchange.as_str()),
+            Symbol::Future(underlying) => format!("{underlying}:FUT"),
+            Symbol::Option { underlying, expiry, strike, side } => {
+                format!("{underlying}:{}:{strike}:{}", expiry.format("%Y-%m-%d"), side.as_str())
             }
         }
     }
 
-    pub fn index(&self) -> &'static str {
+    /// The index or stock this is, or is a contract on.
+    pub fn underlying(&self) -> &str {
         match self {
-            Symbol::Index(i) | Symbol::Future(i) | Symbol::Option { index: i, .. } => i,
+            Symbol::Index(u) | Symbol::Future(u) | Symbol::Option { underlying: u, .. } => u,
+            Symbol::Equity { symbol, .. } => symbol,
         }
     }
+
+    /// Whether the underlying is one of the six indices.
+    pub fn is_index(&self) -> bool {
+        INDEX_NAMES.contains(&self.underlying())
+    }
+
+    /// Why this symbol cannot be charted although it parsed: a listing the
+    /// catalog does not carry. `None` when it can.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Symbol::Equity { symbol, exchange: Exchange::Bse } => {
+                Some(format!("{symbol}@BSE: only NSE listings are charted (the catalog is NSE-only)"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What the first segment of a symbol named.
+enum Underlying {
+    Index(String),
+    Stock(String),
+}
+
+impl Underlying {
+    fn into_name(self) -> String {
+        match self {
+            Underlying::Index(n) | Underlying::Stock(n) => n,
+        }
+    }
+}
+
+/// The F&O segment an underlying's contracts trade in: SENSEX and BANKEX in
+/// `bse_fo`, every other index and every stock in `nse_fo`.
+pub fn fo_segment(underlying: &str) -> &'static str {
+    index_fo_segment(underlying)
 }
 
 /// Upstox's key for an index's spot value.
@@ -91,33 +203,34 @@ fn same_strike(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
 
-/// The contract `symbol` names among Upstox's index derivatives on `today`.
+/// The contract `symbol` names among Upstox's derivatives on `today`.
 pub fn find_upstox<'a>(symbol: &Symbol, derivatives: &'a [Derivative], today: NaiveDate) -> Option<&'a Derivative> {
-    match *symbol {
-        Symbol::Index(_) => None,
-        Symbol::Future(index) => derivatives
+    match symbol {
+        Symbol::Index(_) | Symbol::Equity { .. } => None,
+        Symbol::Future(underlying) => derivatives
             .iter()
-            .filter(|d| d.underlying == index && d.kind == "FUT" && d.expiry >= today)
+            .filter(|d| d.underlying == *underlying && d.kind == "FUT" && d.expiry >= today)
             .min_by_key(|d| d.expiry),
-        Symbol::Option { index, expiry, strike, side } => derivatives.iter().find(|d| {
-            d.underlying == index && d.kind == side.as_str() && d.expiry == expiry && same_strike(d.strike, strike)
+        Symbol::Option { underlying, expiry, strike, side } => derivatives.iter().find(|d| {
+            d.underlying == *underlying && d.kind == side.as_str() && d.expiry == *expiry && same_strike(d.strike, *strike)
         }),
     }
 }
 
-/// The contract `symbol` names in Kotak's scrip master on `today`.
+/// The contract `symbol` names in Kotak's scrip master on `today`, in the
+/// underlying's own F&O segment.
 pub fn find_kotak<'a>(symbol: &Symbol, store: &'a ScripStore, today: NaiveDate) -> Option<&'a ScripRecord> {
-    let index = symbol.index();
-    let segment = index_fo_segment(index);
-    let records = store.records.get(index)?.iter().filter(move |r| r.exchange_segment_code == segment);
-    match *symbol {
-        Symbol::Index(_) => None,
+    let underlying = symbol.underlying();
+    let segment = fo_segment(underlying);
+    let records = store.records.get(underlying)?.iter().filter(move |r| r.exchange_segment_code == segment);
+    match symbol {
+        Symbol::Index(_) | Symbol::Equity { .. } => None,
         Symbol::Future(_) => records
             .filter(|r| r.trading_symbol.trim().ends_with("FUT") && r.expiry_date >= today)
             .min_by_key(|r| r.expiry_date),
         Symbol::Option { expiry, strike, side, .. } => {
-            let mut matches = records.filter(|r| r.option_type == side.as_str() && r.expiry_date == expiry);
-            matches.find(|r| r.normalized_strike().is_some_and(|s| same_strike(s, strike)))
+            let mut matches = records.filter(|r| r.option_type == side.as_str() && r.expiry_date == *expiry);
+            matches.find(|r| r.normalized_strike().is_some_and(|s| same_strike(s, *strike)))
         }
     }
 }
@@ -130,22 +243,88 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, m, d).unwrap()
     }
 
+    fn index(name: &str) -> Symbol {
+        Symbol::Index(name.into())
+    }
+
+    fn future(name: &str) -> Symbol {
+        Symbol::Future(name.into())
+    }
+
+    fn option(underlying: &str, expiry: NaiveDate, strike: f64, side: Side) -> Symbol {
+        Symbol::Option { underlying: underlying.into(), expiry, strike, side }
+    }
+
+    /// The catalog of the tests: three stocks.
+    fn catalog(name: &str) -> bool {
+        matches!(name, "RELIANCE" | "M&M" | "BAJAJ-AUTO")
+    }
+
     #[test]
     fn symbols_parse_and_read_back() {
-        let option = Symbol::Option { index: "NIFTY", expiry: date(10, 27), strike: 22750.0, side: Side::Ce };
-        assert_eq!(Symbol::parse("NIFTY"), Some(Symbol::Index("NIFTY")));
-        assert_eq!(Symbol::parse(" sensex:fut "), Some(Symbol::Future("SENSEX")));
-        assert_eq!(Symbol::parse("nifty:2026-10-27:22750:ce"), Some(option));
-        assert_eq!(option.name(), "NIFTY:2026-10-27:22750:CE");
-        assert_eq!(Symbol::parse(&option.name()), Some(option));
+        let call = option("NIFTY", date(10, 27), 22750.0, Side::Ce);
+        assert_eq!(Symbol::parse("NIFTY"), Some(index("NIFTY")));
+        assert_eq!(Symbol::parse(" sensex:fut "), Some(future("SENSEX")));
+        assert_eq!(Symbol::parse("nifty:2026-10-27:22750:ce"), Some(call.clone()));
+        assert_eq!(call.name(), "NIFTY:2026-10-27:22750:CE");
+        assert_eq!(Symbol::parse(&call.name()), Some(call));
         assert_eq!(Symbol::parse("MIDCPNIFTY:2026-10-27:12437.5:PE").unwrap().name(), "MIDCPNIFTY:2026-10-27:12437.5:PE");
 
         for bad in [
             "", "RELIANCE", "NIFTY50", "NIFTY:FUTURE", "NIFTY:FUT:X", "NIFTY:2026-13-01:22750:CE",
             "NIFTY:2026-10-27:0:CE", "NIFTY:2026-10-27:22750:XX", "NIFTY:2026-10-27:22750", "NIFTY:2026-10-27:22750:CE:1",
+            "NIFTY@NSE", "NIFTY@BSE",
         ] {
             assert_eq!(Symbol::parse(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn stocks_parse_only_when_the_catalog_knows_them() {
+        let nse = Symbol::Equity { symbol: "RELIANCE".into(), exchange: Exchange::Nse };
+        let bse = Symbol::Equity { symbol: "RELIANCE".into(), exchange: Exchange::Bse };
+        assert_eq!(Symbol::parse_with("reliance", &catalog), Some(nse.clone()));
+        assert_eq!(Symbol::parse_with("RELIANCE@NSE", &catalog), Some(nse.clone()));
+        assert_eq!(nse.name(), "RELIANCE", "the default listing is spelt bare");
+        assert_eq!(Symbol::parse_with("RELIANCE@BSE", &catalog), Some(bse.clone()));
+        assert_eq!(bse.name(), "RELIANCE@BSE");
+        assert_eq!(Symbol::parse_with(&bse.name(), &catalog), Some(bse.clone()));
+        // Parsed, but refused: the catalog is NSE-only.
+        assert!(nse.refusal().is_none());
+        assert!(bse.refusal().unwrap().contains("NSE"));
+        assert!(index("NIFTY").refusal().is_none());
+
+        assert_eq!(Symbol::parse_with("RELIANCE:FUT", &catalog), Some(future("RELIANCE")));
+        let call = option("RELIANCE", date(11, 24), 1400.0, Side::Ce);
+        assert_eq!(Symbol::parse_with("reliance:2026-11-24:1400:ce", &catalog), Some(call.clone()));
+        assert_eq!(call.name(), "RELIANCE:2026-11-24:1400:CE");
+        assert_eq!(Symbol::parse_with(&call.name(), &catalog), Some(call.clone()));
+        assert_eq!((call.underlying(), call.is_index()), ("RELIANCE", false));
+        assert!(index("BANKNIFTY").is_index());
+        // Names with the characters stocks carry.
+        assert_eq!(Symbol::parse_with("m&m", &catalog).unwrap().name(), "M&M");
+        assert_eq!(Symbol::parse_with("BAJAJ-AUTO:FUT", &catalog), Some(future("BAJAJ-AUTO")));
+        // The indices never need the catalog, and parse the same with one.
+        assert_eq!(Symbol::parse_with("NIFTY:FUT", &catalog), Some(future("NIFTY")));
+
+        for bad in [
+            "TCS", "TCS:FUT", "RELIANCE@", "RELIANCE@MCX", "RELIANCE@BSE:FUT", "RELIANCE@NSE:2026-11-24:1400:CE",
+            "RELIANCE:FUT:X", "RELIANCE:2026-11-24:1400", "RELI ANCE", "RELIANCE.NS", "@BSE",
+        ] {
+            assert_eq!(Symbol::parse_with(bad, &catalog), None, "{bad}");
+        }
+        // Without the catalog, a stock is still not a symbol.
+        assert_eq!(Symbol::parse("RELIANCE:FUT"), None);
+        assert_eq!(Symbol::parse("RELIANCE@BSE"), None);
+    }
+
+    #[test]
+    fn the_fo_segment_follows_the_underlying() {
+        assert_eq!(fo_segment("SENSEX"), "bse_fo");
+        assert_eq!(fo_segment("BANKEX"), "bse_fo");
+        assert_eq!(fo_segment("NIFTY"), "nse_fo");
+        assert_eq!(fo_segment("RELIANCE"), "nse_fo");
+        assert_eq!(fo_segment("M&M"), "nse_fo");
     }
 
     fn derivative(underlying: &str, kind: &str, expiry: NaiveDate, strike: f64, key: &str) -> Derivative {
@@ -167,24 +346,33 @@ mod tests {
             derivative("NIFTY", "CE", date(10, 27), 22750.0, "NSE_FO|51342"),
             derivative("NIFTY", "PE", date(10, 27), 22750.0, "NSE_FO|51343"),
             derivative("BANKNIFTY", "CE", date(10, 27), 22750.0, "NSE_FO|9"),
+            derivative("RELIANCE", "FUT", date(11, 24), 0.0, "NSE_FO|35001"),
+            derivative("RELIANCE", "CE", date(11, 24), 1400.0, "NSE_FO|35002"),
         ];
         let today = date(10, 21);
-        assert_eq!(find_upstox(&Symbol::Future("NIFTY"), &list, today).unwrap().instrument_key, "NSE_FO|48704");
+        assert_eq!(find_upstox(&future("NIFTY"), &list, today).unwrap().instrument_key, "NSE_FO|48704");
         // The day after the October future expires, it rolls to November.
-        assert_eq!(find_upstox(&Symbol::Future("NIFTY"), &list, date(10, 28)).unwrap().instrument_key, "NSE_FO|2");
-        let put = Symbol::Option { index: "NIFTY", expiry: date(10, 27), strike: 22750.0, side: Side::Pe };
+        assert_eq!(find_upstox(&future("NIFTY"), &list, date(10, 28)).unwrap().instrument_key, "NSE_FO|2");
+        let put = option("NIFTY", date(10, 27), 22750.0, Side::Pe);
         assert_eq!(find_upstox(&put, &list, today).unwrap().instrument_key, "NSE_FO|51343");
-        let missing = Symbol::Option { index: "NIFTY", expiry: date(11, 3), strike: 22750.0, side: Side::Pe };
+        let missing = option("NIFTY", date(11, 3), 22750.0, Side::Pe);
         assert!(find_upstox(&missing, &list, today).is_none());
-        assert!(find_upstox(&Symbol::Index("NIFTY"), &list, today).is_none());
+        assert!(find_upstox(&index("NIFTY"), &list, today).is_none());
         assert_eq!(upstox_index_key("MIDCPNIFTY"), Some("NSE_INDEX|NIFTY MID SELECT"));
+        // A stock's contracts, by the same rules.
+        assert_eq!(find_upstox(&future("RELIANCE"), &list, today).unwrap().instrument_key, "NSE_FO|35001");
+        let call = option("RELIANCE", date(11, 24), 1400.0, Side::Ce);
+        assert_eq!(find_upstox(&call, &list, today).unwrap().instrument_key, "NSE_FO|35002");
+        assert!(find_upstox(&option("RELIANCE", date(11, 24), 1400.0, Side::Pe), &list, today).is_none());
+        let equity = Symbol::Equity { symbol: "RELIANCE".into(), exchange: Exchange::Nse };
+        assert!(find_upstox(&equity, &list, today).is_none(), "an equity is not a derivative");
     }
 
     fn record(symbol: &str, segment: &str, raw_strike: f64, opt: &str, expiry: NaiveDate, token: &str) -> ScripRecord {
         ScripRecord {
             instrument_token: token.into(),
             trading_symbol: symbol.into(),
-            symbol_name: symbol.chars().take_while(|c| c.is_ascii_alphabetic()).collect(),
+            symbol_name: symbol.chars().take_while(|c| c.is_ascii_alphabetic() || *c == '&' || *c == '-').collect(),
             exchange_segment_code: segment.into(),
             strike_price: raw_strike,
             option_type: opt.into(),
@@ -204,11 +392,48 @@ mod tests {
             record("NIFTY26N0322750CE", "nse_fo", 2275000.0, "CE", date(11, 3), "51500"),
         ]);
         let today = date(10, 21);
-        assert_eq!(find_kotak(&Symbol::Future("NIFTY"), &store, today).unwrap().instrument_token, "48704");
-        let call = Symbol::Option { index: "NIFTY", expiry: date(10, 27), strike: 22750.0, side: Side::Ce };
+        assert_eq!(find_kotak(&future("NIFTY"), &store, today).unwrap().instrument_token, "48704");
+        let call = option("NIFTY", date(10, 27), 22750.0, Side::Ce);
         assert_eq!(find_kotak(&call, &store, today).unwrap().ws_key(), "nse_fo|51342");
-        let other_strike = Symbol::Option { index: "NIFTY", expiry: date(10, 27), strike: 22800.0, side: Side::Ce };
+        let other_strike = option("NIFTY", date(10, 27), 22800.0, Side::Ce);
         assert!(find_kotak(&other_strike, &store, today).is_none());
-        assert!(find_kotak(&Symbol::Future("SENSEX"), &store, today).is_none());
+        assert!(find_kotak(&future("SENSEX"), &store, today).is_none());
+    }
+
+    #[test]
+    fn a_stocks_kotak_contracts_come_from_nse_fo_only() {
+        let mut store = ScripStore::default();
+        store.records.insert("RELIANCE".into(), vec![
+            // Rows as the real nse_fo file lists them (strike in paise).
+            record("RELIANCE26NOVFUT", "nse_fo", 0.0, "XX", date(11, 24), "43001"),
+            record("RELIANCE26DECFUT", "nse_fo", 0.0, "XX", date(12, 29), "43002"),
+            record("RELIANCE26NOV1400CE", "nse_fo", 140000.0, "CE", date(11, 24), "41222"),
+            record("RELIANCE26NOV1400PE", "nse_fo", 140000.0, "PE", date(11, 24), "41223"),
+            record("RELIANCE26DEC1400CE", "nse_fo", 140000.0, "CE", date(12, 29), "41229"),
+            // The same contract on BSE: never a stock's, the catalog is NSE-only.
+            record("RELIANCE26NOV1400CE", "bse_fo", 140000.0, "CE", date(11, 24), "876001"),
+        ]);
+        store.records.insert("SENSEX".into(), vec![
+            record("SENSEX26NOVFUT", "bse_fo", 0.0, "XX", date(11, 26), "874003"),
+            record("SENSEX26N0575100CE", "bse_fo", 7510000.0, "CE", date(11, 5), "874001"),
+        ]);
+        let today = date(11, 4);
+        assert_eq!(find_kotak(&future("RELIANCE"), &store, today).unwrap().ws_key(), "nse_fo|43001");
+        // On its expiry day the November future still trades; the day after, December's.
+        assert_eq!(find_kotak(&future("RELIANCE"), &store, date(11, 24)).unwrap().ws_key(), "nse_fo|43001");
+        assert_eq!(find_kotak(&future("RELIANCE"), &store, date(11, 25)).unwrap().ws_key(), "nse_fo|43002");
+        let call = option("RELIANCE", date(11, 24), 1400.0, Side::Ce);
+        assert_eq!(find_kotak(&call, &store, today).unwrap().ws_key(), "nse_fo|41222");
+        let put = option("RELIANCE", date(11, 24), 1400.0, Side::Pe);
+        assert_eq!(find_kotak(&put, &store, today).unwrap().ws_key(), "nse_fo|41223");
+        assert!(find_kotak(&option("RELIANCE", date(11, 24), 1420.0, Side::Ce), &store, today).is_none());
+        assert!(find_kotak(&option("RELIANCE", date(11, 25), 1400.0, Side::Ce), &store, today).is_none());
+        // SENSEX stays in bse_fo, by the same segment rule.
+        assert_eq!(find_kotak(&future("SENSEX"), &store, today).unwrap().ws_key(), "bse_fo|874003");
+        assert_eq!(find_kotak(&option("SENSEX", date(11, 5), 75100.0, Side::Ce), &store, today).unwrap().ws_key(), "bse_fo|874001");
+        // An equity is not in the F&O lists; an unknown stock has no records.
+        let equity = Symbol::Equity { symbol: "RELIANCE".into(), exchange: Exchange::Nse };
+        assert!(find_kotak(&equity, &store, today).is_none());
+        assert!(find_kotak(&future("TCS"), &store, today).is_none());
     }
 }

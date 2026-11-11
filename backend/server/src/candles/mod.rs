@@ -8,6 +8,14 @@
 //! Upstox's official candles, which carry the volume. Past days come straight
 //! from Upstox and are not kept. Once nothing has asked for ten minutes it
 //! stops, so with no v2 client open it holds nothing and taps nothing.
+//!
+//! An index, its future or its options subscribe to Kotak's feed as they
+//! always have. A stock, or a stock's contract (behind `stock_charts`), is
+//! put on the feed through the Execute board's ladder budget
+//! (`ExecuteBoard::reserve_chart`), so charts and ladders share the one
+//! daily allowance and positions' ticks keep their room; past the budget,
+//! or when the feed sends no tick within 15 s of subscribing, the chart is
+//! `polled`: its bars come from Upstox's official minutes alone.
 
 pub mod archive;
 pub mod bars;
@@ -30,6 +38,8 @@ use upstox_client::{Derivative, LtpTick, UpstoxClient};
 use bars::{Bar, DaySeries, Tf, MINUTE_MS};
 use symbols::Symbol;
 
+use crate::execute::{ExecuteBoard, SubPool};
+use crate::instruments::Catalog;
 use crate::AppState;
 
 /// A symbol nothing has asked for in this long is dropped; once none is left
@@ -46,6 +56,9 @@ const FALLBACK_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const CHANGES_CAPACITY: usize = 1024;
 /// Falling behind Kotak's ticks is logged at most this often.
 const LAG_WARN_EVERY: Duration = Duration::from_secs(60);
+/// A Kotak subscription that has not ticked this long after it was sent is
+/// taken as refused (the feed only logs a refusal): the chart is `polled`.
+const FEED_TICK_WAIT_MS: i64 = 15_000;
 
 /// Upstox's instruments file for each exchange, and the indices whose
 /// derivatives it lists.
@@ -75,29 +88,74 @@ pub struct Change {
 #[derive(Debug, Clone, Serialize)]
 pub struct Tracking {
     pub name: String,
-    /// Kotak price-map key (`idx|NIFTY 50`, `nse_fo|51342`), when Kotak's
-    /// scrip master knows the contract.
+    /// Kotak price-map key (`idx|NIFTY 50`, `nse_fo|51342`, `nse_cm|2885`),
+    /// when Kotak's scrip master or the catalog knows the instrument.
     pub kotak: Option<String>,
     /// Upstox instrument key, when Upstox is configured and knows it.
     pub upstox: Option<String>,
+    /// No Kotak tick is building the bars: there is no Kotak key, the
+    /// ladder budget had no room for it, or the feed sent nothing within
+    /// 15 s of subscribing. The bars are Upstox's official minutes alone
+    /// (none without Upstox). Read when the tracking is asked for.
+    pub polled: bool,
 }
 
 #[derive(Debug)]
 pub enum TrackError {
     /// Neither broker lists this contract (expired, or no such strike).
     NotFound,
+    /// Kotak's ladder budget has no room for it today and Upstox is not
+    /// configured: no price source at all.
+    NoFeed,
     /// The service stopped while this was being set up; ask again.
     Stopped,
 }
 
+/// How a tracked symbol's Kotak subscription is sent.
+#[derive(Clone)]
+enum KotakSub {
+    /// Nothing: Kotak does not know it.
+    None,
+    /// Sent to the bridge as is — an index, or an index's contract.
+    Direct(String),
+    /// A stock's key, put on the feed through the ladder budget.
+    Budgeted { key: String, pool: SubPool },
+}
+
 struct Tracked {
     tracking: Tracking,
-    /// What the bridge is sent to stream it.
-    kotak_subscribe: Option<String>,
+    kotak_sub: KotakSub,
+    /// The Kotak subscription went out (not refused by the budget).
+    kotak_on_feed: bool,
+    /// When it last went out, to tell a refused one by its silence.
+    subscribed_at_ms: Option<i64>,
+    /// A Kotak tick has arrived since.
+    kotak_ticked: bool,
     day: DaySeries,
     /// The minute ticks are currently building.
     forming: Option<i64>,
     last_used_ms: i64,
+}
+
+impl Tracked {
+    fn tracking_at(&self, now: i64) -> Tracking {
+        Tracking { polled: self.polled(now), ..self.tracking.clone() }
+    }
+
+    fn polled(&self, now: i64) -> bool {
+        is_polled(self.tracking.kotak.is_some(), self.kotak_on_feed, self.kotak_ticked, self.subscribed_at_ms, now)
+    }
+}
+
+/// Whether a symbol's bars are Upstox's alone — see [`Tracking::polled`].
+fn is_polled(has_kotak: bool, on_feed: bool, ticked: bool, subscribed_at_ms: Option<i64>, now: i64) -> bool {
+    if !has_kotak || !on_feed {
+        return true;
+    }
+    if ticked {
+        return false;
+    }
+    subscribed_at_ms.is_none_or(|at| now - at > FEED_TICK_WAIT_MS)
 }
 
 struct State {
@@ -140,17 +198,21 @@ impl CandleService {
             pool: state.db_pool.clone(),
             scrip_store: Arc::clone(&state.scrip_store),
             ws_tx: Arc::clone(&state.ws_tx),
+            catalog: Some(Arc::clone(&state.instruments)),
+            execute: Some(Arc::clone(&state.execute)),
         })
         .await;
         *slot = Some(Arc::clone(&running));
         running
     }
 
-    /// Track `symbol` on the running service (starting it if need be).
-    pub async fn track(&self, state: &AppState, symbol: Symbol) -> Result<(Arc<Running>, Tracking), TrackError> {
+    /// Track `symbol` on the running service (starting it if need be). A
+    /// stock's Kotak subscription draws on `pool`'s share of the ladder
+    /// budget.
+    pub async fn track(&self, state: &AppState, symbol: Symbol, pool: SubPool) -> Result<(Arc<Running>, Tracking), TrackError> {
         for _ in 0..2 {
             let running = self.get(state).await;
-            match running.track(symbol).await {
+            match running.track(symbol.clone(), pool).await {
                 Ok(tracking) => return Ok((running, tracking)),
                 Err(TrackError::Stopped) => continue,
                 Err(e) => return Err(e),
@@ -167,6 +229,12 @@ struct Deps {
     pool: SqlitePool,
     scrip_store: Arc<RwLock<Option<ScripStore>>>,
     ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    /// The instrument catalog: a stock's feed key and Upstox key. Without
+    /// it (the tests), no stock can be tracked.
+    catalog: Option<Arc<Catalog>>,
+    /// The Execute board, whose ladder budget a stock's subscription is
+    /// counted in. Without it, a stock gets no Kotak subscription.
+    execute: Option<Arc<ExecuteBoard>>,
 }
 
 pub struct Running {
@@ -175,10 +243,15 @@ pub struct Running {
     pool: SqlitePool,
     scrip_store: Arc<RwLock<Option<ScripStore>>>,
     ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    catalog: Option<Arc<Catalog>>,
+    execute: Option<Arc<ExecuteBoard>>,
     state: StdMutex<State>,
-    /// Upstox's index futures and options, loaded once per IST day on the
-    /// first future or option asked for.
-    derivatives: Mutex<Option<(NaiveDate, Arc<Vec<Derivative>>)>>,
+    /// Upstox's futures and options by underlying, each list loaded once
+    /// per IST day on the first contract asked for: the six indices
+    /// together from both exchanges' files, a stock on its own from NSE's
+    /// (the day's file is cached on disk by the client, so a second stock
+    /// filters the file again without downloading it).
+    derivatives: Mutex<HashMap<String, (NaiveDate, Arc<Vec<Derivative>>)>>,
     changes: broadcast::Sender<Change>,
     /// The Upstox keys the fallback feed should stream.
     upstox_keys: watch::Sender<BTreeSet<String>>,
@@ -198,6 +271,8 @@ impl Running {
             pool: deps.pool,
             scrip_store: deps.scrip_store,
             ws_tx: deps.ws_tx,
+            catalog: deps.catalog,
+            execute: deps.execute,
             state: StdMutex::new(State {
                 day_start: bars::ist_day_start(now),
                 tracked: HashMap::new(),
@@ -205,7 +280,7 @@ impl Running {
                 kotak_channel: None,
                 last_error: HashMap::new(),
             }),
-            derivatives: Mutex::new(None),
+            derivatives: Mutex::new(HashMap::new()),
             changes: broadcast::channel(CHANGES_CAPACITY).0,
             upstox_keys: watch::channel(BTreeSet::new()).0,
             open_streams: AtomicUsize::new(0),
@@ -228,7 +303,9 @@ impl Running {
     }
 
     /// Start keeping `symbol`'s bars, or note that it was asked for again.
-    pub async fn track(self: &Arc<Self>, symbol: Symbol) -> Result<Tracking, TrackError> {
+    /// A stock's Kotak subscription is paid for out of `pool`'s share of the
+    /// ladder budget; an index's is sent as it always was.
+    pub async fn track(self: &Arc<Self>, symbol: Symbol, pool: SubPool) -> Result<Tracking, TrackError> {
         let name = symbol.name();
         let now = now_ms();
         self.last_used_ms.store(now, Ordering::Release);
@@ -239,39 +316,72 @@ impl Running {
             }
             if let Some(t) = st.tracked.get_mut(&name) {
                 t.last_used_ms = now;
-                return Ok(t.tracking.clone());
+                return Ok(t.tracking_at(now));
             }
+        }
+        if symbol.refusal().is_some() {
+            return Err(TrackError::NotFound);
         }
 
         let today = shared_domain::today_ist();
-        let upstox = match symbol {
+        // A stock's cash row: its feed key, and Upstox's key by ISIN.
+        let equity_key = match &symbol {
+            Symbol::Equity { symbol, .. } => self.catalog.as_ref().and_then(|c| c.spot_key(symbol)),
+            _ => None,
+        };
+        let upstox = match &symbol {
             _ if self.upstox.is_none() => None,
             Symbol::Index(index) => symbols::upstox_index_key(index).map(str::to_string),
-            _ => match self.derivatives(today).await {
+            Symbol::Equity { .. } => equity_key.as_deref().and_then(|key| self.catalog.as_ref()?.upstox_key(key)),
+            _ => match self.derivatives_for(symbol.underlying(), today).await {
                 Some(list) => symbols::find_upstox(&symbol, &list, today).map(|d| d.instrument_key.clone()),
                 None => None,
             },
         };
-        let kotak = match symbol {
-            Symbol::Index(index) => shared_domain::kotak_index_feed(index).map(|(segment, feed_name)| {
-                let msg = serde_json::json!({ "action": "subscribe_indices", "indices": format!("{segment}|{feed_name}") });
-                (shared_domain::index_price_key(feed_name), msg.to_string())
-            }),
+        let (kotak_key, kotak_sub) = match &symbol {
+            Symbol::Index(index) => match shared_domain::kotak_index_feed(index) {
+                Some((segment, feed_name)) => {
+                    let msg = serde_json::json!({ "action": "subscribe_indices", "indices": format!("{segment}|{feed_name}") });
+                    (Some(shared_domain::index_price_key(feed_name)), KotakSub::Direct(msg.to_string()))
+                }
+                None => (None, KotakSub::None),
+            },
+            Symbol::Equity { .. } => match equity_key {
+                Some(key) => (Some(key.clone()), KotakSub::Budgeted { key, pool }),
+                None => (None, KotakSub::None),
+            },
             _ => {
                 let store = self.scrip_store.read().await;
-                store.as_ref().and_then(|s| symbols::find_kotak(&symbol, s, today)).map(|record| {
-                    let key = record.ws_key();
-                    // `ladder`: the bridge drops these at the day's close.
-                    let msg = serde_json::json!({ "action": "subscribe", "scrips": key, "ladder": true });
-                    (key, msg.to_string())
-                })
+                match store.as_ref().and_then(|s| symbols::find_kotak(&symbol, s, today)) {
+                    Some(record) => {
+                        let key = record.ws_key();
+                        if symbol.is_index() {
+                            // `ladder`: the bridge drops these at the day's close.
+                            let msg = serde_json::json!({ "action": "subscribe", "scrips": key, "ladder": true });
+                            (Some(key), KotakSub::Direct(msg.to_string()))
+                        } else {
+                            (Some(key.clone()), KotakSub::Budgeted { key, pool })
+                        }
+                    }
+                    None => (None, KotakSub::None),
+                }
             }
         };
-        if upstox.is_none() && kotak.is_none() {
+        if upstox.is_none() && kotak_key.is_none() {
             return Err(TrackError::NotFound);
         }
-        let (kotak_key, kotak_subscribe) = kotak.unzip();
-        let tracking = Tracking { name: name.clone(), kotak: kotak_key, upstox };
+        // A stock's key goes on the feed only with room in the budget. Asked
+        // before anything is kept, so a refusal with no Upstox leaves
+        // nothing behind: no price source at all is an error, not a chart.
+        let kotak_on_feed = match &kotak_sub {
+            KotakSub::None => false,
+            KotakSub::Direct(_) => true,
+            KotakSub::Budgeted { key, pool } => self.reserve_chart(key, *pool).await,
+        };
+        if !kotak_on_feed && upstox.is_none() {
+            return Err(TrackError::NoFeed);
+        }
+        let tracking = Tracking { name: name.clone(), kotak: kotak_key, upstox, polled: !kotak_on_feed };
 
         let mut day = DaySeries::default();
         for (t, o, h, l, c, v, source) in crate::db::load_candle_minutes(&self.pool, &name, bars::ist_day_start(now)).await {
@@ -287,13 +397,16 @@ impl Running {
             }
             st.tracked.entry(name.clone()).or_insert(Tracked {
                 tracking: tracking.clone(),
-                kotak_subscribe: kotak_subscribe.clone(),
+                kotak_sub: kotak_sub.clone(),
+                kotak_on_feed,
+                subscribed_at_ms: kotak_on_feed.then_some(now),
+                kotak_ticked: false,
                 day,
                 forming: None,
                 last_used_ms: now,
             });
         }
-        if let Some(msg) = &kotak_subscribe {
+        if let KotakSub::Direct(msg) = &kotak_sub {
             self.subscribe_kotak(msg).await;
         }
         if let Some(key) = &tracking.upstox {
@@ -302,8 +415,24 @@ impl Running {
             });
             self.fetch_official(&name, key).await;
         }
-        tracing::info!(symbol = %name, kotak = ?tracking.kotak, upstox = ?tracking.upstox, "Candle service tracking");
+        tracing::info!(symbol = %name, kotak = ?tracking.kotak, upstox = ?tracking.upstox, polled = tracking.polled, "Candle service tracking");
         Ok(tracking)
+    }
+
+    /// Put a stock's `key` on the feed through the ladder budget.
+    async fn reserve_chart(&self, key: &str, pool: SubPool) -> bool {
+        match &self.execute {
+            Some(board) => board.reserve_chart(&self.ws_tx, key, pool).await,
+            None => false,
+        }
+    }
+
+    /// Where a tracked symbol's prices come from now, with `polled` as of
+    /// now; `None` once it has lapsed.
+    #[cfg(test)]
+    pub fn tracking(&self, name: &str) -> Option<Tracking> {
+        let now = now_ms();
+        self.state().tracked.get(name).map(|t| t.tracking_at(now))
     }
 
     /// Mark `names` as still wanted; returns the ones no longer tracked
@@ -362,6 +491,9 @@ impl Running {
         let mut st = self.state();
         let Some(name) = st.by_key.get(key).cloned() else { return };
         let Some(t) = st.tracked.get_mut(&name) else { return };
+        if t.tracking.kotak.as_deref() == Some(key) {
+            t.kotak_ticked = true;
+        }
         let Some(minute) = t.day.tick(at_ms, price) else { return };
         // The minute before just closed: cache it unless Upstox already has it.
         let closed = t.forming.filter(|m| *m != minute).filter(|m| !t.day.has_official(*m));
@@ -382,45 +514,80 @@ impl Running {
     }
 
     /// A bridge this service hasn't sent everything to yet — the first one,
-    /// or a fresh one after a Kotak re-login — gets every subscription.
+    /// or a fresh one after a Kotak re-login — gets every subscription: an
+    /// index's as it was sent, a stock's through the ladder budget again
+    /// (the board starts a fresh bridge's budget over too).
     async fn resubscribe_kotak(&self) {
         let Some(tx) = self.ws_tx.lock().await.clone() else { return };
-        let messages: Vec<String> = {
+        let subs: Vec<(String, KotakSub)> = {
             let mut st = self.state();
             if st.kotak_channel.as_ref().is_some_and(|c| c.same_channel(&tx)) {
                 return;
             }
             st.kotak_channel = Some(tx.clone());
-            st.tracked.values().filter_map(|t| t.kotak_subscribe.clone()).collect()
+            st.tracked.iter().map(|(name, t)| (name.clone(), t.kotak_sub.clone())).collect()
         };
-        for msg in messages {
-            let _ = tx.send(msg);
+        for (name, sub) in subs {
+            match sub {
+                KotakSub::None => {}
+                KotakSub::Direct(msg) => {
+                    let _ = tx.send(msg);
+                }
+                KotakSub::Budgeted { key, pool } => {
+                    let on_feed = self.reserve_chart(&key, pool).await;
+                    let now = now_ms();
+                    if let Some(t) = self.state().tracked.get_mut(&name) {
+                        t.kotak_on_feed = on_feed;
+                        t.subscribed_at_ms = on_feed.then_some(now);
+                        t.kotak_ticked = false;
+                    }
+                }
+            }
         }
     }
 
-    /// Upstox's index derivatives for `today`, downloaded on first use.
-    async fn derivatives(&self, today: NaiveDate) -> Option<Arc<Vec<Derivative>>> {
+    /// Upstox's futures and options on `underlying` for `today`, loaded on
+    /// first use: the six indices' lists together (both exchanges' files), a
+    /// stock's from NSE's file on its own.
+    async fn derivatives_for(&self, underlying: &str, today: NaiveDate) -> Option<Arc<Vec<Derivative>>> {
         let client = self.upstox.as_ref()?;
-        let mut slot = self.derivatives.lock().await;
-        if let Some((day, list)) = slot.as_ref() {
+        let mut cache = self.derivatives.lock().await;
+        if let Some((day, list)) = cache.get(underlying) {
             if *day == today {
                 return Some(Arc::clone(list));
             }
         }
-        let mut list = Vec::new();
-        for (url, wanted) in UPSTOX_INDEX_FILES {
-            match client.index_derivatives(url, wanted).await {
-                Ok(rows) => list.extend(rows),
+        cache.retain(|_, (day, _)| *day == today);
+        if shared_domain::INDEX_NAMES.contains(&underlying) {
+            let mut all: Vec<Derivative> = Vec::new();
+            for (url, wanted) in UPSTOX_INDEX_FILES {
+                match client.derivatives(url, wanted).await {
+                    Ok(rows) => all.extend(rows),
+                    Err(e) => {
+                        tracing::warn!(error = %e, url, "Upstox instruments download failed — futures and options charts have no Upstox data until it works");
+                        return None;
+                    }
+                }
+            }
+            tracing::info!(contracts = all.len(), "Upstox index derivatives loaded for the charts");
+            for index in shared_domain::INDEX_NAMES {
+                let list: Vec<Derivative> = all.iter().filter(|d| d.underlying == *index).cloned().collect();
+                cache.insert(index.to_string(), (today, Arc::new(list)));
+            }
+        } else {
+            // NSE only: a stock's contracts trade there (question 3).
+            match client.derivatives(upstox_client::NSE_INSTRUMENTS_URL, &[underlying]).await {
+                Ok(rows) => {
+                    tracing::info!(underlying, contracts = rows.len(), "Upstox derivatives loaded for a stock's charts");
+                    cache.insert(underlying.to_string(), (today, Arc::new(rows)));
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, url, "Upstox instruments download failed — futures and options charts have no Upstox data until it works");
+                    tracing::warn!(error = %e, underlying, "Upstox instruments download failed — this stock's futures and options charts have no Upstox data until it works");
                     return None;
                 }
             }
         }
-        let list = Arc::new(list);
-        tracing::info!(contracts = list.len(), "Upstox index derivatives loaded for the charts");
-        *slot = Some((today, Arc::clone(&list)));
-        Some(list)
+        cache.get(underlying).map(|(_, list)| Arc::clone(list))
     }
 
     /// Pull Upstox's official minutes for one symbol and keep the finished ones.
@@ -595,10 +762,10 @@ impl Running {
         self.stopped.store(true, Ordering::Release);
         st.by_key.clear();
         drop(st);
-        // The contract map is the biggest thing held; nothing loads it while
-        // stopped, so a busy lock just means it goes with the service.
+        // The contract lists are the biggest thing held; nothing loads them
+        // while stopped, so a busy lock just means they go with the service.
         if let Ok(mut derivatives) = self.derivatives.try_lock() {
-            *derivatives = None;
+            derivatives.clear();
         }
         tracing::info!("Candle service stopped — no chart has asked for anything in 10 minutes");
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
@@ -696,9 +863,15 @@ mod tests {
             pool,
             scrip_store: Arc::new(RwLock::new(None)),
             ws_tx: Arc::new(Mutex::new(None)),
+            catalog: None,
+            execute: None,
         })
         .await;
         (running, db, db_rx)
+    }
+
+    fn nifty() -> Symbol {
+        Symbol::Index("NIFTY".into())
     }
 
     /// Unix ms of `h:m` IST today.
@@ -709,12 +882,14 @@ mod tests {
     #[tokio::test]
     async fn ticks_for_a_tracked_symbol_build_its_bars() {
         let (running, _db, mut db_rx) = service("ticks").await;
-        let tracking = running.track(Symbol::Index("NIFTY")).await.unwrap();
+        let tracking = running.track(nifty(), SubPool::Owner).await.unwrap();
         assert_eq!(tracking.kotak.as_deref(), Some("idx|NIFTY 50"));
+        assert!(!tracking.polled, "an index subscription just sent counts as the feed's");
         let mut changes = running.subscribe_changes();
 
         let t = today_at(9, 20);
         running.apply_tick("idx|NIFTY 50", t + 1_000, 22_800.0);
+        assert!(!running.tracking("NIFTY").unwrap().polled);
         running.apply_tick("idx|NIFTY 50", t + 30_000, 22_810.0);
         // Ticks for anything else are not this symbol's.
         running.apply_tick("nse_fo|999", t + 30_000, 1.0);
@@ -737,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn the_service_stops_once_nothing_has_asked_for_ten_minutes() {
         let (running, _db, _db_rx) = service("idle").await;
-        running.track(Symbol::Index("NIFTY")).await.unwrap();
+        running.track(nifty(), SubPool::Owner).await.unwrap();
         let later = |ms: i64| now_ms() + ms;
 
         assert!(!running.sweep(later(MINUTE_MS)), "just asked for");
@@ -748,6 +923,34 @@ mod tests {
         drop(stream);
         assert!(!running.sweep(later(MINUTE_MS)), "the stream only just closed");
         assert!(running.sweep(later(IDLE_MS + MINUTE_MS)));
-        assert!(matches!(running.track(Symbol::Index("NIFTY")).await, Err(TrackError::Stopped)));
+        assert!(matches!(running.track(nifty(), SubPool::Owner).await, Err(TrackError::Stopped)));
+    }
+
+    #[tokio::test]
+    async fn a_stock_needs_the_catalog_and_a_bse_listing_is_refused() {
+        let (running, _db, _db_rx) = service("stock").await;
+        let nse = Symbol::Equity { symbol: "RELIANCE".into(), exchange: symbols::Exchange::Nse };
+        let bse = Symbol::Equity { symbol: "RELIANCE".into(), exchange: symbols::Exchange::Bse };
+        // No catalog here: neither broker's key is known.
+        assert!(matches!(running.track(nse, SubPool::Owner).await, Err(TrackError::NotFound)));
+        assert!(matches!(running.track(bse, SubPool::Owner).await, Err(TrackError::NotFound)));
+        assert!(matches!(running.track(Symbol::Future("RELIANCE".into()), SubPool::Owner).await, Err(TrackError::NotFound)));
+        assert!(running.tracking("RELIANCE").is_none());
+    }
+
+    #[test]
+    fn a_chart_is_polled_without_a_kotak_tick_within_fifteen_seconds() {
+        let at = 1_000_000;
+        // No Kotak key, or no room in the budget: polled from the start.
+        assert!(is_polled(false, false, false, None, at));
+        assert!(is_polled(true, false, false, None, at));
+        // Subscribed and waiting: the feed's for 15 s, then polled.
+        assert!(!is_polled(true, true, false, Some(at), at + 1_000));
+        assert!(!is_polled(true, true, false, Some(at), at + FEED_TICK_WAIT_MS));
+        assert!(is_polled(true, true, false, Some(at), at + FEED_TICK_WAIT_MS + 1));
+        // A tick arrived: the feed's, however long ago it subscribed.
+        assert!(!is_polled(true, true, true, Some(at), at + 10 * FEED_TICK_WAIT_MS));
+        // On the feed but never stamped: nothing to wait on.
+        assert!(is_polled(true, true, false, None, at));
     }
 }

@@ -1693,12 +1693,12 @@ mod tests {
         let pool = init_db(&db.url()).await;
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: true, chart_stops: false, search: false, watchlists: false },
+            FeatureFlags { index_options_only: true, chart_stops: false, search: false, watchlists: false, stock_charts: false },
         );
-        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true), ("search", true), ("watchlists", true)]).await.unwrap();
+        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true), ("search", true), ("watchlists", true), ("stock_charts", true)]).await.unwrap();
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: false, chart_stops: true, search: true, watchlists: true },
+            FeatureFlags { index_options_only: false, chart_stops: true, search: true, watchlists: true, stock_charts: true },
         );
         pool.close().await;
     }

@@ -34,9 +34,9 @@ use sqlx::SqlitePool;
 
 use crate::scrip_files::{ScripFiles, SEGMENTS};
 use load::{Kind, LoadReport, Source};
-use search::{parse_query, Group, Parsed, SearchIndex, Side, Tier, Underlying, UnderlyingKind};
+use search::{parse_query, Group, Parsed, SearchIndex, Side, Tier};
 
-pub use search::MonthHint;
+pub use search::{MonthHint, Underlying, UnderlyingKind};
 
 /// Rows per group in a search answer.
 pub const PER_GROUP: usize = 8;
@@ -459,6 +459,14 @@ impl Catalog {
     /// index row's. From the search list in memory.
     pub fn spot_key(&self, symbol: &str) -> Option<String> {
         self.index().get(symbol).and_then(|u| u.ws_key.clone())
+    }
+
+    /// The search list's entry for `symbol` — an index, an equity or an
+    /// F&O-only underlying — when the catalog lists it. From memory; what
+    /// the chart, chain and ladder routes resolve a typed name against
+    /// behind the `stock_charts` switch.
+    pub fn underlying(&self, symbol: &str) -> Option<Underlying> {
+        self.index().get(symbol).cloned()
     }
 
     /// Those of `keys` that are a catalog row's price-map key: equities and

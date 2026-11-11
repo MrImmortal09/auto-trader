@@ -427,17 +427,26 @@ pub struct FeatureFlags {
     /// Nothing in the engine reads it.
     #[serde(default)]
     pub watchlists: bool,
+    /// Charts, option chains and ladders for any F&O underlying in the
+    /// catalog, not only the six indices (`/api/v2/candles*`,
+    /// `/api/v2/expiries`, `/api/v2/chain`, `/api/execute/stream`). While
+    /// off, those routes accept the six indices exactly as before. Nothing
+    /// in the engine reads it, and the owner's live buy
+    /// (`POST /api/execute/buy`) stays index-only whatever it says.
+    #[serde(default)]
+    pub stock_charts: bool,
 }
 
 impl FeatureFlags {
     /// Every switch as `(name, on)`; `name` is both its `feature_flags` row
     /// and its JSON field.
-    pub fn entries(&self) -> [(&'static str, bool); 4] {
+    pub fn entries(&self) -> [(&'static str, bool); 5] {
         [
             ("index_options_only", self.index_options_only),
             ("chart_stops", self.chart_stops),
             ("search", self.search),
             ("watchlists", self.watchlists),
+            ("stock_charts", self.stock_charts),
         ]
     }
 
@@ -448,6 +457,7 @@ impl FeatureFlags {
             "chart_stops" => self.chart_stops = on,
             "search" => self.search = on,
             "watchlists" => self.watchlists = on,
+            "stock_charts" => self.stock_charts = on,
             _ => return false,
         }
         true
@@ -1994,19 +2004,19 @@ mod tests {
     fn feature_flags_default_off_and_keep_their_api_names() {
         assert_eq!(
             FeatureFlags::default(),
-            FeatureFlags { index_options_only: false, chart_stops: false, search: false, watchlists: false }
+            FeatureFlags { index_options_only: false, chart_stops: false, search: false, watchlists: false, stock_charts: false }
         );
         assert_eq!(
             serde_json::to_value(FeatureFlags { index_options_only: true, ..FeatureFlags::default() }).unwrap(),
-            serde_json::json!({ "index_options_only": true, "chart_stops": false, "search": false, "watchlists": false }),
+            serde_json::json!({ "index_options_only": true, "chart_stops": false, "search": false, "watchlists": false, "stock_charts": false }),
         );
         // A client from before a switch existed leaves it off.
         let old: FeatureFlags = serde_json::from_str(r#"{"index_options_only": true, "chart_stops": true}"#).unwrap();
-        assert_eq!(old, FeatureFlags { index_options_only: true, chart_stops: true, search: false, watchlists: false });
+        assert_eq!(old, FeatureFlags { index_options_only: true, chart_stops: true, search: false, watchlists: false, stock_charts: false });
 
         // `entries` and `set` use exactly the JSON field names, so a stored
         // row always lands on the switch the API shows.
-        let flags = FeatureFlags { index_options_only: true, chart_stops: false, search: true, watchlists: true };
+        let flags = FeatureFlags { index_options_only: true, chart_stops: false, search: true, watchlists: true, stock_charts: true };
         let json = serde_json::to_value(flags).unwrap();
         assert_eq!(json.as_object().unwrap().len(), flags.entries().len());
         for (name, on) in flags.entries() {

@@ -26,6 +26,7 @@ pub struct FlagsUpdate {
     pub chart_stops: Option<bool>,
     pub search: Option<bool>,
     pub watchlists: Option<bool>,
+    pub stock_charts: Option<bool>,
 }
 
 /// `before` with `update` applied, and the `(name, on)` of each switch that
@@ -43,6 +44,9 @@ fn apply_update(before: FeatureFlags, update: &FlagsUpdate) -> (FeatureFlags, Ve
     }
     if let Some(on) = update.watchlists {
         after.watchlists = on;
+    }
+    if let Some(on) = update.stock_charts {
+        after.stock_charts = on;
     }
     let changes = after
         .entries()
@@ -112,19 +116,23 @@ mod tests {
 
     #[test]
     fn an_update_changes_only_the_switches_it_names() {
-        let before = FeatureFlags { index_options_only: false, chart_stops: true, search: false, watchlists: false };
+        let before = FeatureFlags { index_options_only: false, chart_stops: true, search: false, watchlists: false, stock_charts: false };
 
         let (after, changes) = apply_update(before, &FlagsUpdate { index_options_only: Some(true), ..Default::default() });
-        assert_eq!(after, FeatureFlags { index_options_only: true, chart_stops: true, search: false, watchlists: false });
+        assert_eq!(after, FeatureFlags { index_options_only: true, ..before });
         assert_eq!(changes, vec![("index_options_only", true)]);
 
         let (after, changes) = apply_update(before, &FlagsUpdate { search: Some(true), ..Default::default() });
-        assert_eq!(after, FeatureFlags { index_options_only: false, chart_stops: true, search: true, watchlists: false });
+        assert_eq!(after, FeatureFlags { search: true, ..before });
         assert_eq!(changes, vec![("search", true)]);
 
         let (after, changes) = apply_update(before, &FlagsUpdate { watchlists: Some(true), ..Default::default() });
-        assert_eq!(after, FeatureFlags { index_options_only: false, chart_stops: true, search: false, watchlists: true });
+        assert_eq!(after, FeatureFlags { watchlists: true, ..before });
         assert_eq!(changes, vec![("watchlists", true)]);
+
+        let (after, changes) = apply_update(before, &FlagsUpdate { stock_charts: Some(true), ..Default::default() });
+        assert_eq!(after, FeatureFlags { stock_charts: true, ..before });
+        assert_eq!(changes, vec![("stock_charts", true)]);
 
         // Re-sending a value that is already set is not a change.
         let (after, changes) = apply_update(before, &FlagsUpdate { chart_stops: Some(true), ..Default::default() });
@@ -140,6 +148,11 @@ mod tests {
     fn an_unknown_switch_is_rejected() {
         assert!(serde_json::from_str::<FlagsUpdate>(r#"{"index_only": true}"#).is_err());
         let update: FlagsUpdate = serde_json::from_str(r#"{"chart_stops": false}"#).unwrap();
-        assert_eq!((update.index_options_only, update.chart_stops, update.search, update.watchlists), (None, Some(false), None, None));
+        assert_eq!(
+            (update.index_options_only, update.chart_stops, update.search, update.watchlists, update.stock_charts),
+            (None, Some(false), None, None, None)
+        );
+        let update: FlagsUpdate = serde_json::from_str(r#"{"stock_charts": true}"#).unwrap();
+        assert_eq!(update.stock_charts, Some(true));
     }
 }

@@ -1128,8 +1128,11 @@ async fn main() {
     let upstox_token = std::env::var("UPSTOX_ANALYTICS_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     // `configured` only when a poller actually runs, so a client build failure
     // shows the "not configured" banner instead of waiting forever.
+    // The instruments files (a few MB gzipped) are kept under
+    // `data/upstox/<IST day>/`, so every underlying asked for on a day
+    // filters the one download (see `candles::Running::derivatives_for`).
     let upstox = match upstox_token.map(upstox_client::UpstoxClient::new) {
-        Some(Ok(client)) => Some(client),
+        Some(Ok(client)) => Some(client.with_instruments_cache(scrip_files::data_dir().join("upstox"))),
         Some(Err(e)) => {
             tracing::error!(error = %e, "Failed to build Upstox client — market data disabled");
             None
