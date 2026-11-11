@@ -49,6 +49,34 @@ struct Upstox {
     token_expires: Option<String>,
 }
 
+/// The instrument catalog, in totals; the breakdown is at
+/// `GET /api/v2/instruments/status`.
+#[derive(Serialize)]
+struct CatalogSummary {
+    /// IST date of the CSVs it was built from.
+    day: Option<String>,
+    /// Rows in the table, every segment and the index rows together.
+    rows: i64,
+    /// Symbols in the search list.
+    underlyings: usize,
+    last_error: Option<String>,
+}
+
+/// The quote hub, in totals; the breakdown is at
+/// `GET /api/v2/instruments/status`.
+#[derive(Serialize)]
+struct QuotesSummary {
+    /// Keys asked for in the last 15 s.
+    wanted: usize,
+    calls_last_minute: u64,
+    calls_per_sec: f64,
+    /// Why nothing is being polled, when nothing is.
+    paused: Option<String>,
+    /// The day of the close on file, and whether some key got no close.
+    close_day: Option<String>,
+    close_partial: bool,
+}
+
 #[derive(Serialize)]
 struct SystemAnswer {
     day: String,
@@ -65,6 +93,10 @@ struct SystemAnswer {
     telegram: Telegram,
     kotak: Kotak,
     upstox: Upstox,
+    /// The instrument catalog in totals — see `instruments`.
+    catalog: CatalogSummary,
+    /// The quote hub in totals — see `quotes`.
+    quotes: QuotesSummary,
 }
 
 fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
@@ -181,6 +213,21 @@ pub async fn system_handler(State(state): State<AppState>) -> Response {
         telegram: Telegram { listening: listening(&state).await, messages, last_at },
         kotak: Kotak { relogins, logged_in_at },
         upstox: Upstox { configured: state.market.configured, token_expires },
+        catalog: {
+            let c = state.instruments.status();
+            CatalogSummary { rows: c.total_rows(), day: c.day, underlyings: c.underlyings, last_error: c.last_error }
+        },
+        quotes: {
+            let q = state.quotes.status();
+            QuotesSummary {
+                wanted: q.wanted,
+                calls_last_minute: q.calls_last_minute,
+                calls_per_sec: q.calls_per_sec,
+                paused: q.paused,
+                close_day: q.close.as_ref().map(|c| c.day.clone()),
+                close_partial: q.close.as_ref().is_some_and(|c| c.partial),
+            }
+        },
     })
     .into_response()
 }

@@ -45,6 +45,11 @@ struct HealthDto {
     memory: MemoryDto,
     swap: MemoryDto,
     current_process: Option<ProcessDto>,
+    /// `MEMORY_WARN_MB`: the server's resident memory, in MiB, above which
+    /// the System screen flags it and the log warns — see `pulse`.
+    memory_warn_mb: f64,
+    /// Whether `current_process.memory_mib` is above it right now.
+    memory_warn: bool,
     /// Whether `AUTH_SECRET` is set on the backend. Not a secret itself — just
     /// a diagnostic flag — so it's safe on this public, unauthenticated route.
     /// When `false`, every signed-in `/api/*` route returns 500 (see
@@ -98,6 +103,11 @@ pub async fn health_handler() -> impl IntoResponse {
             run_time_secs: process.run_time(),
         }));
 
+    let memory_warn_mb = crate::pulse::memory_warn_mb();
+    let memory_warn = current_process
+        .as_ref()
+        .is_some_and(|p| p.memory_bytes as f64 / 1024.0 / 1024.0 >= memory_warn_mb);
+
     let total_memory = system.total_memory();
     let used_memory = system.used_memory();
     let free_memory = total_memory.saturating_sub(used_memory);
@@ -138,6 +148,8 @@ pub async fn health_handler() -> impl IntoResponse {
                 free_mib: mib(free_swap),
             },
             current_process,
+            memory_warn_mb,
+            memory_warn,
             auth_secret_configured: auth_secret_configured(),
         }),
     )

@@ -177,6 +177,20 @@ WA_API_KEY=change-me
 # ── SQLite ───────────────────────────────────────────────
 DATABASE_URL=sqlite://trades.db          # default
 
+# ── Files kept between runs ──────────────────────────────
+# The Kotak scrip-master CSVs are saved here after every download and
+# streamed back by the admin's CSV download, so only the parsed store stays
+# in memory; the instrument catalog (search) is built from them into
+# data/instruments.db. Relative to the working directory, like trades.db.
+DATA_DIR=data                            # default
+
+# ── Memory alarm ─────────────────────────────────────────
+# Server resident memory (MB) above which the log warns once (MEMORY_WARN in
+# the dashboard log) and the pulse JSON (/api/telemetry/*, /api/health)
+# reports memory_warn: true, until it falls 5% back under. Sized to the VM's
+# real headroom: about 330 MB free with the server at 150 MB on 2026-11-04.
+MEMORY_WARN_MB=450                       # default
+
 # Trading mode (PAPER/LIVE), max trade size, brokerage, and target/SL
 # settings all live in the `trading_config` SQLite table, not env vars —
 # edit them via the Settings bar in the UI or POST /api/settings.
@@ -278,7 +292,7 @@ The backend binary itself does **not** need to be built on the VM — see step 4
 
 Important runtime note — **PATH CONTRACT**:
 
-- the server binary must run with `auto-trader/backend/` as its working directory, not the repo root — it resolves `trades.db`, `session.json`, `../frontend/dist`, and `../kotak-bridge` relative to the working directory it was started from. Starting it from anywhere else breaks those lookups. In production the binary itself also lives directly inside `backend/` (see step 4), so in practice this means: `cd ~/auto-trader/backend && ./the-binary`.
+- the server binary must run with `auto-trader/backend/` as its working directory, not the repo root — it resolves `trades.db`, `session.json`, `data/` (the saved scrip-master CSVs), `../frontend/dist`, and `../kotak-bridge` relative to the working directory it was started from. Starting it from anywhere else breaks those lookups. In production the binary itself also lives directly inside `backend/` (see step 4), so in practice this means: `cd ~/auto-trader/backend && ./the-binary`.
 - `frontend/dist` doesn't need to contain a real build in production, since the frontend is served by Vercel, not this server — the static-fallback route just won't have anything to serve if you hit the VM's IP directly, which is expected.
 
 ### 3. Build the frontend for Vercel
@@ -461,8 +475,20 @@ These files should remain on persistent disk on the VM, inside `backend/`:
 - `.env`
 - the current release binary, `backend/server-<version>-x86_64-unknown-linux-gnu`
 - `kotak-bridge/node_modules/`
+- `data/` (`DATA_DIR`): the three Scrip Master CSVs the last download saved (`data/scrip/<segment>.csv`) and the instrument catalog built from them with its close snapshot (`data/instruments.db` + `-wal`/`-shm`). Gitignored, and **rebuildable**: the next Kotak login downloads the CSVs again and the catalog is rebuilt from them, so it is safe to delete (it costs one download, and search is empty until then) and need not be copied to a fresh VM. The engine never reads it: its Scrip Master comes from the login's download alone.
 
 The deploy workflow keeps the previous binary (and a copy as `backend/.server_prev`) for rollback and prunes older ones — you don't need to manage binary versions by hand. If you ever move to a fresh VM, copy over `trades.db*`, `session.json`, and `.env` from `backend/` before starting the server there.
+
+### 11. Day one of the instrument search: what to check
+
+The search slice (`instruments/`, `quotes/`, behind the `search` switch — `PUT /api/v2/flags {"search": true}`) was written against Kotak's documentation plus one day's real files, and ships with fallbacks that log what they find rather than refusing to start. On the first trading day with the switch on, read these:
+
+- **`Scrip Master CSV header`** (`tracing`, once per file per build) — the header line as the file has it and `missing=[...]`, the columns the catalog expected and did not find (their fields are left empty: no `pDesc` means names are derived from the symbol, no `pISIN` means no ISIN search). Then **`Instrument catalog segment loaded`** with `kept`, `skipped`, `skip_reasons`, `unresolved_strikes` (options whose symbol agreed with no strike scale) and `duplicates`; on 2026-11-04's files every segment loaded with nothing missing and nothing unresolved.
+- **`Kotak quotes: first response shape`** (`tracing`, once per process) — the field names of the first REST quotes answer; the parser reads the documented ones (`ltp`, `ohlc`, `change`, `per_change`, `last_volume`, `oi`, `year_high`/`year_low`) and a renamed field shows up here as a missing figure.
+- **`Kotak quotes call failed`** (`warn`, the first of a streak) with its `outcome`: `Refused` halves the batch (`batch_size` on the status page) and a key refused on its own is quarantined for ten minutes; `RateLimited` (a 429) and `Transient` back off.
+- **`Close snapshot sweep ...`** at 15:35 IST: `started` with the key count, then `saved`, or `cut short` / `finished with keys unanswered` (`warn`) when the day's close is partial.
+- **`MEMORY_WARN`** / **`MEMORY_WARN_CLEARED`** in the dashboard's log terminal — the server's resident memory crossed `MEMORY_WARN_MB` (default 450 MB), or fell 5% back under it. The pulse (`memory_warn`, `memory_warn_mb`) and `/api/health` carry the same.
+- **`GET /api/v2/instruments/status`** (admin): `catalog.day` should be today after the 09:05 login, `catalog.last_error` null, `quotes.calls_per_sec` at or under 2 while screens are open, `quotes.paused` null during hours with a session, `quotes.close.partial` false after 15:40.
 
 ---
 
@@ -733,7 +759,7 @@ The **Daily Reports** page provides an aggregated view of trading performance by
 | `POST` | `/api/settings` | Update `TradingConfig` (persisted to DB + in-memory) |
 | `POST` | `/api/webhook/telegram` | Inject a `TradeSignal` JSON manually (422 for a non-index call while `index_options_only` is on) |
 | `GET` | `/api/logs/stream` | SSE stream of engine log events |
-| `GET` | `/api/v2/flags` | v2 engine switches: `{"index_options_only": false, "chart_stops": false}` |
+| `GET` | `/api/v2/flags` | v2 switches: `{"index_options_only": false, "chart_stops": false, "search": false}`. `search` opens the instrument search and quote routes below to anyone signed in; off (the default), they answer 404 |
 | `PUT` | `/api/v2/flags` | Change only the switches named in the body; saved in their own table, so a v1 settings save never resets them |
 | `PATCH` | `/api/v2/positions/:id` | A scalp's chart `stop` and `target`: each `{price, trigger}` with `trigger` `premium` (the option's price) or `index` (its index — a CE's stop fires as the index falls, a PE's as it rises; targets the other way). Left out keeps a level, `null` clears it. Reaching either sells the whole holding; a level already crossed sells on the next tick (`sells_now`). New levels need `chart_stops` on; ones already set stay until the position closes |
 | `GET` | `/api/v2/history?range=&group=&mode=` | The v2 Desk's history: trades grouped into calls (one per Telegram call or scalp, with its legs and original message) closed in `range` (`today`, `7d` default, `30d`, `all`), with KPIs (net, calls, win rate, profit factor, average per call, max drawdown), the cumulative P&L curve, P&L grouped by `channel` (default), `index` or `cepe`, and trading days. A call counts once fully sold, on the day of its last sell. Rows from before channels were stored show as "Unknown channel" |
@@ -743,6 +769,10 @@ The **Daily Reports** page provides an aggregated view of trading performance by
 | `GET` | `/api/v2/chain?index=&expiry=` | One expiry's strikes (the nearest by default), each side with its trading symbol and delta (Upstox's for the expiry it polls, else an assumed ±0.50) |
 | `GET` | `/api/v2/candles?symbol=&tf=&from=&to=` | Chart bars, oldest first. `symbol`: an index (`NIFTY`), its nearest future (`NIFTY:FUT`) or an option (`NIFTY:2026-10-27:22750:CE`); `tf`: `1m`, `5m` (default) or `15m`; `from`/`to`: IST days (default: the last five). Past days come from Upstox; today's are built from live ticks and replaced minute by minute with Upstox's official candles, which carry the volume |
 | `GET` | `/api/v2/candles/stream?symbols=&tf=` | SSE: every 250 ms, the bars that changed — the forming bar, and a closed bar again when Upstox's official minutes correct it. Up to 6 comma-separated symbols |
+| `GET` | `/api/v2/search?q=&limit=` | Behind the `search` flag, for anyone signed in. Everything `q` matches in the instrument catalog (every NSE equity and ETF, the six indices, every NSE F&O contract, SENSEX and BANKEX options), grouped `indices` / `stocks` / `futures` / `options` and ranked (exact symbol or ISIN, symbol prefix, name words, substring; F&O underlyings first), `limit` rows a group (1–8, default 8). A typed `BANKNIFTY 52000 CE`, `RELIANCE NOV 1400 PE` or `TATA FUT` resolves to the listed contracts; otherwise futures come nearest expiry first and options from the strikes around the spot. Each row carries `id` (`<segment>:<token>`), `symbol`, `name`, `kind` (`INDEX`/`EQ`/`FUT`/`CE`/`PE`), `exchange`, `expiry`, `strike`, `lot_size`, `tick_size` (rupees; the scrip master's paise divided by 100), `ws_key` and its `quote` when any source has one (`source: live` — Kotak's feed or REST quotes, never told apart; `upstox` while Kotak is down; after hours the 15:35 close, `source: close` with `as_of`), else `null` — every row's key is polled from then on, so asking again in 2 s fills the prices in; a contract is never priced before the poller's first read of it, however it is subscribed. Every figure of a quote is present, `null` when the source has none. `catalog_day` says which day's scrip master the catalog was built from |
+| `GET` | `/api/v2/quotes?keys=` | Behind the `search` flag. The quotes for up to 60 comma-separated price-map keys (`nse_cm\|2885`, `nse_fo\|51386`, `idx\|NIFTY 50`; more is a 400), feed first; `missing` lists known keys no source has yet (polled from now, for 15 s; the hub keeps interest in at most 600 keys, oldest dropped), `unknown` the keys the catalog has no row for, which are never sent to Kotak |
+| `GET` | `/api/v2/instruments/:id` | Behind the `search` flag. One instrument by its `id` as the search lists it: symbol, name, exchange, segment and token, ISIN, lot and tick size, expiry and strike, `underlying_key` (a derivative's spot), `nearest_expiry` for an F&O underlying, and its `quote` (LTP, change, open/high/low, previous close, volume, 52-week range) plus the underlying's `spot` quote. 404 for an id the catalog has no row for; 500 (`could not read the instrument catalog`) when the catalog database failed |
+| `GET` | `/api/v2/instruments/status` | Behind the `search` flag, **admin only**: the catalog's data day, rows per segment and per kind, `loading` and `last_error`, and the quote hub's `wanted` keys, `calls_last_minute` / `calls_per_sec`, `batch_size`, `quarantined`, `refused` / `rate_limited` / `errors`, `paused` (why nothing is polled: the switch off, no healthy session, a back-off), `last_error`, the running `sweep` and the `close` on file (`day`, `rows`, `asked`, `partial`). `/api/v2/system` carries the totals only |
 | `GET` | `/api/v2/me/desk` | A user's own paper Desk, in `/api/v2/desk`'s shape: wallet (₹10,00,000 to start), today's figures, open positions and the calls closed today. `/api/v2/me/*` is for a user's phone sign-in only (the admin gets 403) |
 | `GET` | `/api/v2/me/history?range=&group=` · `/me/marks` · `/me/positions` · `/me/activity` | The user's closed calls (`/api/v2/history`'s shape), today's fills for the charts, open positions, and the last 100 things that happened to them (in memory) |
 | `POST` | `/api/v2/me/buy` | `{trading_symbol, lots}`: a paper buy, filled at once at the live price — the same checks as `/api/execute/buy` but the kill switch, plus 10 open contracts per user, 40 across all users, and no buy of a contract being squared off. Charges are Kotak's with ₹20 brokerage a leg; the wallet never goes below zero |

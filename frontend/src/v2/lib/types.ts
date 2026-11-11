@@ -610,6 +610,10 @@ export interface PaperActivity {
 export interface Flags {
   index_options_only: boolean;
   chart_stops: boolean;
+  /** The instrument search and its quotes (`/api/v2/search`, `/quotes`,
+   * `/instruments/*`) for anyone signed in; off (the default) they answer 404
+   * and the server asks Kotak for no quotes. No toggle in the UI yet. */
+  search: boolean;
 }
 
 export interface ChainSide {

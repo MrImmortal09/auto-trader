@@ -34,6 +34,61 @@ const RATE_WINDOW: Duration = Duration::from_secs(10);
 const QUANTILE_WINDOW: Duration = Duration::from_secs(30);
 /// Per-scrip last-tick entries older than this are dropped (clears overnight).
 const SCRIP_TICK_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
+/// `MEMORY_WARN_MB` unset. Sized to the VM's real headroom, not its 954 MB:
+/// on 2026-11-04 the server sat at 149 MB resident with 332 MB free and the
+/// 1 GB swapfile already 261 MB in use (`answers.json` item 6), so the
+/// process can grow by roughly 300 MB before the kernel starts paging it —
+/// and a paged engine is what the alarm exists to warn about, since the
+/// 50 ms tick's latency is then unpredictable long before an OOM kill (which
+/// would stop the engine with nothing restarting it). 450 MB warns while
+/// the growth is still in RAM.
+pub const DEFAULT_MEMORY_WARN_MB: f64 = 450.0;
+/// The alarm clears only once RSS is this far back under the threshold, so
+/// a process hovering at it warns once, not on every sample.
+const MEMORY_WARN_CLEAR_RATIO: f64 = 0.95;
+
+/// Resident memory, in MB, above which the sampler warns and `memory_warn`
+/// is set: `MEMORY_WARN_MB`, or [`DEFAULT_MEMORY_WARN_MB`].
+pub fn memory_warn_mb() -> f64 {
+    parse_memory_warn_mb(std::env::var("MEMORY_WARN_MB").ok().as_deref())
+}
+
+/// [`memory_warn_mb`] for a `MEMORY_WARN_MB` value: anything that isn't a
+/// positive number is the default.
+fn parse_memory_warn_mb(raw: Option<&str>) -> f64 {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_MEMORY_WARN_MB)
+}
+
+/// Whether the process RSS is over the threshold, with one warning per
+/// crossing — see [`MemoryAlarm::observe`].
+struct MemoryAlarm {
+    threshold_mb: f64,
+    over: bool,
+}
+
+impl MemoryAlarm {
+    fn new(threshold_mb: f64) -> Self {
+        Self { threshold_mb, over: false }
+    }
+
+    /// Takes a reading: `Some(true)` on the sample that crosses the
+    /// threshold, `Some(false)` on the one that comes back under it (by
+    /// [`MEMORY_WARN_CLEAR_RATIO`]), `None` while nothing changed.
+    fn observe(&mut self, rss_mb: f64) -> Option<bool> {
+        let over = if self.over {
+            rss_mb >= self.threshold_mb * MEMORY_WARN_CLEAR_RATIO
+        } else {
+            rss_mb >= self.threshold_mb
+        };
+        if over == self.over {
+            return None;
+        }
+        self.over = over;
+        Some(over)
+    }
+}
 
 /// The charted subset of a sample — what the history ring keeps.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -100,6 +155,10 @@ pub struct Sample {
     // Process / host / runtime
     pub process_uptime_secs: u64,
     pub process_virtual_mb: f64,
+    /// `MEMORY_WARN_MB` — see [`memory_warn_mb`].
+    pub memory_warn_mb: f64,
+    /// Resident memory over `memory_warn_mb` (until it falls 5% under).
+    pub memory_warn: bool,
     pub host_memory_total_mb: f64,
     pub host_swap_total_mb: f64,
     pub host_swap_used_mb: f64,
@@ -407,6 +466,7 @@ pub fn spawn_sampler(state: AppState) {
         let mut mode: &'static str = "paper";
         let mut kill_switch = false;
         let mut kotak_connected = false;
+        let mut memory_alarm = MemoryAlarm::new(memory_warn_mb());
 
         let mut every = tokio::time::interval(SAMPLE_EVERY);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -433,6 +493,38 @@ pub fn spawn_sampler(state: AppState) {
                 v => v,
             };
             let load = System::load_average();
+            // Once per crossing, both ways: the log, and the dashboard's log
+            // (which outlives a restart) — not on every sample it stays over.
+            let rss_mb = mb(rss);
+            match memory_alarm.observe(rss_mb) {
+                Some(true) => {
+                    tracing::warn!(
+                        rss_mb, threshold_mb = memory_alarm.threshold_mb,
+                        "Server memory above MEMORY_WARN_MB — an OOM kill would stop the engine with nothing restarting it"
+                    );
+                    crate::routes::auth_kotak::send_log(&state.db_tx, &state.log_tx, "WARN", serde_json::json!({
+                        "event": "MEMORY_WARN",
+                        "level": "WARN",
+                        "rss_mb": rss_mb,
+                        "threshold_mb": memory_alarm.threshold_mb,
+                        "message": format!(
+                            "Server memory {rss_mb} MB, above MEMORY_WARN_MB {} MB — an OOM kill would stop the engine",
+                            memory_alarm.threshold_mb
+                        ),
+                    })).await;
+                }
+                Some(false) => {
+                    tracing::info!(rss_mb, threshold_mb = memory_alarm.threshold_mb, "Server memory back under MEMORY_WARN_MB");
+                    crate::routes::auth_kotak::send_log(&state.db_tx, &state.log_tx, "INFO", serde_json::json!({
+                        "event": "MEMORY_WARN_CLEARED",
+                        "level": "INFO",
+                        "rss_mb": rss_mb,
+                        "threshold_mb": memory_alarm.threshold_mb,
+                        "message": format!("Server memory {rss_mb} MB, back under MEMORY_WARN_MB {} MB", memory_alarm.threshold_mb),
+                    })).await;
+                }
+                None => {}
+            }
             telemetry::PROCESS_CPU_PERCENT.set(process_cpu as f64);
             telemetry::PROCESS_RSS_BYTES.set(rss as i64);
             telemetry::PROCESS_VIRTUAL_BYTES.set(virt as i64);
@@ -572,6 +664,8 @@ pub fn spawn_sampler(state: AppState) {
                 kill_switch,
                 process_uptime_secs: uptime,
                 process_virtual_mb: mb(virt),
+                memory_warn_mb: memory_alarm.threshold_mb,
+                memory_warn: memory_alarm.over,
                 host_memory_total_mb: mb(sys.total_memory()),
                 host_swap_total_mb: mb(sys.total_swap()),
                 host_swap_used_mb: mb(sys.used_swap()),
@@ -642,4 +736,39 @@ pub fn spawn_sampler(state: AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_memory_alarm_fires_once_per_crossing() {
+        let mut alarm = MemoryAlarm::new(600.0);
+        assert!(!alarm.over);
+        assert_eq!(alarm.observe(500.0), None);
+        assert_eq!(alarm.observe(599.9), None);
+        // Crossing up: once, however long it stays over.
+        assert_eq!(alarm.observe(600.0), Some(true));
+        assert_eq!(alarm.observe(650.0), None);
+        assert_eq!(alarm.observe(900.0), None);
+        assert!(alarm.over);
+        // Hovering just under the threshold doesn't clear it...
+        assert_eq!(alarm.observe(590.0), None);
+        assert!(alarm.over);
+        // ...5% under does, once; then a new crossing warns again.
+        assert_eq!(alarm.observe(569.0), Some(false));
+        assert_eq!(alarm.observe(560.0), None);
+        assert_eq!(alarm.observe(610.0), Some(true));
+    }
+
+    #[test]
+    fn the_threshold_is_read_defensively() {
+        assert_eq!(parse_memory_warn_mb(None), DEFAULT_MEMORY_WARN_MB);
+        assert_eq!(parse_memory_warn_mb(Some(" 750 ")), 750.0);
+        assert_eq!(parse_memory_warn_mb(Some("512.5")), 512.5);
+        for bad in ["", "abc", "0", "-5", "NaN", "inf"] {
+            assert_eq!(parse_memory_warn_mb(Some(bad)), DEFAULT_MEMORY_WARN_MB, "{bad:?}");
+        }
+    }
 }

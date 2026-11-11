@@ -177,6 +177,20 @@ struct OptionContract {
     expiry: String,
 }
 
+/// A quote's day: open, high, low and the previous close. `None` where
+/// Upstox sends null or nothing.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Ohlc {
+    #[serde(default, deserialize_with = "opt_num")]
+    pub open: Option<f64>,
+    #[serde(default, deserialize_with = "opt_num")]
+    pub high: Option<f64>,
+    #[serde(default, deserialize_with = "opt_num")]
+    pub low: Option<f64>,
+    #[serde(default, deserialize_with = "opt_num")]
+    pub close: Option<f64>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Quote {
     /// Pipe form (`NSE_FO|12345`) — the response map itself is keyed by the
@@ -192,6 +206,9 @@ pub struct Quote {
     pub volume: f64,
     #[serde(default, deserialize_with = "num")]
     pub oi: f64,
+    /// The day's open, high and low and the previous close, when sent.
+    #[serde(default)]
+    pub ohlc: Option<Ohlc>,
     /// Points from the previous session's close to `last_price`.
     #[serde(default, deserialize_with = "num")]
     pub net_change: f64,
