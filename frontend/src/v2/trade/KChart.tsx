@@ -11,8 +11,10 @@ import { drawableStudies, fitPanes, showStudies } from './studies';
 import {
   barAt,
   countdown,
-  futureName,
+  daySummary,
+  futureFor,
   inSession,
+  hasVolume,
   symbolName,
   TF_MS,
   vwapOf,
@@ -20,6 +22,7 @@ import {
   type Bar,
   type CandleStyle,
   type ChartSym,
+  type DaySummary,
   type Tf,
 } from './model';
 
@@ -72,6 +75,15 @@ function rangeWithLines(prices: { current: number[] }): AxisCreateRangeCallback 
   };
 }
 
+/** What a chart reports as it loads: loading, an error, the latest bar and
+ * the instrument's day so far (for the quote strip). */
+export interface ChartState {
+  loading: boolean;
+  error: string | null;
+  last: Bar | null;
+  day: DaySummary | null;
+}
+
 /** What either chart (KLineChart or Vela) is given. */
 export interface ChartProps {
   chartId: string;
@@ -90,8 +102,8 @@ export interface ChartProps {
   placing: Placing | null;
   onPlacingDone: () => void;
   bus: CrosshairBus;
-  /** Loading, an error, or the latest bar's close. */
-  onState?: (s: { loading: boolean; error: string | null; last: Bar | null }) => void;
+  /** Loading, an error, the latest bar and the day so far. */
+  onState?: (s: ChartState) => void;
 }
 
 /**
@@ -142,7 +154,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   const doneNow = useRef(onPlacingDone);
 
   const symbol = symbolName(sym);
-  const future = sym.kind === 'index' ? futureName(sym.index) : null;
+  const future = futureFor(sym);
 
   useEffect(() => {
     tfRef.current = tf;
@@ -313,7 +325,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   const loaded = bars != null;
 
   useEffect(() => {
-    onState?.({ loading: !loaded && !error, error, last: bars?.[bars.length - 1] ?? null });
+    onState?.({ loading: !loaded && !error, error, last: bars?.[bars.length - 1] ?? null, day: daySummary(bars) });
   }, [loaded, error, bars, onState]);
 
   useEffect(() => {
@@ -328,7 +340,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   // RSI and CCI (the Layers menu's) and the Indicators menu's picks, those
   // built from volume only on an option; then the panes under the price
   // share at most part of the chart, so the price keeps the room.
-  const studyKey = drawableStudies(studies, sym.kind === 'index').join(',');
+  const studyKey = drawableStudies(studies, !hasVolume(sym)).join(',');
   const [hostHeight, setHostHeight] = useState(0);
   useLayoutEffect(() => {
     const el = host.current;

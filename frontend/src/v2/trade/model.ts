@@ -1,7 +1,8 @@
 // The Trade screen's model: what a chart shows, a level's estimated rupees,
 // the words for a level, and VWAP.
 
-import type { ChartLevel, ExecutePosition } from '../../types';
+import type { ChartLevel, ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
+import { INDEX_ORDER } from '../../lib/execute';
 import { level, signedMoney } from '../lib/format';
 
 export type Tf = '1m' | '5m' | '15m';
@@ -22,25 +23,154 @@ export const TF_MS: Record<Tf, number> = { '1m': 60_000, '5m': 300_000, '15m': 9
 /** Days of bars a chart opens with, under each timeframe's server cap. */
 export const TF_DAYS: Record<Tf, number> = { '1m': 2, '5m': 5, '15m': 10 };
 
-/** What a chart shows: an index, or one of its options. */
+/** A stock's listing. The catalog is NSE-only, so `BSE` is read but the
+ * server refuses to chart it (`RELIANCE@BSE`). */
+export type Exchange = 'NSE' | 'BSE';
+
+/**
+ * What a chart shows: an index or a stock, its nearest future, or one of
+ * its options. `index` names the underlying on a future or an option — an
+ * index or, behind the `stock_charts` switch, any F&O stock — under the
+ * name it has had since charts were index-only, so saved layouts load.
+ */
 export type ChartSym =
   | { kind: 'index'; index: string }
+  | { kind: 'equity'; symbol: string; exchange: Exchange }
+  | { kind: 'future'; index: string }
   | { kind: 'option'; index: string; expiry: string; strike: number; side: 'CE' | 'PE' };
 
-/** The candle service's name for it: `NIFTY`, `NIFTY:2026-10-27:25100:CE`. */
+/** One of the six indices the app has a feed name for. */
+export function isIndex(name: string): boolean {
+  return INDEX_ORDER.includes(name);
+}
+
+/** An underlying's name as the scrip master spells it: letters, digits and
+ * the `&`, `-` and `_` some stocks carry (`M&M`, `BAJAJ-AUTO`). */
+export function isTicker(name: unknown): name is string {
+  return typeof name === 'string' && /^[A-Z0-9&_-]+$/.test(name);
+}
+
+/** The index or stock `s` is, or is a contract on. */
+export function underlyingOf(s: ChartSym): string {
+  return s.kind === 'equity' ? s.symbol : s.index;
+}
+
+/** The candle service's name for it: `NIFTY`, `RELIANCE` (`RELIANCE@BSE`
+ * for a BSE listing), `NIFTY:FUT`, `NIFTY:2026-10-27:25100:CE`. */
 export function symbolName(s: ChartSym): string {
-  return s.kind === 'index' ? s.index : `${s.index}:${s.expiry}:${s.strike}:${s.side}`;
+  switch (s.kind) {
+    case 'index':
+      return s.index;
+    case 'equity':
+      return s.exchange === 'NSE' ? s.symbol : `${s.symbol}@${s.exchange}`;
+    case 'future':
+      return futureName(s.index);
+    case 'option':
+      return `${s.index}:${s.expiry}:${s.strike}:${s.side}`;
+  }
 }
 
-/** The index's future, whose volume makes an index chart's VWAP. */
-export function futureName(index: string): string {
-  return `${index}:FUT`;
+/** An underlying's nearest future, whose volume makes an index chart's VWAP. */
+export function futureName(underlying: string): string {
+  return `${underlying}:FUT`;
 }
 
-/** "NIFTY 50", "BANKNIFTY", "NIFTY 25100 CE". */
+/** The future whose volume an index chart's VWAP is built from; a stock,
+ * a future and an option trade themselves. */
+export function futureFor(s: ChartSym): string | null {
+  return s.kind === 'index' ? futureName(s.index) : null;
+}
+
+/** Whether the instrument trades, so its bars carry volume: an index's don't. */
+export function hasVolume(s: ChartSym): boolean {
+  return s.kind !== 'index';
+}
+
+/** "NIFTY 50", "BANKNIFTY", "RELIANCE", "RELIANCE · BSE", "RELIANCE FUT", "NIFTY 25100 CE". */
 export function symbolLabel(s: ChartSym): string {
-  if (s.kind === 'option') return `${s.index} ${s.strike} ${s.side}`;
-  return s.index === 'NIFTY' ? 'NIFTY 50' : s.index;
+  switch (s.kind) {
+    case 'option':
+      return `${s.index} ${s.strike} ${s.side}`;
+    case 'future':
+      return `${s.index} FUT`;
+    case 'equity':
+      return s.exchange === 'NSE' ? s.symbol : `${s.symbol} · ${s.exchange}`;
+    case 'index':
+      return s.index === 'NIFTY' ? 'NIFTY 50' : s.index;
+  }
+}
+
+/**
+ * A saved chart symbol read back (`v2.trade`): the shape as kept, or `null`
+ * for anything else — a layout saved by a newer or older build, or edited
+ * by hand — so the caller falls back to an index. A future or an option on
+ * a stock, and a stock itself, are kept; whether the server will chart them
+ * is the `stock_charts` switch's call when the screen opens.
+ */
+export function parseChartSym(raw: unknown): ChartSym | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const s = raw as Record<string, unknown>;
+  const index = isTicker(s.index) ? s.index : null;
+  if (s.kind === 'index') return index && isIndex(index) ? { kind: 'index', index } : null;
+  if (s.kind === 'future') return index ? { kind: 'future', index } : null;
+  if (s.kind === 'equity') {
+    if (!isTicker(s.symbol) || isIndex(s.symbol)) return null;
+    return { kind: 'equity', symbol: s.symbol, exchange: s.exchange === 'BSE' ? 'BSE' : 'NSE' };
+  }
+  if (s.kind === 'option') {
+    const ok = index && typeof s.expiry === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.expiry) && typeof s.strike === 'number' && Number.isFinite(s.strike) && s.strike > 0 && (s.side === 'CE' || s.side === 'PE');
+    return ok ? { kind: 'option', index, expiry: s.expiry as string, strike: s.strike as number, side: s.side as 'CE' | 'PE' } : null;
+  }
+  return null;
+}
+
+/** What a ladder's underlying is: the server says since stocks joined;
+ * an older one only ever served the six indices. */
+export function boardKind(board: Pick<ExecuteBoard, 'index'> & { kind?: string }): 'index' | 'stock' {
+  if (board.kind === 'stock' || board.kind === 'index') return board.kind;
+  return isIndex(board.index) ? 'index' : 'stock';
+}
+
+/** The price is the quote hub's (Kotak's REST quote every ~2 s), not the
+ * feed's: the strike is past the feed budget. No buy route accepts it. */
+export function quotePolled(q: ExecuteQuote & { polled?: boolean }): boolean {
+  return q.polled === true;
+}
+
+/** The charted instrument's day so far, from its bars: the latest IST day's
+ * open, high, low, last and volume, and the close of the day before it
+ * (null when the bars start on that day). */
+export interface DaySummary {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  /** The day's traded volume; null when no bar carries any (an index). */
+  volume: number | null;
+  prevClose: number | null;
+}
+
+export function daySummary(bars: Bar[] | null): DaySummary | null {
+  if (!bars || bars.length === 0) return null;
+  const last = bars[bars.length - 1];
+  const day = dayOf(last.t);
+  let open = last.o;
+  let high = last.h;
+  let low = last.l;
+  let volume: number | null = null;
+  let prevClose: number | null = null;
+  for (let i = bars.length - 1; i >= 0; i--) {
+    const b = bars[i];
+    if (dayOf(b.t) !== day) {
+      prevClose = b.c;
+      break;
+    }
+    open = b.o;
+    if (b.h > high) high = b.h;
+    if (b.l < low) low = b.l;
+    if (b.v != null) volume = (volume ?? 0) + b.v;
+  }
+  return { open, high, low, close: last.c, volume, prevClose };
 }
 
 export function sameSym(a: ChartSym, b: ChartSym): boolean {

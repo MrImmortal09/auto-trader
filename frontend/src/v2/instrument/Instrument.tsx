@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { ArrowLeft, ChartLine, Plus } from 'lucide-react';
 import { getInstrument } from '../lib/api';
 import { dayLabel, price, shortDate, signedPct, signedPrice, todayIst, toneOf, whole } from '../lib/format';
-import { chartOf, tradeIndexOf, type TradeIntent } from '../lib/openInstrument';
+import { chartSymOf, ladderOf, tradeIndexOf, type StockChip, type TradeIntent } from '../lib/openInstrument';
 import type { InstrumentKind, InstrumentRow, Quote } from '../lib/types';
 import { usePoll } from '../lib/usePoll';
 import { seedQuotes, useQuotes } from '../lib/useQuotes';
@@ -16,7 +16,9 @@ import { Stat } from '../ui/Stat';
 // as the hero, its day — open, high, low, previous close, volume, the
 // 52-week range — its lot and tick size and nearest expiry, and where it
 // can go: the chart and the ladder on the Trade screen for the six indices
-// and their options now; stocks' Chart and Chain tabs light up in Phase 3.
+// and their options, and for stocks while the `stock_charts` switch is on
+// (`stocksOn`): their Chart and Chain tabs light up, and the stock takes
+// the seventh tab on the Trade screen.
 // "+ Watchlist" adds it to a list (`onAddToWatchlist`, while watchlists are
 // on). Read-only: nothing here places an order.
 
@@ -53,28 +55,28 @@ function Figure({ quote, identity, hero }: { quote: Quote | null; identity: stri
 }
 
 /** One of the page's tabs: Overview (this page), Chart and Chain — the last
- * two open the Trade screen for an index family, and say "coming" for a
- * stock's until Phase 3. */
-function Tab({ selected = false, coming = false, onClick, children }: { selected?: boolean; coming?: boolean; onClick?: () => void; children: string }) {
+ * two open the Trade screen. `off` says why one can't (stock charts switched
+ * off, no options listed); `coming` adds the chip for a switch that is off. */
+function Tab({ selected = false, off, coming = false, onClick, children }: { selected?: boolean; off?: string; coming?: boolean; onClick?: () => void; children: string }) {
   return (
     <button
       type="button"
       role="tab"
       aria-selected={selected}
-      disabled={coming}
-      title={coming ? `${children} for stocks comes in Phase 3` : undefined}
+      disabled={!!off}
+      title={off}
       onClick={onClick}
       className={`-mb-px flex h-11 items-center gap-2 border-b-2 px-3 type-body transition-colors duration-120 disabled:cursor-not-allowed ${
         selected ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg disabled:hover:text-fg-muted'
       }`}
     >
       {children}
-      {coming && <Chip kind="neutral">coming</Chip>}
+      {off && coming && <Chip kind="neutral">off</Chip>}
     </button>
   );
 }
 
-export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAddToWatchlist }: {
+export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAddToWatchlist, stocksOn = false }: {
   serverBase: string;
   desktop: boolean;
   /** The catalog id: `nse_cm:2885`. */
@@ -84,6 +86,8 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAdd
   onOpenTrade: (intent: TradeIntent) => void;
   /** Add this instrument to a watchlist; left out while watchlists are off. */
   onAddToWatchlist?: (row: InstrumentRow) => void;
+  /** The `stock_charts` switch: a stock's Chart and Chain tabs light up. */
+  stocksOn?: boolean;
 }) {
   // The facts (lot, tick, expiries) change with the daily catalog; the
   // prices come from the shared quotes poll.
@@ -110,8 +114,14 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAdd
   const spot = data.underlying_key && data.underlying_key !== data.ws_key ? quotes.get(data.underlying_key) ?? data.spot : null;
   const derivative = data.kind === 'FUT' || data.kind === 'CE' || data.kind === 'PE';
   const index = tradeIndexOf(data);
-  const chart = chartOf(data);
-  const ladder = index ? { index, expiry: derivative ? data.expiry : null } : null;
+  const chart = chartSymOf(data, stocksOn);
+  const ladder = ladderOf(data, stocksOn);
+  // A stock, or a stock's contract: the Trade screen's seventh tab, priced
+  // from its cash row (`underlying_key`).
+  const stock: StockChip | undefined = index ? undefined : { symbol: data.underlying, key: data.underlying_key ?? (data.kind === 'EQ' ? data.ws_key : null), fo: data.has_fo };
+  const intent = (what: 'chart' | 'chain'): TradeIntent => (what === 'chart' ? { chart: chart ?? undefined, ladder: ladder ?? undefined, stock } : { ladder: ladder ?? undefined, stock });
+  const chartOff = chart ? undefined : index ? 'No chart for this contract' : stocksOn ? 'No chart for this listing' : 'Stock charts are switched off';
+  const chainOff = ladder ? undefined : !stocksOn && !index ? 'Stock charts are switched off' : 'No options listed for this stock';
   const closed = quote?.source === 'close';
   const yearRange = quote?.year_low != null && quote?.year_high != null ? `${price(quote.year_low)} – ${price(quote.year_high)}` : null;
   const catalogNote = data.catalog_day && data.catalog_day !== todayIst() ? `catalog from ${shortDate(data.catalog_day)}` : null;
@@ -137,7 +147,7 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAdd
         </div>
         {desktop && (
           <div className="flex shrink-0 items-center gap-2">
-            <Button size="md" kind="accent" icon={<ChartLine size={14} />} disabled={!chart} title={chart ? undefined : 'Charts for stocks come in Phase 3'} onClick={() => chart && onOpenTrade({ chart, ladder: ladder ?? undefined })}>
+            <Button size="md" kind="accent" icon={<ChartLine size={14} />} disabled={!chart} title={chartOff} onClick={() => chart && onOpenTrade(intent('chart'))}>
               Open chart
             </Button>
             <Button size="md" kind="neutral" icon={<Plus size={14} />} disabled={!onAddToWatchlist} title={onAddToWatchlist ? 'Add to a watchlist' : 'Watchlists are off'} onClick={() => onAddToWatchlist?.(data)}>
@@ -157,7 +167,7 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAdd
 
       {!desktop && (
         <div className="flex gap-2">
-          <Button size="lg" kind="accent" icon={<ChartLine size={18} />} disabled={!chart} title={chart ? undefined : 'Charts for stocks come in Phase 3'} onClick={() => chart && onOpenTrade({ chart, ladder: ladder ?? undefined })} className="flex-1">
+          <Button size="lg" kind="accent" icon={<ChartLine size={18} />} disabled={!chart} title={chartOff} onClick={() => chart && onOpenTrade(intent('chart'))} className="flex-1">
             Open chart
           </Button>
           <Button size="lg" kind="neutral" icon={<Plus size={18} />} disabled={!onAddToWatchlist} title={onAddToWatchlist ? 'Add to a watchlist' : 'Watchlists are off'} onClick={() => onAddToWatchlist?.(data)} className="flex-1">
@@ -168,10 +178,10 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAdd
 
       <div role="tablist" aria-label="Instrument" className="flex border-b border-line">
         <Tab selected>Overview</Tab>
-        <Tab coming={!chart} onClick={() => chart && onOpenTrade({ chart, ladder: ladder ?? undefined })}>
+        <Tab off={chartOff} coming={!stocksOn} onClick={() => chart && onOpenTrade(intent('chart'))}>
           Chart
         </Tab>
-        <Tab coming={!ladder} onClick={() => ladder && onOpenTrade({ ladder })}>
+        <Tab off={chainOff} coming={!stocksOn} onClick={() => ladder && onOpenTrade(intent('chain'))}>
           Chain
         </Tab>
       </div>

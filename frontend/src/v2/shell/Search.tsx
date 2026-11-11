@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { ChartLine, Plus, Search as SearchIcon, X } from 'lucide-react';
-import { chartOf } from '../lib/openInstrument';
+import { chartSymOf } from '../lib/openInstrument';
 import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
@@ -12,12 +12,15 @@ import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 // status bar; focus, `/` anywhere outside an input, or ⌘/Ctrl K opens the
 // results under it, grouped Indices / Stocks / Futures / Options, each row
 // priced and ticking. ↑/↓ move the highlight, Enter opens the instrument
-// (an index opens the Trade screen on it), Shift+Enter puts an index on the
-// ladder, `+` adds it to a watchlist (`onAdd`, while watchlists are on),
-// Escape closes. The well is the combobox, the results its listbox.
+// (an index opens the Trade screen on it), Shift+Enter puts it on the
+// ladder (an index; an F&O stock too while stocks are on), the chart button
+// charts it on the Trade screen, `+` adds it to a watchlist (`onAdd`, while
+// watchlists are on), Escape closes. The well is the combobox, the results
+// its listbox.
 
-/** How a result is opened: Enter / a tap, or Shift+Enter for the ladder. */
-export type OpenHow = 'open' | 'ladder';
+/** How a result is opened: Enter / a tap, Shift+Enter for the ladder, or
+ * its chart button for the chart. */
+export type OpenHow = 'open' | 'ladder' | 'chart';
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 
@@ -29,11 +32,13 @@ function inField(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
-export function Search({ serverBase, onOpen, onAdd }: {
+export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
   serverBase: string;
   onOpen: (row: InstrumentRow, how: OpenHow) => void;
   /** Add a result to a watchlist; left out while watchlists are off. */
   onAdd?: (row: InstrumentRow) => void;
+  /** The `stock_charts` switch: a stock's chart button lights up. */
+  stocksOn?: boolean;
 }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
@@ -204,7 +209,7 @@ export function Search({ serverBase, onOpen, onAdd }: {
                 </div>
                 {g.rows.map((row) => {
                   const on = activeRow?.id === row.id;
-                  const chart = chartOf(row);
+                  const chart = chartSymOf(row, stocksOn);
                   const extra = derivativeNote(row);
                   return (
                     <div
@@ -238,11 +243,11 @@ export function Search({ serverBase, onOpen, onAdd }: {
                           type="button"
                           tabIndex={-1}
                           aria-label={chart ? `Chart ${rowTitle(row)}` : 'Chart'}
-                          title={chart ? 'Open the chart' : 'Charts for stocks come in Phase 3'}
+                          title={chart ? 'Open the chart' : 'Stock charts are switched off'}
                           disabled={!chart}
                           onClick={(e) => {
                             e.stopPropagation();
-                            pick(row, 'open');
+                            pick(row, 'chart');
                           }}
                           className="grid size-7 place-items-center rounded-6 text-fg-muted transition-colors duration-120 hover:bg-raised hover:text-fg disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                         >

@@ -1,9 +1,13 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { ChartSpline, ChevronDown, ChevronUp, Layers as LayersIcon, Maximize2, Minimize2 } from 'lucide-react';
+import { ChartSpline, ChevronDown, ChevronUp, Layers as LayersIcon, Maximize2, Minimize2, Search as SearchIcon } from 'lucide-react';
 import { INDEX_ORDER } from '../../lib/execute';
 import { price, signedPct, toneOf } from '../lib/format';
-import type { ChainAnswer } from '../lib/types';
+import { chartSymOf } from '../lib/openInstrument';
+import type { ChainAnswer, InstrumentRow } from '../lib/types';
+import { rowsOf, useSearch } from '../lib/useSearch';
 import { useTickFlash } from '../lib/useTickFlash';
+import { derivativeNote, rowSymbol, rowTitle } from '../shell/searchModel';
+import { KindChips } from '../shell/searchParts';
 import { CheckboxRow } from '../ui/CheckboxRow';
 import { Popover } from '../ui/Popover';
 import { Segment } from '../ui/Segment';
@@ -13,9 +17,10 @@ import { DrawBanner, DrawMenu } from './DrawMenu';
 import { DrawToolbar } from './DrawToolbar';
 import { useDrawing, useDrawPrefs, type DrawApi, type DrawTool } from './drawings';
 import { expiryChip, type ExpiryRow } from './expiries';
-import { KChart, type ChartLine, type ChartMarker, type Placing } from './KChart';
+import { KChart, type ChartLine, type ChartMarker, type ChartState, type Placing } from './KChart';
 import type { Layers } from './lines';
-import { CANDLE_STYLES, CHART_LIBS, sameSym, symbolLabel, symbolName, type Bar, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { CANDLE_STYLES, CHART_LIBS, hasVolume, sameSym, symbolLabel, symbolName, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { QuoteStrip } from './QuoteStrip';
 import { drawableStudies, STUDIES } from './studies';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -56,24 +61,81 @@ function LotsStepper({ lots }: { lots: LotsPick }) {
   );
 }
 
-/** One chart: its header (instrument, timeframe, Layers) and the chart. */
-export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, style, onStyle, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide, fullscreen = false, onFullscreen }: {
+/**
+ * The symbol picker's search row (behind the `stock_charts` switch): any
+ * stock, future or option the catalog lists, typed and picked for this
+ * chart. Mounted only while the picker is open, so a query never outlives
+ * it.
+ */
+function PickerSearch({ serverBase, compact, onPick }: { serverBase: string; compact: boolean; onPick: (row: InstrumentRow) => void }) {
+  const [query, setQuery] = useState('');
+  const typed = query.trim();
+  const search = useSearch(serverBase, query, true);
+  const rows = rowsOf(search.answer).filter((r) => chartSymOf(r, true) != null);
+  const row = compact ? 'h-11' : 'h-8';
+  return (
+    <div className="pb-2">
+      <div className={`flex items-center gap-2 rounded-6 border border-line bg-inset px-2 transition-colors duration-120 focus-within:border-accent ${row}`}>
+        <SearchIcon size={14} className="shrink-0 text-fg-muted" aria-hidden />
+        <input
+          type="text"
+          aria-label="Search an instrument for this chart"
+          autoComplete="off"
+          spellCheck={false}
+          placeholder="Search a stock, future or option…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          className="min-w-0 flex-1 bg-transparent type-label text-fg outline-none placeholder:text-fg-subtle"
+        />
+      </div>
+      {typed && (
+        <div role="listbox" aria-label="Instruments" className="mt-1 max-h-56 overflow-y-auto">
+          {rows.slice(0, 12).map((r) => (
+            <button
+              key={r.id}
+              type="button"
+              role="option"
+              aria-selected={false}
+              title={rowTitle(r)}
+              onClick={() => onPick(r)}
+              className={`flex w-full items-center gap-2 rounded-6 px-2 text-left text-fg-muted hover:bg-raised hover:text-fg ${row}`}
+            >
+              <span className="shrink-0 whitespace-nowrap type-label text-fg">{rowSymbol(r)}</span>
+              <KindChips row={r} />
+              <span className="min-w-0 truncate type-caption">{derivativeNote(r) ?? r.name}</span>
+            </button>
+          ))}
+          {search.pending && <p className="px-2 py-1 type-caption text-fg-subtle">Searching…</p>}
+          {!search.pending && search.answer && rows.length === 0 && <p className="px-2 py-1 type-caption text-fg-subtle">No match for '{typed}'</p>}
+          {search.error && <p className="px-2 py-1 type-caption text-loss">{search.error}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One chart: its header (instrument, timeframe, Layers), the quote strip
+ * and the chart. */
+export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, style, onStyle, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide, fullscreen = false, onFullscreen, stocksOn = false }: {
   chartId: string;
   serverBase: string;
   sym: ChartSym;
   tf: Tf;
-  onSym: (s: ChartSym) => void;
+  /** A new instrument for this chart — with the catalog row it was picked
+   * from, when the picker's search chose it. */
+  onSym: (s: ChartSym, from?: InstrumentRow) => void;
   onTf: (tf: Tf) => void;
   layers: Layers;
   onLayers: (l: Layers) => void;
   style: CandleStyle;
   onStyle: (s: CandleStyle) => void;
-  /** Each index's value and its change today. */
+  /** Each underlying's value and its change today (the six indices from the
+   * stream; a stock's while the ladder is on it). */
   spot: Record<string, number | null>;
   change: Record<string, number | null>;
-  /** The chart's index's listed expiries, for the picker. */
+  /** The chart's underlying's listed expiries, for the picker. */
   expiries: ExpiryRow[] | undefined;
-  /** The chart's index's strikes for an expiry (null: the nearest), once loaded. */
+  /** The chart's underlying's strikes for an expiry (null: the nearest), once loaded. */
   chainAt: (expiry: string | null) => ChainAnswer | undefined;
   /** The picker wants an expiry's strikes the screen hasn't loaded. */
   onNeedChain: (expiry: string | null) => void;
@@ -93,9 +155,11 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   onHide?: () => void;
   fullscreen?: boolean;
   onFullscreen?: (on: boolean) => void;
+  /** The `stock_charts` switch: the picker's search row and the quote strip. */
+  stocksOn?: boolean;
 }) {
   const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | 'studies' | null>(null);
-  const [chartState, setChartState] = useState<{ loading: boolean; error: string | null; last: Bar | null }>({ loading: true, error: null, last: null });
+  const [chartState, setChartState] = useState<ChartState>({ loading: true, error: null, last: null, day: null });
   // Drawing tools (KLineChart or Vela), while it draws this chart.
   const drawApi = useRef<DrawApi | null>(null);
   const { drawing, pick: pickTool, cancel: cancelDrawing } = useDrawing(useCallback(() => drawApi.current, []));
@@ -135,7 +199,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   const strikeList = useRef<HTMLDivElement>(null);
   const atmRow = useRef<HTMLDivElement>(null);
   const close = useCallback(() => setMenu(null), []);
-  const onState = useCallback((s: { loading: boolean; error: string | null; last: Bar | null }) => setChartState(s), []);
+  const onState = useCallback((s: ChartState) => setChartState(s), []);
 
   useEffect(() => {
     if (menu === 'draw') {
@@ -146,19 +210,19 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
     }
   }, [menu]);
 
-  const index = sym.index;
-  const symbolKey = sym.kind === 'option' ? `${sym.index}:${sym.expiry}` : sym.index;
+  const underlying = underlyingOf(sym);
+  const symbolKey = sym.kind === 'option' ? `${underlying}:${sym.expiry}` : underlying;
   const pickExpiry = picked?.on === symbolKey ? picked.expiry : sym.kind === 'option' ? sym.expiry : null;
   const setPickExpiry = (expiry: string | null) => setPicked({ on: symbolKey, expiry });
   useEffect(() => {
     if (menu === 'pick') onNeedChain(pickExpiry);
   }, [menu, pickExpiry, onNeedChain]);
 
-  const shown = sym.kind === 'index' ? spot[index] ?? chartState.last?.c ?? null : chartState.last?.c ?? null;
+  const shown = sym.kind === 'index' ? spot[underlying] ?? chartState.last?.c ?? null : chartState.last?.c ?? null;
   // A different instrument is a new figure, not a tick.
   const flash = useTickFlash(shown, true, symbolName(sym));
-  const pct = sym.kind === 'index' ? change[index] ?? null : null;
-  const spotNow = spot[index];
+  const pct = sym.kind === 'index' ? change[underlying] ?? null : null;
+  const spotNow = spot[underlying];
   const chain = chainAt(pickExpiry);
   const strikes = chain?.strikes ?? [];
   const atm = chain && spotNow != null ? strikes.reduce((best, s, i, all) => (Math.abs(s.strike - spotNow) < Math.abs(all[best].strike - spotNow) ? i : best), 0) : -1;
@@ -178,7 +242,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   const setStudy = (name: string, on: boolean) =>
     onLayers({ ...layers, studies: STUDIES.filter((s) => (s.name === name ? on : layers.studies.includes(s.name))).map((s) => s.name) });
   const studyRow = (s: (typeof STUDIES)[number]) => {
-    const noVolume = s.volume === true && sym.kind === 'index';
+    const noVolume = s.volume === true && !hasVolume(sym);
     return (
       <CheckboxRow
         key={s.name}
@@ -207,7 +271,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
     </>
   );
   // What the chart draws: a volume study isn't, on an index.
-  const studyCount = drawableStudies(layers.studies, sym.kind === 'index').length + (layers.rsi ? 1 : 0) + (layers.cci ? 1 : 0);
+  const studyCount = drawableStudies(layers.studies, !hasVolume(sym)).length + (layers.rsi ? 1 : 0) + (layers.cci ? 1 : 0);
 
   return (
     // Not clipped as a whole: its menus (the symbol picker, Layers) open over
@@ -227,7 +291,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             {sym.kind === 'option' ? (
               // The index over the strike, so the strike is never cut off.
               <span className="flex min-w-0 flex-col">
-                <span className="truncate type-caption leading-none text-fg-muted">{sym.index}</span>
+                <span className="truncate type-caption leading-none text-fg-muted">{underlying}</span>
                 <span className="truncate type-body-strong leading-tight">
                   {sym.strike} {sym.side}
                 </span>
@@ -238,6 +302,17 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             <ChevronDown size={14} className="shrink-0 text-fg-muted" />
           </button>
           <Popover open={menu === 'pick'} onClose={close} backdrop={compact}>
+            {stocksOn && (
+              <PickerSearch
+                serverBase={serverBase}
+                compact={compact}
+                onPick={(row) => {
+                  const picked = chartSymOf(row, true);
+                  if (picked) onSym(picked, row);
+                  close();
+                }}
+              />
+            )}
             <div className="px-2 pt-1 pb-1.5 type-caption text-fg-muted">Index</div>
             <div className="grid grid-cols-3 gap-1">
               {INDEX_ORDER.map((i) => {
@@ -249,7 +324,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                 );
               })}
             </div>
-            <div className="px-2 pt-3 pb-1.5 type-caption text-fg-muted">{index} options</div>
+            <div className="px-2 pt-3 pb-1.5 type-caption text-fg-muted">{underlying} options</div>
             {all.length > 0 && (
               <div role="tablist" aria-label="Expiry" className="flex gap-1 overflow-x-auto pb-1.5">
                 {all.map((e, i) => {
@@ -276,7 +351,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                 {strikes.map((s, i) => (
                   <div key={s.strike} ref={i === atm ? atmRow : undefined} className={`flex items-center gap-1 ${i === atm ? 'rounded-6 bg-raised' : ''}`}>
                     {(['CE', 'PE'] as const).map((side) => {
-                      const opt: ChartSym = { kind: 'option', index, expiry: chain!.expiry, strike: s.strike, side };
+                      const opt: ChartSym = { kind: 'option', index: underlying, expiry: chain!.expiry, strike: s.strike, side };
                       const has = side === 'CE' ? s.ce : s.pe;
                       return (
                         <button
@@ -382,7 +457,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             <CheckboxRow
               checked={layers.vwap}
               title="VWAP"
-              note={sym.kind === 'index' ? `From ${index} futures` : "From this option's own trades"}
+              note={sym.kind === 'index' ? `From ${underlying} futures` : `From this ${sym.kind === 'option' ? 'option' : sym.kind === 'future' ? 'future' : 'stock'}'s own trades`}
               onChange={(v) => onLayers({ ...layers, vwap: v })}
             />
             <CheckboxRow
@@ -418,6 +493,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           </button>
         )}
       </header>
+      {stocksOn && <QuoteStrip sym={sym} day={chartState.day} spot={sym.kind === 'index' ? spot[underlying] : null} changePct={sym.kind === 'index' ? change[underlying] : null} />}
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <div className="absolute inset-0 flex">
           {toolbar && (

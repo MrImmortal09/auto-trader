@@ -3,15 +3,29 @@ import type { ChartSym } from '../trade/model';
 import { TRADE_KEY } from './layout';
 import type { InstrumentRow } from './types';
 
-// Where a search result or an instrument page sends you. The Trade screen
-// charts the six indices and their options and ladders the indices, so
-// those open there; everything else opens its instrument page.
+// Where a search result, a watchlist row or an instrument page sends you.
+// The Trade screen charts the six indices and their options and ladders the
+// indices; with the `stock_charts` switch on (`stocksOn`), any stock too —
+// its own chart, its futures and options, and the ladder of any F&O stock.
+// Everything else opens its instrument page.
+
+/** The stock the Trade screen shows as a seventh tab beside the six indices:
+ * the one last chosen from a search, a watchlist row or an instrument page.
+ * `key` is its cash row's price-map key (`nse_cm|2885`), for its price on the
+ * tab; null when the row that chose it was a contract. `fo`: it has options,
+ * so the tab can put it on the ladder. */
+export interface StockChip {
+  symbol: string;
+  key: string | null;
+  fo: boolean;
+}
 
 /** What the Trade screen should show when it opens: slot 1's chart and/or
- * the ladder's index (and expiry). */
+ * the ladder's underlying (and expiry), and the stock tab. */
 export interface TradeIntent {
   chart?: ChartSym;
   ladder?: { index: string; expiry?: string | null };
+  stock?: StockChip;
 }
 
 /** One of the six indices the Trade screen knows, by its catalog symbol. */
@@ -20,20 +34,53 @@ export function tradeIndexOf(row: Pick<InstrumentRow, 'kind' | 'symbol' | 'under
   return INDEX_ORDER.includes(index) ? index : null;
 }
 
-/** The chart the Trade screen can draw for `row`: an index, or an index's
- * option; `null` for a stock, a future or a stock option (Phase 3). */
-export function chartOf(row: Pick<InstrumentRow, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike'>): ChartSym | null {
+type RowFacts = Pick<InstrumentRow, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike' | 'exchange' | 'has_fo' | 'ws_key'>;
+
+/**
+ * The chart the Trade screen can draw for `row`: an index or an index's
+ * option always; with `stocksOn`, a stock, a stock's future or option too.
+ * `null` for an index's future (no row of the six has one in the catalog
+ * the ladder knows) and for a stock while the switch is off.
+ */
+export function chartSymOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike' | 'exchange'>, stocksOn: boolean): ChartSym | null {
   const index = tradeIndexOf(row);
-  if (!index) return null;
-  if (row.kind === 'INDEX') return { kind: 'index', index };
-  if ((row.kind === 'CE' || row.kind === 'PE') && row.expiry && row.strike != null) return { kind: 'option', index, expiry: row.expiry, strike: row.strike, side: row.kind };
+  if (row.kind === 'INDEX') return index ? { kind: 'index', index } : null;
+  const underlying = index ?? (stocksOn ? row.underlying : null);
+  if (!underlying) return null;
+  if (row.kind === 'EQ') return stocksOn ? { kind: 'equity', symbol: row.symbol, exchange: row.exchange === 'BSE' ? 'BSE' : 'NSE' } : null;
+  if (row.kind === 'FUT') return { kind: 'future', index: underlying };
+  if ((row.kind === 'CE' || row.kind === 'PE') && row.expiry && row.strike != null) return { kind: 'option', index: underlying, expiry: row.expiry, strike: row.strike, side: row.kind };
   return null;
 }
 
-/** Where `row` opens: the Trade screen for an index (Enter) or for an index
- * put on the ladder (Shift+Enter, also from an index option, on its expiry);
- * its instrument page otherwise. */
-export function targetOf(row: InstrumentRow, how: 'open' | 'ladder'): { trade: TradeIntent } | { instrument: string } {
+/** The chart for `row` as the screens knew it before stock charts: an
+ * index or an index's option. */
+export function chartOf(row: Pick<InstrumentRow, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike'>): ChartSym | null {
+  return chartSymOf({ ...row, exchange: 'NSE' }, false);
+}
+
+/** The ladder `row` can open: its index, or with `stocksOn` its F&O stock,
+ * on a contract's own expiry. */
+export function ladderOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'has_fo'>, stocksOn: boolean): { index: string; expiry?: string | null } | null {
+  const index = tradeIndexOf(row) ?? (stocksOn && row.has_fo ? row.underlying : null);
+  if (!index) return null;
+  const derivative = row.kind === 'FUT' || row.kind === 'CE' || row.kind === 'PE';
+  return { index, expiry: derivative ? row.expiry : null };
+}
+
+/** The stock tab `row` puts on the Trade screen: its underlying, when that
+ * is a stock; nothing for an index or an index's contract. */
+export function stockChipOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying' | 'has_fo' | 'ws_key'>): StockChip | undefined {
+  if (tradeIndexOf(row)) return undefined;
+  return { symbol: row.underlying, key: row.kind === 'EQ' ? row.ws_key : null, fo: row.has_fo };
+}
+
+/** Where `row` opens, with the stock switch `stocksOn`: the Trade screen for
+ * an index (Enter) or for an index put on the ladder (Shift+Enter, also from
+ * an index option, on its expiry); a stock's chart or ladder on the Trade
+ * screen from its chart button or Shift+Enter while stocks are on; its
+ * instrument page otherwise. */
+export function targetOf(row: InstrumentRow, how: 'open' | 'ladder' | 'chart', stocksOn: boolean): { trade: TradeIntent } | { instrument: string } {
   const index = tradeIndexOf(row);
   if (index && row.kind === 'INDEX') {
     return { trade: how === 'ladder' ? { ladder: { index } } : { chart: { kind: 'index', index }, ladder: { index } } };
@@ -41,14 +88,22 @@ export function targetOf(row: InstrumentRow, how: 'open' | 'ladder'): { trade: T
   if (index && how === 'ladder' && (row.kind === 'CE' || row.kind === 'PE')) {
     return { trade: { ladder: { index, expiry: row.expiry } } };
   }
+  if (!index && stocksOn && how !== 'open') {
+    const chart = chartSymOf(row, true);
+    const ladder = ladderOf(row, true);
+    const stock = stockChipOf(row);
+    if (how === 'ladder' && ladder) return { trade: { ladder, stock } };
+    if (how === 'chart' && chart) return { trade: { chart, ladder: ladder ?? undefined, stock } };
+  }
   return { instrument: row.id };
 }
 
 /**
  * Point the Trade screen's saved layout (`v2.trade`) at `intent` before it
- * opens: slot 1's symbol, the ladder's index and its expiry. Everything
- * else saved (timeframes, layers, pane sizes) stays. The screen reads this
- * when it mounts, so the caller remounts it if it is already open.
+ * opens: slot 1's symbol, the ladder's underlying and its expiry, the stock
+ * tab. Everything else saved (timeframes, layers, pane sizes) stays. The
+ * screen reads this when it mounts, so the caller remounts it if it is
+ * already open.
  */
 export function pointTradeAt(intent: TradeIntent) {
   const saved = readStored<Record<string, unknown>>(TRADE_KEY, {});
@@ -66,5 +121,6 @@ export function pointTradeAt(intent: TradeIntent) {
       next.expiry = { ...expiry, [intent.ladder.index]: intent.ladder.expiry };
     }
   }
+  if (intent.stock) next.stock = intent.stock;
   writeStored(TRADE_KEY, next);
 }

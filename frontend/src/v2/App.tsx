@@ -60,6 +60,9 @@ export default function App() {
   // Watchlists too; `null` until the switches are known, so an opened
   // `/v2/watchlist` waits for them rather than bounce to Desk.
   const watchlistsOn: boolean | null = flags.data ? flags.data.watchlists === true : null;
+  // Any stock's chart, ladder and option chain (plan Phase 3): off, every
+  // stock control stays hidden and a stock opens its instrument page alone.
+  const stocksOn = flags.data?.stock_charts === true;
   const screens = visibleScreens(role, watchlistsOn !== false);
   const nav = navScreens(role, watchlistsOn === true);
   // Phone: the tabs with a place of their own (a user's start with Watchlist once it is on).
@@ -126,10 +129,11 @@ export default function App() {
     go('trade');
   }
 
-  /** A search result: Enter opens it, Shift+Enter puts an index on the ladder. */
+  /** A search result: Enter opens it, Shift+Enter puts it on the ladder, the
+   * chart button charts it (a stock's, while stocks are on). */
   function openResult(row: InstrumentRow, how: OpenHow) {
     setSearchOpen(false);
-    const target = targetOf(row, how);
+    const target = targetOf(row, how, stocksOn);
     if ('trade' in target) openTrade(target.trade);
     else go({ screen: 'instrument', key: target.instrument });
   }
@@ -166,14 +170,14 @@ export default function App() {
         <Market serverBase={serverBase} desktop={desktop} canReadOwner={canReadOwner} />
       </Suspense>
     ) : screen === 'instrument' && place.key ? (
-      <Instrument key={place.key} serverBase={serverBase} desktop={desktop} id={place.key} onBack={back} onOpenTrade={openTrade} onAddToWatchlist={onAdd} />
+      <Instrument key={place.key} serverBase={serverBase} desktop={desktop} id={place.key} onBack={back} onOpenTrade={openTrade} onAddToWatchlist={onAdd} stocksOn={stocksOn} />
     ) : screen === 'watchlist' && watchlistsOn == null ? (
       <p className="p-6 type-body text-fg-subtle">Loading…</p>
     ) : (
       (() => {
         const page =
           screen === 'watchlist' ? (
-            <Watchlist serverBase={serverBase} desktop={desktop} onOpenTrade={openTrade} onOpenInstrument={(id) => go({ screen: 'instrument', key: id })} />
+            <Watchlist serverBase={serverBase} desktop={desktop} stocksOn={stocksOn} onOpenTrade={openTrade} onOpenInstrument={(id) => go({ screen: 'instrument', key: id })} />
           ) : screen === 'system' ? (
             <System serverBase={serverBase} desktop={desktop} health={s?.health ?? null} marketOpen={s?.market_open ?? false} />
           ) : screen === 'admin' ? (
@@ -217,7 +221,7 @@ export default function App() {
           unreachable={unreachable}
           role={role}
           onKillSwitch={() => setKillSwitchOpen(true)}
-          search={searchOn ? <Search serverBase={serverBase} onOpen={openResult} onAdd={onAdd} /> : undefined}
+          search={searchOn ? <Search serverBase={serverBase} onOpen={openResult} onAdd={onAdd} stocksOn={stocksOn} /> : undefined}
         />
       ) : (
         <PhoneStatusBar

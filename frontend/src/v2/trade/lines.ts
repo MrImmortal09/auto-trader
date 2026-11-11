@@ -7,7 +7,7 @@ import { level, price, signedMoney } from '../lib/format';
 import type { CallMark, ChainAnswer, FillMark, TelegramLine } from '../lib/types';
 import { C, type LinePart, type MarkerData, type OrderLineData } from './chartSetup';
 import type { ChartLine, ChartMarker } from './KChart';
-import { approxMoney, istMs, levelCrossed, levelPnl, optionOf, sameSym, type ChartSym } from './model';
+import { approxMoney, istMs, levelCrossed, levelPnl, optionOf, sameSym, underlyingOf, type ChartSym } from './model';
 
 export type LevelKind = 'stop' | 'target';
 
@@ -263,8 +263,9 @@ function markerKind(f: FillMark): MarkerData['kind'] {
 export function chartMarkers(cx: LineContext): ChartMarker[] {
   const out: ChartMarker[] = [];
   const s = cx.sym;
+  const underlying = underlyingOf(s);
   for (const f of cx.fills) {
-    if (f.index !== s.index) continue;
+    if (f.index !== underlying) continue;
     if (f.scalp ? !cx.layers.myTrades : !cx.layers.telegramTrades) continue;
     if (s.kind === 'option' && (f.strike !== s.strike || f.side !== s.side)) continue;
     const kind = markerKind(f);
