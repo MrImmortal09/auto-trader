@@ -52,14 +52,21 @@ fn sync(sent: &mut Sent, tx: &mpsc::UnboundedSender<String>, scrips: BTreeSet<St
     }
 }
 
-/// Every 30 s, subscribe what the desk holds and the feed hasn't been asked for.
+/// Every 30 s, and at once when a buy brings a new stock's cash row onto
+/// the books (`PaperDesk::buy` wakes it), subscribe what the desk holds and
+/// the feed hasn't been asked for.
 pub fn spawn_keeper(desk: Arc<PaperDesk>, ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sent = Sent::default();
         loop {
-            tick.tick().await;
+            // A wake while a pass runs is kept (`notify_one` stores it), so
+            // the next pass follows straight on.
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = desk.feed_wake.notified() => {}
+            }
             let Some(tx) = ws_tx.lock().await.clone() else { continue };
             let (scrips, indices) = desk.feed_keys().await;
             sync(&mut sent, &tx, scrips, indices);
@@ -70,6 +77,7 @@ pub fn spawn_keeper(desk: Arc<PaperDesk>, ws_tx: Arc<Mutex<Option<mpsc::Unbounde
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paper::tests::{desk, nifty, reliance};
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -95,5 +103,31 @@ mod tests {
         sync(&mut sent, &tx2, set(&["nse_fo|3"]), set(&[]));
         assert_eq!(rx2.try_recv().unwrap(), r#"{"action":"subscribe","scrips":"nse_fo|3"}"#);
         assert!(rx2.try_recv().is_err());
+    }
+
+    /// The keeper's next message, or a panic once `within` passes — far
+    /// shorter than its 30-second pass.
+    async fn next(rx: &mut mpsc::UnboundedReceiver<String>, within: Duration) -> String {
+        tokio::time::timeout(within, rx.recv()).await.expect("nothing sent in time").expect("channel open")
+    }
+
+    #[tokio::test]
+    async fn a_buy_that_brings_a_new_stock_wakes_the_keeper_at_once() {
+        let (_db, desk) = desk("feed-wake").await;
+        let desk = Arc::new(desk);
+        desk.buy(1, &nifty(25_000.0, "CE"), 1, 100.0).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_keeper(Arc::clone(&desk), Arc::new(Mutex::new(Some(tx))));
+        // The first pass runs at once: the index contract and its index.
+        let soon = Duration::from_secs(5);
+        assert_eq!(next(&mut rx, soon).await, r#"{"action":"subscribe","scrips":"nse_fo|25000CE"}"#);
+        assert_eq!(next(&mut rx, soon).await, r#"{"action":"subscribe_indices","indices":"nse_cm|Nifty 50"}"#);
+        // A first RELIANCE option: its contract and the stock's cash row go
+        // out now, not on the pass 30 s later — a stop on the stock's price
+        // has a value to trigger on straight away.
+        desk.buy(2, &reliance(1_400.0, "CE"), 1, 40.0).await.unwrap();
+        assert_eq!(next(&mut rx, soon).await, r#"{"action":"subscribe","scrips":"nse_cm|2885&nse_fo|R1400CE"}"#);
+        // Nothing else until the next pass.
+        assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err());
     }
 }

@@ -39,7 +39,7 @@ use shared_domain::{ChartLevel, ChartLevels, LevelTrigger};
 
 use crate::routes::v2::positions::{level_refusal, LevelsUpdate};
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, Notify};
 use trading_engine::ChargeBreakdown;
 
 use crate::desk::contract_label;
@@ -268,6 +268,12 @@ pub struct PaperDesk {
     /// across users hold exactly.
     book: Mutex<Book>,
     activity: std::sync::Mutex<HashMap<i64, VecDeque<Activity>>>,
+    /// Woken by a buy that brings a stock's cash row onto the books, so the
+    /// feed keeper (`feed`) subscribes it at once rather than on its next
+    /// pass: a stock's value is on the feed only if a chart reserved it, and
+    /// until then a stop on the stock's price has nothing to trigger on. An
+    /// index's value is always on the feed, so an index buy wakes nothing.
+    feed_wake: Notify,
 }
 
 impl PaperDesk {
@@ -290,7 +296,7 @@ impl PaperDesk {
         if held > 0 {
             tracing::info!("Paper desk: {held} open position(s) across {} user(s) restored", book.len());
         }
-        Ok(PaperDesk { pool, prices, book: Mutex::new(book), activity: Default::default() })
+        Ok(PaperDesk { pool, prices, book: Mutex::new(book), activity: Default::default(), feed_wake: Notify::new() })
     }
 
     /// The live price behind feed key `key`, however old.
@@ -403,6 +409,8 @@ impl PaperDesk {
         let mut book = self.book.lock().await;
         let mut next = book.get(&user_id).cloned().unwrap_or_default();
         let held = next.iter().position(|p| p.trading_symbol == contract.trading_symbol);
+        // A stock no book holds yet: its cash row isn't on the keeper's list.
+        let mut new_cash_row = false;
         if held.is_none() {
             if next.len() >= MAX_OPEN_POSITIONS_PER_USER {
                 return Err(Refusal::conflict(format!(
@@ -419,8 +427,8 @@ impl PaperDesk {
                 .flat_map(|p| [Some(p.ws_key.as_str()), p.underlying_key.as_deref()])
                 .flatten()
                 .collect();
-            let needed = usize::from(!subscribed.contains(contract.ws_key.as_str()))
-                + usize::from(contract.underlying_key.as_deref().is_some_and(|k| !subscribed.contains(k)));
+            new_cash_row = contract.underlying_key.as_deref().is_some_and(|k| !subscribed.contains(k));
+            let needed = usize::from(!subscribed.contains(contract.ws_key.as_str())) + usize::from(new_cash_row);
             if needed > 0 && subscribed.len() + needed > MAX_USER_POSITION_SCRIPS {
                 return Err(Refusal::conflict(
                     "Paper trading is full right now — too many contracts are held across all accounts. Try again later",
@@ -470,6 +478,10 @@ impl PaperDesk {
         let (trade_id, balance) = self.record(user_id, leg, &next).await?;
         book.insert(user_id, next);
         drop(book);
+        if new_cash_row {
+            // After the book lock is let go: the keeper reads the book.
+            self.feed_wake.notify_one();
+        }
         self.note(user_id, "buy", Some(&pos.id), format!("Bought {qty} {} at ₹{price:.2}", pos.label()));
         Ok(Filled {
             trade_id,
@@ -1197,6 +1209,28 @@ pub(crate) mod tests {
         assert!(calls[0].closed_at.is_some());
         let wallet = desk.wallet(3).await.unwrap();
         assert!((wallet.balance - (INITIAL_WALLET - buy.net_value + part.net_value + rest.net_value)).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn only_a_buy_that_brings_a_new_stock_wakes_the_feed_keeper() {
+        use futures::FutureExt;
+        let (_db, desk) = desk("feed-wake").await;
+        let woken = |desk: &PaperDesk| desk.feed_wake.notified().now_or_never().is_some();
+        // An index option: its index is always on the feed. Nothing to wake for.
+        desk.buy(1, &nifty(25_000.0, "CE"), 1, 100.0).await.unwrap();
+        assert!(!woken(&desk));
+        // A first RELIANCE option: the stock's cash row is new to the books.
+        desk.buy(2, &reliance(1_400.0, "CE"), 1, 40.0).await.unwrap();
+        assert!(woken(&desk));
+        assert!(!woken(&desk), "one wake per buy");
+        // An add, another strike, another user: the cash row is held already.
+        desk.buy(2, &reliance(1_400.0, "CE"), 1, 41.0).await.unwrap();
+        desk.buy(2, &reliance(1_420.0, "PE"), 1, 30.0).await.unwrap();
+        desk.buy(3, &reliance(1_400.0, "CE"), 1, 42.0).await.unwrap();
+        assert!(!woken(&desk));
+        // A refused buy wakes nothing either.
+        assert!(desk.buy(4, &reliance(1_440.0, "CE"), 0, 10.0).await.is_err());
+        assert!(!woken(&desk));
     }
 
     #[tokio::test]
