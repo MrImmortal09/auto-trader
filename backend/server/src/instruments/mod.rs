@@ -548,8 +548,10 @@ impl Catalog {
     /// (`nse_cm|Nifty 50` names an index's virtual row but is not its key,
     /// as in `known_keys`). A key with no row is simply absent from the
     /// answer. What the watchlists check keys against and label rows with;
-    /// the row's `ws_key` is what they keep.
-    pub async fn rows_for_keys(&self, keys: &[String]) -> HashMap<String, SearchRow> {
+    /// the row's `ws_key` is what they keep. `Err` when the contracts'
+    /// lookup itself failed, so a broken catalog database is never taken
+    /// for keys it has no row for (an unopened catalog has none, `Ok`).
+    pub async fn rows_for_keys(&self, keys: &[String]) -> Result<HashMap<String, SearchRow>, sqlx::Error> {
         let index = self.index();
         let mut found: HashMap<String, SearchRow> = HashMap::new();
         let mut ids: Vec<String> = Vec::new();
@@ -567,9 +569,9 @@ impl Catalog {
                 ids.push(key.clone());
             }
         }
-        let Some(pool) = &self.pool else { return found };
+        let Some(pool) = &self.pool else { return Ok(found) };
         if ids.is_empty() {
-            return found;
+            return Ok(found);
         }
         ids.sort();
         ids.dedup();
@@ -578,21 +580,29 @@ impl Catalog {
         for id in &ids {
             query = query.bind(id);
         }
-        match query.fetch_all(pool).await {
-            Ok(rows) => {
-                let rows: Vec<SearchRow> = rows.into_iter().map(|r| r.into_row(&index)).collect();
-                for key in keys {
-                    if found.contains_key(key) {
-                        continue;
-                    }
-                    if let Some(row) = rows.iter().find(|r| r.ws_key == *key || r.id == *key) {
-                        found.insert(key.clone(), row.clone());
-                    }
-                }
+        let rows = query.fetch_all(pool).await.map_err(|e| {
+            tracing::error!(error = %e, "Instrument catalog: rows lookup failed");
+            e
+        })?;
+        let rows: Vec<SearchRow> = rows.into_iter().map(|r| r.into_row(&index)).collect();
+        for key in keys {
+            if found.contains_key(key) {
+                continue;
             }
-            Err(e) => tracing::error!(error = %e, "Instrument catalog: rows lookup failed"),
+            if let Some(row) = rows.iter().find(|r| r.ws_key == *key || r.id == *key) {
+                found.insert(key.clone(), row.clone());
+            }
         }
-        found
+        Ok(found)
+    }
+
+    /// Closes the catalog database's pool, so every lookup that reaches it
+    /// fails from then on: the tests' broken catalog.
+    #[cfg(test)]
+    pub(crate) async fn close_db_for_tests(&self) {
+        if let Some(pool) = &self.pool {
+            pool.close().await;
+        }
     }
 
     /// The instrument with `id` (`<segment>:<token>`), with its underlying's
