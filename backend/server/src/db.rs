@@ -1692,6 +1692,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_dated_future_chart_and_the_archive_share_a_name_but_never_a_row() {
+        let db = TempDb::new("candle-archive-live");
+        let pool = init_db(&db.url()).await;
+        // A chart of `NIFTY:FUT:2026-11-24` caches its day under the name
+        // the archive keeps that contract's minutes under.
+        let name = crate::candles::symbols::Symbol::parse("NIFTY:FUT:2026-11-24").unwrap().name();
+        let (tx, rx) = mpsc::channel(4);
+        let writer = tokio::spawn(db_writer(rx, pool.clone(), Arc::new(BalanceCache::new())));
+        tx.send(DbWriteMessage::ArchiveCandles {
+            symbol: name.clone(),
+            candles: vec![ArchivedCandle { t: 60_000, open: 1.0, high: 2.0, low: 0.5, close: 1.5, volume: 900.0, oi: 7.0 }],
+        }).await.unwrap();
+        tx.send(DbWriteMessage::CandleMinute {
+            symbol: name.clone(), t: 60_000, open: 9.0, high: 9.0, low: 9.0, close: 9.0, volume: None, source: "ticks",
+        }).await.unwrap();
+        drop(tx);
+        writer.await.unwrap();
+
+        // Each reads its own table: the live minute never overwrote the
+        // archived one, and the day's prune leaves the archive alone.
+        let live = load_candle_minutes(&pool, &name, 0).await;
+        assert_eq!(live.len(), 1);
+        assert_eq!((live[0].0, live[0].4), (60_000, 9.0));
+        let archived: (f64, f64) = sqlx::query_as("SELECT close, volume FROM candle_archive WHERE symbol = ?")
+            .bind(&name).fetch_one(&pool).await.unwrap();
+        assert_eq!(archived, (1.5, 900.0));
+        prune_candles(&pool, 120_000).await;
+        assert!(load_candle_minutes(&pool, &name, 0).await.is_empty());
+        assert_eq!(last_archived_minute(&pool, &name).await.unwrap(), Some(60_000));
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn feature_flags_start_off_and_survive_a_restart_and_a_settings_save() {
         let db = TempDb::new("flags");
         let pool = init_db(&db.url()).await;
@@ -1709,12 +1742,12 @@ mod tests {
         let pool = init_db(&db.url()).await;
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: true, chart_stops: false, search: false, watchlists: false },
+            FeatureFlags { index_options_only: true, chart_stops: false, search: false, watchlists: false, stock_charts: false },
         );
-        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true), ("search", true), ("watchlists", true)]).await.unwrap();
+        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true), ("search", true), ("watchlists", true), ("stock_charts", true)]).await.unwrap();
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: false, chart_stops: true, search: true, watchlists: true },
+            FeatureFlags { index_options_only: false, chart_stops: true, search: true, watchlists: true, stock_charts: true },
         );
         pool.close().await;
     }

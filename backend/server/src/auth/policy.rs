@@ -52,7 +52,9 @@ const RULES: &[Rule] = &[
     rule(On::Write, "/api/auth/otp/verify", Access::Public),
     rule(On::Read, "/api/auth/me", Access::Public),
     rule(On::Read, "/api/auth/session", Access::Public),
-    // Market data, for anyone signed in.
+    // Market data, for anyone signed in. The expiries, chain, candles and
+    // ladder stream take any catalog F&O underlying behind the
+    // `stock_charts` switch (Phase 3) — the same routes, no new ones.
     rule(On::Read, "/api/v2/expiries", Access::SignedIn),
     rule(On::Read, "/api/v2/chain", Access::SignedIn),
     rule(On::Read, "/api/v2/flags", Access::SignedIn),
@@ -252,6 +254,20 @@ mod tests {
         for (method, path, want) in ROUTES {
             assert_eq!(required(method, path), *want, "{method} {path}");
         }
+    }
+
+    /// Phase 3 widened what these routes accept (any catalog F&O
+    /// underlying behind `stock_charts`), not who may call them; and the
+    /// buys that place or fill orders stay exactly as they were.
+    #[test]
+    fn the_stock_chart_routes_stay_signed_in_and_the_buys_stay_put() {
+        for path in ["/api/v2/expiries", "/api/v2/chain", "/api/v2/candles", "/api/v2/candles/stream", "/api/execute/stream", "/api/v2/flags"] {
+            assert_eq!(required(&GET, path), Access::SignedIn, "{path}");
+            assert_eq!(required(&POST, path), Access::Admin, "{path}");
+        }
+        assert_eq!(required(&PUT, "/api/v2/flags"), Access::Admin);
+        assert_eq!(required(&POST, "/api/execute/buy"), Access::Admin);
+        assert_eq!(required(&POST, "/api/v2/me/buy"), Access::PhoneUser);
     }
 
     #[test]

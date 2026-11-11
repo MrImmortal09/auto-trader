@@ -22,7 +22,7 @@ use chrono::NaiveDate;
 use futures::stream::Stream;
 use serde::Deserialize;
 use serde_json::json;
-use shared_domain::{ManualAdd, MonitoredPosition, TradeSignal, TradeState, INDEX_NAMES};
+use shared_domain::{ManualAdd, MonitoredPosition, TradeSignal, TradeState};
 
 use crate::auth::Identity;
 use crate::execute::{self, STREAM_EVERY};
@@ -35,7 +35,13 @@ pub const MAX_LOTS_PER_TAP: i32 = 10;
 
 #[derive(Deserialize)]
 pub struct StreamQuery {
+    /// The underlying: one of the six indices, or, with the `stock_charts`
+    /// switch on, any F&O underlying the catalog lists (`RELIANCE`).
+    /// Anything else, or nothing, is NIFTY.
     index: Option<String>,
+    /// The same as `index`, under the name it has had since stocks joined;
+    /// `index` wins when both are sent.
+    underlying: Option<String>,
     /// `YYYY-MM-DD`; missing, the nearest expiry. An unlisted one gives a
     /// board error rather than another expiry's ladder.
     expiry: Option<String>,
@@ -44,7 +50,7 @@ pub struct StreamQuery {
 }
 
 /// `GET /api/execute/stream?index=NIFTY&expiry=&centre=` — SSE, one frame
-/// every 250 ms: every index's spot, the chosen index's ladder for that
+/// every 250 ms: every index's spot, the chosen underlying's ladder for that
 /// expiry (nearest by default) around that strike (ATM by default), and the
 /// caller's open positions (the engine's for the owner and the admin, none
 /// for a visitor — see `execute::build_frame`). Public: a token, when there
@@ -56,22 +62,22 @@ pub async fn execute_stream_handler(
     Extension(identity): Extension<Identity>,
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let wanted = q.index.unwrap_or_default().trim().to_uppercase();
-    let index = INDEX_NAMES.iter().copied().find(|i| *i == wanted).unwrap_or("NIFTY");
+    let wanted = q.index.or(q.underlying).unwrap_or_default();
+    let index = execute::underlying_named(&state, &wanted).await.unwrap_or_else(|| "NIFTY".to_string());
     let expiry = q.expiry.as_deref().and_then(|s| NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok());
     let centre = q.centre.filter(|c| c.is_finite() && *c > 0.0);
 
     let mut tick = tokio::time::interval(STREAM_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let stream = futures::stream::unfold((state, tick, identity), move |(state, mut tick, identity)| async move {
+    let stream = futures::stream::unfold((state, tick, identity, index), move |(state, mut tick, identity, index)| async move {
         tick.tick().await;
         // A user disabled by the admin loses the stream now, not on reconnect.
         if !crate::auth::still_signed_in(&state.auth, &identity) {
             return None;
         }
-        let frame = execute::build_frame(&state, &identity, index, expiry, centre).await;
+        let frame = execute::build_frame(&state, &identity, &index, expiry, centre).await;
         let event = Event::default().data(serde_json::to_string(&frame).unwrap_or_default());
-        Some((Ok(event), (state, tick, identity)))
+        Some((Ok(event), (state, tick, identity, index)))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -88,7 +94,9 @@ fn refuse(status: StatusCode, msg: impl Into<String>) -> Response {
 
 /// `POST /api/execute/buy {trading_symbol, lots}` — one tap. Opens a manual
 /// position, or adds to the open manual position on the same contract.
-/// Answers at once with the verdict; the fill shows up on the stream.
+/// Answers at once with the verdict; the fill shows up on the stream. Index
+/// options only (`ExecuteBoard::find_contract`), whatever ladder is open:
+/// a stock's row is refused here even with `stock_charts` on.
 pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<BuyReq>) -> Response {
     if !(1..=MAX_LOTS_PER_TAP).contains(&req.lots) {
         return refuse(StatusCode::BAD_REQUEST, format!("Lots must be between 1 and {MAX_LOTS_PER_TAP}"));

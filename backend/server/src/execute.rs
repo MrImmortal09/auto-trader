@@ -1,13 +1,17 @@
-//! Execute screen ("Scalp Desk" in v1, the Trade window in v2): an index's
-//! option ladder for one expiry (the nearest unless asked otherwise) — the
-//! strikes around ATM, or around a strike the screen scrolled to, with live
-//! Kotak prices — streamed to the dashboard, and the board the manual-order
-//! routes check a tap against.
+//! Execute screen ("Scalp Desk" in v1, the Trade window in v2): an
+//! underlying's option ladder for one expiry (the nearest unless asked
+//! otherwise) — the strikes around ATM, or around a strike the screen
+//! scrolled to, with live Kotak prices — streamed to the dashboard, and the
+//! board the manual-order routes check a tap against. The underlying is one
+//! of the six indices, or, behind the `stock_charts` switch, any F&O
+//! underlying the instrument catalog lists; a stock's ladder is read-only on
+//! the owner's desk (`POST /api/execute/buy` resolves index options only).
 //!
 //! Everything here reads in-memory state only (scrip master, the shared price
-//! map, positions, telemetry). It never calls Kotak; the only thing it sends
-//! anywhere is feed subscriptions (and their release) through the
-//! market-data bridge.
+//! map, the quote hub, positions, telemetry). It never calls Kotak; the only
+//! thing it sends anywhere is feed subscriptions (and their release) through
+//! the market-data bridge, and the stock deltas it caches come from Upstox's
+//! read-only option chain.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,7 +24,9 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use trading_engine::{index_fo_segment, ChainStrike, OptionChain, ScripRecord};
 
 use crate::auth::Identity;
+use crate::market_data::StrikeRow;
 use crate::paper::PaperPosition;
+use crate::quotes::hub::Source as QuoteSource;
 use crate::AppState;
 
 /// Strikes streamed each side of the strike the screen is centred on (ATM
@@ -44,11 +50,23 @@ const BAND_SWEEP_EVERY: Duration = Duration::from_secs(5);
 /// reference client for the native one) must keep room for positions'
 /// contracts, whose stops depend on their ticks. Past it a strike shows no
 /// price, and the buy route refuses a contract with no recent price: it
-/// fails toward not trading.
+/// fails toward not trading. A stock chart's subscription (`candles`, behind
+/// `stock_charts`) is counted inside this same total, never on top of it.
 const MAX_BAND_SCRIPS: usize = 180;
 /// Signed-in users' ladders add strikes only while the total is under this
 /// (two bands), so the owner always has room for four more of their own.
 const MAX_PUBLIC_BAND_SCRIPS: usize = 60;
+/// Users' chart keys stay on the feed until the close (a band key is
+/// released once no ladder wants it), so they get a fixed slice of the
+/// users' share and users' bands always keep the rest: one user browsing
+/// sixty stock charts can never leave every user's index ladder without
+/// band strikes (and every paper buy refused) for the rest of the day. A
+/// user's chart past it is `polled`: Upstox's minutes. The owner's charts
+/// draw on the owner's budget as before.
+const MAX_PUBLIC_CHART_SCRIPS: usize = 10;
+/// Upstox's option chain for a stock is read at most this often per expiry,
+/// for the deltas the chain route shows.
+const STOCK_DELTAS_EVERY: Duration = Duration::from_secs(60);
 /// The "band full" warning is logged at most this often: every open ladder
 /// asks four times a second.
 const BAND_WARN_EVERY: Duration = Duration::from_secs(60);
@@ -142,9 +160,56 @@ struct Subscriptions {
     day: Option<NaiveDate>,
     /// Every band strike on the feed, with when a ladder last wanted it.
     band: HashMap<String, Instant>,
+    /// Every stock chart's subscription (`"ladder": true` on the bridge:
+    /// dropped at the close, never released before it), with when it was
+    /// sent and whose share reserved it. Counted with `band` against the
+    /// one budget, never taken off by the band sweep; the users' are capped
+    /// at [`MAX_PUBLIC_CHART_SCRIPS`] besides.
+    chart: HashMap<String, (Instant, SubPool)>,
     indices_sent: bool,
     /// When the "band full" warning was last logged.
     warned_at: Option<Instant>,
+}
+
+impl Subscriptions {
+    /// Strikes and chart keys on the feed out of the budget.
+    fn used(&self) -> usize {
+        self.band.len() + self.chart.len()
+    }
+
+    /// How many more keys `pool` may put on the feed.
+    fn room(&self, pool: SubPool) -> usize {
+        pool.budget().saturating_sub(self.used())
+    }
+
+    /// Chart keys the users' share reserved.
+    fn public_charts(&self) -> usize {
+        self.chart.values().filter(|(_, p)| *p == SubPool::Public).count()
+    }
+
+    /// Start over: a fresh bridge knows none of these, and the feed drops
+    /// bands and chart keys at each day's close.
+    fn is_current(&self, tx: &mpsc::UnboundedSender<String>, today: NaiveDate) -> bool {
+        self.channel.as_ref().is_some_and(|c| c.same_channel(tx)) && self.day == Some(today)
+    }
+}
+
+/// Upstox's option chain for one stock expiry, as last read, for the deltas.
+struct CachedDeltas {
+    read_at: Instant,
+    /// IST `YYYY-MM-DD HH:MM:SS` of the read; `None` when it failed.
+    updated_at: Option<String>,
+    /// By strike in paise; empty when Upstox had none or the read failed.
+    rows: Arc<HashMap<i64, StrikeRow>>,
+}
+
+/// A stock chain's deltas from Upstox — see [`ExecuteBoard::stock_deltas`].
+#[derive(Clone)]
+pub struct StockDeltas {
+    /// IST `YYYY-MM-DD HH:MM:SS` the chain was read.
+    pub updated_at: String,
+    /// By strike in paise (`(strike * 100).round()`).
+    pub rows: Arc<HashMap<i64, StrikeRow>>,
 }
 
 /// An engine error from the log stream, kept briefly for the Execute screen.
@@ -165,6 +230,7 @@ pub struct ExecuteBoard {
     expiries: RwLock<HashMap<String, CachedExpiries>>,
     subs: Mutex<Subscriptions>,
     errors: std::sync::Mutex<Vec<RecentError>>,
+    deltas: Mutex<HashMap<(String, NaiveDate), CachedDeltas>>,
 }
 
 impl ExecuteBoard {
@@ -214,6 +280,8 @@ impl ExecuteBoard {
     /// The expiries `index`'s options are listed for, from today, earliest
     /// first, each with its lot size — read again whenever the scrip master
     /// is reloaded or the IST date rolls over (yesterday's expiry is gone).
+    /// `index` is any underlying the scrip master keys records under: an
+    /// index or a stock, each in its own F&O segment (`fo_segment`).
     pub async fn expiries(&self, state: &AppState, index: &str) -> Arc<Vec<(NaiveDate, u32)>> {
         let loaded_at = *state.scrip_loaded_at.read().await;
         let today = shared_domain::today_ist();
@@ -268,7 +336,9 @@ impl ExecuteBoard {
     /// The contract `trading_symbol` names, if it is a listed index option
     /// on any expiry from today — what the Execute screen trades. Comes with
     /// its index and that expiry's chain. Only the six indices' records are
-    /// searched, never a stock's.
+    /// searched, never a stock's: the owner's one-tap buy stays index-only
+    /// whatever the `stock_charts` switch says (question 8, to be
+    /// re-confirmed before it is ever widened).
     pub async fn find_contract(&self, state: &AppState, trading_symbol: &str) -> Option<(String, Arc<OptionChain>, ScripRecord)> {
         let record = state.scrip_store.read().await.as_ref()?.find_index_option(trading_symbol)?;
         let index = index_option(&record, shared_domain::today_ist())?;
@@ -276,18 +346,119 @@ impl ExecuteBoard {
         Some((index.to_string(), chain, record))
     }
 
-    /// Make sure the feed streams every index's spot value and `keys` (a
-    /// band, nearest ATM first), paid for out of `pool`'s share, and note
-    /// that a ladder wants them now.
-    async fn ensure_subscribed(&self, state: &AppState, keys: &[String], pool: SubPool) {
-        if pool == SubPool::None {
-            return;
+    /// Upstox's deltas for a stock's `expiry` chain, read at most once a
+    /// minute per expiry (a failed read is not retried for a minute either).
+    /// `None` without Upstox, without an ISIN for the stock, or while the
+    /// last read failed — the chain route then shows no delta, never an
+    /// assumed one.
+    pub async fn stock_deltas(&self, state: &AppState, underlying: &str, expiry: NaiveDate) -> Option<StockDeltas> {
+        let client = state.upstox.as_ref()?;
+        let key = (underlying.to_string(), expiry);
+        let now = Instant::now();
+        {
+            let deltas = self.deltas.lock().await;
+            if let Some(c) = deltas.get(&key).filter(|c| now.duration_since(c.read_at) < STOCK_DELTAS_EVERY) {
+                return c.updated_at.clone().map(|updated_at| StockDeltas { updated_at, rows: Arc::clone(&c.rows) });
+            }
         }
-        let Some(tx) = state.ws_tx.lock().await.clone() else { return };
+        let upstox_key = state.instruments.spot_key(underlying).and_then(|k| state.instruments.upstox_key(&k))?;
+        // Fetched outside the lock: a slow Upstox must not hold up another
+        // underlying's chain. Two callers racing both fetch; harmless.
+        let read = client.option_chain(&upstox_key, expiry).await;
+        let (updated_at, rows) = match read {
+            Ok(chain) => {
+                let rows: HashMap<i64, StrikeRow> = crate::market_data::to_strike_rows(&chain)
+                    .into_iter()
+                    .map(|r| ((r.strike * 100.0).round() as i64, r))
+                    .collect();
+                (Some(shared_domain::current_ist_timestamp_string()), rows)
+            }
+            Err(e) => {
+                tracing::debug!(underlying, expiry = %expiry, error = %e, "Upstox option chain for a stock failed — no deltas for a minute");
+                (None, HashMap::new())
+            }
+        };
+        let rows = Arc::new(rows);
+        let mut deltas = self.deltas.lock().await;
+        deltas.retain(|_, c| now.duration_since(c.read_at) < 10 * STOCK_DELTAS_EVERY);
+        deltas.insert(key, CachedDeltas { read_at: Instant::now(), updated_at: updated_at.clone(), rows: Arc::clone(&rows) });
+        updated_at.map(|updated_at| StockDeltas { updated_at, rows })
+    }
+
+    /// Put one stock chart's feed key on the feed out of `pool`'s share of
+    /// the ladder budget (`"ladder": true`: the bridge drops it at the close
+    /// and the band sweep never releases it). `true` when it is on the feed
+    /// (now or already); `false` when the budget is full — for a user, also
+    /// once the users' charts hold [`MAX_PUBLIC_CHART_SCRIPS`] keys — or
+    /// nothing can be sent, and the chart then has no Kotak ticks: the
+    /// candle service falls back to Upstox's minutes. A visitor's pool
+    /// subscribes nothing.
+    pub async fn reserve_chart(&self, ws_tx: &Mutex<Option<mpsc::UnboundedSender<String>>>, key: &str, pool: SubPool) -> bool {
+        if pool == SubPool::None {
+            return false;
+        }
+        let Some(tx) = ws_tx.lock().await.clone() else { return false };
         let today = shared_domain::today_ist();
         let now = Instant::now();
         let mut subs = self.subs.lock().await;
-        if !subs.channel.as_ref().is_some_and(|c| c.same_channel(&tx)) || subs.day != Some(today) {
+        if !subs.is_current(&tx, today) {
+            *subs = Subscriptions { channel: Some(tx.clone()), day: Some(today), ..Default::default() };
+        }
+        if subs.chart.contains_key(key) {
+            return true;
+        }
+        // The users' charts have their slice. Checked before a band strike
+        // is taken over too: that turns a key the sweep would release into
+        // one held until the close.
+        if pool == SubPool::Public && subs.public_charts() >= MAX_PUBLIC_CHART_SCRIPS {
+            if subs.warned_at.map_or(true, |t| now.duration_since(t) >= BAND_WARN_EVERY) {
+                subs.warned_at = Some(now);
+                tracing::warn!(
+                    "Users' chart keys at their cap ({MAX_PUBLIC_CHART_SCRIPS}): the chart for {key} gets no Kotak ticks today"
+                );
+            }
+            return false;
+        }
+        // A strike some ladder's band already streams: it becomes the
+        // chart's for the day (the band sweep must not release it), and the
+        // count does not change.
+        if subs.band.remove(key).is_some() {
+            let msg = serde_json::json!({ "action": "subscribe", "scrips": key, "ladder": true });
+            let _ = tx.send(msg.to_string());
+            subs.chart.insert(key.to_string(), (now, pool));
+            return true;
+        }
+        if subs.room(pool) == 0 {
+            if subs.warned_at.map_or(true, |t| now.duration_since(t) >= BAND_WARN_EVERY) {
+                subs.warned_at = Some(now);
+                tracing::warn!(
+                    "Ladder budget full ({pool:?}): {} of {} keys on the feed; the chart for {key} gets no Kotak ticks today",
+                    subs.used(),
+                    pool.budget()
+                );
+            }
+            return false;
+        }
+        let msg = serde_json::json!({ "action": "subscribe", "scrips": key, "ladder": true });
+        if tx.send(msg.to_string()).is_err() {
+            return false;
+        }
+        subs.chart.insert(key.to_string(), (now, pool));
+        true
+    }
+
+    /// Make sure the feed streams every index's spot value and `keys` (a
+    /// band, nearest ATM first), paid for out of `pool`'s share, and note
+    /// that a ladder wants them now.
+    async fn ensure_subscribed(&self, ws_tx: &Mutex<Option<mpsc::UnboundedSender<String>>>, keys: &[String], pool: SubPool) {
+        if pool == SubPool::None {
+            return;
+        }
+        let Some(tx) = ws_tx.lock().await.clone() else { return };
+        let today = shared_domain::today_ist();
+        let now = Instant::now();
+        let mut subs = self.subs.lock().await;
+        if !subs.is_current(&tx, today) {
             *subs = Subscriptions { channel: Some(tx.clone()), day: Some(today), ..Default::default() };
         }
         if !subs.indices_sent {
@@ -301,6 +472,12 @@ impl ExecuteBoard {
         }
         let mut wanted = Vec::new();
         for key in keys {
+            // A strike a stock chart streams (`"ladder": true`, kept for the
+            // day) is already on the feed and counted once, as the chart's:
+            // sending it again as a band would count it twice.
+            if subs.chart.contains_key(key) {
+                continue;
+            }
             match subs.band.get_mut(key) {
                 Some(at) => *at = now,
                 None => wanted.push(key.clone()),
@@ -309,12 +486,12 @@ impl ExecuteBoard {
         if wanted.is_empty() {
             return;
         }
-        let room = pool.budget().saturating_sub(subs.band.len());
+        let room = subs.room(pool);
         if wanted.len() > room && subs.warned_at.map_or(true, |t| now.duration_since(t) >= BAND_WARN_EVERY) {
             subs.warned_at = Some(now);
             tracing::warn!(
-                "Ladder band full ({pool:?}): {} of {} strikes on the feed, {} more asked for; they show no price until a band frees",
-                subs.band.len(),
+                "Ladder band full ({pool:?}): {} of {} keys on the feed, {} more asked for; they show no feed price until a band frees",
+                subs.used(),
                 pool.budget(),
                 wanted.len()
             );
@@ -365,9 +542,11 @@ impl ExecuteBoard {
         let Some(tx) = state.ws_tx.lock().await.clone() else { return };
         let mut subs = self.subs.lock().await;
         // A fresh bridge or a new day: the next ladder frame starts over.
-        if !subs.channel.as_ref().is_some_and(|c| c.same_channel(&tx)) || subs.day != Some(shared_domain::today_ist()) {
+        if !subs.is_current(&tx, shared_domain::today_ist()) {
             return;
         }
+        // A stock chart's key stays for the day, whatever the bands say.
+        held.extend(subs.chart.keys().cloned());
         let stale = unwanted_band_keys(&subs.band, &held, Instant::now());
         if stale.is_empty() {
             return;
@@ -408,14 +587,48 @@ fn band_keys(strikes: &[ChainStrike], atm: usize, half: usize) -> Vec<String> {
         .collect()
 }
 
-/// The index `record` is an option of, if it is one the Execute screen may
-/// trade: a CE/PE with a readable strike, in that index's own F&O segment,
-/// expiring on or after `today`. Stocks, futures and expired contracts give
-/// `None`.
+/// Whether `record` is a listed option of `underlying` a ladder may show:
+/// a CE/PE with a readable strike, in the underlying's own F&O segment
+/// (SENSEX and BANKEX in `bse_fo`, every other index and every stock in
+/// `nse_fo`), expiring on or after `today`. Futures, expired contracts, a
+/// contract in the other exchange's segment and another underlying's rows
+/// are not.
+fn listed_option(record: &ScripRecord, underlying: &str, today: NaiveDate) -> bool {
+    record.symbol_name == underlying
+        && record.exchange_segment_code == index_fo_segment(underlying)
+        && record.normalized_strike().is_some()
+        && record.expiry_date >= today
+}
+
+/// The index `record` is an option of, if it is one the owner's one-tap buy
+/// may trade: [`listed_option`] on one of the six indices. Stocks give
+/// `None` whatever the `stock_charts` switch says.
 fn index_option(record: &ScripRecord, today: NaiveDate) -> Option<&'static str> {
     let index = INDEX_NAMES.iter().copied().find(|i| *i == record.symbol_name)?;
-    let listed = record.exchange_segment_code == index_fo_segment(index) && record.normalized_strike().is_some() && record.expiry_date >= today;
-    listed.then_some(index)
+    listed_option(record, index, today).then_some(index)
+}
+
+/// The underlying `wanted` names for a ladder, chain or expiry list: one of
+/// the six indices always; with the `stock_charts` switch on, any F&O
+/// underlying the instrument catalog lists (a stock, or an index the app has
+/// no feed name for). `None` for anything else, so nothing typed reaches
+/// the scrip master unchecked.
+pub async fn underlying_named(state: &AppState, wanted: &str) -> Option<String> {
+    let wanted = wanted.trim().to_ascii_uppercase();
+    if let Some(index) = INDEX_NAMES.iter().find(|i| **i == wanted) {
+        return Some(index.to_string());
+    }
+    if !state.flags.read().await.stock_charts {
+        return None;
+    }
+    let u = state.instruments.underlying(&wanted)?;
+    u.has_fo.then_some(u.symbol)
+}
+
+/// What a ladder's underlying is: `"index"` for the six, `"stock"` for
+/// anything else the catalog lists.
+pub fn underlying_kind(underlying: &str) -> &'static str {
+    if INDEX_NAMES.contains(&underlying) { "index" } else { "stock" }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +672,14 @@ struct IndexHeadline {
 
 #[derive(Serialize)]
 struct Board {
+    /// The underlying, under its older name: `NIFTY`, or a stock such as
+    /// `RELIANCE` behind the `stock_charts` switch.
     index: String,
+    /// The same as `index`.
+    underlying: String,
+    /// `"index"` or `"stock"`. A stock's rows are read-only on the owner's
+    /// desk: `POST /api/execute/buy` refuses them.
+    kind: &'static str,
     /// `YYYY-MM-DD`: the expiry the rows are from.
     expiry: String,
     days_to_expiry: i64,
@@ -468,8 +688,12 @@ struct Board {
     expiries: Vec<String>,
     lot_size: u32,
     spot: Option<f64>,
-    /// `"kotak"` (live index tick), `"upstox"` (60 s option-chain poll) or
-    /// `"parity"` (estimated from the ladder's own call/put prices).
+    /// `"kotak"` (the feed's tick: an index's value, or a stock's cash
+    /// price while a chart streams it), `"polled"` (Kotak's REST quote
+    /// through the quote hub, ~2 s), `"upstox"` (the 60 s option-chain poll
+    /// for an index; the hub's Upstox fallback for a stock), `"close"` (the
+    /// 15:35 snapshot, after hours) or `"parity"` (estimated from the
+    /// ladder's own call/put prices).
     spot_source: Option<&'static str>,
     atm: Option<f64>,
     /// The strikes `rows` run from and to: the subscribed window, around ATM
@@ -492,8 +716,14 @@ struct Row {
 struct Quote {
     sym: String,
     ltp: Option<f64>,
-    /// Milliseconds since this contract's own last tick.
+    /// Milliseconds since this contract's own last tick — or, for a polled
+    /// row, since the quote hub read it.
     age_ms: Option<u64>,
+    /// The price is the quote hub's (Kotak's REST quote every ~2 s, or the
+    /// close after hours), not the feed's: the strike is past the feed
+    /// budget. No buy route accepts a polled price — the paper and live buys
+    /// read the feed alone.
+    polled: bool,
 }
 
 #[derive(Serialize)]
@@ -603,6 +833,49 @@ async fn upstox_prev_close(state: &AppState, index: &str) -> Option<f64> {
     state.market.indices.read().await.get(index).and_then(|l| l.prev_close).filter(|c| *c > 0.0)
 }
 
+/// What a quote hub source is called on a board.
+fn hub_source_label(source: QuoteSource) -> &'static str {
+    match source {
+        QuoteSource::Feed => "kotak",
+        QuoteSource::Rest => "polled",
+        QuoteSource::Upstox => "upstox",
+        QuoteSource::Close => "close",
+    }
+}
+
+/// A stock's spot: its cash price from the feed while a chart streams it,
+/// else the quote hub's (asked to keep polling it). `None` for an
+/// underlying with no cash row (`NIFTYNXT50`), or before any quote.
+fn stock_spot(state: &AppState, underlying: &str, now: DateTime<FixedOffset>) -> Option<(f64, &'static str)> {
+    let key = state.instruments.spot_key(underlying)?;
+    if let Some(ltp) = price(state, &key).filter(|_| contract_age_secs(&key).is_some()) {
+        return Some((ltp, "kotak"));
+    }
+    state.quotes.want([key.clone()]);
+    let quote = state.quotes.get_at(&key, now)?;
+    (quote.ltp > 0.0).then(|| (quote.ltp, hub_source_label(quote.source)))
+}
+
+/// The row for one option: the feed's price with its own tick age; without
+/// one, and with stock charts on, the quote hub's with the hub's read time
+/// (the key is added to `polled` so the hub keeps asking for it).
+fn row_quote(state: &AppState, r: &ScripRecord, stocks_on: bool, now: DateTime<FixedOffset>, polled: &mut Vec<String>) -> Quote {
+    let key = r.ws_key();
+    let sym = r.trading_symbol.clone();
+    let age = contract_age_secs(&key);
+    if let Some(ltp) = price(state, &key).filter(|_| age.is_some()) {
+        return Quote { sym, ltp: Some(ltp), age_ms: age.map(|s| (s * 1000.0) as u64), polled: false };
+    }
+    if !stocks_on {
+        return Quote { sym, ltp: None, age_ms: None, polled: false };
+    }
+    polled.push(key.clone());
+    match state.quotes.get_at(&key, now).filter(|q| q.ltp > 0.0) {
+        Some(q) => Quote { sym, ltp: Some(q.ltp), age_ms: Some(now.timestamp_millis().saturating_sub(q.at).max(0) as u64), polled: true },
+        None => Quote { sym, ltp: None, age_ms: None, polled: true },
+    }
+}
+
 /// Spot from put-call parity on whatever strikes have both prices: at the
 /// strike where call and put are closest, `K + CE − PE`.
 fn parity_spot(state: &AppState, strikes: &[ChainStrike]) -> Option<f64> {
@@ -631,10 +904,15 @@ fn window(len: usize, atm: usize, half: usize) -> std::ops::Range<usize> {
     atm.saturating_sub(half)..(atm + half + 1).min(len)
 }
 
-/// The board for `index`: its `expiry`'s chain (the nearest when `None`; an
-/// unlisted one is an error), with the band around ATM subscribed (out of
-/// `pool`'s share) and the rows streamed around `centre` (ATM when `None`).
-async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>, pool: SubPool) -> Result<Board, String> {
+/// The board for `index` (an index, or a stock with `stocks_on`): its
+/// `expiry`'s chain (the nearest when `None`; an unlisted one is an error),
+/// with the band around ATM subscribed (out of `pool`'s share) and the rows
+/// streamed around `centre` (ATM when `None`).
+async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, centre: Option<f64>, pool: SubPool, stocks_on: bool) -> Result<Board, String> {
+    let kind = underlying_kind(index);
+    if kind == "stock" && !stocks_on {
+        return Err("Stock ladders are off — the admin turns them on with the `stock_charts` switch".to_string());
+    }
     if state.scrip_store.read().await.is_none() {
         return Err("Scrip Master not loaded yet — connect Kotak first".to_string());
     }
@@ -653,13 +931,20 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
         .await
         .ok_or_else(|| format!("No {index} option contracts in the Scrip Master"))?;
 
+    // Spot, best source first: the feed's index value; a stock's cash price
+    // from the feed, else the quote hub (Kotak REST, Upstox while Kotak is
+    // down, the close after hours); Upstox's index poll; put-call parity.
+    let now = shared_domain::now_ist();
     let (spot, spot_source) = match kotak_index(state, index) {
         Some((s, _)) => (Some(s), Some("kotak")),
-        None => match upstox_spot(state, index).await {
-            Some(s) => (Some(s), Some("upstox")),
-            None => match parity_spot(state, &chain.strikes) {
-                Some(s) => (Some(s), Some("parity")),
-                None => (None, None),
+        None => match if kind == "stock" { stock_spot(state, index, now) } else { None } {
+            Some((s, source)) => (Some(s), Some(source)),
+            None => match upstox_spot(state, index).await {
+                Some(s) => (Some(s), Some("upstox")),
+                None => match parity_spot(state, &chain.strikes) {
+                    Some(s) => (Some(s), Some("parity")),
+                    None => (None, None),
+                },
             },
         },
     };
@@ -668,29 +953,28 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
     // flowing; parity takes over as soon as they do.
     let atm = spot.and_then(|s| atm_index(&chain.strikes, s)).unwrap_or(chain.strikes.len() / 2);
     // Only the band around ATM is on the feed, wherever the screen scrolled.
-    state.execute.ensure_subscribed(state, &band_keys(&chain.strikes, atm, BAND_HALF), pool).await;
+    state.execute.ensure_subscribed(&state.ws_tx, &band_keys(&chain.strikes, atm, BAND_HALF), pool).await;
     // The screen may have scrolled away from ATM: its rows are streamed there.
     let centre = centre.and_then(|c| atm_index(&chain.strikes, c)).unwrap_or(atm);
     let range = window(chain.strikes.len(), centre, ROWS_HALF);
 
-    let quote = |r: &Option<ScripRecord>| {
-        r.as_ref().map(|r| {
-            let key = r.ws_key();
-            Quote {
-                sym: r.trading_symbol.clone(),
-                ltp: price(state, &key),
-                age_ms: contract_age_secs(&key).map(|s| (s * 1000.0) as u64),
-            }
-        })
-    };
     // The whole window goes out: v1 shows ATM ± 5 of it and v2 merges it
     // into the full strike list, and while a finger is on the ladder it
     // holds its rows still — the spare strikes keep their prices live
-    // meanwhile.
+    // meanwhile. A row the feed has no price for is polled through the hub
+    // (stock charts on), so every row has a price, labelled.
+    let mut polled: Vec<String> = Vec::new();
     let rows: Vec<Row> = chain.strikes[range]
         .iter()
-        .map(|s| Row { strike: s.strike, ce: quote(&s.ce), pe: quote(&s.pe) })
+        .map(|s| Row {
+            strike: s.strike,
+            ce: s.ce.as_ref().map(|r| row_quote(state, r, stocks_on, now, &mut polled)),
+            pe: s.pe.as_ref().map(|r| row_quote(state, r, stocks_on, now, &mut polled)),
+        })
         .collect();
+    if !polled.is_empty() {
+        state.quotes.want(polled);
+    }
     let window = Window {
         from: rows.first().map(|r| r.strike).unwrap_or(0.0),
         to: rows.last().map(|r| r.strike).unwrap_or(0.0),
@@ -698,6 +982,8 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
 
     Ok(Board {
         index: index.to_string(),
+        underlying: index.to_string(),
+        kind,
         expiry: chain.expiry.format("%Y-%m-%d").to_string(),
         days_to_expiry: (chain.expiry - shared_domain::today_ist()).num_days(),
         expiries: expiries.iter().map(|(d, _)| d.format("%Y-%m-%d").to_string()).collect(),
@@ -769,7 +1055,8 @@ fn paper_row(state: &AppState, p: &PaperPosition) -> PositionRow {
     }
 }
 
-/// One frame of the Execute screen for `index`: its `expiry`'s ladder (the
+/// One frame of the Execute screen for `index` (an index, or any F&O
+/// underlying `underlying_named` accepted): its `expiry`'s ladder (the
 /// nearest when `None`), the subscribed window around `centre` (ATM when
 /// `None`). The market data is the same for everyone; whose positions ride
 /// along, and whether the owner's mode, kill switch and Kotak state show,
@@ -803,7 +1090,8 @@ pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, exp
         indices.push(IndexHeadline { index: name, spot, prev_close, change_pct });
     }
 
-    let (board, board_error) = match build_board(state, index, expiry, centre, SubPool::of(identity)).await {
+    let stocks_on = state.flags.read().await.stock_charts;
+    let (board, board_error) = match build_board(state, index, expiry, centre, SubPool::of(identity), stocks_on).await {
         Ok(b) => (Some(b), None),
         Err(e) => (None, Some(e)),
     };
@@ -965,6 +1253,27 @@ mod tests {
     }
 
     #[test]
+    fn a_ladder_shows_an_underlyings_listed_options_in_its_own_segment() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 24).unwrap();
+        let rel = |sym: &str, seg: &str, opt: &str, exp: (i32, u32, u32)| record("RELIANCE", sym, seg, 140000.0, opt, exp);
+        assert!(listed_option(&rel("RELIANCE26NOV1400CE", "nse_fo", "CE", (2026, 11, 24)), "RELIANCE", today));
+        assert!(listed_option(&rel("RELIANCE26NOV1400PE", "nse_fo", "PE", (2026, 11, 24)), "RELIANCE", today));
+        // Expired, a future, the BSE listing, another underlying's row.
+        assert!(!listed_option(&rel("RELIANCE26OCT1400CE", "nse_fo", "CE", (2026, 10, 23)), "RELIANCE", today));
+        assert!(!listed_option(&record("RELIANCE", "RELIANCE26NOVFUT", "nse_fo", 0.0, "XX", (2026, 11, 24)), "RELIANCE", today));
+        assert!(!listed_option(&rel("RELIANCE26NOV1400CE", "bse_fo", "CE", (2026, 11, 24)), "RELIANCE", today));
+        assert!(!listed_option(&rel("RELIANCE26NOV1400CE", "nse_fo", "CE", (2026, 11, 24)), "TCS", today));
+        // The indices keep their segments.
+        assert!(listed_option(&record("SENSEX", "SENSEX26O2982000CE", "bse_fo", 8200000.0, "CE", (2026, 10, 29)), "SENSEX", today));
+        assert!(!listed_option(&record("SENSEX", "SENSEX26O2982000CE", "nse_fo", 8200000.0, "CE", (2026, 10, 29)), "SENSEX", today));
+        assert!(listed_option(&record("NIFTY", "NIFTY26O2725100CE", "nse_fo", 2510000.0, "CE", (2026, 10, 27)), "NIFTY", today));
+        assert_eq!(underlying_kind("NIFTY"), "index");
+        assert_eq!(underlying_kind("BANKEX"), "index");
+        assert_eq!(underlying_kind("RELIANCE"), "stock");
+        assert_eq!(underlying_kind("NIFTYNXT50"), "stock", "an index the app has no feed name for is treated as a stock");
+    }
+
+    #[test]
     fn only_listed_index_options_can_be_bought() {
         let today = NaiveDate::from_ymd_opt(2026, 10, 24).unwrap();
         // Any expiry from today, weekly or monthly.
@@ -977,5 +1286,224 @@ mod tests {
         assert_eq!(index_option(&record("NIFTY", "NIFTY26OCTFUT", "nse_fo", 0.0, "XX", (2026, 10, 27)), today), None);
         assert_eq!(index_option(&record("RELIANCE", "RELIANCE26OCT1400CE", "nse_fo", 140000.0, "CE", (2026, 10, 27)), today), None);
         assert_eq!(index_option(&record("SENSEX", "SENSEX26O2982000CE", "nse_fo", 8200000.0, "CE", (2026, 10, 29)), today), None);
+        // A stock option is listed for its ladder, and still never for the buy.
+        let stock = record("RELIANCE", "RELIANCE26NOV1400CE", "nse_fo", 140000.0, "CE", (2026, 11, 24));
+        assert!(listed_option(&stock, "RELIANCE", today));
+        assert_eq!(index_option(&stock, today), None);
+    }
+
+    /// A bridge channel and the lock the board takes it from.
+    fn bridge() -> (Mutex<Option<mpsc::UnboundedSender<String>>>, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Mutex::new(Some(tx)), rx)
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(serde_json::from_str(&msg).unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_stock_chart_draws_on_the_same_budget_as_the_bands() {
+        let board = ExecuteBoard::new();
+        let (ws_tx, mut rx) = bridge();
+
+        // A chart's key goes out with the ladder flag, once.
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|2885", SubPool::Owner).await);
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|2885", SubPool::Owner).await, "already on the feed");
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], serde_json::json!({ "action": "subscribe", "scrips": "nse_cm|2885", "ladder": true }));
+        {
+            let subs = board.subs.lock().await;
+            assert_eq!((subs.band.len(), subs.chart.len(), subs.used()), (0, 1, 1));
+            assert_eq!(subs.room(SubPool::Owner), MAX_BAND_SCRIPS - 1);
+            assert_eq!(subs.room(SubPool::Public), MAX_PUBLIC_BAND_SCRIPS - 1);
+        }
+
+        // Users' charts take their slice of the users' share; the next one
+        // is refused and sends nothing, though the share has room.
+        for i in 0..MAX_PUBLIC_CHART_SCRIPS {
+            assert!(board.reserve_chart(&ws_tx, &format!("nse_cm|{i}"), SubPool::Public).await, "{i}");
+        }
+        assert!(!board.reserve_chart(&ws_tx, "nse_cm|refused", SubPool::Public).await);
+        assert_eq!(drain(&mut rx).len(), MAX_PUBLIC_CHART_SCRIPS);
+        {
+            let subs = board.subs.lock().await;
+            assert!(!subs.chart.contains_key("nse_cm|refused"));
+            assert!(subs.room(SubPool::Public) > 0);
+        }
+        // The owner still has room, and a visitor never subscribes.
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|owner", SubPool::Owner).await);
+        assert!(!board.reserve_chart(&ws_tx, "nse_cm|visitor", SubPool::None).await);
+        assert_eq!(drain(&mut rx).len(), 1);
+
+        // A band asked for next counts the chart keys: the users' bands get
+        // what the users' share has left, the owner's what the total has.
+        let chain: Vec<ChainStrike> = (0..60).map(|i| priced(24000.0 + 50.0 * i as f64, 1000 + 2 * i)).collect();
+        let keys = band_keys(&chain, 30, BAND_HALF);
+        let used_before = board.subs.lock().await.used();
+        assert_eq!(used_before, 1 + MAX_PUBLIC_CHART_SCRIPS + 1);
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Public).await;
+        // The first band of the day also puts the six indices on the feed.
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 2, "the indices, then the band");
+        assert_eq!(sent[0]["action"], serde_json::json!("subscribe_indices"));
+        assert_eq!(sent[1]["band"], serde_json::json!(true));
+        let public_band = keys.len().min(MAX_PUBLIC_BAND_SCRIPS - used_before);
+        assert_eq!(sent[1]["scrips"].as_str().unwrap().split('&').count(), public_band);
+        let other: Vec<ChainStrike> = (0..60).map(|i| priced(24000.0 + 50.0 * i as f64, 5000 + 2 * i)).collect();
+        let owner_keys = band_keys(&other, 30, BAND_HALF);
+        board.ensure_subscribed(&ws_tx, &owner_keys, SubPool::Owner).await;
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["band"], serde_json::json!(true));
+        let subs = board.subs.lock().await;
+        assert_eq!(subs.band.len(), public_band + owner_keys.len().min(MAX_BAND_SCRIPS - used_before - public_band));
+        assert!(subs.used() <= MAX_BAND_SCRIPS);
+        // Chart keys are never among what the band sweep releases.
+        let held = HashSet::new();
+        let later = Instant::now() + BAND_GRACE + Duration::from_secs(1);
+        let stale = unwanted_band_keys(&subs.band, &held, later);
+        assert!(stale.iter().all(|k| !subs.chart.contains_key(k)));
+        assert!(stale.iter().all(|k| k.starts_with("nse_fo|")));
+    }
+
+    #[tokio::test]
+    async fn users_charts_never_take_the_users_bands() {
+        let board = ExecuteBoard::new();
+        let (ws_tx, mut rx) = bridge();
+        // One user browses sixty stock charts: only the users' slice goes on
+        // the feed (for the day); the rest are `polled`.
+        let mut on_feed = 0;
+        for i in 0..60 {
+            if board.reserve_chart(&ws_tx, &format!("nse_cm|{i}"), SubPool::Public).await {
+                on_feed += 1;
+            }
+        }
+        assert_eq!(on_feed, MAX_PUBLIC_CHART_SCRIPS);
+        assert_eq!(drain(&mut rx).len(), MAX_PUBLIC_CHART_SCRIPS);
+
+        // Every user's index ladder still gets its whole band, so a paper
+        // buy still has a feed price to read.
+        assert!(MAX_PUBLIC_CHART_SCRIPS + 2 * (2 * BAND_HALF + 1) <= MAX_PUBLIC_BAND_SCRIPS, "a full band fits beside the charts");
+        let chain: Vec<ChainStrike> = (0..60).map(|i| priced(24000.0 + 50.0 * i as f64, 1000 + 2 * i)).collect();
+        let keys = band_keys(&chain, 30, BAND_HALF);
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Public).await;
+        assert_eq!(drain(&mut rx).len(), 2, "the indices and the whole band");
+        assert_eq!(board.subs.lock().await.band.len(), keys.len());
+
+        // Past the cap, a user's chart of a band strike leaves it a band key
+        // (released once no ladder wants it), never one held until the close.
+        let shared = keys[0].clone();
+        assert!(!board.reserve_chart(&ws_tx, &shared, SubPool::Public).await);
+        assert!(drain(&mut rx).is_empty());
+        {
+            let subs = board.subs.lock().await;
+            assert!(subs.band.contains_key(&shared) && !subs.chart.contains_key(&shared));
+        }
+        // The owner's charts are not the users' slice.
+        assert!(board.reserve_chart(&ws_tx, &shared, SubPool::Owner).await);
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|owner", SubPool::Owner).await);
+        assert_eq!(drain(&mut rx).len(), 2);
+        // A key the feed already streams is a user's chart's at no cost.
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|owner", SubPool::Public).await);
+        assert!(drain(&mut rx).is_empty());
+        let subs = board.subs.lock().await;
+        assert_eq!(subs.public_charts(), MAX_PUBLIC_CHART_SCRIPS);
+        assert_eq!(subs.chart.len(), MAX_PUBLIC_CHART_SCRIPS + 2);
+    }
+
+    #[tokio::test]
+    async fn a_chart_takes_over_a_strike_a_band_already_streams() {
+        let board = ExecuteBoard::new();
+        let (ws_tx, mut rx) = bridge();
+        let chain: Vec<ChainStrike> = (0..20).map(|i| priced(24000.0 + 50.0 * i as f64, 1000 + 2 * i)).collect();
+        let keys = band_keys(&chain, 10, BAND_HALF);
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Owner).await;
+        assert_eq!(drain(&mut rx).len(), 2, "the indices and the band");
+        let used = board.subs.lock().await.used();
+
+        // The chart wants a strike the band has: it moves to the chart, is
+        // sent once more with the ladder flag, and the total is unchanged.
+        let shared = keys[0].clone();
+        assert!(board.reserve_chart(&ws_tx, &shared, SubPool::Owner).await);
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], serde_json::json!({ "action": "subscribe", "scrips": shared, "ladder": true }));
+        {
+            let subs = board.subs.lock().await;
+            assert_eq!(subs.used(), used);
+            assert!(subs.chart.contains_key(&shared) && !subs.band.contains_key(&shared));
+            // The band sweep leaves it alone once no ladder wants the band.
+            let later = Instant::now() + BAND_GRACE + Duration::from_secs(1);
+            let stale = unwanted_band_keys(&subs.band, &HashSet::new(), later);
+            assert_eq!(stale.len(), keys.len() - 1);
+            assert!(!stale.contains(&shared));
+        }
+
+        // The ladder asks for its band again: the strike the chart took is
+        // on the feed already, so nothing is sent and nothing is counted
+        // twice — neither for the shared key alone nor for the whole band.
+        board.ensure_subscribed(&ws_tx, std::slice::from_ref(&shared), SubPool::Owner).await;
+        assert!(drain(&mut rx).is_empty(), "the shared strike is not sent again");
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Owner).await;
+        assert!(drain(&mut rx).is_empty(), "the band is already on the feed");
+        let subs = board.subs.lock().await;
+        assert_eq!(subs.used(), used);
+        assert_eq!(subs.band.len(), keys.len() - 1);
+        assert!(subs.chart.contains_key(&shared) && !subs.band.contains_key(&shared));
+    }
+
+    #[tokio::test]
+    async fn a_band_leaves_out_a_strike_a_chart_already_streams() {
+        let board = ExecuteBoard::new();
+        let (ws_tx, mut rx) = bridge();
+        let chain: Vec<ChainStrike> = (0..20).map(|i| priced(24000.0 + 50.0 * i as f64, 1000 + 2 * i)).collect();
+        let keys = band_keys(&chain, 10, BAND_HALF);
+
+        // The chart comes first, then a ladder whose band includes its strike.
+        let shared = keys[3].clone();
+        assert!(board.reserve_chart(&ws_tx, &shared, SubPool::Owner).await);
+        assert_eq!(drain(&mut rx).len(), 1);
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Owner).await;
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 2, "the indices and the band");
+        assert_eq!(sent[1]["band"], serde_json::json!(true));
+        let scrips = sent[1]["scrips"].as_str().unwrap();
+        let band_sent: Vec<&str> = scrips.split('&').collect();
+        assert_eq!(band_sent.len(), keys.len() - 1);
+        assert!(!band_sent.contains(&shared.as_str()), "the chart's strike is not sent as a band");
+        {
+            let subs = board.subs.lock().await;
+            assert_eq!(subs.used(), keys.len(), "each strike counted once");
+            assert_eq!((subs.band.len(), subs.chart.len()), (keys.len() - 1, 1));
+            assert!(!subs.band.contains_key(&shared));
+        }
+        // Asked again, the band is already there: nothing sent, nothing added.
+        board.ensure_subscribed(&ws_tx, &keys, SubPool::Owner).await;
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(board.subs.lock().await.used(), keys.len());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_bridge_starts_the_budget_over() {
+        let board = ExecuteBoard::new();
+        let (ws_tx, mut rx) = bridge();
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|2885", SubPool::Owner).await);
+        assert_eq!(drain(&mut rx).len(), 1);
+        // A re-login starts a new bridge with a new channel: nothing it was
+        // sent survives, so the key is sent again and counted once.
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        *ws_tx.lock().await = Some(tx2);
+        assert!(board.reserve_chart(&ws_tx, "nse_cm|2885", SubPool::Owner).await);
+        assert_eq!(drain(&mut rx2).len(), 1);
+        assert_eq!(board.subs.lock().await.used(), 1);
+        // No bridge at all: nothing can be put on the feed.
+        *ws_tx.lock().await = None;
+        assert!(!board.reserve_chart(&ws_tx, "nse_cm|11536", SubPool::Owner).await);
     }
 }
