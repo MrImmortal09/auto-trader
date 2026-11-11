@@ -129,8 +129,9 @@ export default function App() {
     go('trade');
   }
 
-  /** A search result: Enter opens it, Shift+Enter puts it on the ladder, the
-   * chart button charts it (a stock's, while stocks are on). */
+  /** A search result: Enter opens it (its chart, while stocks are on and the
+   * Trade screen can draw one; its page otherwise), Shift+Enter puts it on
+   * the ladder, the chart button charts it. */
   function openResult(row: InstrumentRow, how: OpenHow) {
     setSearchOpen(false);
     const target = targetOf(row, how, stocksOn);

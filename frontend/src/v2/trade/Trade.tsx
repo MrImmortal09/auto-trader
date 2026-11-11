@@ -735,7 +735,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
                 changePct: change[stock.symbol] ?? null,
                 on: ladderIndex === stock.symbol,
                 onSelect: () => (stock.fo ? selectUnderlying(stock.symbol) : chartInFirst(ownChart(stock.symbol))),
-                onRemove: () => save((s) => ({ ...s, stock: null })),
+                // Off the bar; a ladder that was on the stock goes back to NIFTY (the charts stay).
+                onRemove: () => save((s) => ({ ...s, stock: null, index: s.index === stock.symbol ? DEFAULTS.index : s.index })),
                 title: stock.fo ? undefined : `${stock.symbol} has no options listed: its chart only`,
                 points: 'wide' as const,
               },
@@ -1019,8 +1020,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
                 <h2 className="min-w-0 truncate type-body-strong text-fg" title={`${ladderIndex} options`}>
                   {ladderIndex} options
                 </h2>
-                {/* A long name (MIDCPNIFTY, RELIANCE) leaves the expiry its short form. */}
-                <span className="ml-auto shrink-0">{expiryPicker('sm', ladderIndex.length > 6)}</span>
+                {/* A stock's ladder (RELIANCE, BAJAJ-AUTO) leaves the expiry its short form; the six indices keep the long one. */}
+                <span className="ml-auto shrink-0">{expiryPicker('sm', !isIndex(ladderIndex))}</span>
                 <button
                   type="button"
                   onClick={() => save((s) => ({ ...s, ladderHidden: true }))}

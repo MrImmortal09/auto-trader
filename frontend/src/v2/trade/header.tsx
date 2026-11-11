@@ -69,36 +69,51 @@ function useLongPress(onLong: (() => void) | undefined) {
 
 /** Figma "Index tab": the name, its value (flashing its tint as it ticks)
  * and the day's change. A white tile; the selected one is outlined and
- * tinted in accent. A long press takes the tile's other action (the ladder). */
+ * tinted in accent. A long press takes the tile's other action (the ladder).
+ * The stock tab ends in an × column, 44 px wide and the tile's height, to
+ * take it off. */
 function Tile({ tile }: { tile: HeaderTile }) {
   const flash = useTickFlash(tile.spot, true, tile.id);
   const press = useLongPress(tile.onAlt);
   return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={tile.on}
-      title={tile.title}
-      onPointerDown={press.onPointerDown}
-      onPointerUp={press.onPointerUp}
-      onPointerLeave={press.onPointerLeave}
-      onPointerCancel={press.onPointerCancel}
-      onContextMenu={press.onContextMenu}
-      onClick={(e) => {
-        if (press.swallow()) return;
-        if (e.shiftKey && tile.onAlt) tile.onAlt();
-        else tile.onSelect();
-      }}
-      className={`flex min-w-[124px] shrink-0 flex-col rounded-8 border px-3 py-2 text-left transition-colors duration-120 ${tile.on ? 'border-accent bg-accent-subtle' : 'border-line bg-panel hover:bg-raised/40'}`}
-    >
-      <span className="truncate type-caption text-fg-muted">{tile.label}</span>
-      <span className="flex items-baseline gap-1.5">
-        <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium text-fg ${flash.className}`}>
-          {tile.spot == null ? '—' : price(tile.spot)}
+    <span className={`flex shrink-0 items-stretch overflow-hidden rounded-8 border transition-colors duration-120 ${tile.on ? 'border-accent bg-accent-subtle' : 'border-line bg-panel hover:bg-raised/40'}`}>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tile.on}
+        title={tile.title}
+        onPointerDown={press.onPointerDown}
+        onPointerUp={press.onPointerUp}
+        onPointerLeave={press.onPointerLeave}
+        onPointerCancel={press.onPointerCancel}
+        onContextMenu={press.onContextMenu}
+        onClick={(e) => {
+          if (press.swallow()) return;
+          if (e.shiftKey && tile.onAlt) tile.onAlt();
+          else tile.onSelect();
+        }}
+        className={`flex min-w-[124px] flex-col py-2 pl-3 text-left ${tile.onRemove ? 'pr-1' : 'pr-3'}`}
+      >
+        <span className="truncate type-caption text-fg-muted">{tile.label}</span>
+        <span className="flex items-baseline gap-1.5">
+          <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium text-fg ${flash.className}`}>
+            {tile.spot == null ? '—' : price(tile.spot)}
+          </span>
+          {tile.changePct != null && <span className={`num-small ${TONE_TEXT[toneOf(tile.changePct)]}`}>{signedPct(tile.changePct)}</span>}
         </span>
-        {tile.changePct != null && <span className={`num-small ${TONE_TEXT[toneOf(tile.changePct)]}`}>{signedPct(tile.changePct)}</span>}
-      </span>
-    </button>
+      </button>
+      {tile.onRemove && (
+        <button
+          type="button"
+          aria-label={`Take ${tile.label} off the tabs`}
+          title={`Take ${tile.label} off the tabs`}
+          onClick={tile.onRemove}
+          className="grid w-11 shrink-0 place-items-center text-fg-muted transition-colors duration-120 hover:bg-raised hover:text-fg"
+        >
+          <X size={14} />
+        </button>
+      )}
+    </span>
   );
 }
 

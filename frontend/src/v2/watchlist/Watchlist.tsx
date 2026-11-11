@@ -215,7 +215,7 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, onOpenTrade, 
                       actions={{
                         onOpen: () => {
                           if (!row) return;
-                          const target = targetOf(row, 'open', stocksOn);
+                          const target = targetOf(row, 'page', stocksOn);
                           if ('trade' in target) onOpenTrade(target.trade);
                           else onOpenInstrument(target.instrument);
                         },

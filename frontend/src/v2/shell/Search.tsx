@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { ChartLine, Plus, Search as SearchIcon, X } from 'lucide-react';
-import { chartSymOf } from '../lib/openInstrument';
+import { chartSymOf, type OpenHow as InstrumentHow } from '../lib/openInstrument';
 import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
@@ -11,16 +11,17 @@ import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 // Spec §13: the global instrument search. A 320 px well in the desktop
 // status bar; focus, `/` anywhere outside an input, or ⌘/Ctrl K opens the
 // results under it, grouped Indices / Stocks / Futures / Options, each row
-// priced and ticking. ↑/↓ move the highlight, Enter opens the instrument
-// (an index opens the Trade screen on it), Shift+Enter puts it on the
-// ladder (an index; an F&O stock too while stocks are on), the chart button
-// charts it on the Trade screen, `+` adds it to a watchlist (`onAdd`, while
-// watchlists are on), Escape closes. The well is the combobox, the results
-// its listbox.
+// priced and ticking. ↑/↓ move the highlight, Enter opens the instrument:
+// an index on the Trade screen, and while stocks are on any row the Trade
+// screen can chart (a stock, a future, an option), its instrument page
+// otherwise; Shift+Enter puts it on the ladder (an index; an F&O stock too
+// while stocks are on), the chart button charts it on the Trade screen, `+`
+// adds it to a watchlist (`onAdd`, while watchlists are on), Escape closes.
+// The well is the combobox, the results its listbox.
 
 /** How a result is opened: Enter / a tap, Shift+Enter for the ladder, or
- * its chart button for the chart. */
-export type OpenHow = 'open' | 'ladder' | 'chart';
+ * its chart button for the chart (`openInstrument.ts` says where each goes). */
+export type OpenHow = Exclude<InstrumentHow, 'page'>;
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 

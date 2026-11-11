@@ -75,27 +75,36 @@ export function stockChipOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying'
   return { symbol: row.underlying, key: row.kind === 'EQ' ? row.ws_key : null, fo: row.has_fo };
 }
 
-/** Where `row` opens, with the stock switch `stocksOn`: the Trade screen for
- * an index (Enter) or for an index put on the ladder (Shift+Enter, also from
- * an index option, on its expiry); a stock's chart or ladder on the Trade
- * screen from its chart button or Shift+Enter while stocks are on; its
- * instrument page otherwise. */
-export function targetOf(row: InstrumentRow, how: 'open' | 'ladder' | 'chart', stocksOn: boolean): { trade: TradeIntent } | { instrument: string } {
+/** How a row is opened: `open` is Enter or a tap on a search result,
+ * `ladder` Shift+Enter, `chart` its chart button, `page` a watchlist row's
+ * tap. */
+export type OpenHow = 'open' | 'ladder' | 'chart' | 'page';
+
+/**
+ * Where `row` opens, with the stock switch `stocksOn`. An index: the Trade
+ * screen, charted (`open`, `chart`, `page`) or on the ladder (`ladder`). A
+ * watchlist row's tap (`page`) otherwise keeps the instrument page a tap
+ * away, since the row's own Chart and Chain actions reach the Trade screen.
+ * Any other row: on the ladder (`ladder`) where it has one — its index at an
+ * option's expiry, or while stocks are on its F&O stock — or charted
+ * (`chart`; `open` too while stocks are on, the plan's "Enter on any search
+ * row opens its chart"), with the stock tab; its instrument page when the
+ * Trade screen has nothing to show for it.
+ */
+export function targetOf(row: InstrumentRow, how: OpenHow, stocksOn: boolean): { trade: TradeIntent } | { instrument: string } {
   const index = tradeIndexOf(row);
   if (index && row.kind === 'INDEX') {
     return { trade: how === 'ladder' ? { ladder: { index } } : { chart: { kind: 'index', index }, ladder: { index } } };
   }
-  if (index && how === 'ladder' && (row.kind === 'CE' || row.kind === 'PE')) {
-    return { trade: { ladder: { index, expiry: row.expiry } } };
-  }
-  if (!index && stocksOn && how !== 'open') {
-    const chart = chartSymOf(row, true);
-    const ladder = ladderOf(row, true);
-    const stock = stockChipOf(row);
-    if (how === 'ladder' && ladder) return { trade: { ladder, stock } };
-    if (how === 'chart' && chart) return { trade: { chart, ladder: ladder ?? undefined, stock } };
-  }
-  return { instrument: row.id };
+  const page = { instrument: row.id };
+  if (how === 'page') return page;
+  const ladder = ladderOf(row, stocksOn);
+  const stock = stockChipOf(row);
+  if (how === 'ladder') return ladder ? { trade: { ladder, stock } } : page;
+  const chart = chartSymOf(row, stocksOn);
+  // Before stocks, Enter on an index's option opened its page; it still does while the switch is off.
+  if (chart && (how === 'chart' || stocksOn)) return { trade: { chart, ladder: ladder ?? undefined, stock } };
+  return page;
 }
 
 /**
