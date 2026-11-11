@@ -612,6 +612,10 @@ export interface Flags {
    * `/api/v2/instruments/*`) for anyone signed in; while off they answer 404
    * and the search well and tab are hidden. */
   search: boolean;
+  /** Watchlists (`/api/v2/watchlists`) for anyone signed in; while off they
+   * answer 404 and the Watchlist screen, its tab and the "+" on a search
+   * result or an instrument page are hidden. */
+  watchlists: boolean;
 }
 
 export interface ChainSide {
@@ -1118,4 +1122,62 @@ export interface InstrumentsStatus {
   quotes: QuoteHubStatus;
   /** The day of the close snapshot served after hours, when one is on file. */
   snapshot_day: string | null;
+}
+
+// ── Watchlists — mirrors backend/server/src/routes/v2/watchlists.rs ──────── //
+
+/** One row of a watchlist: the key as kept, the catalog's row for it and
+ * its quote. */
+export interface WatchlistItem {
+  /** The price-map key (`nse_cm|2885`, `nse_fo|51386`, `idx|NIFTY 50`). */
+  key: string;
+  /** 0-based within the list. */
+  position: number;
+  /** IST `YYYY-MM-DD HH:MM:SS`. */
+  added_at: string;
+  /** The catalog's row, as `/api/v2/search` lists it; `null` when the
+   * catalog no longer has one (an expired contract, or no catalog built
+   * yet). */
+  instrument: InstrumentRow | null;
+  /** From the feed or Kotak's REST quotes during hours (`live`), Upstox
+   * while Kotak is down, the 15:35 close after hours (`close`, with
+   * `as_of`); `null` until the poller has fetched it — ask again in 2 s. */
+  quote: Quote | null;
+  /** How old the quote's price is, by the server's clock; `null` without a quote. */
+  age_secs: number | null;
+}
+
+export interface Watchlist {
+  id: number;
+  name: string;
+  /** 0-based among the person's lists. */
+  position: number;
+  /** IST `YYYY-MM-DD HH:MM:SS`. */
+  created_at: string;
+  /** In order. */
+  items: WatchlistItem[];
+}
+
+/** `GET /api/v2/watchlists`: every list of the signed-in person's, the
+ * admin's included — they are keyed by user id, not role. A first call
+ * makes the default list (`Watchlist 1`: NIFTY, BANKNIFTY, SENSEX). */
+export interface WatchlistsAnswer {
+  /** Unix ms the answer was made, to age the rows against. */
+  at: number;
+  market_open: boolean;
+  /** 5. */
+  max_lists: number;
+  /** 50. */
+  max_items: number;
+  /** 40. */
+  max_name_chars: number;
+  /** In position order. */
+  watchlists: Watchlist[];
+}
+
+/** Every other watchlist route's answer: the one list the call was about. */
+export interface WatchlistAnswer {
+  at: number;
+  market_open: boolean;
+  watchlist: Watchlist;
 }

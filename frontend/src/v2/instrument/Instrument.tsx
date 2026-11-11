@@ -3,10 +3,11 @@ import { ArrowLeft, ChartLine, Plus } from 'lucide-react';
 import { getInstrument } from '../lib/api';
 import { dayLabel, price, shortDate, signedPct, signedPrice, todayIst, toneOf, whole } from '../lib/format';
 import { chartOf, tradeIndexOf, type TradeIntent } from '../lib/openInstrument';
-import type { Instrument as InstrumentAnswer, InstrumentKind, Quote } from '../lib/types';
+import type { InstrumentKind, InstrumentRow, Quote } from '../lib/types';
 import { usePoll } from '../lib/usePoll';
 import { seedQuotes, useQuotes } from '../lib/useQuotes';
 import { useTickFlash } from '../lib/useTickFlash';
+import { rowTitle } from '../shell/searchModel';
 import { Button } from '../ui/Button';
 import { Chip } from '../ui/Chip';
 import { Stat } from '../ui/Stat';
@@ -15,19 +16,12 @@ import { Stat } from '../ui/Stat';
 // as the hero, its day — open, high, low, previous close, volume, the
 // 52-week range — its lot and tick size and nearest expiry, and where it
 // can go: the chart and the ladder on the Trade screen for the six indices
-// and their options now; stocks' Chart and Chain tabs light up in Phase 3,
-// "+ Watchlist" in Phase 2. Read-only: nothing here places an order.
+// and their options now; stocks' Chart and Chain tabs light up in Phase 3.
+// "+ Watchlist" adds it to a list (`onAddToWatchlist`, while watchlists are
+// on). Read-only: nothing here places an order.
 
 const KIND_WORD: Record<InstrumentKind, string> = { INDEX: 'Index', EQ: 'Stock', FUT: 'Future', CE: 'Call', PE: 'Put' };
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg-muted' } as const;
-
-/** "RELIANCE", "NIFTY 25600 CE", "RELIANCE NOV FUT". */
-function titleOf(i: InstrumentAnswer): string {
-  if (i.kind === 'EQ' || i.kind === 'INDEX') return i.symbol;
-  const month = i.expiry ? shortDate(i.expiry).split(' ')[1].toUpperCase() : '';
-  if (i.kind === 'FUT') return `${i.underlying} ${month} FUT`;
-  return `${i.underlying} ${i.strike != null ? price(i.strike).replace(/\.00$/, '') : ''} ${i.kind}`;
-}
 
 /** The price's provenance: "Live · 11:42:17", "Close · as of 15:30, Fri 7 Nov", "Upstox · 11:42:17". */
 function sourceLine(q: Quote): string {
@@ -80,7 +74,7 @@ function Tab({ selected = false, coming = false, onClick, children }: { selected
   );
 }
 
-export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade }: {
+export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAddToWatchlist }: {
   serverBase: string;
   desktop: boolean;
   /** The catalog id: `nse_cm:2885`. */
@@ -88,6 +82,8 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade }: {
   onBack: () => void;
   /** Open the Trade screen on a chart and/or the ladder. */
   onOpenTrade: (intent: TradeIntent) => void;
+  /** Add this instrument to a watchlist; left out while watchlists are off. */
+  onAddToWatchlist?: (row: InstrumentRow) => void;
 }) {
   // The facts (lot, tick, expiries) change with the daily catalog; the
   // prices come from the shared quotes poll.
@@ -128,7 +124,7 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade }: {
         <Button size={desktop ? 'md' : 'lg'} kind="quiet" icon={<ArrowLeft size={desktop ? 14 : 18} />} onClick={onBack} aria-label="Back" className={desktop ? 'px-2' : 'px-3'} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h1 className="type-title text-fg">{titleOf(data)}</h1>
+            <h1 className="type-title text-fg">{rowTitle(data)}</h1>
             <Chip>{data.exchange}</Chip>
             <Chip>{KIND_WORD[data.kind]}</Chip>
             {data.kind === 'EQ' && data.has_fo && <Chip>F&O</Chip>}
@@ -144,7 +140,7 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade }: {
             <Button size="md" kind="accent" icon={<ChartLine size={14} />} disabled={!chart} title={chart ? undefined : 'Charts for stocks come in Phase 3'} onClick={() => chart && onOpenTrade({ chart, ladder: ladder ?? undefined })}>
               Open chart
             </Button>
-            <Button size="md" kind="neutral" icon={<Plus size={14} />} disabled title="Watchlists come in Phase 2">
+            <Button size="md" kind="neutral" icon={<Plus size={14} />} disabled={!onAddToWatchlist} title={onAddToWatchlist ? 'Add to a watchlist' : 'Watchlists are off'} onClick={() => onAddToWatchlist?.(data)}>
               Watchlist
             </Button>
           </div>
@@ -164,7 +160,7 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade }: {
           <Button size="lg" kind="accent" icon={<ChartLine size={18} />} disabled={!chart} title={chart ? undefined : 'Charts for stocks come in Phase 3'} onClick={() => chart && onOpenTrade({ chart, ladder: ladder ?? undefined })} className="flex-1">
             Open chart
           </Button>
-          <Button size="lg" kind="neutral" icon={<Plus size={18} />} disabled title="Watchlists come in Phase 2" className="flex-1">
+          <Button size="lg" kind="neutral" icon={<Plus size={18} />} disabled={!onAddToWatchlist} title={onAddToWatchlist ? 'Add to a watchlist' : 'Watchlists are off'} onClick={() => onAddToWatchlist?.(data)} className="flex-1">
             Watchlist
           </Button>
         </div>

@@ -19,23 +19,34 @@ const quotes = new Map<string, Quote>();
 /** How many consumers want each key right now. */
 const wanted = new Map<string, number>();
 const listeners = new Set<() => void>();
-let version = 0;
+/** The server the keys are asked of: `''` is this site (same origin). */
 let serverBase = '';
+/** Whether a hook has bound the server yet. */
+let bound = false;
 let timer: number | null = null;
 /** A poll promised for the next tick of the event loop: new keys wanted. */
 let soon: number | null = null;
 let inFlight = false;
-/** Unix ms of the last answer, and whether the market was open then. */
-let at: number | null = null;
-let marketOpen: boolean | null = null;
 
-function notify() {
-  version++;
+/** What a render reads: a new object on every change, so a consumer's
+ * memoised output (the React Compiler's) is invalidated by it — the map
+ * itself is mutable module state the compiler cannot see change. */
+interface Snapshot {
+  version: number;
+  /** Unix ms of the last answer, and whether the market was open then. */
+  at: number | null;
+  marketOpen: boolean | null;
+}
+let snapshot: Snapshot = { version: 0, at: null, marketOpen: null };
+
+function notify(patch: Partial<Snapshot> = {}) {
+  snapshot = { ...snapshot, ...patch, version: snapshot.version + 1 };
   for (const l of listeners) l();
 }
 
-/** Keep `incoming` where it is newer than what is held. */
-export function seedQuotes(incoming: (Quote | null | undefined)[]) {
+/** Keep `incoming` where it is newer than what is held; `true` when
+ * anything changed (and every subscriber was told). */
+export function seedQuotes(incoming: (Quote | null | undefined)[], patch: Partial<Snapshot> = {}): boolean {
   let changed = false;
   for (const q of incoming) {
     if (!q) continue;
@@ -45,20 +56,22 @@ export function seedQuotes(incoming: (Quote | null | undefined)[]) {
       changed = true;
     }
   }
-  if (changed) notify();
+  if (changed) notify(patch);
+  return changed;
 }
 
 async function poll() {
-  if (inFlight || !serverBase || document.visibilityState !== 'visible') return;
+  if (inFlight || !bound || document.visibilityState !== 'visible') return;
   const keys = [...wanted.keys()];
   if (keys.length === 0) return;
   inFlight = true;
   try {
     for (let i = 0; i < keys.length; i += MAX_KEYS) {
       const answer = await getQuotes(serverBase, keys.slice(i, i + MAX_KEYS));
-      at = answer.at;
-      marketOpen = answer.market_open;
-      seedQuotes(answer.quotes);
+      const patch = { at: answer.at, marketOpen: answer.market_open };
+      // The market opening or closing is news even when no price moved.
+      if (!seedQuotes(answer.quotes, patch) && snapshot.marketOpen !== answer.market_open) notify(patch);
+      else snapshot = { ...snapshot, ...patch };
     }
   } catch {
     // The next tick tries again; the rows keep their last price.
@@ -138,19 +151,19 @@ export function useQuotes(base: string, keys: (string | null | undefined)[]): Qu
   // Keyed by content, so a re-render with the same keys asks for nothing new.
   const signature = asked.join(',');
   useEffect(() => {
-    if (serverBase !== base) {
+    if (!bound || serverBase !== base) {
+      bound = true;
       serverBase = base;
       quotes.clear();
-      at = null;
-      marketOpen = null;
-      notify();
+      notify({ at: null, marketOpen: null });
     }
     const mine = signature ? signature.split(',') : [];
     want(mine);
     return () => drop(mine);
   }, [base, signature]);
-  useSyncExternalStore(subscribe, () => version, () => version);
-  return { get: (key) => (key ? quotes.get(key) ?? null : null), at, marketOpen };
+  const snap = useSyncExternalStore(subscribe, () => snapshot, () => snapshot);
+  // Built from the snapshot, so it is a new object on every change.
+  return { get: (key) => (key ? quotes.get(key) ?? null : null), at: snap.at, marketOpen: snap.marketOpen };
 }
 
 /** One key's quote, polled with everything else on screen. */

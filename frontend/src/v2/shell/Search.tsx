@@ -13,7 +13,8 @@ import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 // results under it, grouped Indices / Stocks / Futures / Options, each row
 // priced and ticking. ↑/↓ move the highlight, Enter opens the instrument
 // (an index opens the Trade screen on it), Shift+Enter puts an index on the
-// ladder, Escape closes. The well is the combobox, the results its listbox.
+// ladder, `+` adds it to a watchlist (`onAdd`, while watchlists are on),
+// Escape closes. The well is the combobox, the results its listbox.
 
 /** How a result is opened: Enter / a tap, or Shift+Enter for the ladder. */
 export type OpenHow = 'open' | 'ladder';
@@ -28,7 +29,12 @@ function inField(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
-export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (row: InstrumentRow, how: OpenHow) => void }) {
+export function Search({ serverBase, onOpen, onAdd }: {
+  serverBase: string;
+  onOpen: (row: InstrumentRow, how: OpenHow) => void;
+  /** Add a result to a watchlist; left out while watchlists are off. */
+  onAdd?: (row: InstrumentRow) => void;
+}) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   // The highlighted row's id; nothing highlighted until ↓ (or the first
@@ -109,6 +115,9 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
       if (!activeRow) return;
       e.preventDefault();
       pick(activeRow, e.shiftKey ? 'ladder' : 'open');
+    } else if (e.key === '+' && onAdd && activeRow && open) {
+      e.preventDefault();
+      onAdd(activeRow);
     } else if (e.key === 'Escape') {
       e.preventDefault();
       if (open) setOpen(false);
@@ -241,11 +250,14 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
                         <button
                           type="button"
                           tabIndex={-1}
-                          aria-label="Add to watchlist"
-                          title="Watchlists come in Phase 2"
-                          disabled
-                          onClick={(e) => e.stopPropagation()}
-                          className="grid size-7 place-items-center rounded-6 text-fg-muted transition-colors duration-120 disabled:cursor-not-allowed disabled:opacity-50"
+                          aria-label={`Add ${row.symbol} to a watchlist`}
+                          title={onAdd ? 'Add to a watchlist' : 'Watchlists are off'}
+                          disabled={!onAdd}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onAdd?.(row);
+                          }}
+                          className="grid size-7 place-items-center rounded-6 text-fg-muted transition-colors duration-120 hover:bg-raised hover:text-fg disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                         >
                           <Plus size={14} />
                         </button>
@@ -275,6 +287,14 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
                 </Chip>
                 ladder
               </span>
+              {onAdd && (
+                <span className="flex items-center gap-1">
+                  <Chip kind="accent" className="px-1">
+                    +
+                  </Chip>
+                  watchlist
+                </span>
+              )}
             </span>
           </div>
         </div>
