@@ -376,6 +376,8 @@ export interface OrderTimingRow {
   /** The exchange's confirmation time, as Kotak writes it. */
   exchange_confirm: string | null;
   order_time: string | null;
+  /** When the engine's own order-book poll first saw it finished. */
+  seen_at_ms: number | null;
 }
 
 export interface OrderTimingAnswer {
