@@ -108,18 +108,41 @@ pub fn open_at(now: DateTime<FixedOffset>) -> bool {
 /// The next `hour:minute` IST at or after `now`: today's, or tomorrow's
 /// once today's has passed.
 pub fn next_at(now: DateTime<FixedOffset>, hour: u32, minute: u32) -> DateTime<FixedOffset> {
-    let today = now
-        .date_naive()
-        .and_hms_opt(hour, minute, 0)
-        .expect("valid time")
-        .and_local_timezone(shared_domain::ist_offset())
-        .single()
-        .expect("IST time is unambiguous");
+    let today = today_at(now, hour, minute);
     if today > now {
         today
     } else {
         today + chrono::Duration::hours(24)
     }
+}
+
+/// `hour:minute` IST on `now`'s day.
+fn today_at(now: DateTime<FixedOffset>, hour: u32, minute: u32) -> DateTime<FixedOffset> {
+    now.date_naive()
+        .and_hms_opt(hour, minute, 0)
+        .expect("valid time")
+        .and_local_timezone(shared_domain::ist_offset())
+        .single()
+        .expect("IST time is unambiguous")
+}
+
+/// When the next sweep starts and by when it must be done: the next 15:35
+/// and [`SWEEP_WINDOW`] after it — except on the sweep task's `first`
+/// schedule (a start or restart; deploys run at any time of day) when
+/// `now` is already inside today's window and no close of today's is on
+/// file (`close_day`): then at once, with what is left of the window.
+/// Otherwise the restart would wait for tomorrow's sweep and the evening
+/// would show the day's last REST reads and, once those are evicted,
+/// yesterday's close. Whether today is a trading day is the caller's
+/// check, as for any sweep.
+pub fn sweep_window(now: DateTime<FixedOffset>, first: bool, close_day: Option<NaiveDate>) -> (DateTime<FixedOffset>, DateTime<FixedOffset>) {
+    let window = chrono::Duration::from_std(SWEEP_WINDOW).expect("a few minutes");
+    let today = today_at(now, SWEEP_HOUR, SWEEP_MINUTE);
+    if first && now >= today && now < today + window && close_day.is_none_or(|day| day < now.date_naive()) {
+        return (now, today + window);
+    }
+    let at = next_at(now, SWEEP_HOUR, SWEEP_MINUTE);
+    (at, at + window)
 }
 
 fn day_text(day: NaiveDate) -> String {
@@ -216,15 +239,27 @@ pub async fn prune(pool: &SqlitePool, before: NaiveDate) -> sqlx::Result<u64> {
 /// Runs forever: at 15:35 IST every trading day, while the `search` switch
 /// is on, sweeps the catalog's equities and indices and every key watched
 /// lately, then writes what came back and keeps it in memory as the day's
-/// close. `pool` is the catalog database's; without one the close is held
-/// in memory only.
+/// close. Started inside the sweep's window with no close of the day on
+/// file (a restart mid-sweep), it sweeps at once with what is left of the
+/// window (`sweep_window`). `pool` is the catalog database's; without one
+/// the close is held in memory only.
 pub async fn run_close_sweep(hub: Arc<QuoteHub>, pool: Option<SqlitePool>, catalog: Arc<Catalog>, flags: Arc<RwLock<FeatureFlags>>) {
+    // The close on file was put back before this task was spawned
+    // (`quotes::spawn`), so the first schedule knows whether today's is in.
+    let mut first = true;
     loop {
         let now = shared_domain::now_ist();
-        let at = next_at(now, SWEEP_HOUR, SWEEP_MINUTE);
-        let secs = (at - now).num_seconds().max(1) as u64;
-        tracing::info!(secs, "Close snapshot sweep scheduled");
-        tokio::time::sleep(Duration::from_secs(secs)).await;
+        let (at, end) = sweep_window(now, std::mem::take(&mut first), hub.snapshot().map(|s| s.day));
+        if at > now {
+            let secs = (at - now).num_seconds().max(1) as u64;
+            tracing::info!(secs, "Close snapshot sweep scheduled");
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+        } else {
+            tracing::info!(
+                secs_left = (end - now).num_seconds(),
+                "Close snapshot sweep starting at once — the server started inside today's sweep window with no close of today's on file"
+            );
+        }
 
         let now = shared_domain::now_ist();
         if telegram_ingester::parser::is_trading_holiday(now.date_naive()) {
@@ -238,11 +273,18 @@ pub async fn run_close_sweep(hub: Arc<QuoteHub>, pool: Option<SqlitePool>, catal
             continue;
         }
 
+        // The deadline is the window's end on the clock: a full window for
+        // the 15:35 start, what is left of it for a catch-up.
+        let Some(left) = (end - now).to_std().ok().filter(|left| !left.is_zero()) else {
+            tracing::warn!("Close snapshot sweep skipped — its window had already passed when it woke");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        };
         let mut keys: BTreeSet<String> = catalog.cash_keys().into_iter().collect();
         let catalog_keys = keys.len();
         keys.extend(hub.watched_keys());
-        let total = hub.start_sweep(keys, now.date_naive(), now, Instant::now() + SWEEP_WINDOW);
-        tracing::info!(keys = total, catalog_keys, "Close snapshot sweep started");
+        let total = hub.start_sweep(keys, now.date_naive(), now, Instant::now() + left);
+        tracing::info!(keys = total, catalog_keys, secs = left.as_secs(), "Close snapshot sweep started");
 
         let sweep = loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -344,6 +386,31 @@ mod tests {
         assert_eq!(next_at(ist(2026, 11, 4, 15, 34), 15, 35), ist(2026, 11, 4, 15, 35));
         assert_eq!(next_at(ist(2026, 11, 4, 15, 35), 15, 35), ist(2026, 11, 5, 15, 35));
         assert_eq!(next_at(ist(2026, 11, 4, 23, 59), 15, 35), ist(2026, 11, 5, 15, 35));
+    }
+
+    #[test]
+    fn a_restart_inside_the_sweep_window_sweeps_at_once_with_what_is_left() {
+        let secs = chrono::Duration::seconds;
+        let day = NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
+        let end = ist(2026, 11, 4, 15, 35) + secs(270);
+        let tomorrow = (ist(2026, 11, 5, 15, 35), ist(2026, 11, 5, 15, 35) + secs(270));
+        // Before the window: today's 15:35 and the full window, first or not.
+        assert_eq!(sweep_window(ist(2026, 11, 4, 9, 0), true, Some(yesterday)), (ist(2026, 11, 4, 15, 35), end));
+        assert_eq!(sweep_window(ist(2026, 11, 4, 15, 34), false, None), (ist(2026, 11, 4, 15, 35), end));
+        // Started inside it with yesterday's close (or none) on file: now,
+        // until the window's end.
+        let restart = ist(2026, 11, 4, 15, 37);
+        assert_eq!(sweep_window(restart, true, Some(yesterday)), (restart, end));
+        assert_eq!(sweep_window(restart, true, None), (restart, end));
+        assert_eq!(sweep_window(ist(2026, 11, 4, 15, 35), true, None), (ist(2026, 11, 4, 15, 35), end));
+        assert_eq!(sweep_window(end - secs(1), true, None), (end - secs(1), end));
+        // Today's close already on file (the sweep finished before the
+        // restart), the loop's later rounds, or the window over: tomorrow.
+        assert_eq!(sweep_window(restart, true, Some(day)), tomorrow);
+        assert_eq!(sweep_window(restart, false, Some(yesterday)), tomorrow);
+        assert_eq!(sweep_window(end, true, None), tomorrow);
+        assert_eq!(sweep_window(ist(2026, 11, 4, 20, 0), true, None), tomorrow);
     }
 
     fn row(key: &str, ltp: f64) -> Row {
