@@ -610,9 +610,9 @@ export interface PaperActivity {
 export interface Flags {
   index_options_only: boolean;
   chart_stops: boolean;
-  /** The instrument search and its quotes (`/api/v2/search`, `/quotes`,
-   * `/instruments/*`) for anyone signed in; off (the default) they answer 404
-   * and the server asks Kotak for no quotes. No toggle in the UI yet. */
+  /** The instrument search and its quotes (`/api/v2/search`, `/api/v2/quotes`,
+   * `/api/v2/instruments/*`) for anyone signed in; while off they answer 404
+   * and the search well and tab are hidden. */
   search: boolean;
 }
 
@@ -940,4 +940,184 @@ export interface ModeCheck {
   open: number;
   waiting: number;
   lots: { index: string; lots: number }[];
+}
+
+// ── Instrument search — mirrors backend/server/src/routes/v2/instruments.rs,
+// instruments/{load,search}.rs and quotes/hub.rs ────────────────────────── //
+
+/** `INDEX`, a cash equity, a future, a call or a put. */
+export type InstrumentKind = 'INDEX' | 'EQ' | 'FUT' | 'CE' | 'PE';
+
+/** How a query matched an underlying, best first; `null` on a derivative
+ * listed under a match. */
+export type SearchTier = 'exact' | 'symbol_prefix' | 'word_prefix' | 'substring';
+
+/** Where a quote's price came from: the feed or Kotak's REST quotes
+ * (`live`, never told apart), Upstox while Kotak is down, or the 15:35
+ * close served after hours. */
+export type QuoteSource = 'live' | 'upstox' | 'close';
+
+/** One instrument's price, from the quote hub. */
+export interface Quote {
+  /** The price-map key: `nse_cm|2885`, `nse_fo|51386`, `idx|NIFTY 50`. */
+  key: string;
+  ltp: number;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  /** The previous close. */
+  close: number | null;
+  /** Against the previous close, for this quote's own `ltp`. */
+  change: number | null;
+  per_change: number | null;
+  volume: number | null;
+  oi: number | null;
+  year_high: number | null;
+  year_low: number | null;
+  /** Unix ms the price was read. */
+  at: number;
+  source: QuoteSource;
+  /** For a close: the IST day and time it stands for, `YYYY-MM-DD 15:30`. */
+  as_of: string | null;
+}
+
+/** A catalog row: an index, a stock, a future or an option. */
+export interface InstrumentRow {
+  /** `<segment>:<token>`: `nse_cm:2885`, `nse_fo:51386`, `nse_cm:Nifty 50`. */
+  id: string;
+  kind: InstrumentKind;
+  /** `RELIANCE`, `NIFTY`. */
+  symbol: string;
+  /** `Reliance Industries Ltd`, `Nifty 50`. */
+  name: string;
+  /** `NSE` or `BSE`. */
+  exchange: string;
+  /** `RELIANCE26NOV1400CE`. */
+  trading_symbol: string;
+  underlying: string;
+  /** `YYYY-MM-DD`, derivatives only. */
+  expiry: string | null;
+  strike: number | null;
+  lot_size: number;
+  tick_size: number;
+  /** The price-map key, for `/api/v2/quotes`. */
+  ws_key: string;
+  /** The underlying has F&O listed. */
+  has_fo: boolean;
+  tier: SearchTier | null;
+}
+
+/** A search result: the row with its quote, when any source has one
+ * (`null` until the poller has fetched it — ask again in 2 s). */
+export interface SearchRow extends InstrumentRow {
+  quote: Quote | null;
+}
+
+/** `GET /api/v2/search?q=&limit=`: the catalog's groups, ranked, at most
+ * `limit` (1–8) rows each. */
+export interface SearchAnswer {
+  query: string;
+  /** How the query was read: a symbol or name, `<SYM> FUT`, or
+   * `<SYM> [<MON>] <STRIKE> CE|PE`. */
+  parsed: 'plain' | 'future' | 'contract';
+  /** IST `YYYY-MM-DD` the derivatives are listed from. */
+  today: string;
+  /** The IST day of the CSVs the catalog was built from, for a "catalog from
+   * <date>" note when it is not today; `null` before the first build. */
+  catalog_day: string | null;
+  market_open: boolean;
+  indices: SearchRow[];
+  stocks: SearchRow[];
+  futures: SearchRow[];
+  options: SearchRow[];
+}
+
+/** `GET /api/v2/quotes?keys=` (at most 60 keys). */
+export interface QuoteAnswer {
+  /** Unix ms the answer was made. */
+  at: number;
+  market_open: boolean;
+  /** One per key with a quote, in the order asked. */
+  quotes: Quote[];
+  /** Known keys no source has a quote for yet; polled from now. */
+  missing: string[];
+  /** Keys the catalog has no row for. */
+  unknown: string[];
+}
+
+/** `GET /api/v2/instruments/:id`: the instrument page. */
+export interface Instrument extends InstrumentRow {
+  segment: string;
+  /** `pSymbol`: the token the feed and the quotes API take. */
+  token: string;
+  isin: string | null;
+  /** The price-map key of the underlying's cash or index row: a derivative's
+   * spot, a cash row's own key; `null` for an underlying with no cash or
+   * index row. */
+  underlying_key: string | null;
+  /** The nearest expiry listed under the underlying from today, on an F&O
+   * underlying's cash or index row; `null` on a contract or a stock with no
+   * F&O. */
+  nearest_expiry: string | null;
+  /** `null` until the poller has fetched it. */
+  quote: Quote | null;
+  /** A derivative's underlying, priced the same way. */
+  spot: Quote | null;
+  catalog_day: string | null;
+  market_open: boolean;
+}
+
+/** The catalog, for `GET /api/v2/instruments/status`. */
+export interface CatalogStatus {
+  /** IST date of the CSVs the catalog was built from. */
+  day: string | null;
+  /** IST `YYYY-MM-DD HH:MM:SS` of the last successful build. */
+  loaded_at: string | null;
+  /** Rows per segment (`nse_cm`, `nse_fo`, `bse_fo`) and the six `index` rows. */
+  rows: Record<string, number>;
+  /** Rows read per kind (`INDEX`, `EQ`, `FUT`, `CE`, `PE`). */
+  kinds: Record<string, number>;
+  /** Symbols in the search list. */
+  underlyings: number;
+  fts: boolean;
+  loading: boolean;
+  last_error: string | null;
+}
+
+/** The quote hub, for `GET /api/v2/instruments/status`. */
+export interface QuoteHubStatus {
+  /** Keys asked for in the last 15 s. */
+  wanted: number;
+  quotes: number;
+  upstox_quotes: number;
+  batch_size: number;
+  quarantined: number;
+  calls: number;
+  refused: number;
+  rate_limited: number;
+  errors: number;
+  unmatched: number;
+  upstox_calls: number;
+  upstox_errors: number;
+  calls_last_minute: number;
+  calls_per_sec: number;
+  upstox_calls_last_minute: number;
+  /** IST `HH:MM:SS` of the last call that answered. */
+  last_call_at: string | null;
+  last_error: string | null;
+  /** Why nothing is being polled, when nothing is. */
+  paused: string | null;
+  sweep: { day: string; total: number; done: number } | null;
+  close: { day: string; taken_at: string; rows: number; asked: number; partial: boolean } | null;
+}
+
+/** `GET /api/v2/instruments/status` — the admin's. */
+export interface InstrumentsStatus {
+  /** IST `YYYY-MM-DD HH:MM:SS`. */
+  now: string;
+  market_open: boolean;
+  catalog: CatalogStatus;
+  quotes: QuoteHubStatus;
+  /** The day of the close snapshot served after hours, when one is on file. */
+  snapshot_day: string | null;
 }

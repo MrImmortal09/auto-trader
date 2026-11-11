@@ -1,16 +1,21 @@
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { Admin } from './admin/Admin';
 import { useIdentity } from './auth/identity';
 import { SignInSheet } from './auth/SignInSheet';
 import { Desk } from './desk/Desk';
-import { resumeTrading, streamToken } from './lib/api';
+import { Instrument } from './instrument/Instrument';
+import { getFlags, resumeTrading, streamToken } from './lib/api';
 import { plural } from './lib/format';
 import { useIsDesktop, useServerBase } from './lib/hooks';
-import type { Stopped } from './lib/types';
+import { pointTradeAt, targetOf, type TradeIntent } from './lib/openInstrument';
+import type { InstrumentRow, Stopped } from './lib/types';
+import { usePoll } from './lib/usePoll';
 import { StatusBanners } from './shell/Banners';
 import { KillSwitchDialog } from './shell/KillSwitchDialog';
 import { NavRail, TabBar } from './shell/Nav';
-import { navScreens, SCREENS, screenFromLocation, screenPath, TAB_SCREENS, visibleScreens, type ScreenId } from './shell/screens';
+import { navScreens, SCREENS, screenFromLocation, screenPath, TAB_SCREENS, visibleScreens, type Place, type ScreenId } from './shell/screens';
+import { Search, type OpenHow } from './shell/Search';
+import { SearchSheet } from './shell/SearchSheet';
 import { DesktopStatusBar, PhoneStatusBar } from './shell/StatusBar';
 import { useGuard } from './shell/useGuard';
 import { useEngineErrors, useStatus } from './shell/useStatus';
@@ -50,12 +55,21 @@ export default function App() {
   const { role, canReadOwner } = useIdentity();
   const screens = visibleScreens(role);
   const nav = navScreens(role);
-  const [wanted, setWanted] = useState<ScreenId>(screenFromLocation);
+  const [wanted, setWanted] = useState<Place>(screenFromLocation);
   // A screen this person may not open (an old link, or a sign-out) falls back to Desk.
-  const screen: ScreenId = screens.includes(wanted) ? wanted : 'desk';
+  const screen: ScreenId = screens.includes(wanted.screen) ? wanted.screen : 'desk';
+  const place: Place = screen === 'instrument' && wanted.key ? { screen, key: wanted.key } : { screen: screen === 'instrument' ? 'desk' : screen };
   const [killSwitchOpen, setKillSwitchOpen] = useState(false);
   const [resuming, setResuming] = useState(false);
+  // Phone: the search sheet over everything.
+  const [searchOpen, setSearchOpen] = useState(false);
+  // Bumped when the search points the Trade screen somewhere, so an open
+  // Trade re-reads its saved layout.
+  const [tradeSeq, setTradeSeq] = useState(0);
   const status = useStatus(serverBase, canReadOwner);
+  const flags = usePoll(() => getFlags(serverBase), 30_000, serverBase);
+  // The instrument search is the admin's switch: off, the well and the tab are gone.
+  const searchOn = flags.data?.search === true;
   const guard = useGuard();
   useEngineErrors(serverBase, streamToken(), canReadOwner);
 
@@ -67,17 +81,55 @@ export default function App() {
   }, []);
 
   // `/`, an old `/#trade` link or a screen this person can't open: show the
-  // address of the screen actually open.
+  // address of the screen actually open (`/v2/i/<key>` for an instrument).
+  const path = screenPath(place);
   useEffect(() => {
-    const path = screenPath(screen);
     if (window.location.pathname !== path || window.location.hash) {
       window.history.replaceState(null, '', path + window.location.search);
     }
-  }, [screen]);
+  }, [path]);
 
-  function go(next: ScreenId) {
-    setWanted(next);
-    if (window.location.pathname !== screenPath(next)) window.history.pushState(null, '', screenPath(next));
+  // Screens this page has pushed onto the history, so Back from an
+  // instrument page knows whether there is a v2 screen behind it.
+  const pushed = useRef(0);
+  useEffect(() => {
+    const onPop = () => {
+      pushed.current = Math.max(0, pushed.current - 1);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  function go(next: ScreenId | Place) {
+    const p: Place = typeof next === 'string' ? { screen: next } : next;
+    setWanted(p);
+    if (window.location.pathname !== screenPath(p)) {
+      window.history.pushState(null, '', screenPath(p));
+      pushed.current++;
+    }
+  }
+
+  /** Open the Trade screen on a chart and/or the ladder (from the search or
+   * an instrument page). */
+  function openTrade(intent: TradeIntent) {
+    pointTradeAt(intent);
+    setTradeSeq((n) => n + 1);
+    go('trade');
+  }
+
+  /** A search result: Enter opens it, Shift+Enter puts an index on the ladder. */
+  function openResult(row: InstrumentRow, how: OpenHow) {
+    setSearchOpen(false);
+    const target = targetOf(row, how);
+    if ('trade' in target) openTrade(target.trade);
+    else go({ screen: 'instrument', key: target.instrument });
+  }
+
+  /** Back from an instrument page: the screen before it, or Desk when the
+   * page was opened from its address alone. */
+  function back() {
+    if (pushed.current > 0) window.history.back();
+    else go('desk');
   }
 
   async function resume() {
@@ -98,12 +150,14 @@ export default function App() {
       <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} role={role} />
     ) : screen === 'trade' ? (
       <Suspense fallback={<p className="p-6 type-body text-fg-subtle">Loading charts…</p>}>
-        <Trade serverBase={serverBase} desktop={desktop} />
+        <Trade key={tradeSeq} serverBase={serverBase} desktop={desktop} />
       </Suspense>
     ) : screen === 'market' ? (
       <Suspense fallback={<p className="p-6 type-body text-fg-subtle">Loading charts…</p>}>
         <Market serverBase={serverBase} desktop={desktop} canReadOwner={canReadOwner} />
       </Suspense>
+    ) : screen === 'instrument' && place.key ? (
+      <Instrument key={place.key} serverBase={serverBase} desktop={desktop} id={place.key} onBack={back} onOpenTrade={openTrade} />
     ) : (
       (() => {
         const page =
@@ -147,9 +201,21 @@ export default function App() {
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-canvas text-fg">
       {desktop ? (
-        <DesktopStatusBar status={s} unreachable={unreachable} role={role} onKillSwitch={() => setKillSwitchOpen(true)} />
+        <DesktopStatusBar
+          status={s}
+          unreachable={unreachable}
+          role={role}
+          onKillSwitch={() => setKillSwitchOpen(true)}
+          search={searchOn ? <Search serverBase={serverBase} onOpen={openResult} /> : undefined}
+        />
       ) : (
-        <PhoneStatusBar status={s} unreachable={unreachable} role={role} onKillSwitch={() => setKillSwitchOpen(true)} />
+        <PhoneStatusBar
+          status={s}
+          unreachable={unreachable}
+          role={role}
+          onKillSwitch={() => setKillSwitchOpen(true)}
+          more={searchOn ? { screens: more, screen, onSelect: go } : undefined}
+        />
       )}
       {stopped && (
         <Banner
@@ -165,7 +231,8 @@ export default function App() {
         {/* Trade fits the window and never scrolls: its ladder and panel scroll inside. */}
         <main className={`min-w-0 flex-1 ${screen === 'trade' ? 'overflow-hidden' : 'overflow-y-auto'}`}>{content}</main>
       </div>
-      {!desktop && <TabBar screens={nav} screen={screen} onSelect={go} />}
+      {!desktop && <TabBar screens={nav} screen={screen} onSelect={go} search={searchOn ? { open: searchOpen, onOpen: () => setSearchOpen(true) } : undefined} />}
+      {!desktop && searchOn && <SearchSheet serverBase={serverBase} open={searchOpen} onClose={() => setSearchOpen(false)} onOpen={openResult} />}
 
       {killSwitchOpen && canReadOwner && (
         <KillSwitchDialog serverBase={serverBase} mode={s?.mode} onClose={() => setKillSwitchOpen(false)} onDone={() => void status.refresh()} />

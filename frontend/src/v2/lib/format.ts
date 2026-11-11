@@ -30,6 +30,17 @@ export function price(n: number): string {
   return TWO.format(n);
 }
 
+/** "+12.40", "−0.05", "0.00" — a price change with its sign. */
+export function signedPrice(n: number): string {
+  const v = clean(n);
+  return `${v > 0 ? '+' : v < 0 ? MINUS : ''}${TWO.format(Math.abs(v))}`;
+}
+
+/** "12,34,567" — a count: volume, open interest. */
+export function whole(n: number): string {
+  return WHOLE.format(n);
+}
+
 /** An index level or strike: "25,060", "25,112.4". */
 export function level(n: number): string {
   return UP_TO_TWO.format(n);
