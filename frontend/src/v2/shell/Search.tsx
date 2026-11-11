@@ -5,7 +5,7 @@ import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
 import { Chip } from '../ui/Chip';
-import { derivativeNote, groupsOf, optionId, rowSymbol } from './searchModel';
+import { defaultRow, derivativeNote, groupsOf, optionId, rowSymbol } from './searchModel';
 import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 
 // Spec §13: the global instrument search. A 320 px well in the desktop
@@ -14,9 +14,10 @@ import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 // priced and ticking. ↑/↓ move the highlight, Enter opens the instrument
 // (an index opens the Trade screen on it), Shift+Enter puts an index on the
 // ladder, a row's chart button charts it on the Trade screen (an index or an
-// index's option), Escape closes. Enter's default is the first row only once
-// the answer is for what was typed. The well is the combobox, the results
-// its listbox.
+// index's option), Escape closes. Enter's default comes only once the answer
+// is for what was typed, and is what the query names: a typed contract or
+// future (none when it matched none), else the first row. The well is the
+// combobox, the results its listbox.
 
 /** How a result is opened: Enter / a tap, Shift+Enter for the ladder, or
  * its chart button for the chart (`openInstrument.ts` says where each goes). */
@@ -48,8 +49,10 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
   const flat = groups.flatMap((g) => g.rows);
   const quotes = useQuotes(serverBase, open ? flat.map((r) => r.ws_key) : []);
   // While a newer query is pending the rows on show are the last answer's:
-  // a row picked with ↑/↓ is still Enter's, but nothing is by default.
-  const activeRow = flat.find((r) => r.id === active) ?? (typed && !search.pending ? flat[0] : undefined);
+  // a row picked with ↑/↓ is still Enter's, but nothing is by default. Once
+  // the answer is in, the default is what the query names (`defaultRow`):
+  // `NIFTY 25600 CE` highlights that contract, not the NIFTY index above it.
+  const activeRow = flat.find((r) => r.id === active) ?? (typed && !search.pending && search.answer ? defaultRow(search.answer) : undefined);
 
   // `/` and ⌘K from anywhere outside a field put the cursor in the well.
   useEffect(() => {

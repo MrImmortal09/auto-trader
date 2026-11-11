@@ -4,7 +4,7 @@ import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
 import { Button } from '../ui/Button';
-import { derivativeNote, groupsOf, rowSymbol } from './searchModel';
+import { defaultRow, derivativeNote, groupsOf, rowSymbol } from './searchModel';
 import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 import type { OpenHow } from './Search';
 
@@ -12,7 +12,8 @@ import type { OpenHow } from './Search';
 // well with the keyboard up, Cancel, and the same groups as the desktop
 // popover in 56 px rows (symbol and chips on the first line, name and the
 // price on the second). A tap opens the instrument; the keyboard's search
-// key opens the first row once the answer is for what was typed.
+// key, once the answer is for what was typed, opens what it names: the typed
+// contract or future (nothing when it matched none), else the first row.
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 
@@ -85,10 +86,13 @@ export function SearchSheet({ serverBase, open, onClose, onOpen }: {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
-              // The first row of the answer to what was typed: never a row of
+              // What the answer to what was typed names (`defaultRow`): the
+              // typed contract or future, else its first row; never a row of
               // an earlier query's answer still on show while this one is
               // pending, nor a recent when nothing is typed.
-              if (e.key === 'Enter' && typed && !search.pending && flat[0]) pick(flat[0]);
+              if (e.key !== 'Enter' || !typed || search.pending || !search.answer) return;
+              const first = defaultRow(search.answer);
+              if (first) pick(first);
             }}
             className="min-w-0 flex-1 bg-transparent type-body text-ellipsis text-fg outline-none placeholder:text-fg-subtle [&::-webkit-search-cancel-button]:hidden"
           />
