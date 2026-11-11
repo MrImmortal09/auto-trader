@@ -9,6 +9,10 @@ export interface Identity {
   role: Role;
   /** The phone sign-in, once the server has confirmed it. */
   user: SessionUser | null;
+  /** Why `user` is still null though a sign-in is held: the check with the
+   * server (`/api/auth/me`) failed, as "Could not reach the server". Null
+   * while the check is out, once it answered, and without a sign-in. */
+  userError: string | null;
   /** The sign-in's role — the server's word, else the token's claim — or
    * null without one: `role` without `anon`. */
   phoneRole: 'admin' | 'user' | null;

@@ -2,12 +2,14 @@ import { useState } from 'react';
 import { ChevronLeft, ChevronRight, Ellipsis, Pencil, Plus, Trash2 } from 'lucide-react';
 import type { Watchlist } from '../lib/types';
 import { Button } from '../ui/Button';
+import { Menu } from '../ui/Menu';
 import { Popover } from '../ui/Popover';
 import { Segment } from '../ui/Segment';
 
 // The lists as a Segment — up to five, the open one the white pill — with a
-// "+" for a new list and a menu on the open one: rename, move left or
-// right among the lists, delete (`ListMenu`). The dialogs the menu opens
+// "+" for a new list and a menu on the open one (`ui/Menu`, so the arrow
+// keys walk it): rename, move left or right among the lists, delete
+// (`ListMenu`). The dialogs the menu opens
 // are the screen's (`dialogs.tsx`); this only says what was asked. On
 // desktop the buttons sit beside the Segment; on a phone the Segment has
 // the whole width (scrolling edge to edge when five long names need it)
@@ -72,7 +74,7 @@ export function ListMenu({ lists, selected, maxLists, desktop, onNew, onAction }
           className={desktop ? 'px-2' : 'px-3'}
         />
         <Popover open={menu} onClose={() => setMenu(false)} align="right" backdrop={!desktop}>
-          <div role="menu" aria-label={list ? `${list.name}` : 'Watchlist'} className="flex flex-col">
+          <Menu label={list ? list.name : 'Watchlist'}>
             <button type="button" role="menuitem" className={ITEM} onClick={() => { setMenu(false); onAction('rename'); }}>
               <Pencil size={14} className="text-fg-muted" /> Rename…
             </button>
@@ -93,7 +95,7 @@ export function ListMenu({ lists, selected, maxLists, desktop, onNew, onAction }
             >
               <Trash2 size={14} /> Delete…
             </button>
-          </div>
+          </Menu>
         </Popover>
       </span>
     </div>

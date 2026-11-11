@@ -184,6 +184,8 @@ export interface Watchlists {
   answer: WatchlistsAnswer | null;
   /** The lists in order; `[]` before the first answer. */
   lists: Watchlist[];
+  /** Why there is no (fresh) answer: the last read's failure, or — before
+   * the first read — that the sign-in itself could not be confirmed. */
   error: string | null;
   loading: boolean;
   /** Read the set again now. */
@@ -199,7 +201,7 @@ export interface Watchlists {
 export function useWatchlists(base: string, { enabled = true, poll = false }: { enabled?: boolean; poll?: boolean } = {}): Watchlists {
   // The confirmed sign-in (`/api/auth/me`), not the token's claim: the lists
   // are keyed by its user id, and the scope must not change once read.
-  const { user } = useIdentity();
+  const { user, userError } = useIdentity();
   const scope = enabled && user ? `${base}|${user.id}` : '';
   useEffect(() => {
     if (!scope) return;
@@ -223,10 +225,14 @@ export function useWatchlists(base: string, { enabled = true, poll = false }: { 
   }, [scope, poll]);
   const s = useSyncExternalStore(subscribe, () => state, () => state);
   const current = s.scope === scope ? s : null;
+  // No scope because the sign-in's check never got through: the read can't
+  // start, and the screen would otherwise say "Loading…" for as long as the
+  // server stays away. The check is retried, and a confirmed sign-in reads.
+  const unconfirmed = enabled && !user && userError ? `the sign-in could not be confirmed (${userError})` : null;
   return {
     answer: current?.answer ?? null,
     lists: current?.answer?.watchlists ?? [],
-    error: current?.error ?? null,
+    error: current?.error ?? unconfirmed,
     loading: current?.loading ?? false,
     refresh: loadWatchlists,
   };

@@ -4,7 +4,7 @@ import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
 import { Button } from '../ui/Button';
-import { derivativeNote, groupsOf, rowSymbol } from './searchModel';
+import { derivativeNote, groupsOf, rowSymbol, rowTitle } from './searchModel';
 import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 import type { OpenHow } from './Search';
 
@@ -149,7 +149,7 @@ export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd }: {
                 {onAdd && (
                   <button
                     type="button"
-                    aria-label={`Add ${row.symbol} to a watchlist`}
+                    aria-label={`Add ${rowTitle(row)} to a watchlist`}
                     onClick={() => onAdd(row)}
                     className="grid w-11 shrink-0 place-items-center rounded-8 text-fg-muted transition-colors duration-120 active:bg-raised/40"
                   >

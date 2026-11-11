@@ -28,9 +28,12 @@ let timer: number | null = null;
 let soon: number | null = null;
 let inFlight = false;
 
-/** What a render reads: a new object on every change, so a consumer's
- * memoised output (the React Compiler's) is invalidated by it — the map
- * itself is mutable module state the compiler cannot see change. */
+/** What a render reads: a new object on every change (`notify`), so a
+ * consumer's memoised output (the React Compiler's) is invalidated by it —
+ * the map itself is mutable module state the compiler cannot see change.
+ * Only `at` is ever written in place, by an answer that changed nothing a
+ * row shows: a new object then would make `useSyncExternalStore` re-render
+ * every consumer for it on their next render anyway. */
 interface Snapshot {
   version: number;
   /** Unix ms of the last answer, and whether the market was open then. */
@@ -69,9 +72,12 @@ async function poll() {
     for (let i = 0; i < keys.length; i += MAX_KEYS) {
       const answer = await getQuotes(serverBase, keys.slice(i, i + MAX_KEYS));
       const patch = { at: answer.at, marketOpen: answer.market_open };
-      // The market opening or closing is news even when no price moved.
-      if (!seedQuotes(answer.quotes, patch) && snapshot.marketOpen !== answer.market_open) notify(patch);
-      else snapshot = { ...snapshot, ...patch };
+      if (!seedQuotes(answer.quotes, patch)) {
+        // The market opening or closing is news even when no price moved;
+        // the answer's time alone is not, so it is noted without a word.
+        if (snapshot.marketOpen !== answer.market_open) notify(patch);
+        else snapshot.at = answer.at;
+      }
     }
   } catch {
     // The next tick tries again; the rows keep their last price.

@@ -6,13 +6,15 @@ import { useTickFlash } from '../lib/useTickFlash';
 import { derivativeNote, rowSymbol, rowTitle } from '../shell/searchModel';
 import { KindChips } from '../shell/searchParts';
 import { Button } from '../ui/Button';
+import { Menu } from '../ui/Menu';
 import { Modal } from '../ui/Modal';
 import { Popover } from '../ui/Popover';
 
 // One instrument on a watchlist. Desktop: a 44 px hairline row — the symbol
 // with its exchange and kind chips, a contract's expiry and strike or the
 // name, the LTP and the day's change (flashing as they tick), and on hover
-// Chart, Chain and Buy with a menu for moving and removing. Phone: a 56 px
+// Chart, Chain and Buy with a menu (`ui/Menu`: arrow keys, focus returned on
+// close) for moving and removing. Phone: a 56 px
 // row (symbol and chips, then the name; the price stacked at the right) that
 // opens the instrument, and a "⋯" that opens a sheet with the same actions.
 // Nothing here places an order: Buy opens the ladder on the Trade screen.
@@ -162,7 +164,7 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
               <Ellipsis size={14} />
             </button>
             <Popover open={menu} onClose={() => setMenu(false)} align="right">
-              <div role="menu" aria-label={title} className="flex flex-col">
+              <Menu label={title}>
                 <button type="button" role="menuitem" className={MENU_ITEM} disabled={first} onClick={() => { setMenu(false); actions.onMove('top'); }}>
                   <ArrowUpToLine size={14} className="text-fg-muted" /> Move to top
                 </button>
@@ -176,7 +178,7 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
                 <button type="button" role="menuitem" className={`${MENU_ITEM} text-loss hover:bg-loss-subtle`} onClick={() => { setMenu(false); actions.onRemove(); }}>
                   <Trash2 size={14} /> Remove
                 </button>
-              </div>
+              </Menu>
             </Popover>
           </span>
         </span>

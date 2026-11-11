@@ -5,7 +5,7 @@ import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
 import { Chip } from '../ui/Chip';
-import { derivativeNote, groupsOf, optionId, rowSymbol } from './searchModel';
+import { derivativeNote, groupsOf, optionId, rowSymbol, rowTitle } from './searchModel';
 import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 
 // Spec §13: the global instrument search. A 320 px well in the desktop
@@ -232,11 +232,12 @@ export function Search({ serverBase, onOpen, onAdd }: {
                         )}
                       </div>
                       <PriceCell quote={quotes.get(row.ws_key)} identity={row.ws_key} stacked={false} muted={on} />
+                      {/* Named in full ("RELIANCE NOV FUT"), since a stock and its contracts share a symbol. */}
                       <span className={`flex shrink-0 items-center transition-opacity duration-120 ${on ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
                         <button
                           type="button"
                           tabIndex={-1}
-                          aria-label={chart ? `Chart ${row.symbol}` : 'Chart'}
+                          aria-label={chart ? `Chart ${rowTitle(row)}` : 'Chart'}
                           title={chart ? 'Open the chart' : 'Charts for stocks come in Phase 3'}
                           disabled={!chart}
                           onClick={(e) => {
@@ -250,7 +251,7 @@ export function Search({ serverBase, onOpen, onAdd }: {
                         <button
                           type="button"
                           tabIndex={-1}
-                          aria-label={`Add ${row.symbol} to a watchlist`}
+                          aria-label={`Add ${rowTitle(row)} to a watchlist`}
                           title={onAdd ? 'Add to a watchlist' : 'Watchlists are off'}
                           disabled={!onAdd}
                           onClick={(e) => {
