@@ -20,7 +20,11 @@ const quotes = new Map<string, Quote>();
 const wanted = new Map<string, number>();
 const listeners = new Set<() => void>();
 let version = 0;
+/** The server the keys are asked of: `''` is this site (same origin). */
 let serverBase = '';
+/** Whether a hook has bound the server yet: `''` is a server too, so the
+ * base alone can't say. */
+let bound = false;
 let timer: number | null = null;
 /** A poll promised for the next tick of the event loop: new keys wanted. */
 let soon: number | null = null;
@@ -49,7 +53,7 @@ export function seedQuotes(incoming: (Quote | null | undefined)[]) {
 }
 
 async function poll() {
-  if (inFlight || !serverBase || document.visibilityState !== 'visible') return;
+  if (inFlight || !bound || document.visibilityState !== 'visible') return;
   const keys = [...wanted.keys()];
   if (keys.length === 0) return;
   inFlight = true;
@@ -138,7 +142,8 @@ export function useQuotes(base: string, keys: (string | null | undefined)[]): Qu
   // Keyed by content, so a re-render with the same keys asks for nothing new.
   const signature = asked.join(',');
   useEffect(() => {
-    if (serverBase !== base) {
+    if (!bound || serverBase !== base) {
+      bound = true;
       serverBase = base;
       quotes.clear();
       at = null;

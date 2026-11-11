@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { ChartLine, Plus, Search as SearchIcon, X } from 'lucide-react';
-import { chartOf } from '../lib/openInstrument';
+import { chartOf, type OpenHow as InstrumentHow } from '../lib/openInstrument';
 import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
@@ -13,10 +13,14 @@ import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 // results under it, grouped Indices / Stocks / Futures / Options, each row
 // priced and ticking. ↑/↓ move the highlight, Enter opens the instrument
 // (an index opens the Trade screen on it), Shift+Enter puts an index on the
-// ladder, Escape closes. The well is the combobox, the results its listbox.
+// ladder, a row's chart button charts it on the Trade screen (an index or an
+// index's option), Escape closes. Enter's default is the first row only once
+// the answer is for what was typed. The well is the combobox, the results
+// its listbox.
 
-/** How a result is opened: Enter / a tap, or Shift+Enter for the ladder. */
-export type OpenHow = 'open' | 'ladder';
+/** How a result is opened: Enter / a tap, Shift+Enter for the ladder, or
+ * its chart button for the chart (`openInstrument.ts` says where each goes). */
+export type OpenHow = InstrumentHow;
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 
@@ -32,7 +36,7 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   // The highlighted row's id; nothing highlighted until ↓ (or the first
-  // result of a typed query).
+  // result of a typed query, once its answer is in).
   const [active, setActive] = useState<string | null>(null);
   const [recents, setRecents] = useState<InstrumentRow[]>([]);
   const input = useRef<HTMLInputElement>(null);
@@ -43,7 +47,9 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
   const groups = typed ? (search.answer ? groupsOf(search.answer) : []) : recents.length ? [{ head: 'Recent', rows: recents }] : [];
   const flat = groups.flatMap((g) => g.rows);
   const quotes = useQuotes(serverBase, open ? flat.map((r) => r.ws_key) : []);
-  const activeRow = flat.find((r) => r.id === active) ?? (typed ? flat[0] : undefined);
+  // While a newer query is pending the rows on show are the last answer's:
+  // a row picked with ↑/↓ is still Enter's, but nothing is by default.
+  const activeRow = flat.find((r) => r.id === active) ?? (typed && !search.pending ? flat[0] : undefined);
 
   // `/` and ⌘K from anywhere outside a field put the cursor in the well.
   useEffect(() => {
@@ -232,7 +238,7 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
                           disabled={!chart}
                           onClick={(e) => {
                             e.stopPropagation();
-                            pick(row, 'open');
+                            pick(row, 'chart');
                           }}
                           className="grid size-7 place-items-center rounded-6 text-fg-muted transition-colors duration-120 hover:bg-raised hover:text-fg disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                         >

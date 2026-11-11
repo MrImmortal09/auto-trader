@@ -11,7 +11,8 @@ import type { OpenHow } from './Search';
 // Spec §13, phone: the Search tab opens this full-screen sheet — a 48 px
 // well with the keyboard up, Cancel, and the same groups as the desktop
 // popover in 56 px rows (symbol and chips on the first line, name and the
-// price on the second). A tap opens the instrument.
+// price on the second). A tap opens the instrument; the keyboard's search
+// key opens the first row once the answer is for what was typed.
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 
@@ -33,15 +34,22 @@ export function SearchSheet({ serverBase, open, onClose, onOpen }: {
   const groups = typed ? (search.answer ? groupsOf(search.answer) : []) : recents.length ? [{ head: 'Recent', rows: recents }] : [];
   const flat = groups.flatMap((g) => g.rows);
   const quotes = useQuotes(serverBase, open ? flat.map((r) => r.ws_key) : []);
+  // The caller's latest `onClose`, for the Escape listener: a new function
+  // on every render of the caller must not re-run the effect below, which
+  // would pull the keyboard back up on each status poll.
+  const closeRef = useRef(onClose);
+  useEffect(() => {
+    closeRef.current = onClose;
+  });
 
-  // Opened: the keyboard comes up on the well.
+  // Opened: the keyboard comes up on the well, once.
   useEffect(() => {
     if (!open) return;
     input.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && closeRef.current();
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
@@ -77,7 +85,10 @@ export function SearchSheet({ serverBase, open, onClose, onOpen }: {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && flat[0]) pick(flat[0]);
+              // The first row of the answer to what was typed: never a row of
+              // an earlier query's answer still on show while this one is
+              // pending, nor a recent when nothing is typed.
+              if (e.key === 'Enter' && typed && !search.pending && flat[0]) pick(flat[0]);
             }}
             className="min-w-0 flex-1 bg-transparent type-body text-ellipsis text-fg outline-none placeholder:text-fg-subtle [&::-webkit-search-cancel-button]:hidden"
           />
