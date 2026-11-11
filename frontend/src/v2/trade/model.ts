@@ -268,6 +268,21 @@ export function optionOf(p: Pick<ExecutePosition, 'index' | 'strike' | 'option_t
 }
 
 /**
+ * Which level of `p` a chart showing `sym` takes: a premium level on the
+ * position's own option (on `expiry`: its own, or the nearest for a row from
+ * before that was recorded), an index level on its underlying's own chart
+ * (the index, or the stock's cash price), and none on any other chart. A
+ * level read off any other chart's price scale — NIFTY's ~25,000 for a
+ * RELIANCE option — would sit far past the price and sell the whole
+ * position at once.
+ */
+export function levelTriggerOn(sym: ChartSym, p: Pick<ExecutePosition, 'index' | 'strike' | 'option_type'>, expiry: string | null | undefined): ChartLevel['trigger'] | null {
+  const option = expiry ? optionOf(p, expiry) : null;
+  if (option && sameSym(option, sym)) return 'premium';
+  return isOwnChart(sym, p.index) ? 'index' : null;
+}
+
+/**
  * What exiting at `lvl` would make, roughly. On the option's price it is
  * `(level − avg) × qty`; on the index, the option is taken to move by its
  * delta for each point the index moves from now.

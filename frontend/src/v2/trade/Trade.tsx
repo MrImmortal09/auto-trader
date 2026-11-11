@@ -54,7 +54,7 @@ import { HeaderSwitch, HeaderTabs, HeaderTicker, ListPicker } from './header';
 import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from './headerModel';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
-import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isTicker, istClock, levelCrossed, levelPnl, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isTicker, istClock, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
@@ -238,6 +238,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [exitAllBusy, setExitAllBusy] = useState(false);
   // `lots`: what a target being placed sells — its top value is "all left".
   const [placingAt, setPlacingAt] = useState<{ slot: number; id: string; kind: LevelKind; trigger: ChartLevel['trigger']; lots: number } | null>(null);
+  // The last placement dropped because its chart stopped showing its
+  // instrument (see `placingFits`), for the toast that says so.
+  const [lostPlacing, setLostPlacing] = useState<{ p: ExecutePosition; kind: LevelKind; trigger: ChartLevel['trigger']; stockOff: boolean } | null>(null);
   const [sheet, setSheet] = useState(false);
   // The strike the ladder scrolled to, for the ladder it was scrolled on.
   const [centreAt, setCentreAt] = useState<{ key: string; strike: number } | null>(null);
@@ -613,11 +616,20 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // What "+ Stop" is placing, rebuilt each render so its checks see the
   // latest prices; the chart keeps one line for it while `key` stays the same.
   const placingPos = placingAt ? scalps.find((p) => p.id === placingAt.id) ?? null : null;
+  // The level goes only on the chart its trigger reads — the position's own
+  // option for a premium level, its underlying's own chart for an index one
+  // — as the slot is drawn now, not as it was when "+ Stop" was tapped: the
+  // first flags answer or a later poll can turn `stock_charts` off (`shownAs`
+  // then draws a stock's slot as NIFTY), and a slot's symbol can be changed
+  // mid-placement. A tap on any other chart reads another instrument's price
+  // scale: a stop around 25,000 on a RELIANCE option sells it all at once.
+  const placingSym = placingAt ? shownSlots[placingAt.slot]?.sym : undefined;
+  const placingFits = placingAt != null && placingPos != null && placingSym != null && levelTriggerOn(placingSym, placingPos, placingPos.expiry ?? chains[placingPos.index]?.expiry) === placingAt.trigger;
   // A target's lots: up to what no other target has; the top is "all left".
   // With every lot covered meanwhile, there is nothing to place.
   const room = placingPos ? targetRoom(placingPos) : null;
   const placing = ((): (Placing & { what: string; lots?: LotsPick }) | null => {
-    if (!placingAt || !placingPos) return null;
+    if (!placingAt || !placingPos || !placingFits) return null;
     const { kind, trigger } = placingAt;
     const p = placingPos;
     const isTarget = kind === 'target';
@@ -659,6 +671,28 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     };
   })();
 
+  // A placement whose chart stopped showing its instrument is dropped, and a
+  // toast says so, rather than kept armed for when that chart comes back: a
+  // tap the chart no longer asks for would set a level by surprise later.
+  // It is dropped while rendering (React's "adjusting state when a prop
+  // changes"), so no commit holds it; the toast follows in an effect.
+  if (placingAt && placingPos && !placingFits) {
+    setPlacingAt(null);
+    setLostPlacing({ p: placingPos, kind: placingAt.kind, trigger: placingAt.trigger, stockOff: stocksOn === false && !isIndex(placingPos.index) });
+  }
+  useEffect(() => {
+    if (!lostPlacing) return;
+    const { p, kind, trigger, stockOff } = lostPlacing;
+    toast({
+      tone: 'neutral',
+      title: `${contractLabel(p.index, p.strike, p.option_type)}: no ${kind} placed`,
+      body: stockOff
+        ? `Stock charts were switched off before the tap, and its ${kind} is set on ${p.index}'s own chart.`
+        : `The chart it was going on no longer shows ${trigger === 'premium' ? 'its option' : `${p.index}'s own chart`}. Start it again from the position.`,
+      key: `placing-lost-${p.id}-${kind}`,
+    });
+  }, [lostPlacing, toast]);
+
   const setSlot = (i: number, change: Partial<Slot>) =>
     save((s) => ({ ...s, slots: s.slots.map((slot, n) => (n === i ? { ...slot, ...change } : slot)) }));
   const setLib = (chartLib: ChartLib) => save((s) => ({ ...s, chartLib }));
@@ -668,7 +702,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
    * `stock_charts` switch is off that chart can't show — `shownAs` renders
    * its slot as NIFTY — so nothing is placed, and a toast says why: a tap on
    * the index's chart would set the stock's level ~25,000 points past its
-   * price and sell the whole holding at market on the engine's next tick. */
+   * price and sell the whole holding at market on the engine's next tick.
+   * This only refuses the start; the switch not known yet lets it begin,
+   * and `placingFits` checks the slot as it is drawn at every render after. */
   function levelChartShows(p: ExecutePosition, kind: LevelKind): boolean {
     if (stocksOn !== false || isIndex(p.index)) return true;
     toast({

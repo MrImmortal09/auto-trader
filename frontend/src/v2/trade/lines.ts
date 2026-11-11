@@ -7,7 +7,7 @@ import { level, price, signedMoney } from '../lib/format';
 import type { CallMark, ChainAnswer, FillMark, TelegramLine } from '../lib/types';
 import { C, type LinePart, type MarkerData, type OrderLineData } from './chartSetup';
 import type { ChartLine, ChartMarker } from './KChart';
-import { approxMoney, isOwnChart, istMs, levelCrossed, levelPnl, optionOf, sameSym, underlyingOf, type ChartSym } from './model';
+import { approxMoney, istMs, levelCrossed, levelPnl, levelTriggerOn, underlyingOf, type ChartSym } from './model';
 
 export type LevelKind = 'stop' | 'target';
 
@@ -191,13 +191,9 @@ export function chartLines(cx: LineContext): ChartLine[] {
     for (const p of cx.scalps) {
       if (p.qty <= 0) continue;
       // The position's own expiry; the nearest only for rows from before it was recorded.
-      const expiry = p.expiry ?? cx.chains[p.index]?.expiry;
-      const option = expiry ? optionOf(p, expiry) : null;
-      const onOption = option != null && sameSym(option, cx.sym);
-      const onIndex = isOwnChart(cx.sym, p.index);
-      if (!onOption && !onIndex) continue;
-      const trigger: ChartLevel['trigger'] = onOption ? 'premium' : 'index';
-      if (onOption) out.push(positionLine(p, p.avg, trigger, cx));
+      const trigger = levelTriggerOn(cx.sym, p, p.expiry ?? cx.chains[p.index]?.expiry);
+      if (!trigger) continue;
+      if (trigger === 'premium') out.push(positionLine(p, p.avg, trigger, cx));
       else {
         const bought = firstBuy(p, cx.fills);
         if (bought != null) out.push(positionLine(p, { at: bought }, trigger, cx));
