@@ -327,7 +327,8 @@ async fn owned(tx: &mut SqliteConnection, user_id: i64, id: i64) -> sqlx::Result
 }
 
 /// Makes `keys`, in that order, the whole of list `id` of `user_id`
-/// (distinct and checked against the catalog by the route). A key that
+/// (distinct; the route checks against the catalog every key the list did
+/// not already hold). A key that
 /// was already in the list keeps its `added_at`. [`Error::TooManyItems`]
 /// past [`MAX_ITEMS`], and nothing is changed then.
 pub async fn replace_items(pool: &SqlitePool, user_id: i64, id: i64, keys: &[String], now: &str) -> Result<(), Error> {

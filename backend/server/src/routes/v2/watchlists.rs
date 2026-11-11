@@ -7,15 +7,19 @@
 //! sign-in's user id, the admin's included (the admin is a `users` row, and
 //! `Access::PhoneUser` would refuse it), and every read and write here is
 //! scoped to the caller's id, so another person's list is a plain 404.
-//! A key is accepted only when the catalog has a row for it, and the row's
-//! own price-map key is what the list keeps; an unknown key is a 400 that
-//! names it, and is never polled. Every key answered that the catalog
-//! still has a row for is marked wanted on the hub, so the next call (the
-//! front end re-polls every 2 s) finds it priced; a kept key the catalog
-//! has dropped (an expired contract) is shown without a row and not
-//! polled. A quote never says whether the feed carries its key
-//! (`QuoteHub::get_at`). Nothing here reaches the feed task, the bridge,
-//! the engine or anyone's positions.
+//! A new key is accepted only when the catalog has a row for it, and the
+//! row's own price-map key is what the list keeps; an unknown key is a 400
+//! that names it, and is never polled. A key the list already holds is
+//! kept as it is, without asking the catalog, so a list holding a contract
+//! the catalog has dropped (an expired weekly) can still be reordered, and
+//! that row removed by its key or its catalog id. Every key answered that
+//! the catalog still has a row for is marked wanted on the hub, so the
+//! next call (the front end re-polls every 2 s) finds it priced; a kept
+//! key the catalog has dropped is shown without a row and not polled. A
+//! catalog database that cannot be read is a 500, never "unknown keys" or
+//! rows without their instrument. A quote never says whether the feed
+//! carries its key (`QuoteHub::get_at`). Nothing here reaches the feed
+//! task, the bridge, the engine or anyone's positions.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -187,6 +191,13 @@ fn read_failed(e: sqlx::Error) -> Fail {
     Fail::Server("could not read the watchlists")
 }
 
+/// The 500 for a catalog lookup that failed (logged by the catalog), as
+/// `/api/v2/instruments/:id` answers it: never taken for keys the catalog
+/// has no row for.
+fn catalog_failed(_: sqlx::Error) -> Fail {
+    Fail::Server("could not read the instrument catalog")
+}
+
 /// IST `YYYY-MM-DD HH:MM:SS` of `now`, as the user tables stamp rows.
 fn stamp(now: DateTime<FixedOffset>) -> String {
     now.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -197,15 +208,16 @@ fn stamp(now: DateTime<FixedOffset>) -> String {
 /// Every key the catalog resolved is marked wanted on the hub (the default
 /// `idx|` keys resolve to the index rows); a kept key it has no row for
 /// is answered without one and not wanted, so the poller never asks Kotak
-/// for a contract that is gone.
-async fn priced(deps: &Deps<'_>, lists: Vec<ListRow>, items: Vec<ItemRow>, now: DateTime<FixedOffset>) -> Vec<WatchlistOut> {
+/// for a contract that is gone. [`Fail::Server`] when the catalog could
+/// not be read: every row would otherwise look expired.
+async fn priced(deps: &Deps<'_>, lists: Vec<ListRow>, items: Vec<ItemRow>, now: DateTime<FixedOffset>) -> Result<Vec<WatchlistOut>, Fail> {
     let mut keys: Vec<String> = Vec::new();
     for item in &items {
         if !keys.contains(&item.key) {
             keys.push(item.key.clone());
         }
     }
-    let rows = deps.catalog.rows_for_keys(&keys).await;
+    let rows = deps.catalog.rows_for_keys(&keys).await.map_err(catalog_failed)?;
     let now_ms = now.timestamp_millis();
     let mut by_list: HashMap<i64, Vec<ItemOut>> = HashMap::new();
     for item in items {
@@ -221,7 +233,7 @@ async fn priced(deps: &Deps<'_>, lists: Vec<ListRow>, items: Vec<ItemRow>, now: 
         });
     }
     deps.hub.want(keys.into_iter().filter(|key| rows.contains_key(key)));
-    lists
+    Ok(lists
         .into_iter()
         .map(|list| WatchlistOut {
             items: by_list.remove(&list.id).unwrap_or_default(),
@@ -230,16 +242,23 @@ async fn priced(deps: &Deps<'_>, lists: Vec<ListRow>, items: Vec<ItemRow>, now: 
             position: list.position,
             created_at: list.created_at,
         })
-        .collect()
+        .collect())
 }
 
 /// Every list of `user_id` with its items priced, as of `now`. A person
-/// with no list yet gets the default one first.
+/// with no list yet gets the default one first. Only then is trades.db
+/// written: the front end asks every 2 s, and a plain read under WAL never
+/// waits for the write lock, where [`watchlists::ensure_default`]'s
+/// `BEGIN IMMEDIATE` would queue each poll behind the engine's
+/// `db_writer` and the paper desk (and fail it after `busy_timeout`).
 pub async fn all_answer(deps: &Deps<'_>, user_id: i64, now: DateTime<FixedOffset>) -> Result<AllOut, Fail> {
-    if watchlists::ensure_default(deps.pool, user_id, &stamp(now)).await.map_err(read_failed)? {
-        tracing::info!(user_id, "Default watchlist created");
+    let mut lists = watchlists::lists(deps.pool, user_id).await.map_err(read_failed)?;
+    if lists.is_empty() {
+        if watchlists::ensure_default(deps.pool, user_id, &stamp(now)).await.map_err(read_failed)? {
+            tracing::info!(user_id, "Default watchlist created");
+        }
+        lists = watchlists::lists(deps.pool, user_id).await.map_err(read_failed)?;
     }
-    let lists = watchlists::lists(deps.pool, user_id).await.map_err(read_failed)?;
     let items = watchlists::items(deps.pool, user_id).await.map_err(read_failed)?;
     Ok(AllOut {
         at: now.timestamp_millis(),
@@ -247,7 +266,7 @@ pub async fn all_answer(deps: &Deps<'_>, user_id: i64, now: DateTime<FixedOffset
         max_lists: MAX_LISTS,
         max_items: MAX_ITEMS,
         max_name_chars: MAX_NAME_CHARS,
-        watchlists: priced(deps, lists, items, now).await,
+        watchlists: priced(deps, lists, items, now).await?,
     })
 }
 
@@ -255,7 +274,7 @@ pub async fn all_answer(deps: &Deps<'_>, user_id: i64, now: DateTime<FixedOffset
 pub async fn one_answer(deps: &Deps<'_>, user_id: i64, id: i64, now: DateTime<FixedOffset>) -> Result<OneOut, Fail> {
     let list = watchlists::list(deps.pool, user_id, id).await.map_err(read_failed)?.ok_or(Fail::NotFound("no such watchlist"))?;
     let items = watchlists::items_of(deps.pool, user_id, id).await.map_err(read_failed)?;
-    let mut lists = priced(deps, vec![list], items, now).await;
+    let mut lists = priced(deps, vec![list], items, now).await?;
     Ok(OneOut { at: now.timestamp_millis(), market_open: eod::open_at(now), watchlist: lists.remove(0) })
 }
 
@@ -306,15 +325,33 @@ fn too_many(count: usize) -> Fail {
     Fail::Bad(format!("at most {MAX_ITEMS} instruments in a watchlist ({count} given)"))
 }
 
+/// The key of `held` (a list's keys, as stored) that `key` names, typed
+/// as stored or as the catalog id of a cash row or contract
+/// (`nse_fo:51386` for `nse_fo|51386`, the conversion `rows_for_keys`
+/// makes), without asking the catalog: a contract it has dropped (an
+/// expired weekly) is still found. An index's id (`nse_cm:Nifty 50`) is
+/// not its key (`idx|NIFTY 50`), so it is left to the catalog.
+fn held_key<'a>(held: &'a [String], key: &str) -> Option<&'a String> {
+    held.iter().find(|h| *h == key).or_else(|| {
+        let (segment, token) = key.split_once(':').filter(|(s, t)| !key.contains('|') && !s.is_empty() && !t.is_empty())?;
+        let stored = format!("{segment}|{token}");
+        held.iter().find(|h| **h == stored)
+    })
+}
+
 /// The price-map key of each of `keys` (a price-map key or a catalog id,
-/// as `clean_keys` left them), in order and distinct; [`Fail::UnknownKeys`]
-/// naming every key the catalog has no row for, else [`Fail::Bad`] past
-/// [`MAX_ITEMS`] distinct instruments — counted here, after an id and its
-/// key have collapsed into one, so 51 typed keys naming 50 instruments
-/// are 50.
-async fn resolve(catalog: &Catalog, keys: &[String]) -> Result<Vec<String>, Fail> {
-    let rows = catalog.rows_for_keys(keys).await;
-    let unknown: Vec<String> = keys.iter().filter(|k| !rows.contains_key(*k)).cloned().collect();
+/// as `clean_keys` left them), in order and distinct: a key the list
+/// already holds (`held`, in either form, [`held_key`]) as it is stored,
+/// every other one by the catalog's row for it. [`Fail::UnknownKeys`]
+/// naming every key not held that the catalog has no row for, else
+/// [`Fail::Bad`] past [`MAX_ITEMS`] distinct instruments — counted here,
+/// after an id and its key have collapsed into one, so 51 typed keys
+/// naming 50 instruments are 50. [`Fail::Server`] when the catalog could
+/// not be read.
+async fn resolve(catalog: &Catalog, keys: &[String], held: &[String]) -> Result<Vec<String>, Fail> {
+    let fresh: Vec<String> = keys.iter().filter(|k| held_key(held, k).is_none()).cloned().collect();
+    let rows = if fresh.is_empty() { HashMap::new() } else { catalog.rows_for_keys(&fresh).await.map_err(catalog_failed)? };
+    let unknown: Vec<String> = fresh.iter().filter(|k| !rows.contains_key(*k)).cloned().collect();
     if !unknown.is_empty() {
         if catalog.status().day.is_none() {
             tracing::warn!(?unknown, "v2 watchlists: keys refused — the instrument catalog is not built (the `search` switch builds it)");
@@ -323,9 +360,12 @@ async fn resolve(catalog: &Catalog, keys: &[String]) -> Result<Vec<String>, Fail
     }
     let mut out: Vec<String> = Vec::new();
     for key in keys {
-        let ws_key = &rows[key].ws_key;
-        if !out.contains(ws_key) {
-            out.push(ws_key.clone());
+        let kept = match held_key(held, key) {
+            Some(stored) => stored,
+            None => &rows[key].ws_key,
+        };
+        if !out.contains(kept) {
+            out.push(kept.clone());
         }
     }
     if out.len() > MAX_ITEMS {
@@ -373,9 +413,18 @@ pub async fn delete_answer(deps: &Deps<'_>, user_id: i64, id: i64) -> Result<(),
     Ok(())
 }
 
-/// `keys`, resolved against the catalog, as the whole of list `id`.
+/// The keys list `id` of `user_id` holds now, as stored; none for a list
+/// that is not theirs (the store's write then says so).
+async fn held(deps: &Deps<'_>, user_id: i64, id: i64) -> Result<Vec<String>, Fail> {
+    Ok(watchlists::items_of(deps.pool, user_id, id).await.map_err(read_failed)?.into_iter().map(|item| item.key).collect())
+}
+
+/// `keys` as the whole of list `id`: those it holds already kept as they
+/// are (so an expired contract in it never blocks a reorder), the new ones
+/// resolved against the catalog.
 pub async fn put_items_answer(deps: &Deps<'_>, user_id: i64, id: i64, keys: &[String], now: DateTime<FixedOffset>) -> Result<OneOut, Fail> {
-    let keys = resolve(deps.catalog, &clean_keys(keys)?).await?;
+    let keys = clean_keys(keys)?;
+    let keys = resolve(deps.catalog, &keys, &held(deps, user_id, id).await?).await?;
     watchlists::replace_items(deps.pool, user_id, id, &keys, &stamp(now)).await?;
     one_answer(deps, user_id, id, now).await
 }
@@ -383,21 +432,25 @@ pub async fn put_items_answer(deps: &Deps<'_>, user_id: i64, id: i64, keys: &[St
 /// `key` (a price-map key or a catalog id) added at the end of list `id`;
 /// `false` when the list held it already.
 pub async fn add_item_answer(deps: &Deps<'_>, user_id: i64, id: i64, key: &str, now: DateTime<FixedOffset>) -> Result<(bool, OneOut), Fail> {
-    let keys = resolve(deps.catalog, &clean_keys(&[key.to_string()])?).await?;
+    let keys = resolve(deps.catalog, &clean_keys(&[key.to_string()])?, &[]).await?;
     let Some(key) = keys.first() else { return Err(Fail::Bad("key is required".into())) };
     let added = watchlists::add_item(deps.pool, user_id, id, key, &stamp(now)).await?;
     Ok((added, one_answer(deps, user_id, id, now).await?))
 }
 
-/// `key` taken out of list `id`. A key the catalog knows is removed under
-/// its price-map key, whichever form was given; one it no longer knows (an
-/// expired contract) under the key as typed, so it can always be removed.
+/// `key` taken out of list `id`. A key the list holds is removed as it is
+/// stored, typed as its price-map key or as its catalog id, without asking
+/// the catalog, so an expired contract can always be removed; any other is
+/// removed under the price-map key the catalog gives it (an index's id),
+/// and one the catalog does not know either is not in the list.
 pub async fn remove_item_answer(deps: &Deps<'_>, user_id: i64, id: i64, key: &str, now: DateTime<FixedOffset>) -> Result<OneOut, Fail> {
     let cleaned = clean_keys(&[key.to_string()])?;
     let Some(typed) = cleaned.first() else { return Err(Fail::Bad("key is required".into())) };
-    let key = match resolve(deps.catalog, &cleaned).await {
+    let key = match resolve(deps.catalog, &cleaned, &held(deps, user_id, id).await?).await {
         Ok(keys) => keys.into_iter().next().unwrap_or_else(|| typed.clone()),
-        Err(_) => typed.clone(),
+        // Not held and unknown: the store's answer says whose list it is.
+        Err(Fail::UnknownKeys(_)) => typed.clone(),
+        Err(e) => return Err(e),
     };
     if !watchlists::remove_item(deps.pool, user_id, id, &key).await? {
         return Err(Fail::NotFound("that instrument is not in this watchlist"));
@@ -668,7 +721,7 @@ mod tests {
             for token in [874001, 874002, 874003, 875001] {
                 candidates.push(format!("bse_fo|{token}"));
             }
-            let rows = self.catalog.rows_for_keys(&candidates).await;
+            let rows = self.catalog.rows_for_keys(&candidates).await.unwrap();
             let mut known: Vec<String> = Vec::new();
             for key in &candidates {
                 if let Some(row) = rows.get(key) {
@@ -802,6 +855,157 @@ mod tests {
         for key in ["nse_fo|999999", "junk", "nse_cm|Nifty 50", "nse_fo|1"] {
             assert!(!watched.iter().any(|k| k == key), "{key} has no catalog row, yet is wanted");
         }
+    }
+
+    /// Puts `key` at the end of list `id` straight into the table, as a key
+    /// the catalog resolved once and has since dropped (an expired weekly).
+    async fn hold_expired(pool: &SqlitePool, id: i64, key: &str, added_at: &str) {
+        sqlx::query(
+            "INSERT INTO user_watchlist_items (watchlist_id, key, position, added_at)
+             SELECT ?1, ?2, COALESCE((SELECT MAX(position) + 1 FROM user_watchlist_items WHERE watchlist_id = ?1), 0), ?3",
+        )
+        .bind(id)
+        .bind(key)
+        .bind(added_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A list holding a contract the catalog has dropped can still be
+    /// reordered (the held key is kept as it is, typed as its key or its
+    /// catalog id) and that row removed by either form; a new unknown key
+    /// is still refused, named alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_list_holding_an_expired_contract_can_be_reordered_and_emptied() {
+        let noon = ist(2026, 11, 4, 12, 0);
+        let world = World::new("expired", Arc::new(DashMap::new()), noon).await;
+        let deps = world.deps();
+        let id = all_answer(&deps, 7, noon).await.unwrap().watchlists[0].id;
+        hold_expired(&world.pool, id, "nse_fo|1", "2026-10-27 10:00:00").await;
+        assert_eq!(keys(&one_answer(&deps, 7, id, noon).await.unwrap().watchlist), vec!["idx|NIFTY 50", "idx|NIFTY BANK", "idx|SENSEX", "nse_fo|1"]);
+
+        // A Move: every key of the list, the expired one among them, in a new order.
+        let moved: Vec<String> = ["nse_fo|1", "idx|SENSEX", "idx|NIFTY 50", "idx|NIFTY BANK"].iter().map(|k| k.to_string()).collect();
+        let out = put_items_answer(&deps, 7, id, &moved, noon).await.unwrap();
+        assert_eq!(keys(&out.watchlist), moved.iter().map(String::as_str).collect::<Vec<_>>());
+        let expired = &out.watchlist.items[0];
+        assert!(expired.instrument.is_none() && expired.quote.is_none());
+        assert_eq!((expired.position, expired.added_at.as_str()), (0, "2026-10-27 10:00:00"), "kept as it was");
+
+        // Held keys typed as catalog ids name the held rows; a new one by id is resolved.
+        let typed: Vec<String> = ["idx|NIFTY 50", "nse_fo:1", "nse_cm:2885", "idx|SENSEX"].iter().map(|k| k.to_string()).collect();
+        let out = put_items_answer(&deps, 7, id, &typed, noon).await.unwrap();
+        assert_eq!(keys(&out.watchlist), vec!["idx|NIFTY 50", "nse_fo|1", "nse_cm|2885", "idx|SENSEX"]);
+        assert_eq!(out.watchlist.items[2].instrument.as_ref().map(|r| r.symbol.as_str()), Some("RELIANCE"));
+
+        // A new key the catalog has no row for is still refused, named
+        // alone (never the held one), and nothing changes.
+        let with_new: Vec<String> = ["nse_fo|1", "nse_fo|999999", "idx|NIFTY 50", "nse_cm|2885", "idx|SENSEX"].iter().map(|k| k.to_string()).collect();
+        assert_eq!(put_items_answer(&deps, 7, id, &with_new, noon).await.unwrap_err(), Fail::UnknownKeys(vec!["nse_fo|999999".into()]));
+        assert_eq!(keys(&one_answer(&deps, 7, id, noon).await.unwrap().watchlist), vec!["idx|NIFTY 50", "nse_fo|1", "nse_cm|2885", "idx|SENSEX"]);
+        // Someone else's list does not hold it: there it is unknown.
+        assert_eq!(put_items_answer(&deps, 8, id, &["nse_fo|1".to_string()], noon).await.unwrap_err(), Fail::UnknownKeys(vec!["nse_fo|1".into()]));
+
+        // Once left out, a dropped contract cannot come back.
+        let out = put_items_answer(&deps, 7, id, &["idx|NIFTY 50".to_string(), "nse_cm|2885".to_string()], noon).await.unwrap();
+        assert_eq!(keys(&out.watchlist), vec!["idx|NIFTY 50", "nse_cm|2885"]);
+        let back: Vec<String> = ["idx|NIFTY 50", "nse_cm|2885", "nse_fo|1"].iter().map(|k| k.to_string()).collect();
+        assert_eq!(put_items_answer(&deps, 7, id, &back, noon).await.unwrap_err(), Fail::UnknownKeys(vec!["nse_fo|1".into()]));
+
+        // Removed by its catalog id: the row is kept as `nse_fo|51999`, the
+        // id typed is `nse_fo:51999`, and the catalog has neither.
+        hold_expired(&world.pool, id, "nse_fo|51999", "2026-10-27 10:00:00").await;
+        let out = remove_item_answer(&deps, 7, id, "nse_fo:51999", noon).await.unwrap();
+        assert_eq!(keys(&out.watchlist), vec!["idx|NIFTY 50", "nse_cm|2885"]);
+        assert_eq!(remove_item_answer(&deps, 7, id, "nse_fo:51999", noon).await.unwrap_err(), Fail::NotFound("that instrument is not in this watchlist"));
+        // A live instrument by its id, and an index by its (non-key) id.
+        let out = remove_item_answer(&deps, 7, id, "nse_cm:2885", noon).await.unwrap();
+        assert_eq!(keys(&out.watchlist), vec!["idx|NIFTY 50"]);
+        let out = remove_item_answer(&deps, 7, id, "nse_cm:Nifty 50", noon).await.unwrap();
+        assert!(out.watchlist.items.is_empty());
+        // Through the route, with the id in the path.
+        hold_expired(&world.pool, id, "nse_fo|51999", "2026-10-27 10:00:00").await;
+        let flags = Arc::new(RwLock::new(FeatureFlags { watchlists: true, ..Default::default() }));
+        let app = world.app(flags, Identity::User { user_id: 7 });
+        let uri = format!("/api/v2/watchlists/{id}/items/nse_fo:51999");
+        let response = app.oneshot(Request::builder().method("DELETE").uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_json(response).await["watchlist"]["items"].as_array().unwrap().is_empty());
+
+        // The dropped contracts were never polled.
+        let watched = world.hub.watched_keys();
+        for key in ["nse_fo|1", "nse_fo|51999"] {
+            assert!(!watched.iter().any(|k| k == key), "{key} has no catalog row, yet is wanted");
+        }
+    }
+
+    /// The front end asks for every list every 2 s: once a person has a
+    /// list, that read never waits for trades.db's write lock, which the
+    /// engine's `db_writer` or the paper desk may hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poll_never_waits_for_the_write_lock() {
+        let noon = ist(2026, 11, 4, 12, 0);
+        let world = World::new("poll-lock", Arc::new(DashMap::new()), noon).await;
+        let deps = world.deps();
+        let id = all_answer(&deps, 7, noon).await.unwrap().watchlists[0].id;
+
+        // Another connection is mid-write (the busy timeout is 5 s).
+        let mut writer = world.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE wallet SET balance = balance WHERE id = 1").execute(&mut *writer).await.unwrap();
+        let polled = tokio::time::timeout(std::time::Duration::from_secs(2), all_answer(&deps, 7, noon)).await;
+        let out = polled.expect("the poll waited for the write lock").unwrap();
+        assert_eq!((out.watchlists.len(), out.watchlists[0].id), (1, id));
+        assert_eq!(keys(&out.watchlists[0]), vec!["idx|NIFTY 50", "idx|NIFTY BANK", "idx|SENSEX"]);
+        writer.rollback().await.unwrap();
+
+        // A first call still makes the default list, once.
+        let first = all_answer(&deps, 8, noon).await.unwrap();
+        assert_eq!((first.watchlists.len(), first.watchlists[0].name.as_str()), (1, "Watchlist 1"));
+        assert_eq!(all_answer(&deps, 8, noon).await.unwrap().watchlists[0].id, first.watchlists[0].id);
+    }
+
+    /// A catalog database that cannot be read is a 500 in general terms:
+    /// never "unknown keys" for instruments it has, nor rows shown as if
+    /// their instrument had expired. A held key still comes out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broken_catalog_is_a_500_never_unknown_keys() {
+        let noon = ist(2026, 11, 4, 12, 0);
+        let world = World::new("broken-catalog", Arc::new(DashMap::new()), noon).await;
+        let deps = world.deps();
+        let id = all_answer(&deps, 7, noon).await.unwrap().watchlists[0].id;
+        add_item_answer(&deps, 7, id, "nse_fo|41222", noon).await.unwrap();
+
+        world.catalog.close_db_for_tests().await;
+        let broken = Fail::Server("could not read the instrument catalog");
+        assert_eq!(put_items_answer(&deps, 7, id, &["nse_fo|41223".to_string()], noon).await.unwrap_err(), broken);
+        assert_eq!(add_item_answer(&deps, 7, id, "nse_fo:41223", noon).await.unwrap_err(), broken);
+        assert_eq!(remove_item_answer(&deps, 7, id, "nse_fo:41223", noon).await.unwrap_err(), broken, "not held: only the catalog can say");
+        assert_eq!(all_answer(&deps, 7, noon).await.unwrap_err(), broken);
+        assert_eq!(one_answer(&deps, 7, id, noon).await.unwrap_err(), broken);
+        let held: Vec<String> = watchlists::items_of(&world.pool, 7, id).await.unwrap().into_iter().map(|i| i.key).collect();
+        assert_eq!(held, vec!["idx|NIFTY 50", "idx|NIFTY BANK", "idx|SENSEX", "nse_fo|41222"], "nothing changed");
+
+        // Through the route: a 500 with the general message.
+        let flags = Arc::new(RwLock::new(FeatureFlags { watchlists: true, ..Default::default() }));
+        let app = world.app(flags, Identity::User { user_id: 7 });
+        let response = app.clone().oneshot(Request::builder().method("GET").uri("/api/v2/watchlists").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(response).await["error"], "could not read the instrument catalog");
+        let put = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v2/watchlists/{id}/items"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"keys": ["nse_fo|41223"]}"#))
+            .unwrap();
+        let response = app.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_json(response).await.get("unknown").is_none());
+
+        // The held contract comes out without the catalog; what is left
+        // (indices, from the search list in memory) is answered.
+        let out = remove_item_answer(&deps, 7, id, "nse_fo|41222", noon).await.unwrap();
+        assert_eq!(keys(&out.watchlist), vec!["idx|NIFTY 50", "idx|NIFTY BANK", "idx|SENSEX"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

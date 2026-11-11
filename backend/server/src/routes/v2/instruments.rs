@@ -218,7 +218,7 @@ pub fn parse_keys(raw: &str) -> Result<Vec<String>, String> {
     Ok(keys)
 }
 
-/// The quotes for `keys` as of `now`, feed first: a key the catalog knows
+/// The quotes for `keys` as of `now`: a key the catalog knows
 /// is answered from the hub's best source and marked wanted; one it does
 /// not know is listed as unknown and never asked for.
 pub async fn quotes_answer(catalog: &Catalog, hub: &QuoteHub, keys: Vec<String>, now: DateTime<FixedOffset>) -> QuotesOut {
@@ -242,9 +242,10 @@ pub async fn quotes_answer(catalog: &Catalog, hub: &QuoteHub, keys: Vec<String>,
     QuotesOut { at: now.timestamp_millis(), market_open: eod::open_at(now), quotes, missing, unknown }
 }
 
-/// `GET /api/v2/quotes?keys=` — the quotes for up to 60 price-map keys,
-/// the feed's tick first, then Kotak's REST quotes, Upstox while Kotak is
-/// down, the day's close after hours. The keys are marked wanted, so the
+/// `GET /api/v2/quotes?keys=` — the quotes for up to 60 price-map keys:
+/// the feed's tick first for an equity or index, Kotak's REST quotes (a
+/// contract's only live source), Upstox while Kotak is down, the day's
+/// close after hours. The keys are marked wanted, so the
 /// hub polls them for the next 15 s.
 pub async fn quotes_handler(State(state): State<AppState>, Query(q): Query<QuotesQuery>) -> Response {
     if let Some(off) = gate(&state).await {
@@ -427,14 +428,15 @@ mod tests {
             symbols(&out.options),
             vec!["RELIANCE26NOV1380CE", "RELIANCE26NOV1380PE", "RELIANCE26NOV1400CE", "RELIANCE26NOV1400PE", "RELIANCE26NOV1420CE", "RELIANCE26NOV1420PE"]
         );
-        // A contract on the feed is priced like any other: not before the
-        // poller has read it, so a held contract never stands out.
+        // A contract on the feed is priced like any other, from REST alone:
+        // not before the poller has read it, and then at REST's price and
+        // time, so a held contract never stands out.
         assert!(out.options[0].quote.is_none(), "the 1380 CE is on the feed, but not polled yet");
         assert!(out.options[1].quote.is_none(), "no source has the 1380 PE yet");
         hub.put_rest(Quote::bare("nse_fo|41226", 12.4, ms(noon) - 1_000, Source::Rest));
         let out = search_answer(&catalog, &hub, "reliance", PER_GROUP, noon).await;
         let ce = out.options[0].quote.as_ref().unwrap();
-        assert_eq!((ce.ltp, ce.source), (12.5, Source::Feed), "polled once, the feed's fresher tick gives the price");
+        assert_eq!((ce.ltp, ce.source, ce.at), (12.4, Source::Rest, ms(noon) - 1_000), "polled once, REST's read gives the price, never the feed's fresher tick");
         assert_eq!(serde_json::to_value(ce).unwrap()["source"], "live");
         assert_eq!(symbols(&out.futures), vec!["RELIANCE26NOVFUT", "RELIANCE26DECFUT"]);
         assert!(out.futures.iter().all(|r| r.quote.is_none()));
@@ -552,7 +554,7 @@ mod tests {
         assert_eq!(watched, vec!["idx|NIFTY 50", "nse_fo|51386"]);
         hub.put_rest(Quote::bare("nse_fo|51386", 149.0, ms(noon) - 1_000, Source::Rest));
         let page = instrument_answer(&catalog, &hub, "nse_fo:51386", noon).await.unwrap().unwrap();
-        assert_eq!(page.quote.as_ref().map(|q| q.ltp), Some(150.0));
+        assert_eq!(page.quote.as_ref().map(|q| q.ltp), Some(149.0), "REST's read, not the feed's 150");
         // A cash row is its own spot: no second quote, one key wanted.
         let page = instrument_answer(&catalog, &hub, "nse_cm:2885", noon).await.unwrap().unwrap();
         assert!(page.spot.is_none() && page.quote.is_none());

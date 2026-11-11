@@ -17,6 +17,7 @@ import { useEngineErrors, useStatus } from './shell/useStatus';
 import { Banner } from './ui/Banner';
 import { Settings } from './settings/Settings';
 import { UserSettings } from './settings/UserSettings';
+import { Logs } from './system/Logs';
 import { System } from './system/System';
 import { Segment } from './ui/Segment';
 import { useNavHidden } from './lib/layout';
@@ -108,6 +109,8 @@ export default function App() {
         const page =
           screen === 'system' ? (
             <System serverBase={serverBase} desktop={desktop} health={s?.health ?? null} marketOpen={s?.market_open ?? false} />
+          ) : screen === 'logs' ? (
+            <Logs serverBase={serverBase} desktop={desktop} />
           ) : screen === 'admin' ? (
             <Admin serverBase={serverBase} desktop={desktop} />
           ) : canReadOwner ? (

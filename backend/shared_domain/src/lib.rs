@@ -1570,6 +1570,12 @@ pub enum DbWriteMessage {
     /// An order update from Kotak's push stream, merged into its order's
     /// timing row (analytics only).
     OrderUpdate(OrderUpdate),
+    /// When the engine's own order-book poll first saw an order finished,
+    /// this server's clock (analytics only). The first one is kept.
+    OrderSeen {
+        order_no: String,
+        at_ms: i64,
+    },
     TelegramMessage {
         chat_id: i64,
         chat_title: Option<String>,

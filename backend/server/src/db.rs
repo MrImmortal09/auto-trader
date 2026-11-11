@@ -291,6 +291,8 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     ).execute(&pool).await.unwrap();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_order_timings_day ON order_timings (day)")
         .execute(&pool).await.unwrap();
+    // When the engine's own order-book poll first saw the order finished.
+    ensure_column(&pool, "ALTER TABLE order_timings ADD COLUMN seen_at_ms INTEGER").await;
 
     // The permanent 1-minute archive (see `candles::archive`): the indices and
     // every listed future on them, with volume and OI, never pruned, so a past
@@ -1187,6 +1189,18 @@ pub async fn db_writer(
                     telemetry::db_write_error("order_update");
                 }
             }
+            DbWriteMessage::OrderSeen { order_no, at_ms } => {
+                // Only an order this table already has: the first time kept.
+                if let Err(e) = sqlx::query("UPDATE order_timings SET seen_at_ms = COALESCE(seen_at_ms, ?) WHERE order_no = ?")
+                    .bind(at_ms)
+                    .bind(&order_no)
+                    .execute(&pool)
+                    .await
+                {
+                    tracing::error!(%order_no, error = %e, "DB order seen update");
+                    telemetry::db_write_error("order_seen");
+                }
+            }
             DbWriteMessage::ArchiveCandles { symbol, candles } => {
                 if let Err(e) = write_archived_candles(&pool, &symbol, &candles).await {
                     // A later batch that lands moves the symbol's last archived
@@ -1380,6 +1394,8 @@ pub struct OrderTimingRow {
     pub exchange_epoch_s: Option<i64>,
     pub exchange_confirm: Option<String>,
     pub order_time: Option<String>,
+    /// When the engine's own order-book poll first saw it finished.
+    pub seen_at_ms: Option<i64>,
 }
 
 /// The day's orders, newest first.
@@ -1387,7 +1403,7 @@ pub async fn load_order_timings(pool: &SqlitePool, day: &str) -> Result<Vec<Orde
     sqlx::query_as::<_, OrderTimingRow>(
         "SELECT order_no, trading_symbol, side, order_type, qty, price, trigger_price, sent_at_ms, replied_at_ms, error,
                 status, filled_qty, avg_price, reject_reason, first_update_ms, accepted_at_ms, first_fill_ms, filled_at_ms,
-                kotak_received_ns, exchange_epoch_s, exchange_confirm, order_time
+                kotak_received_ns, exchange_epoch_s, exchange_confirm, order_time, seen_at_ms
          FROM order_timings WHERE day = ?
          ORDER BY COALESCE(sent_at_ms, first_update_ms) DESC, id DESC",
     )
@@ -1788,6 +1804,11 @@ mod order_timing_tests {
             DbWriteMessage::OrderUpdate(update("1", T0 + 150, "open", 0, None)),
             DbWriteMessage::OrderUpdate(update("1", T0 + 300, "open", 25, Some(120.0))),
             DbWriteMessage::OrderUpdate(update("1", T0 + 420, "complete", 75, Some(120.5))),
+            // The engine's poll saw it finished; a later sighting doesn't move it.
+            DbWriteMessage::OrderSeen { order_no: "1".into(), at_ms: T0 + 1_200 },
+            DbWriteMessage::OrderSeen { order_no: "1".into(), at_ms: T0 + 3_200 },
+            // An order the table never had stays out of it.
+            DbWriteMessage::OrderSeen { order_no: "99".into(), at_ms: T0 + 1_300 },
             // Order 2: Kotak's push beats the send tap to the writer.
             DbWriteMessage::OrderUpdate(update("2", T0 + 5_250, "complete", 75, Some(99.0))),
             DbWriteMessage::OrderSent(sent(Some("2"), T0 + 5_000, None)),
@@ -1813,6 +1834,7 @@ mod order_timing_tests {
         assert_eq!((one.first_update_ms, one.accepted_at_ms, one.first_fill_ms, one.filled_at_ms), (Some(T0 + 150), Some(T0 + 150), Some(T0 + 300), Some(T0 + 420)));
         assert_eq!((one.status.as_deref(), one.filled_qty, one.avg_price, one.qty), (Some("complete"), Some(75), Some(120.5), Some(75)));
         assert_eq!(one.exchange_epoch_s, Some((T0 + 420) / 1000));
+        assert_eq!((one.seen_at_ms, two.seen_at_ms), (Some(T0 + 1_200), None));
         assert!(load_order_timings(&pool, "2026-11-08").await.unwrap().is_empty());
         pool.close().await;
     }
