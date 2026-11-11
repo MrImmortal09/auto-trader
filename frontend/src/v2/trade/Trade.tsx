@@ -292,8 +292,14 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // A stock saved as the ladder's underlying streams as NIFTY while stocks
   // are off: the server would answer NIFTY's board for it anyway.
   const ladderIndex = stocksOn === false && !isIndex(saved.index) ? 'NIFTY' : saved.index;
-  // A stock's chart saved while the switch is off shows its index instead.
-  const shownAs = (slot: Slot): Slot => (stocksOn === false && !isIndex(underlyingOf(slot.sym)) ? indexSlot('NIFTY') : slot);
+  // A stock's chart saved while the switch is off shows NIFTY instead, and
+  // an index's future its index (futures are charted behind the switch too).
+  const shownAs = (slot: Slot): Slot => {
+    if (stocksOn !== false) return slot;
+    const name = underlyingOf(slot.sym);
+    if (!isIndex(name)) return indexSlot('NIFTY');
+    return slot.sym.kind === 'future' ? { ...slot, sym: { kind: 'index', index: name } } : slot;
+  };
   // Each underlying on screen: its listed expiries, before the stream opens.
   const shownSlots = (desktop ? saved.slots.slice(0, saved.layout) : saved.slots.slice(0, 1)).map(shownAs);
 

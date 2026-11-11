@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { ChartLine, Plus, Search as SearchIcon, X } from 'lucide-react';
-import { chartSymOf, type OpenHow as InstrumentHow } from '../lib/openInstrument';
+import { chartOffWhy, chartSymOf, type OpenHow as InstrumentHow } from '../lib/openInstrument';
 import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
@@ -255,7 +255,7 @@ export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
                           type="button"
                           tabIndex={-1}
                           aria-label={chart ? `Chart ${rowTitle(row)}` : 'Chart'}
-                          title={chart ? 'Open the chart' : 'Stock charts are switched off'}
+                          title={chart ? 'Open the chart' : chartOffWhy(row, stocksOn)}
                           disabled={!chart}
                           onClick={(e) => {
                             e.stopPropagation();

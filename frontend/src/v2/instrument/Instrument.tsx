@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { ArrowLeft, ChartLine, Plus } from 'lucide-react';
 import { getInstrument } from '../lib/api';
 import { dayLabel, price, shortDate, signedPct, signedPrice, todayIst, toneOf, whole } from '../lib/format';
-import { chartSymOf, ladderOf, tradeIndexOf, type StockChip, type TradeIntent } from '../lib/openInstrument';
+import { chartOffWhy, chartSymOf, ladderOf, tradeIndexOf, type StockChip, type TradeIntent } from '../lib/openInstrument';
 import type { InstrumentKind, InstrumentRow, Quote } from '../lib/types';
 import { usePoll } from '../lib/usePoll';
 import { seedQuotes, useQuotes } from '../lib/useQuotes';
@@ -120,7 +120,7 @@ export function Instrument({ serverBase, desktop, id, onBack, onOpenTrade, onAdd
   // from its cash row (`underlying_key`).
   const stock: StockChip | undefined = index ? undefined : { symbol: data.underlying, key: data.underlying_key ?? (data.kind === 'EQ' ? data.ws_key : null), fo: data.has_fo };
   const intent = (what: 'chart' | 'chain'): TradeIntent => (what === 'chart' ? { chart: chart ?? undefined, ladder: ladder ?? undefined, stock } : { ladder: ladder ?? undefined, stock });
-  const chartOff = chart ? undefined : index ? 'No chart for this contract' : stocksOn ? 'No chart for this listing' : 'Stock charts are switched off';
+  const chartOff = chart ? undefined : chartOffWhy(data, stocksOn);
   const chainOff = ladder ? undefined : !stocksOn && !index ? 'Stock charts are switched off' : 'No options listed for this stock';
   const closed = quote?.source === 'close';
   const yearRange = quote?.year_low != null && quote?.year_high != null ? `${price(quote.year_low)} – ${price(quote.year_high)}` : null;

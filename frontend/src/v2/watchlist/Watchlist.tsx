@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { readStored, writeStored } from '../../lib/execute';
 import type { Sent } from '../lib/api';
 import { dayLabel, plural, price, signedPct, signedPrice, toneOf } from '../lib/format';
-import { chartSymOf, ladderOf, stockChipOf, targetOf, type TradeIntent } from '../lib/openInstrument';
+import { chartOffWhy, chartSymOf, ladderOf, stockChipOf, targetOf, type TradeIntent } from '../lib/openInstrument';
 import type { Quote, Watchlist as WatchlistData, WatchlistAnswer } from '../lib/types';
 import { useQuotes } from '../lib/useQuotes';
 import { useTickFlash } from '../lib/useTickFlash';
@@ -229,6 +229,7 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, onOpenTrade, 
                           else onOpenInstrument(target.instrument);
                         },
                         onChart: chart ? () => onOpenTrade({ chart, ladder: ladder ?? undefined, stock: chip }) : null,
+                        chartWhy: row && !chart ? chartOffWhy(row, stocksOn) : undefined,
                         onChain: ladder ? () => onOpenTrade({ ladder, stock: chip }) : null,
                         chainWhy: stocksOn && row && !row.has_fo ? 'No options listed for this stock' : undefined,
                         onBuy: indexLadder ? () => onOpenTrade({ ladder: indexLadder }) : null,

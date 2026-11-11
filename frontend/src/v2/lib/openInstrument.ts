@@ -5,9 +5,10 @@ import type { InstrumentRow } from './types';
 
 // Where a search result, a watchlist row or an instrument page sends you.
 // The Trade screen charts the six indices and their options and ladders the
-// indices; with the `stock_charts` switch on (`stocksOn`), any stock too —
-// its own chart, its futures and options, and the ladder of any F&O stock.
-// Everything else opens its instrument page.
+// indices; with the `stock_charts` switch on (`stocksOn`), any future too
+// (an index's or a stock's) and any stock — its own chart, its futures and
+// options, and the ladder of any F&O stock. Everything else opens its
+// instrument page.
 
 /** The stock the Trade screen shows as a seventh tab beside the six indices:
  * the one last chosen from a search, a watchlist row or an instrument page.
@@ -37,12 +38,13 @@ export function tradeIndexOf(row: Pick<InstrumentRow, 'kind' | 'symbol' | 'under
 type RowFacts = Pick<InstrumentRow, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike' | 'exchange' | 'has_fo' | 'ws_key'>;
 
 /**
- * The chart the Trade screen can draw for `row`: an index, an index's
- * future or option always; with `stocksOn`, a stock, a stock's future or
- * option too. A future is named by its expiry (`RELIANCE:FUT:2026-12-29`),
- * so a later month's row charts that contract, never the nearest one; a row
+ * The chart the Trade screen can draw for `row`: an index or an index's
+ * option always; with `stocksOn`, a stock, any future (an index's too) or a
+ * stock's option. Before the switch no future was charted, and with it off
+ * none is. A future is named by its expiry (`RELIANCE:FUT:2026-12-29`), so
+ * a later month's row charts that contract, never the nearest one; a row
  * without an expiry (none in the catalog) is the nearest. `null` for a
- * stock while the switch is off.
+ * stock or a future while the switch is off.
  */
 export function chartSymOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike' | 'exchange'>, stocksOn: boolean): ChartSym | null {
   const index = tradeIndexOf(row);
@@ -50,9 +52,17 @@ export function chartSymOf(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying' 
   const underlying = index ?? (stocksOn ? row.underlying : null);
   if (!underlying) return null;
   if (row.kind === 'EQ') return stocksOn ? { kind: 'equity', symbol: row.symbol, exchange: row.exchange === 'BSE' ? 'BSE' : 'NSE' } : null;
-  if (row.kind === 'FUT') return row.expiry ? { kind: 'future', index: underlying, expiry: row.expiry } : { kind: 'future', index: underlying };
+  if (row.kind === 'FUT') return stocksOn ? (row.expiry ? { kind: 'future', index: underlying, expiry: row.expiry } : { kind: 'future', index: underlying }) : null;
   if ((row.kind === 'CE' || row.kind === 'PE') && row.expiry && row.strike != null) return { kind: 'option', index: underlying, expiry: row.expiry, strike: row.strike, side: row.kind };
   return null;
+}
+
+/** Why the Trade screen can't chart `row` (`chartSymOf` gave null): the
+ * switch while it is off and would light it — "Futures charts" for an
+ * index's future, which the switch turns on too — or the row itself. */
+export function chartOffWhy(row: Pick<RowFacts, 'kind' | 'symbol' | 'underlying'>, stocksOn: boolean): string {
+  if (tradeIndexOf(row)) return !stocksOn && row.kind === 'FUT' ? 'Futures charts are switched off' : 'No chart for this contract';
+  return stocksOn ? 'No chart for this listing' : 'Stock charts are switched off';
 }
 
 /** The ladder `row` can open: its index, or with `stocksOn` its F&O stock,
@@ -84,7 +94,8 @@ export type OpenHow = 'open' | 'ladder' | 'chart' | 'page';
  * watchlist row's tap (`page`) otherwise keeps the instrument page a tap
  * away, since the row's own Chart and Chain actions reach the Trade screen.
  * Any other row: on the ladder (`ladder`) where it has one — its index at an
- * option's expiry, or while stocks are on its F&O stock — or charted
+ * option's expiry (a future's too while stocks are on), or while stocks are
+ * on its F&O stock — or charted
  * (`chart`; `open` too while stocks are on, the plan's "Enter on any search
  * row opens its chart"), with the stock tab and the ladder on its underlying
  * at a contract's expiry (an index option's chart button: its index at its
@@ -100,7 +111,8 @@ export function targetOf(row: InstrumentRow, how: OpenHow, stocksOn: boolean): {
   if (how === 'page') return page;
   const ladder = ladderOf(row, stocksOn);
   const stock = stockChipOf(row);
-  if (how === 'ladder') return ladder ? { trade: { ladder, stock } } : page;
+  // Before the switch, Shift+Enter on an index's future opened its page; it still does while it is off.
+  if (how === 'ladder') return ladder && (stocksOn || row.kind !== 'FUT') ? { trade: { ladder, stock } } : page;
   const chart = chartSymOf(row, stocksOn);
   // Before stocks, Enter on an index's option opened its page; it still does while the switch is off.
   if (chart && (how === 'chart' || stocksOn)) return { trade: { chart, ladder: ladder ?? undefined, stock } };

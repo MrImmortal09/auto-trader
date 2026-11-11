@@ -38,6 +38,8 @@ export interface RowActions {
   /** The row itself: the instrument page, or the Trade screen for an index. */
   onOpen: () => void;
   onChart: (() => void) | null;
+  /** Why there is no chart, when there is none. */
+  chartWhy?: string;
   /** The option chain: the ladder on the Trade screen, for an index or an
    * F&O stock while stocks are on. */
   onChain: (() => void) | null;
@@ -162,7 +164,7 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
           {/* The actions show on hover and on keyboard focus; the menu stays put. */}
           {live && (
             <span className="flex items-center gap-1 opacity-0 transition-opacity duration-120 group-focus-within:opacity-100 group-hover:opacity-100">
-              <button type="button" aria-label={`Chart ${title}`} title={actions.onChart ? 'Open the chart' : COMING.chart} disabled={!actions.onChart} onClick={actions.onChart ?? undefined} className={ICON_BUTTON}>
+              <button type="button" aria-label={`Chart ${title}`} title={actions.onChart ? 'Open the chart' : actions.chartWhy ?? COMING.chart} disabled={!actions.onChart} onClick={actions.onChart ?? undefined} className={ICON_BUTTON}>
                 <ChartLine size={14} />
               </button>
               <button type="button" aria-label={`Option chain for ${title}`} title={actions.onChain ? 'Open the option chain' : actions.chainWhy ?? COMING.chain} disabled={!actions.onChain} onClick={actions.onChain ?? undefined} className={ICON_BUTTON}>
@@ -228,7 +230,7 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
             </div>
             {live && (
               <div className="grid grid-cols-3 gap-2">
-                <Button size="lg" icon={<ChartLine size={18} />} disabled={!actions.onChart} title={actions.onChart ? undefined : COMING.chart} onClick={() => { setSheet(false); actions.onChart?.(); }}>
+                <Button size="lg" icon={<ChartLine size={18} />} disabled={!actions.onChart} title={actions.onChart ? undefined : actions.chartWhy ?? COMING.chart} onClick={() => { setSheet(false); actions.onChart?.(); }}>
                   Chart
                 </Button>
                 <Button size="lg" icon={<Rows3 size={18} />} disabled={!actions.onChain} title={actions.onChain ? undefined : actions.chainWhy ?? COMING.chain} onClick={() => { setSheet(false); actions.onChain?.(); }}>
