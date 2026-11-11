@@ -620,6 +620,12 @@ export interface Flags {
    * of `search`; while off the charts and ladders are the six indices' and
    * every stock control is hidden. Missing from a server older than it. */
   stock_charts?: boolean;
+  /** Stock options on users' paper books (plan Phase 4), on top of `search`
+   * and `stock_charts`: `POST /api/v2/me/buy` takes an NSE stock's CE/PE, one
+   * tap as an index option's. While off, the ladder's Buy on a stock's row is
+   * disabled and says so. The owner's live buy stays index-only whatever it
+   * says. Missing from a server older than it. */
+  stock_paper?: boolean;
 }
 
 export interface ChainSide {

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { readStored, writeStored } from '../../lib/execute';
+import { useIdentity } from '../auth/identity';
 import type { Sent } from '../lib/api';
 import { dayLabel, plural, price, signedPct, signedPrice, toneOf } from '../lib/format';
 import { chartSymOf, ladderOf, stockChipOf, targetOf, type TradeIntent } from '../lib/openInstrument';
@@ -8,6 +9,7 @@ import { useQuotes } from '../lib/useQuotes';
 import { useTickFlash } from '../lib/useTickFlash';
 import { useWatchlists, watchlistActions } from '../lib/useWatchlists';
 import { rowTitle } from '../shell/searchModel';
+import { stockBuyBlocked } from '../trade/model';
 import { Chip } from '../ui/Chip';
 import { useToast } from '../ui/toast';
 import { DeleteDialog, NameDialog } from './dialogs';
@@ -78,11 +80,13 @@ function IndexTile({ index, quote, desktop, onOpen }: { index: string; quote: Qu
 
 type Dialog = { kind: 'new' } | { kind: 'rename'; list: WatchlistData } | { kind: 'delete'; list: WatchlistData };
 
-export function Watchlist({ serverBase, desktop, stocksOn = false, onOpenTrade, onOpenInstrument }: {
+export function Watchlist({ serverBase, desktop, stocksOn = false, stockPaperOn = false, onOpenTrade, onOpenInstrument }: {
   serverBase: string;
   desktop: boolean;
   /** The `stock_charts` switch: a stock's Chart and Chain light up. */
   stocksOn?: boolean;
+  /** The `stock_paper` switch: a stock's Buy lights up on a user's paper book. */
+  stockPaperOn?: boolean;
   /** Open the Trade screen on a chart and/or the ladder. */
   onOpenTrade: (intent: TradeIntent) => void;
   /** Open an instrument's page by its catalog id. */
@@ -90,6 +94,10 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, onOpenTrade, 
 }) {
   const data = useWatchlists(serverBase, { poll: true });
   const toast = useToast();
+  // Whose desk a Buy would trade on: the owner's engine for the admin, a
+  // paper book for anyone else (the Trade screen asks a visitor to sign in).
+  const { canReadOwner } = useIdentity();
+  const paper = !canReadOwner;
   const [picked, setPicked] = useState<number | null>(() => readStored<{ selected?: number }>(STORE_KEY, {}).selected ?? null);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const lists = data.lists;
@@ -199,8 +207,10 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, onOpenTrade, 
                   const ladder = row ? ladderOf(row, stocksOn) : null;
                   const chart = row ? chartSymOf(row, stocksOn) : null;
                   const chip = row ? stockChipOf(row) : undefined;
-                  // Buy stays an index's until Phase 4; a stock's ladder is read-only.
-                  const indexLadder = ladder && !chip ? ladder : null;
+                  // Buy: an index's ladder for anyone; a stock's for a user's paper
+                  // book behind `stock_paper`, never from the owner's desk.
+                  const buyWhy = ladder && chip ? stockBuyBlocked('stock', paper, stockPaperOn) ?? undefined : undefined;
+                  const buyLadder = ladder && !buyWhy ? ladder : null;
                   const title = row ? rowTitle(row) : item.key;
                   return (
                     <Row
@@ -222,7 +232,8 @@ export function Watchlist({ serverBase, desktop, stocksOn = false, onOpenTrade, 
                         onChart: chart ? () => onOpenTrade({ chart, ladder: ladder ?? undefined, stock: chip }) : null,
                         onChain: ladder ? () => onOpenTrade({ ladder, stock: chip }) : null,
                         chainWhy: stocksOn && row && !row.has_fo ? 'No options listed for this stock' : undefined,
-                        onBuy: indexLadder ? () => onOpenTrade({ ladder: indexLadder }) : null,
+                        onBuy: buyLadder ? () => onOpenTrade({ ladder: buyLadder, stock: chip }) : null,
+                        buyWhy,
                         onMove: (to) => move(item.key, to),
                         onRemove: () => void act(`Couldn't remove ${title}`, () => watchlistActions.removeItem(list.id, item.key)),
                       }}

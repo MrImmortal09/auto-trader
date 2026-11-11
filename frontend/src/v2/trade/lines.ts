@@ -7,7 +7,7 @@ import { level, price, signedMoney } from '../lib/format';
 import type { CallMark, ChainAnswer, FillMark, TelegramLine } from '../lib/types';
 import { C, type LinePart, type MarkerData, type OrderLineData } from './chartSetup';
 import type { ChartLine, ChartMarker } from './KChart';
-import { approxMoney, istMs, levelCrossed, levelPnl, optionOf, sameSym, underlyingOf, type ChartSym } from './model';
+import { approxMoney, isOwnChart, istMs, levelCrossed, levelPnl, optionOf, sameSym, underlyingOf, type ChartSym } from './model';
 
 export type LevelKind = 'stop' | 'target';
 
@@ -151,8 +151,9 @@ function levelLine(p: ExecutePosition, ref: LevelRef, lvl: ChartLevel, cx: LineC
   };
 }
 
-/** A scalp's position line: avg on its option's chart, where the index was
- * when it was bought on the index's chart. "+ Stop" / "+ Target" ride on it. */
+/** A scalp's position line: avg on its option's chart, where the underlying
+ * was when it was bought on the underlying's own chart (the index, or the
+ * stock's price). "+ Stop" / "+ Target" ride on it. */
 function positionLine(p: ExecutePosition, at: number | { at: number }, trigger: ChartLevel['trigger'], cx: LineContext): ChartLine {
   const pnlColor = p.pnl == null ? C.fg : p.pnl < 0 ? C.loss : C.profit;
   const add = cx.actions.canSet && editable(p);
@@ -193,7 +194,7 @@ export function chartLines(cx: LineContext): ChartLine[] {
       const expiry = p.expiry ?? cx.chains[p.index]?.expiry;
       const option = expiry ? optionOf(p, expiry) : null;
       const onOption = option != null && sameSym(option, cx.sym);
-      const onIndex = cx.sym.kind === 'index' && cx.sym.index === p.index;
+      const onIndex = isOwnChart(cx.sym, p.index);
       if (!onOption && !onIndex) continue;
       const trigger: ChartLevel['trigger'] = onOption ? 'premium' : 'index';
       if (onOption) out.push(positionLine(p, p.avg, trigger, cx));

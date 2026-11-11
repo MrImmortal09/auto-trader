@@ -55,6 +55,17 @@ export function underlyingOf(s: ChartSym): string {
   return s.kind === 'equity' ? s.symbol : s.index;
 }
 
+/** An underlying's own chart: the index, or the stock's cash price. */
+export function ownChartOf(name: string): ChartSym {
+  return isIndex(name) ? { kind: 'index', index: name } : { kind: 'equity', symbol: name, exchange: 'NSE' };
+}
+
+/** Whether `s` is `underlying`'s own chart (the index, or the stock's cash
+ * price) rather than one of its contracts: where an index-trigger level lives. */
+export function isOwnChart(s: ChartSym, underlying: string): boolean {
+  return (s.kind === 'index' || s.kind === 'equity') && underlyingOf(s) === underlying;
+}
+
 /** The candle service's name for it: `NIFTY`, `RELIANCE` (`RELIANCE@BSE`
  * for a BSE listing), `NIFTY:FUT`, `NIFTY:2026-10-27:25100:CE`. */
 export function symbolName(s: ChartSym): string {
@@ -129,6 +140,28 @@ export function parseChartSym(raw: unknown): ChartSym | null {
 export function boardKind(board: Pick<ExecuteBoard, 'index'> & { kind?: string }): 'index' | 'stock' {
   if (board.kind === 'stock' || board.kind === 'index') return board.kind;
   return isIndex(board.index) ? 'index' : 'stock';
+}
+
+/** The owner's one-tap buy on a stock's ladder: never widened without an
+ * explicit re-confirmation (the plan's question 8), whatever the switches
+ * say — `POST /api/execute/buy` resolves index options only. */
+export const OWNER_STOCK_BUY = 'Live stock options stay index-only until you re-confirm';
+/** A user's paper buy on a stock's ladder while the server's `stock_paper`
+ * switch is off, or not known yet. */
+export const STOCK_PAPER_OFF = 'Stock options on paper are off';
+
+/**
+ * Why no row of a ladder can be bought from this desk, or null. An index's
+ * rows never are. A stock's rows: on the owner's desk always
+ * ({@link OWNER_STOCK_BUY}); on a user's paper book only while the server's
+ * `stock_paper` switch is on — not yet known counts as off, so nothing is
+ * bought on a guess. Everything else (market hours, the feed, a row's own
+ * tick, the caps, the wallet) is the server's to refuse, and its text shows.
+ */
+export function stockBuyBlocked(kind: 'index' | 'stock', paper: boolean, stockPaper: boolean | undefined): string | null {
+  if (kind === 'index') return null;
+  if (!paper) return OWNER_STOCK_BUY;
+  return stockPaper === true ? null : STOCK_PAPER_OFF;
 }
 
 /** The price is the quote hub's (Kotak's REST quote every ~2 s), not the

@@ -14,7 +14,7 @@ function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: 
   if (!q || q.ltp == null) return 'No price for this contract yet';
   // The hub's REST quote stands in for a strike past the feed budget: good to
   // look at, but no buy route accepts a price the feed never carried.
-  if (quotePolled(q)) return 'Polled price — this strike is past the feed budget, so it can’t be bought yet';
+  if (quotePolled(q)) return 'No live tick for this strike';
   if (q.age_ms != null && q.age_ms > maxAgeMs) return `This contract's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}`;
   return null;
 }
@@ -103,9 +103,10 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
   onLots: (n: number) => void;
   /** Why nothing can be bought now (market closed, stale feed…), or null. */
   blocked: string | null;
-  /** Why no row of this ladder can be bought at all — a stock's: on paper
-   * until Phase 4, never from the owner's desk — or null. Every Buy is
-   * disabled with it as its title; the prices still chart. */
+  /** Why no row of this ladder can be bought at all — a stock's: never
+   * from the owner's desk, on a paper book while the server's `stock_paper`
+   * switch is off — or null. Every Buy is disabled with it as its title; the
+   * prices still chart. */
   readOnly?: string | null;
   /** Symbols with a buy in flight. */
   sending: Record<string, boolean>;

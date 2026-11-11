@@ -54,7 +54,7 @@ import { HeaderSwitch, HeaderTabs, HeaderTicker, ListPicker } from './header';
 import { indexTiles, type HeaderMode, type HeaderTile } from './headerModel';
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
-import { approxMoney, boardKind, CHART_LIBS, isIndex, isTicker, istClock, levelCrossed, levelPnl, optionOf, parseChartSym, sameSym, symbolLabel, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isTicker, istClock, levelCrossed, levelPnl, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
@@ -122,7 +122,7 @@ const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANK
 /** An option that has expired goes back to its underlying's own chart. */
 function unexpired(sym: ChartSym, today: string): ChartSym {
   if (sym.kind !== 'option' || sym.expiry >= today) return sym;
-  return isIndex(sym.index) ? { kind: 'index', index: sym.index } : { kind: 'equity', symbol: sym.index, exchange: 'NSE' };
+  return ownChartOf(sym.index);
 }
 
 /** The saved stock tab, if it reads as one. */
@@ -221,8 +221,9 @@ const chainKeyOf = (index: string, expiry: string) => `${index}:${expiry}`;
  * stock, its future or its options too behind the `stock_charts` switch)
  * with each manual trade's position line, stop and target — dragged to
  * move, behind `chart_stops` — the ladder of any listed expiry, every
- * strike (one tap = market buy; a stock's rows are read-only until Phase
- * 4), and the trades themselves with −1 lot, Exit and a held Exit all.
+ * strike (one tap = market buy; a stock's rows too on a user's paper book
+ * behind `stock_paper`, never on the owner's desk), and the trades
+ * themselves with −1 lot, Exit and a held Exit all.
  * The header is the six index tabs plus one for the current stock, or a
  * watchlist's rows in their place.
  */
@@ -353,9 +354,11 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const headerList = headerWatchlist ? lists.lists.find((l) => l.id === saved.headerList) ?? lists.lists[0] ?? null : null;
   const headerItems = headerList?.items.filter((i) => i.instrument != null) ?? [];
   const quotes = useQuotes(serverBase, [stock?.key, ...headerItems.map((i) => i.key)]);
-  // A stock's ladder is read-only: on paper until Phase 4, never from the
-  // owner's desk (`POST /api/execute/buy` resolves index options only).
-  const readOnly = board && boardKind(board) === 'stock' ? (paper ? 'Stock options on paper come in Phase 4' : "Stock options can't be bought from the owner's desk") : null;
+  // A stock's ladder: a user's paper book buys from it behind the server's
+  // `stock_paper` switch, one tap as an index option; the owner's desk never
+  // does (`POST /api/execute/buy` resolves index options only). The switch
+  // not known yet counts as off. Every other refusal is the server's.
+  const readOnly = board ? stockBuyBlocked(boardKind(board), paper, flags.data?.stock_paper) : null;
 
   // Each underlying in use: its nearest chain (deltas, tick size).
   const wantedIndices = [...new Set([ladderIndex, ...shownSlots.map((s) => underlyingOf(s.sym)), ...scalps.map((p) => p.index)])].sort();
@@ -423,6 +426,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   if (board && boardKind(board) === 'stock') spot[board.index] = board.spot;
   if (stock && spot[stock.symbol] == null && stockQuote) spot[stock.symbol] = stockQuote.ltp;
   if (stock && stockQuote?.per_change != null) change[stock.symbol] = stockQuote.per_change;
+  // A held stock option whose stock is off the ladder: its desk row carries
+  // the stock's price (`index_ltp`), for its index-trigger levels' estimates.
+  for (const row of desk.data?.open ?? []) if (spot[row.index] == null && row.index_ltp != null) spot[row.index] = row.index_ltp;
   const held = new Map(scalps.map((p) => [p.symbol, p]));
   const blocked = buyBlockedReason(frame, stale);
   const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[ladderIndex] ?? 1));
@@ -630,16 +636,17 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const setLib = (chartLib: ChartLib) => save((s) => ({ ...s, chartLib }));
 
   /** "+ Stop" from the positions panel: placed on the chart showing the
-   * trade's option (a premium level), else its index (an index level) — the
-   * first chart is put on the index when none shows either. */
+   * trade's option (a premium level), else its underlying — the index, or
+   * the stock's own price (an index level) — the first chart is put on the
+   * underlying when none shows either. */
   function placeFromPanel(p: ExecutePosition, kind: LevelKind) {
     const option = p.expiry ? optionOf(p, p.expiry) : null;
     const onOption = option ? shownSlots.findIndex((s) => sameSym(s.sym, option)) : -1;
     if (onOption >= 0) return startPlacing(onOption, p, kind, 'premium');
-    let onIndex = shownSlots.findIndex((s) => s.sym.kind === 'index' && s.sym.index === p.index);
+    let onIndex = shownSlots.findIndex((s) => isOwnChart(s.sym, p.index));
     if (onIndex < 0) {
       onIndex = 0;
-      setSlot(0, { sym: { kind: 'index', index: p.index } });
+      setSlot(0, { sym: ownChartOf(p.index) });
     }
     if (!desktop) showChart(true);
     startPlacing(onIndex, p, kind, 'index');
@@ -658,7 +665,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   }
 
   /** An underlying's own chart: the index, or the stock's cash price. */
-  const ownChart = (name: string): ChartSym => (isIndex(name) ? { kind: 'index', index: name } : { kind: 'equity', symbol: name, exchange: 'NSE' });
+  const ownChart = ownChartOf;
 
   /** Put the ladder on `index` (an index or an F&O stock), on `expiry` when
    * given (null: the nearest). */
@@ -861,7 +868,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       onAdd={(p, kind) => {
         setSheet(false);
         const targetSlot = activeFullscreenSlot ?? 0;
-        if (underlyingOf(saved.slots[targetSlot].sym) !== p.index || saved.slots[targetSlot].sym.kind !== 'index') setSlot(targetSlot, { sym: { kind: 'index', index: p.index } });
+        if (!isOwnChart(saved.slots[targetSlot].sym, p.index)) setSlot(targetSlot, { sym: ownChartOf(p.index) });
         if (!desktop) showChart(true);
         startPlacing(targetSlot, p, kind, 'index');
       }}
