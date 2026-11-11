@@ -58,3 +58,12 @@ export function derivativeNote(row: InstrumentRow): string | null {
 export function rowSymbol(row: InstrumentRow): string {
   return row.symbol;
 }
+
+/** An instrument named in one go, for a title or a toast: "RELIANCE",
+ * "NIFTY 25600 CE", "RELIANCE NOV FUT". */
+export function rowTitle(row: Pick<InstrumentRow, 'kind' | 'symbol' | 'underlying' | 'expiry' | 'strike'>): string {
+  if (row.kind === 'EQ' || row.kind === 'INDEX') return row.symbol;
+  const month = row.expiry ? shortDate(row.expiry).split(' ')[1].toUpperCase() : '';
+  if (row.kind === 'FUT') return `${row.underlying} ${month} FUT`;
+  return `${row.underlying} ${row.strike != null ? price(row.strike).replace(/\.00$/, '') : ''} ${row.kind}`;
+}

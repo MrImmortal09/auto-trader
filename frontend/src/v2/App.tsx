@@ -13,7 +13,7 @@ import { usePoll } from './lib/usePoll';
 import { StatusBanners } from './shell/Banners';
 import { KillSwitchDialog } from './shell/KillSwitchDialog';
 import { NavRail, TabBar } from './shell/Nav';
-import { navScreens, SCREENS, screenFromLocation, screenPath, TAB_SCREENS, visibleScreens, type Place, type ScreenId } from './shell/screens';
+import { navScreens, SCREENS, screenFromLocation, screenPath, tabScreens, visibleScreens, type Place, type ScreenId } from './shell/screens';
 import { Search, type OpenHow } from './shell/Search';
 import { SearchSheet } from './shell/SearchSheet';
 import { DesktopStatusBar, PhoneStatusBar } from './shell/StatusBar';
@@ -26,6 +26,8 @@ import { Logs } from './system/Logs';
 import { System } from './system/System';
 import { Segment } from './ui/Segment';
 import { useNavHidden } from './lib/layout';
+import { useAddToWatchlist } from './watchlist/AddToWatchlist';
+import { Watchlist } from './watchlist/Watchlist';
 
 // The charts are heavy (KLineChart): only loaded once Trade or Market is opened.
 const Trade = lazy(() => import('./trade/Trade').then((m) => ({ default: m.Trade })));
@@ -53,8 +55,21 @@ export default function App() {
   // Desktop: the navigation rail folded away (the status bar's mode chip).
   const [navHidden] = useNavHidden();
   const { role, canReadOwner } = useIdentity();
-  const screens = visibleScreens(role);
-  const nav = navScreens(role);
+  const flags = usePoll(() => getFlags(serverBase), 30_000, serverBase);
+  // The instrument search is the admin's switch: off, the well and the tab are gone.
+  const searchOn = flags.data?.search === true;
+  // Watchlists too, and only while the search is on as well: with search
+  // off the server prices no stock or contract (its quote poller skips
+  // every tick), and the search and the instrument page, the only ways to
+  // add one, are gone. Everything below reads this one value: the screen,
+  // the rail and tabs, the "+" on a result or an instrument page, the
+  // picker. `null` until the switches are known, so an opened
+  // `/v2/watchlist` waits for them rather than bounce to Desk.
+  const watchlistsOn: boolean | null = flags.data ? flags.data.watchlists === true && flags.data.search === true : null;
+  const screens = visibleScreens(role, watchlistsOn !== false);
+  const nav = navScreens(role, watchlistsOn === true);
+  // Phone: the tabs with a place of their own (a user's start with Watchlist once it is on).
+  const tabs = tabScreens(role, watchlistsOn === true);
   const [wanted, setWanted] = useState<Place>(screenFromLocation);
   // A screen this person may not open (an old link, or a sign-out) falls back to Desk.
   const screen: ScreenId = screens.includes(wanted.screen) ? wanted.screen : 'desk';
@@ -67,10 +82,10 @@ export default function App() {
   // Trade re-reads its saved layout.
   const [tradeSeq, setTradeSeq] = useState(0);
   const status = useStatus(serverBase, canReadOwner);
-  const flags = usePoll(() => getFlags(serverBase), 30_000, serverBase);
-  // The instrument search is the admin's switch: off, the well and the tab are gone.
-  const searchOn = flags.data?.search === true;
   const guard = useGuard();
+  // The "+" on a search result or an instrument page, and its picker.
+  const addTo = useAddToWatchlist(serverBase, watchlistsOn === true);
+  const onAdd = watchlistsOn === true ? addTo.add : undefined;
   useEngineErrors(serverBase, streamToken(), canReadOwner);
 
   // The screen is the address (`/v2/trade`): Back and Forward move between screens.
@@ -143,7 +158,7 @@ export default function App() {
   const unreachable = !!status.error;
   const stopped = canReadOwner && s?.kill_switch ? s.stopped ?? { at: null, positions_exited: 0, entries_cancelled: 0 } : null;
   // Phone: the screens behind More, with a switch between them when there are several.
-  const more = nav.filter((id) => !TAB_SCREENS.includes(id));
+  const more = nav.filter((id) => !tabs.includes(id));
 
   const content =
     screen === 'desk' ? (
@@ -157,11 +172,15 @@ export default function App() {
         <Market serverBase={serverBase} desktop={desktop} canReadOwner={canReadOwner} />
       </Suspense>
     ) : screen === 'instrument' && place.key ? (
-      <Instrument key={place.key} serverBase={serverBase} desktop={desktop} id={place.key} onBack={back} onOpenTrade={openTrade} />
+      <Instrument key={place.key} serverBase={serverBase} desktop={desktop} id={place.key} onBack={back} onOpenTrade={openTrade} onAddToWatchlist={onAdd} />
+    ) : screen === 'watchlist' && watchlistsOn == null ? (
+      <p className="p-6 type-body text-fg-subtle">Loading…</p>
     ) : (
       (() => {
         const page =
-          screen === 'system' ? (
+          screen === 'watchlist' ? (
+            <Watchlist serverBase={serverBase} desktop={desktop} onOpenTrade={openTrade} onOpenInstrument={(id) => go({ screen: 'instrument', key: id })} />
+          ) : screen === 'system' ? (
             <System serverBase={serverBase} desktop={desktop} health={s?.health ?? null} marketOpen={s?.market_open ?? false} />
           ) : screen === 'logs' ? (
             <Logs serverBase={serverBase} desktop={desktop} />
@@ -206,7 +225,7 @@ export default function App() {
           unreachable={unreachable}
           role={role}
           onKillSwitch={() => setKillSwitchOpen(true)}
-          search={searchOn ? <Search serverBase={serverBase} onOpen={openResult} /> : undefined}
+          search={searchOn ? <Search serverBase={serverBase} onOpen={openResult} onAdd={onAdd} /> : undefined}
         />
       ) : (
         <PhoneStatusBar
@@ -231,8 +250,9 @@ export default function App() {
         {/* Trade fits the window and never scrolls: its ladder and panel scroll inside. */}
         <main className={`min-w-0 flex-1 ${screen === 'trade' ? 'overflow-hidden' : 'overflow-y-auto'}`}>{content}</main>
       </div>
-      {!desktop && <TabBar screens={nav} screen={screen} onSelect={go} search={searchOn ? { open: searchOpen, onOpen: () => setSearchOpen(true) } : undefined} />}
-      {!desktop && searchOn && <SearchSheet serverBase={serverBase} open={searchOpen} onClose={() => setSearchOpen(false)} onOpen={openResult} />}
+      {!desktop && <TabBar screens={nav} tabs={tabs} screen={screen} onSelect={go} search={searchOn ? { open: searchOpen, onOpen: () => setSearchOpen(true) } : undefined} />}
+      {!desktop && searchOn && <SearchSheet serverBase={serverBase} open={searchOpen} onClose={() => setSearchOpen(false)} onOpen={openResult} onAdd={onAdd} />}
+      {addTo.picker}
 
       {killSwitchOpen && canReadOwner && (
         <KillSwitchDialog serverBase={serverBase} mode={s?.mode} onClose={() => setKillSwitchOpen(false)} onDone={() => void status.refresh()} />

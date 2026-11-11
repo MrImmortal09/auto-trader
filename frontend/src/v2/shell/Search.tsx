@@ -5,7 +5,7 @@ import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
 import { Chip } from '../ui/Chip';
-import { defaultRow, derivativeNote, groupsOf, optionId, rowSymbol } from './searchModel';
+import { defaultRow, derivativeNote, groupsOf, optionId, rowSymbol, rowTitle } from './searchModel';
 import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 
 // Spec §13: the global instrument search. A 320 px well in the desktop
@@ -14,10 +14,11 @@ import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 // priced and ticking. ↑/↓ move the highlight, Enter opens the instrument
 // (an index opens the Trade screen on it), Shift+Enter puts an index on the
 // ladder, a row's chart button charts it on the Trade screen (an index or an
-// index's option), Escape closes. Enter's default comes only once the answer
-// is for what was typed, and is what the query names: a typed contract or
-// future (none when it matched none), else the first row. The well is the
-// combobox, the results its listbox.
+// index's option), `+` adds it to a watchlist (`onAdd`, while watchlists are
+// on), Escape closes. Enter's default comes only once the answer is for what
+// was typed, and is what the query names: a typed contract or future (none
+// when it matched none), else the first row. The well is the combobox, the
+// results its listbox.
 
 /** How a result is opened: Enter / a tap, Shift+Enter for the ladder, or
  * its chart button for the chart (`openInstrument.ts` says where each goes). */
@@ -33,7 +34,12 @@ function inField(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
-export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (row: InstrumentRow, how: OpenHow) => void }) {
+export function Search({ serverBase, onOpen, onAdd }: {
+  serverBase: string;
+  onOpen: (row: InstrumentRow, how: OpenHow) => void;
+  /** Add a result to a watchlist; left out while watchlists are off. */
+  onAdd?: (row: InstrumentRow) => void;
+}) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   // The row picked with ↑/↓ or the pointer; until then the highlight is
@@ -120,6 +126,9 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
       if (!activeRow) return;
       e.preventDefault();
       pick(activeRow, e.shiftKey ? 'ladder' : 'open');
+    } else if (e.key === '+' && onAdd && activeRow && open) {
+      e.preventDefault();
+      onAdd(activeRow);
     } else if (e.key === 'Escape') {
       e.preventDefault();
       if (open) setOpen(false);
@@ -234,11 +243,12 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
                         )}
                       </div>
                       <PriceCell quote={quotes.get(row.ws_key)} identity={row.ws_key} stacked={false} muted={on} />
+                      {/* Named in full ("RELIANCE NOV FUT"), since a stock and its contracts share a symbol. */}
                       <span className={`flex shrink-0 items-center transition-opacity duration-120 ${on ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
                         <button
                           type="button"
                           tabIndex={-1}
-                          aria-label={chart ? `Chart ${row.symbol}` : 'Chart'}
+                          aria-label={chart ? `Chart ${rowTitle(row)}` : 'Chart'}
                           title={chart ? 'Open the chart' : 'Charts for stocks come in Phase 3'}
                           disabled={!chart}
                           onClick={(e) => {
@@ -252,11 +262,14 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
                         <button
                           type="button"
                           tabIndex={-1}
-                          aria-label="Add to watchlist"
-                          title="Watchlists come in Phase 2"
-                          disabled
-                          onClick={(e) => e.stopPropagation()}
-                          className="grid size-7 place-items-center rounded-6 text-fg-muted transition-colors duration-120 disabled:cursor-not-allowed disabled:opacity-50"
+                          aria-label={`Add ${rowTitle(row)} to a watchlist`}
+                          title={onAdd ? 'Add to a watchlist' : 'Watchlists are off'}
+                          disabled={!onAdd}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onAdd?.(row);
+                          }}
+                          className="grid size-7 place-items-center rounded-6 text-fg-muted transition-colors duration-120 hover:bg-raised hover:text-fg disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                         >
                           <Plus size={14} />
                         </button>
@@ -286,6 +299,14 @@ export function Search({ serverBase, onOpen }: { serverBase: string; onOpen: (ro
                 </Chip>
                 ladder
               </span>
+              {onAdd && (
+                <span className="flex items-center gap-1">
+                  <Chip kind="accent" className="px-1">
+                    +
+                  </Chip>
+                  watchlist
+                </span>
+              )}
             </span>
           </div>
         </div>

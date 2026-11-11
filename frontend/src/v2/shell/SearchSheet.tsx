@@ -1,27 +1,31 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { Search as SearchIcon, X } from 'lucide-react';
+import { Plus, Search as SearchIcon, X } from 'lucide-react';
 import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
 import { useQuotes } from '../lib/useQuotes';
 import { Button } from '../ui/Button';
-import { defaultRow, derivativeNote, groupsOf, rowSymbol } from './searchModel';
+import { defaultRow, derivativeNote, groupsOf, rowSymbol, rowTitle } from './searchModel';
 import { AnswerNote, Highlight, KindChips, PriceCell } from './searchParts';
 import type { OpenHow } from './Search';
 
 // Spec §13, phone: the Search tab opens this full-screen sheet — a 48 px
 // well with the keyboard up, Cancel, and the same groups as the desktop
 // popover in 56 px rows (symbol and chips on the first line, name and the
-// price on the second). A tap opens the instrument; the keyboard's search
-// key, once the answer is for what was typed, opens what it names: the typed
-// contract or future (nothing when it matched none), else the first row.
+// price on the second). A tap opens the instrument; the "+" at the end of a
+// row adds it to a watchlist (`onAdd`, while watchlists are on); the
+// keyboard's search key, once the answer is for what was typed, opens what
+// it names: the typed contract or future (nothing when it matched none), else
+// the first row.
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 
-export function SearchSheet({ serverBase, open, onClose, onOpen }: {
+export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd }: {
   serverBase: string;
   open: boolean;
   onClose: () => void;
   onOpen: (row: InstrumentRow, how: OpenHow) => void;
+  /** Add a result to a watchlist; left out while watchlists are off. */
+  onAdd?: (row: InstrumentRow) => void;
 }) {
   const [query, setQuery] = useState('');
   // Bumped when the recents are cleared, so the list re-reads them.
@@ -136,28 +140,39 @@ export function SearchSheet({ serverBase, open, onClose, onOpen }: {
               )}
             </div>
             {g.rows.map((row) => (
-              <button
-                key={row.id}
-                type="button"
-                role="option"
-                aria-selected={false}
-                onClick={() => pick(row)}
-                title={row.expiry ? row.trading_symbol : undefined}
-                className="grid h-14 w-full grid-cols-[minmax(0,1fr)_auto] grid-rows-2 items-center gap-x-3 rounded-8 px-2 text-left transition-colors duration-120 active:bg-raised/40"
-              >
-                <span className="flex min-w-0 items-center gap-2 self-end">
-                  <span className="shrink-0 whitespace-nowrap type-body-strong text-fg">
-                    <Highlight text={rowSymbol(row)} fragment={typed} />
+              <div key={row.id} className="flex items-stretch">
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={false}
+                  onClick={() => pick(row)}
+                  title={row.expiry ? row.trading_symbol : undefined}
+                  className="grid h-14 min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto] grid-rows-2 items-center gap-x-3 rounded-8 px-2 text-left transition-colors duration-120 active:bg-raised/40"
+                >
+                  <span className="flex min-w-0 items-center gap-2 self-end">
+                    <span className="shrink-0 whitespace-nowrap type-body-strong text-fg">
+                      <Highlight text={rowSymbol(row)} fragment={typed} />
+                    </span>
+                    <KindChips row={row} />
+                    {derivativeNote(row) && <span className="shrink-0 whitespace-nowrap num-small text-fg-muted">{derivativeNote(row)}</span>}
                   </span>
-                  <KindChips row={row} />
-                  {derivativeNote(row) && <span className="shrink-0 whitespace-nowrap num-small text-fg-muted">{derivativeNote(row)}</span>}
-                </span>
-                <span aria-hidden className="row-start-1 col-start-2" />
-                <span className="min-w-0 truncate type-caption text-fg-subtle">{row.name}</span>
-                <span className="col-start-2 row-start-2 flex items-center">
-                  <PriceCell quote={quotes.get(row.ws_key)} identity={row.ws_key} stacked={false} />
-                </span>
-              </button>
+                  <span aria-hidden className="row-start-1 col-start-2" />
+                  <span className="min-w-0 truncate type-caption text-fg-subtle">{row.name}</span>
+                  <span className="col-start-2 row-start-2 flex items-center">
+                    <PriceCell quote={quotes.get(row.ws_key)} identity={row.ws_key} stacked={false} />
+                  </span>
+                </button>
+                {onAdd && (
+                  <button
+                    type="button"
+                    aria-label={`Add ${rowTitle(row)} to a watchlist`}
+                    onClick={() => onAdd(row)}
+                    className="grid w-11 shrink-0 place-items-center rounded-8 text-fg-muted transition-colors duration-120 active:bg-raised/40"
+                  >
+                    <Plus size={18} />
+                  </button>
+                )}
+              </div>
             ))}
           </div>
         ))}

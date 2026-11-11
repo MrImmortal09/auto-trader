@@ -1,7 +1,7 @@
-import { Activity, Gauge, LayoutDashboard, ScrollText, Settings, ShieldCheck, Zap, type LucideIcon } from 'lucide-react';
+import { Activity, Gauge, LayoutDashboard, ScrollText, Settings, ShieldCheck, Star, Zap, type LucideIcon } from 'lucide-react';
 import type { Role } from '../lib/types';
 
-export type ScreenId = 'desk' | 'trade' | 'market' | 'logs' | 'system' | 'settings' | 'admin' | 'instrument';
+export type ScreenId = 'desk' | 'trade' | 'market' | 'watchlist' | 'logs' | 'system' | 'settings' | 'admin' | 'instrument';
 
 /** Where the app is: a screen, and for `instrument` which one (`/v2/i/<key>`,
  * the catalog id: `nse_cm:2885`). */
@@ -10,27 +10,39 @@ export interface Place {
   key?: string;
 }
 
-/** The screens with a place in the navigation. */
+/** The screens with a place in the navigation, in the desktop rail's order. */
 export const SCREENS: { id: ScreenId; label: string; icon: LucideIcon }[] = [
   { id: 'desk', label: 'Desk', icon: LayoutDashboard },
   { id: 'trade', label: 'Trade', icon: Zap },
   { id: 'market', label: 'Market', icon: Gauge },
+  { id: 'watchlist', label: 'Watchlist', icon: Star },
   { id: 'logs', label: 'Logs', icon: ScrollText },
   { id: 'system', label: 'System', icon: Activity },
   { id: 'settings', label: 'Settings', icon: Settings },
   { id: 'admin', label: 'Admin', icon: ShieldCheck },
 ];
 
-/** The phone tab bar's own tabs; the rest sit behind More. */
-export const TAB_SCREENS: ScreenId[] = ['desk', 'trade', 'market'];
+/**
+ * The phone tab bar's own tabs, in order; the rest sit behind More (or under
+ * the account menu while the Search tab has More's place). With watchlists
+ * on, a user's tabs are Watchlist · Trade · Desk (the owner's answer to the
+ * plan's question 7); the admin's stay Desk · Trade · Market, Watchlist
+ * reachable from the rail and the account menu.
+ */
+export function tabScreens(role: Role, watchlists: boolean): ScreenId[] {
+  return role !== 'admin' && watchlists ? ['watchlist', 'trade', 'desk'] : ['desk', 'trade', 'market'];
+}
 
 /** The screens `role` may open: users get the public ones and a small
  * Settings; the admin gets everything, the engine log (Logs) included. An
- * instrument page is anyone's. */
-export function visibleScreens(role: Role): ScreenId[] {
-  return role === 'admin'
-    ? ['desk', 'trade', 'market', 'logs', 'system', 'settings', 'admin', 'instrument']
-    : ['desk', 'trade', 'market', 'settings', 'instrument'];
+ * instrument page is anyone's; the Watchlist screen is anyone's while
+ * `watchlists` (the admin's switch) is on. */
+export function visibleScreens(role: Role, watchlists: boolean): ScreenId[] {
+  const all: ScreenId[] =
+    role === 'admin'
+      ? ['desk', 'trade', 'market', 'watchlist', 'logs', 'system', 'settings', 'admin', 'instrument']
+      : ['desk', 'trade', 'market', 'watchlist', 'settings', 'instrument'];
+  return watchlists ? all : all.filter((id) => id !== 'watchlist');
 }
 
 /** Screens with no button anywhere: they open from their address alone
@@ -38,8 +50,8 @@ export function visibleScreens(role: Role): ScreenId[] {
 const LINK_ONLY: ScreenId[] = ['system', 'instrument'];
 
 /** The screens the navigation shows `role`. */
-export function navScreens(role: Role): ScreenId[] {
-  return visibleScreens(role).filter((id) => !LINK_ONLY.includes(id));
+export function navScreens(role: Role, watchlists: boolean): ScreenId[] {
+  return visibleScreens(role, watchlists).filter((id) => !LINK_ONLY.includes(id));
 }
 
 /** v2 lives under `/v2/`, one path per screen: `/v2/trade`; an instrument
