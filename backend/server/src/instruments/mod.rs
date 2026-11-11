@@ -241,6 +241,14 @@ impl Catalog {
         Arc::clone(&self.index.read().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Whether the search list holds anything: a build has finished, or the
+    /// last one was restored from `instruments.db` at startup. What the paper
+    /// desk asks before it takes a stock option, whose stock's cash row on
+    /// the feed only this list names (`spot_key`).
+    pub fn is_built(&self) -> bool {
+        !self.index().is_empty()
+    }
+
     /// The price-map key of every equity and index in the catalog: what
     /// the quote hub's close sweep asks Kotak for. From the search list in
     /// memory; the contract rows are not touched.
