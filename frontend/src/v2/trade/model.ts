@@ -61,6 +61,17 @@ export function underlyingOf(s: ChartSym): string {
   return s.kind === 'equity' ? s.symbol : s.index;
 }
 
+/** An underlying's own chart: the index, or the stock's cash price. */
+export function ownChartOf(name: string): ChartSym {
+  return isIndex(name) ? { kind: 'index', index: name } : { kind: 'equity', symbol: name, exchange: 'NSE' };
+}
+
+/** Whether `s` is `underlying`'s own chart (the index, or the stock's cash
+ * price) rather than one of its contracts: where an index-trigger level lives. */
+export function isOwnChart(s: ChartSym, underlying: string): boolean {
+  return (s.kind === 'index' || s.kind === 'equity') && underlyingOf(s) === underlying;
+}
+
 /** The candle service's name for it: `NIFTY`, `RELIANCE` (`RELIANCE@BSE`
  * for a BSE listing), `RELIANCE:FUT:2026-12-29` (a future by its expiry;
  * `NIFTY:FUT`, the nearest, without one), `NIFTY:2026-10-27:25100:CE`. */
@@ -150,6 +161,28 @@ export function boardKind(board: Pick<ExecuteBoard, 'index'> & { kind?: string }
   return isIndex(board.index) ? 'index' : 'stock';
 }
 
+/** The owner's one-tap buy on a stock's ladder: never widened without an
+ * explicit re-confirmation (the plan's question 8), whatever the switches
+ * say — `POST /api/execute/buy` resolves index options only. */
+export const OWNER_STOCK_BUY = 'Live stock options stay index-only until you re-confirm';
+/** A user's paper buy on a stock's ladder while the server's `stock_paper`
+ * switch is off, or not known yet. */
+export const STOCK_PAPER_OFF = 'Stock options on paper are off';
+
+/**
+ * Why no row of a ladder can be bought from this desk, or null. An index's
+ * rows never are. A stock's rows: on the owner's desk always
+ * ({@link OWNER_STOCK_BUY}); on a user's paper book only while the server's
+ * `stock_paper` switch is on — not yet known counts as off, so nothing is
+ * bought on a guess. Everything else (market hours, the feed, a row's own
+ * tick, the caps, the wallet) is the server's to refuse, and its text shows.
+ */
+export function stockBuyBlocked(kind: 'index' | 'stock', paper: boolean, stockPaper: boolean | undefined): string | null {
+  if (kind === 'index') return null;
+  if (!paper) return OWNER_STOCK_BUY;
+  return stockPaper === true ? null : STOCK_PAPER_OFF;
+}
+
 /** The price is the quote hub's (Kotak's REST quote every ~2 s), not the
  * feed's: the strike is past the feed budget. No buy route accepts it. */
 export function quotePolled(q: ExecuteQuote & { polled?: boolean }): boolean {
@@ -232,6 +265,21 @@ export function symExpiry(s: ChartSym): string | null {
 export function optionOf(p: Pick<ExecutePosition, 'index' | 'strike' | 'option_type'>, expiry: string): ChartSym | null {
   if (p.strike == null || (p.option_type !== 'CE' && p.option_type !== 'PE')) return null;
   return { kind: 'option', index: p.index, expiry, strike: p.strike, side: p.option_type };
+}
+
+/**
+ * Which level of `p` a chart showing `sym` takes: a premium level on the
+ * position's own option (on `expiry`: its own, or the nearest for a row from
+ * before that was recorded), an index level on its underlying's own chart
+ * (the index, or the stock's cash price), and none on any other chart. A
+ * level read off any other chart's price scale — NIFTY's ~25,000 for a
+ * RELIANCE option — would sit far past the price and sell the whole
+ * position at once.
+ */
+export function levelTriggerOn(sym: ChartSym, p: Pick<ExecutePosition, 'index' | 'strike' | 'option_type'>, expiry: string | null | undefined): ChartLevel['trigger'] | null {
+  const option = expiry ? optionOf(p, expiry) : null;
+  if (option && sameSym(option, sym)) return 'premium';
+  return isOwnChart(sym, p.index) ? 'index' : null;
 }
 
 /**

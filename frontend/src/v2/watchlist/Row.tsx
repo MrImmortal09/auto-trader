@@ -30,7 +30,6 @@ const COMING = {
   chart: 'Stock charts are switched off',
   chain: 'Stock charts are switched off',
   noFo: 'No options listed for this stock',
-  buy: 'Stock options on paper come in Phase 4',
 } as const;
 
 /** Where a row's actions go; `null` means it can't (disabled, with the reason). */
@@ -45,7 +44,11 @@ export interface RowActions {
   onChain: (() => void) | null;
   /** Why there is no chain, when there is none. */
   chainWhy?: string;
+  /** The ladder to buy on: an index's for anyone; a stock's on a user's paper
+   * book behind `stock_paper`, never from the owner's desk. */
   onBuy: (() => void) | null;
+  /** Why Buy is off, when it is: the stock rule above, else the chain's reason. */
+  buyWhy?: string;
   onMove: (to: 'top' | 'up' | 'down') => void;
   onRemove: () => void;
 }
@@ -170,7 +173,7 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
               <button type="button" aria-label={`Option chain for ${title}`} title={actions.onChain ? 'Open the option chain' : actions.chainWhy ?? COMING.chain} disabled={!actions.onChain} onClick={actions.onChain ?? undefined} className={ICON_BUTTON}>
                 <Rows3 size={14} />
               </button>
-              <Button size="sm" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? 'Open the ladder' : COMING.buy} onClick={actions.onBuy ?? undefined} className="w-12">
+              <Button size="sm" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? 'Open the ladder' : actions.buyWhy ?? actions.chainWhy ?? COMING.chain} onClick={actions.onBuy ?? undefined} className="w-12">
                 Buy
               </Button>
             </span>
@@ -236,7 +239,7 @@ export function Row({ item, quote, desktop, first, last, marketOpen, now, action
                 <Button size="lg" icon={<Rows3 size={18} />} disabled={!actions.onChain} title={actions.onChain ? undefined : actions.chainWhy ?? COMING.chain} onClick={() => { setSheet(false); actions.onChain?.(); }}>
                   Chain
                 </Button>
-                <Button size="lg" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? undefined : COMING.buy} onClick={() => { setSheet(false); actions.onBuy?.(); }}>
+                <Button size="lg" kind="profit" disabled={!actions.onBuy} title={actions.onBuy ? undefined : actions.buyWhy ?? actions.chainWhy ?? COMING.chain} onClick={() => { setSheet(false); actions.onBuy?.(); }}>
                   Buy
                 </Button>
               </div>

@@ -69,6 +69,8 @@ export default function App() {
   // Any stock's chart, ladder and option chain (plan Phase 3): off, every
   // stock control stays hidden and a stock opens its instrument page alone.
   const stocksOn = flags.data?.stock_charts === true;
+  // Stock options on users' paper books (Phase 4): the watchlist's Buy on a stock row.
+  const stockPaperOn = flags.data?.stock_paper === true;
   const screens = visibleScreens(role, watchlistsOn !== false);
   const nav = navScreens(role, watchlistsOn === true);
   // Phone: the tabs with a place of their own (a user's start with Watchlist once it is on).
@@ -184,7 +186,7 @@ export default function App() {
       (() => {
         const page =
           screen === 'watchlist' ? (
-            <Watchlist serverBase={serverBase} desktop={desktop} stocksOn={stocksOn} onOpenTrade={openTrade} onOpenInstrument={(id) => go({ screen: 'instrument', key: id })} />
+            <Watchlist serverBase={serverBase} desktop={desktop} stocksOn={stocksOn} stockPaperOn={stockPaperOn} onOpenTrade={openTrade} onOpenInstrument={(id) => go({ screen: 'instrument', key: id })} />
           ) : screen === 'system' ? (
             <System serverBase={serverBase} desktop={desktop} health={s?.health ?? null} marketOpen={s?.market_open ?? false} />
           ) : screen === 'logs' ? (

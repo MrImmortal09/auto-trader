@@ -307,6 +307,9 @@ export interface PaperFill {
   position_id: string;
   action: 'BUY' | 'SELL';
   contract: string;
+  /** The underlying: an index (`NIFTY`), or a stock (`RELIANCE`) behind
+   * `stock_paper`. Missing from a server older than it. */
+  index?: string;
   qty: number;
   price: number;
   /** What the wallet paid or got, charges included. */

@@ -6,15 +6,17 @@ import type { ChainAnswer } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
 import { Button } from '../ui/Button';
 import { LotsStepper } from '../ui/LotsStepper';
-import { fmtAge, polledMarker, quotePolled } from './model';
+import { boardKind, fmtAge, polledMarker, quotePolled } from './model';
 
 /** Why one side of a row can't be bought now, or null. */
-function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: number): string | null {
+function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: number, ladder: 'index' | 'stock'): string | null {
   if (blocked) return blocked;
   if (!q || q.ltp == null) return 'No price for this contract yet';
   // The hub's REST quote stands in for a strike past the feed budget: good to
-  // look at, but no buy route accepts a price the feed never carried.
-  if (quotePolled(q)) return 'Polled price — this strike is past the feed budget, so it can’t be bought yet';
+  // look at, but no buy route accepts a price the feed never carried. An
+  // index ladder keeps its wording from before stocks joined, so index
+  // trading reads exactly as it did; a stock's row says it the short way.
+  if (quotePolled(q)) return ladder === 'stock' ? 'No live tick for this strike' : 'Polled price — this strike is past the feed budget, so it can’t be bought yet';
   if (q.age_ms != null && q.age_ms > maxAgeMs) return `This contract's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}`;
   return null;
 }
@@ -103,9 +105,10 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
   onLots: (n: number) => void;
   /** Why nothing can be bought now (market closed, stale feed…), or null. */
   blocked: string | null;
-  /** Why no row of this ladder can be bought at all — a stock's: on paper
-   * until Phase 4, never from the owner's desk — or null. Every Buy is
-   * disabled with it as its title; the prices still chart. */
+  /** Why no row of this ladder can be bought at all — a stock's: never
+   * from the owner's desk, on a paper book while the server's `stock_paper`
+   * switch is off — or null. Every Buy is disabled with it as its title; the
+   * prices still chart. */
   readOnly?: string | null;
   /** The market is open (the stream's `market_open`): closed, a polled row's
    * price is the last close, and its marker says so. */
@@ -122,6 +125,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
   header?: ReactNode;
 }) {
   const rows = ladderRows(chain, board);
+  const ladderKind = boardKind(board);
   const spot = board.spot;
   const atm = board.atm;
   const list = useRef<HTMLDivElement>(null);
@@ -197,7 +201,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
   const side = (q: ExecuteQuote | null, strike: number, kind: 'CE' | 'PE', itm: boolean, near: boolean) => {
     const label = `${board.index} ${strike} ${kind} (${expiryLabel(board.expiry)})`;
     const position = q ? held.get(q.sym) : undefined;
-    const why = readOnly ?? quoteBlocked(q, blocked, buyMaxAgeMs(board));
+    const why = readOnly ?? quoteBlocked(q, blocked, buyMaxAgeMs(board), ladderKind);
     const busy = q ? !!sending[q.sym] : false;
     const button = (
       <Button
