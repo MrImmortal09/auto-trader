@@ -25,7 +25,7 @@
 - Restarting the server programmatically requires commands like
   `tmux send-keys -t 0:0 "cd ~/auto-trader/backend && ./server-<version>-x86_64-unknown-linux-gnu" C-m`
   since it is not managed by systemd.
-- The VM has **954 MB RAM and no swap**, and stdout is only kept in the tmux scrollback (no log file),
+- The VM has **954 MB RAM, 2 vCPU and a 1 GB swapfile (261 MB in use on 2026-11-04)**, and stdout is only kept in the tmux scrollback (no log file),
   so a crash or freeze leaves little forensic trail beyond the `system_logs` table in `trades.db`.
 
 ### Verification Rule

@@ -134,7 +134,11 @@ pub struct KotakLoginDeps<'a> {
     pub prices: &'a Arc<dashmap::DashMap<String, f64>>,
     pub positions: &'a Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
     pub scrip_store: &'a Arc<RwLock<Option<trading_engine::ScripStore>>>,
-    pub raw_scrip_csv: &'a Arc<RwLock<Option<String>>>,
+    /// Where each downloaded segment is saved — see `crate::scrip_files`.
+    pub scrip_files: &'a crate::scrip_files::ScripFiles,
+    /// The instrument catalog, rebuilt from those files after each
+    /// download — see `crate::instruments`.
+    pub instruments: &'a Arc<crate::instruments::Catalog>,
     /// IST timestamp of the last *successful* Scrip Master download. Only ever set
     /// after a login has succeeded (the download runs off the resulting
     /// session), so `Some(today)` means both "logged in today" and "holding
@@ -161,7 +165,8 @@ impl<'a> KotakLoginDeps<'a> {
             prices: &state.prices,
             positions: &state.positions,
             scrip_store: &state.scrip_store,
-            raw_scrip_csv: &state.raw_scrip_csv,
+            scrip_files: &state.scrip_files,
+            instruments: &state.instruments,
             scrip_loaded_at: &state.scrip_loaded_at,
             login_lock: &state.kotak_login_lock,
         }
@@ -299,7 +304,8 @@ async fn perform_kotak_login(
     tokio::spawn(fetch_scrip_master_background(
         Arc::clone(deps.kotak),
         Arc::clone(deps.scrip_store),
-        Arc::clone(deps.raw_scrip_csv),
+        deps.scrip_files.clone(),
+        Arc::clone(deps.instruments),
         Arc::clone(deps.scrip_loaded_at),
         deps.db_tx.clone(),
         deps.log_tx.clone(),
@@ -308,10 +314,16 @@ async fn perform_kotak_login(
     Ok(())
 }
 
+/// Downloads the three segments against the session just opened, saves each
+/// to disk and swaps the parsed store in. Only the parsed store stays in
+/// memory; the admin's CSV downloads stream the files — see
+/// `crate::scrip_files` — and the instrument catalog is rebuilt from them
+/// in the background.
 async fn fetch_scrip_master_background(
     kotak: Arc<Mutex<Option<kotak_client::KotakClient>>>,
     scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
-    raw_scrip_csv: Arc<RwLock<Option<String>>>,
+    scrip_files: crate::scrip_files::ScripFiles,
+    instruments: Arc<crate::instruments::Catalog>,
     scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     db_tx: mpsc::Sender<shared_domain::DbWriteMessage>,
     log_tx: broadcast::Sender<String>,
@@ -336,44 +348,39 @@ async fn fetch_scrip_master_background(
         }
     };
 
-    let mut store = trading_engine::ScripStore::default();
-    let mut raw_sections: Vec<(&str, String)> = Vec::new();
-
-    for segment in ["nse_fo", "bse_fo", "nse_cm"] {
-        match client.get_scrip_master_csv(segment).await {
-            Ok(csv) => {
-                store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
-                raw_sections.push((segment, csv));
-            }
-            Err(e) => {
-                tracing::error!(segment = %segment, "Failed to fetch Scrip Master: {}", e);
-                send_log(&db_tx, &log_tx, "ERROR", serde_json::json!({
-                    "event": "SCRIP_FETCH_ERROR",
-                    "level": "ERROR",
-                    "segment": segment,
-                    "message": format!("Failed to fetch {segment} scrip master: {e}"),
-                })).await;
-            }
-        }
-    }
-
-    if raw_sections.is_empty() {
+    let crate::scrip_files::Downloaded { store, failed } = crate::scrip_files::download(&client, &scrip_files).await;
+    for (segment, e) in &failed {
         send_log(&db_tx, &log_tx, "ERROR", serde_json::json!({
             "event": "SCRIP_FETCH_ERROR",
             "level": "ERROR",
-            "message": "Failed to fetch all scrip master segments — signals cannot be resolved to contracts",
+            "segment": segment,
+            "message": format!("Failed to fetch {segment} scrip master: {e}"),
         })).await;
-    } else {
-        *scrip_store.write().await = Some(store);
-        *raw_scrip_csv.write().await = merge_csv_sections(&raw_sections);
-        // Stamped only here, on the success path, so a day where every segment
-        // failed never looks "ready" to the 09:10 recycle.
-        *scrip_loaded_at.write().await = Some(shared_domain::now_ist());
-        send_log(&db_tx, &log_tx, "INFO", serde_json::json!({
-            "event": "SCRIP_FETCH_SUCCESS",
-            "level": "INFO",
-            "message": "Scrip Master loaded — ready to resolve and place orders",
-        })).await;
+    }
+
+    match store {
+        None => {
+            send_log(&db_tx, &log_tx, "ERROR", serde_json::json!({
+                "event": "SCRIP_FETCH_ERROR",
+                "level": "ERROR",
+                "message": "Failed to fetch all scrip master segments — signals cannot be resolved to contracts",
+            })).await;
+        }
+        Some(store) => {
+            *scrip_store.write().await = Some(store);
+            // Stamped only here, on the success path, so a day where every segment
+            // failed never looks "ready" to the 09:10 recycle.
+            *scrip_loaded_at.write().await = Some(shared_domain::now_ist());
+            // The files just written are the catalog's source; search
+            // keeps answering from the previous build until this lands
+            // (and nothing is built while the `search` switch is off).
+            instruments.rebuild_in_background("Scrip Master download");
+            send_log(&db_tx, &log_tx, "INFO", serde_json::json!({
+                "event": "SCRIP_FETCH_SUCCESS",
+                "level": "INFO",
+                "message": "Scrip Master loaded — ready to resolve and place orders",
+            })).await;
+        }
     }
 }
 
@@ -449,31 +456,6 @@ pub async fn try_env_auto_login(deps: KotakLoginDeps<'_>, source: &str) -> Resul
     Err(last_err)
 }
 
-fn merge_csv_sections(csvs: &[(&str, String)]) -> Option<String> {
-    let mut combined = String::new();
-
-    for (index, (segment, csv)) in csvs.iter().enumerate() {
-        let mut lines = csv.lines();
-        let header = lines.next()?;
-
-        if index == 0 {
-            combined.push_str(header);
-            combined.push('\n');
-        }
-
-        for line in lines {
-            if !line.trim().is_empty() {
-                combined.push_str(line);
-                combined.push('\n');
-            }
-        }
-
-        tracing::info!(segment = %segment, "Merged scrip master segment");
-    }
-
-    Some(combined)
-}
-
 #[derive(Deserialize, Default)]
 pub struct KotakLoginReq {
     #[serde(default)]
@@ -530,18 +512,18 @@ pub async fn kotak_auto_login_handler(State(state): State<AppState>) -> impl Int
     }
 }
 
-/// `GET /api/auth/kotak/scrip-master/raw` — download raw CSV.
+/// `GET /api/auth/kotak/scrip-master/raw` — download raw CSV: the segments
+/// on disk, streamed as one file (see `crate::scrip_files`).
 pub async fn kotak_scrip_raw_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let raw = state.raw_scrip_csv.read().await;
-    match raw.as_ref() {
-        Some(csv) => {
+    match state.scrip_files.merged_body() {
+        Some(body) => {
             let headers = [
                 (axum::http::header::CONTENT_TYPE, "text/csv"),
                 (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"scrip_master.csv\""),
             ];
-            (StatusCode::OK, headers, csv.clone()).into_response()
+            (StatusCode::OK, headers, body).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Scrip Master not loaded yet".to_string()).into_response(),
     }

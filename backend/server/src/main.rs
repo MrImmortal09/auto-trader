@@ -13,12 +13,15 @@ mod desk;
 mod execute;
 mod feed_latency;
 mod history;
+mod instruments;
 mod market_data;
 mod order_timing;
 mod orders;
 mod paper;
 mod pulse;
+mod quotes;
 mod routes;
+mod scrip_files;
 mod system;
 
 use std::sync::Arc;
@@ -147,8 +150,12 @@ pub(crate) struct AppState {
     /// IST timestamp of the last successful Scrip Master download — see
     /// `routes::KotakLoginDeps::scrip_loaded_at`.
     pub scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
-    /// Raw CSV string for frontend download.
-    pub raw_scrip_csv: Arc<RwLock<Option<String>>>,
+    /// The scrip-master CSVs on disk, streamed by the admin's downloads —
+    /// see `scrip_files`. Only the parsed store above stays in memory.
+    pub scrip_files: scrip_files::ScripFiles,
+    /// The instrument catalog built from those CSVs — see `instruments`.
+    /// Search only; the engine never reads it.
+    pub instruments: Arc<instruments::Catalog>,
     /// Handle to the currently running WebSocket task, so we can cancel it on re-auth.
     pub ws_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Channel sender to forward dynamic messages to the Node bridge.
@@ -192,6 +199,10 @@ pub(crate) struct AppState {
     /// Signed-in users' own paper portfolios — see `paper`. Nothing in it
     /// reaches the owner's engine or the broker.
     pub paper: Arc<paper::PaperDesk>,
+    /// Quotes for the catalog's instruments: Kotak REST, the feed's tick for
+    /// keys it carries, Upstox while Kotak is down, the 15:35 close after
+    /// hours — see `quotes`. Its own map; it never writes `prices`.
+    pub quotes: Arc<quotes::QuoteHub>,
     /// How late each feed's prices arrive — see `feed_latency`. Admin only.
     pub feed_latency: Arc<feed_latency::FeedLatency>,
     /// How long each LIVE order took — see `order_timing`. Admin only.
@@ -215,7 +226,8 @@ struct KotakAutoLoginHandles {
     prices: Arc<DashMap<String, f64>>,
     positions: Arc<RwLock<Vec<shared_domain::MonitoredPosition>>>,
     scrip_store: Arc<RwLock<Option<trading_engine::ScripStore>>>,
-    raw_scrip_csv: Arc<RwLock<Option<String>>>,
+    scrip_files: scrip_files::ScripFiles,
+    instruments: Arc<instruments::Catalog>,
     scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>>,
     login_lock: Arc<Mutex<()>>,
 }
@@ -232,7 +244,8 @@ impl KotakAutoLoginHandles {
             prices: &self.prices,
             positions: &self.positions,
             scrip_store: &self.scrip_store,
-            raw_scrip_csv: &self.raw_scrip_csv,
+            scrip_files: &self.scrip_files,
+            instruments: &self.instruments,
             scrip_loaded_at: &self.scrip_loaded_at,
             login_lock: &self.login_lock,
         }
@@ -901,8 +914,21 @@ async fn main() {
 
     let ws_scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
     let scrip_store = Arc::new(RwLock::new(None));
-    let raw_scrip_csv = Arc::new(RwLock::new(None));
+    // Every downloaded segment is saved under `data/` (beside trades.db) and
+    // streamed from there by the admin's CSV downloads — see `scrip_files`.
+    let scrip_files = scrip_files::ScripFiles::at_default_location();
+    match scrip_files.prepare() {
+        Ok(()) => tracing::info!(dir = %scrip_files.dir().display(), "Scrip Master CSVs are kept on disk"),
+        Err(e) => tracing::error!(dir = %scrip_files.dir().display(), error = %e, "Cannot create the data directory — the Scrip Master CSVs will not be kept on disk"),
+    }
+    // The instrument catalog (`instruments`): the search tables built from
+    // those CSVs, in their own SQLite file beside them. Search only; the
+    // engine never reads it.
+    let instruments = instruments::Catalog::open(scrip_files.clone(), &scrip_files::data_dir().join("instruments.db"), Arc::clone(&flags)).await;
     let scrip_loaded_at: Arc<RwLock<Option<chrono::DateTime<chrono::FixedOffset>>>> = Arc::new(RwLock::new(None));
+    // Set when a login below has started a Scrip Master download that will
+    // fill the store in the background.
+    let mut scrip_download_pending = false;
 
     // 7. Try to restore Kotak session from DB
     if let Some(session) = db::load_kotak_session(&pool).await {
@@ -912,31 +938,9 @@ async fn main() {
             
             // Fetch Scrip Master before starting WebSocket
             tracing::info!("Fetching Scrip Master...");
-            let mut store = trading_engine::ScripStore::default();
-            let mut raw_sections: Vec<(&str, String)> = Vec::new();
-            
-            for segment in ["nse_fo", "bse_fo", "nse_cm"] {
-                if let Ok(csv) = client.get_scrip_master_csv(segment).await {
-                    store.merge(trading_engine::ScripStore::parse_csv(&csv, segment));
-                    raw_sections.push((segment, csv));
-                }
-            }
-            
-            if !raw_sections.is_empty() {
+            let scrip_files::Downloaded { store, .. } = scrip_files::download(&client, &scrip_files).await;
+            if let Some(store) = store {
                 *scrip_store.write().await = Some(store);
-                
-                // Combine raw CSVs (simplified for startup)
-                let mut combined = String::new();
-                for (i, (_, csv)) in raw_sections.iter().enumerate() {
-                    let mut lines = csv.lines();
-                    if let Some(header) = lines.next() {
-                        if i == 0 { combined.push_str(header); combined.push('\n'); }
-                        for line in lines {
-                            if !line.trim().is_empty() { combined.push_str(line); combined.push('\n'); }
-                        }
-                    }
-                }
-                *raw_scrip_csv.write().await = Some(combined);
                 *scrip_loaded_at.write().await = Some(shared_domain::now_ist());
                 tracing::info!("Scrip Master fetched successfully.");
             }
@@ -986,21 +990,41 @@ async fn main() {
             positions: &positions,
             scrip_store: &scrip_store,
             scrip_loaded_at: &scrip_loaded_at,
-            raw_scrip_csv: &raw_scrip_csv,
+            scrip_files: &scrip_files,
+            instruments: &instruments,
             login_lock: &kotak_login_lock,
         };
         match routes::try_env_auto_login(deps, "server startup").await {
-            Ok(()) => tracing::info!("Kotak auto-login succeeded at startup"),
+            Ok(()) => {
+                tracing::info!("Kotak auto-login succeeded at startup");
+                scrip_download_pending = true;
+            }
             Err(e) => tracing::info!(reason = %e, "Kotak auto-login not performed at startup — bridge startup deferred until login"),
         }
     }
 
+    // 7a. The engine's Scrip Master is never restored from the CSVs on disk:
+    // with no session to restore and no auto-login, `scrip_store` stays
+    // `None` and every signal is refused with "Scrip Master not loaded"
+    // until a login's download fills it, exactly as before the files
+    // existed. The files serve the instrument catalog (7c) and the admin's
+    // CSV downloads only.
 
     // 7b. VWAP + PCR indicator feed — filled by the Upstox poller (9b) and read
     // by the position monitor at the moment an entry triggers. Seeded from
     // today's oi_snapshots so a mid-session restart keeps its closed checks.
     let indicator_feed = shared_domain::entry_gate::new_indicator_feed();
     market_data::seed_indicator_feed(&pool, &indicator_feed).await;
+
+    // 7c. The instrument catalog: rebuilt from the CSVs on disk when they
+    // are newer than its last build, while the `search` switch is on (off,
+    // the search list restored from `instruments.db` is all search has; the
+    // build runs when the switch is turned on). Not while a login's download
+    // is in flight: `fetch_scrip_master_background` rebuilds it once the new
+    // files are written.
+    if !scrip_download_pending {
+        instruments.rebuild_in_background("startup");
+    }
 
     // 8. Position Monitor
     tracing::info!(mode = %trading_cfg.read().await.mode, "Starting position monitor");
@@ -1052,7 +1076,8 @@ async fn main() {
             positions: Arc::clone(&positions),
             scrip_store: Arc::clone(&scrip_store),
             scrip_loaded_at: Arc::clone(&scrip_loaded_at),
-            raw_scrip_csv: Arc::clone(&raw_scrip_csv),
+            scrip_files: scrip_files.clone(),
+            instruments: Arc::clone(&instruments),
             login_lock: Arc::clone(&kotak_login_lock),
         };
 
@@ -1144,6 +1169,27 @@ async fn main() {
             .expect("cannot read the users' paper positions"),
     );
 
+    // 9e. The quote hub: what the search and the instrument page price
+    // by. Its poller asks Kotak only while the `search` switch is on and
+    // the session watchdog finds the session healthy, and its close sweep
+    // runs at 15:35 IST on trading days, again only while the switch is on.
+    // Its close snapshot lives in the catalog's `instruments.db`.
+    let quotes = {
+        let catalog = Arc::clone(&instruments);
+        Arc::new(quotes::QuoteHub::new(Arc::clone(&prices), Box::new(move |key: &str| catalog.upstox_key(key))))
+    };
+    quotes::spawn(
+        Arc::clone(&quotes),
+        quotes::Deps {
+            kotak: Arc::clone(&kotak_client_opt),
+            healthy: Arc::clone(&kotak_session_healthy),
+            upstox: upstox.clone(),
+            catalog: Arc::clone(&instruments),
+            flags: Arc::clone(&flags),
+        },
+    )
+    .await;
+
     // 10. Router
     let state = AppState {
         signal_tx,
@@ -1157,7 +1203,8 @@ async fn main() {
         telegram: Arc::new(Mutex::new(telegram_ingester::TelegramManager::new())),
         positions,
         scrip_store,
-        raw_scrip_csv,
+        scrip_files,
+        instruments,
         scrip_loaded_at,
         ws_task,
         ws_tx,
@@ -1175,6 +1222,7 @@ async fn main() {
         limits: Arc::new(auth::ratelimit::Limiter::new()),
         whatsapp,
         paper: paper_desk,
+        quotes,
         feed_latency,
         order_timing,
     };
@@ -1274,6 +1322,13 @@ async fn main() {
         .route("/api/v2/mode-check",                get(routes::v2::mode_check_handler))
         .route("/api/v2/candles",                   get(routes::v2::candles_handler))
         .route("/api/v2/candles/stream",            get(routes::v2::candles_stream_handler))
+        // The instrument search and its quotes, behind the `search` flag —
+        // see `routes::v2::instruments`. The static `status` path is
+        // registered beside the `:id` one; axum matches it first.
+        .route("/api/v2/search",                    get(routes::v2::search_handler))
+        .route("/api/v2/quotes",                    get(routes::v2::quotes_handler))
+        .route("/api/v2/instruments/status",        get(routes::v2::instruments_status_handler))
+        .route("/api/v2/instruments/:id",           get(routes::v2::instrument_handler))
         .route("/api/v2/me/desk",                   get(routes::v2::me::desk_handler))
         .route("/api/v2/me/history",                get(routes::v2::me::history_handler))
         .route("/api/v2/me/marks",                  get(routes::v2::me::marks_handler))

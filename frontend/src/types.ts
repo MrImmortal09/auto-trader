@@ -203,6 +203,11 @@ export interface HealthSnapshot {
     virtual_memory_mib: number;
     run_time_secs: number;
   } | null;
+  /** `MEMORY_WARN_MB`: the server's resident memory, in MiB, above which the
+   * log warns and `memory_warn` is set — see `pulse.rs`. */
+  memory_warn_mb: number;
+  /** Whether `current_process.memory_mib` is above it right now. */
+  memory_warn: boolean;
   /** Whether the backend has AUTH_SECRET set. If false, every authenticated
    * API route fails with 500 — see auth_middleware in server/src/main.rs. */
   auth_secret_configured: boolean;
@@ -427,6 +432,10 @@ export interface TelemetrySample extends TelemetryPoint {
 
   process_uptime_secs: number;
   process_virtual_mb: number;
+  /** `MEMORY_WARN_MB` — the alarm's threshold (default 450). */
+  memory_warn_mb: number;
+  /** Resident memory over `memory_warn_mb` (until it falls 5% under). */
+  memory_warn: boolean;
   host_memory_total_mb: number;
   host_swap_total_mb: number;
   host_swap_used_mb: number;

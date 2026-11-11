@@ -405,7 +405,7 @@ impl TradingConfig {
 /// Engine switches for the v2 redesign, stored in their own `feature_flags`
 /// table behind `GET/PUT /api/v2/flags` — never in [`TradingConfig`], which
 /// `POST /api/settings` replaces whole, so a switch kept there would be turned
-/// off every time v1 saves a setting. Both default to off, and with both off
+/// off every time v1 saves a setting. All default to off, and with all off
 /// the engine trades exactly as it did before they existed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureFlags {
@@ -417,15 +417,21 @@ pub struct FeatureFlags {
     /// (`PATCH /api/v2/positions/:id`). While off, no new level can be set;
     /// levels already set stay until their position closes.
     pub chart_stops: bool,
+    /// The instrument search and its quotes for anyone signed in:
+    /// `GET /api/v2/search`, `/api/v2/quotes` and `/api/v2/instruments/*`.
+    /// While off they answer 404. Nothing in the engine reads it.
+    #[serde(default)]
+    pub search: bool,
 }
 
 impl FeatureFlags {
     /// Every switch as `(name, on)`; `name` is both its `feature_flags` row
     /// and its JSON field.
-    pub fn entries(&self) -> [(&'static str, bool); 2] {
+    pub fn entries(&self) -> [(&'static str, bool); 3] {
         [
             ("index_options_only", self.index_options_only),
             ("chart_stops", self.chart_stops),
+            ("search", self.search),
         ]
     }
 
@@ -434,6 +440,7 @@ impl FeatureFlags {
         match name {
             "index_options_only" => self.index_options_only = on,
             "chart_stops" => self.chart_stops = on,
+            "search" => self.search = on,
             _ => return false,
         }
         true
@@ -1572,6 +1579,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_market_is_open_on_weekdays_from_0915_until_1540() {
+        // `is_market_open_at` (`special_session.rs`) also opens for a special
+        // session on the day; the guard clears them, so this checks the
+        // regular hours alone and no other test's session reaches it.
+        let _guard = special_sessions_test_guard();
+        let ist = |y, m, d, h, min| {
+            NaiveDate::from_ymd_opt(y, m, d)
+                .unwrap()
+                .and_hms_opt(h, min, 0)
+                .unwrap()
+                .and_local_timezone(ist_offset())
+                .single()
+                .unwrap()
+        };
+        // 2026-11-04 is a Wednesday.
+        assert!(!is_market_open_at(ist(2026, 11, 4, 9, 14)));
+        assert!(is_market_open_at(ist(2026, 11, 4, 9, 15)));
+        assert!(is_market_open_at(ist(2026, 11, 4, 15, 39)));
+        assert!(!is_market_open_at(ist(2026, 11, 4, 15, 40)));
+        assert!(!is_market_open_at(ist(2026, 11, 4, 20, 0)));
+        assert!(!is_market_open_at(ist(2026, 11, 7, 12, 0)), "Saturday");
+        assert!(!is_market_open_at(ist(2026, 11, 8, 12, 0)), "Sunday");
+    }
+
+    #[test]
     fn signal_saved_before_entry_ranges_still_loads() {
         // Open positions are persisted as JSON; ones written by an older build
         // have no `entry_price_max` and must restore as plain triggers.
@@ -1959,15 +1991,18 @@ mod tests {
 
     #[test]
     fn feature_flags_default_off_and_keep_their_api_names() {
-        assert_eq!(FeatureFlags::default(), FeatureFlags { index_options_only: false, chart_stops: false });
+        assert_eq!(FeatureFlags::default(), FeatureFlags { index_options_only: false, chart_stops: false, search: false });
         assert_eq!(
-            serde_json::to_value(FeatureFlags { index_options_only: true, chart_stops: false }).unwrap(),
-            serde_json::json!({ "index_options_only": true, "chart_stops": false }),
+            serde_json::to_value(FeatureFlags { index_options_only: true, chart_stops: false, search: false }).unwrap(),
+            serde_json::json!({ "index_options_only": true, "chart_stops": false, "search": false }),
         );
+        // A client from before the switch existed leaves it off.
+        let old: FeatureFlags = serde_json::from_str(r#"{"index_options_only": true, "chart_stops": true}"#).unwrap();
+        assert_eq!(old, FeatureFlags { index_options_only: true, chart_stops: true, search: false });
 
         // `entries` and `set` use exactly the JSON field names, so a stored
         // row always lands on the switch the API shows.
-        let flags = FeatureFlags { index_options_only: true, chart_stops: false };
+        let flags = FeatureFlags { index_options_only: true, chart_stops: false, search: true };
         let json = serde_json::to_value(flags).unwrap();
         assert_eq!(json.as_object().unwrap().len(), flags.entries().len());
         for (name, on) in flags.entries() {

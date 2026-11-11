@@ -1,6 +1,7 @@
 use shared_domain::{current_ist_timestamp_string, ArchivedCandle, DbWriteMessage, MonitoredPosition};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 use shared_domain::{telemetry, FeatureFlags, TradingConfig};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -454,6 +455,160 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     ).execute(&pool).await.unwrap();
 
     pool
+}
+
+// ---------------------------------------------------------------------------
+// The instrument catalog's own database
+// ---------------------------------------------------------------------------
+
+/// The `instruments` table's columns — of `instruments` itself and of the
+/// `instruments_new` a rebuild fills before renaming it over (see
+/// `instruments::load`). One row per listed instrument: `id` is
+/// `<segment>:<token>`, `kind` is INDEX, EQ, FUT, CE or PE, `expiry` is
+/// `YYYY-MM-DD` or NULL for cash, `ws_key` the price-map key.
+pub const INSTRUMENTS_COLUMNS: &str = "
+    id TEXT PRIMARY KEY,
+    segment TEXT NOT NULL,
+    token TEXT NOT NULL,
+    trading_symbol TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    underlying TEXT NOT NULL,
+    expiry TEXT,
+    strike REAL,
+    lot_size INTEGER NOT NULL,
+    tick_size REAL NOT NULL,
+    isin TEXT,
+    exchange TEXT NOT NULL,
+    ws_key TEXT NOT NULL,
+    loaded_day TEXT NOT NULL";
+
+/// Its indexes: by symbol, by chain (underlying, kind, expiry, strike) and
+/// by ISIN. A rebuild creates them again on the renamed table. The chain
+/// index leads with `kind` after the underlying so the search's lookups are
+/// seeks, never a walk of every contract under NIFTY: the futures from
+/// today (`underlying, 'FUT', expiry >=`), an option expiry list as repeated
+/// `MIN(expiry)` seeks per kind, one expiry's strikes around the spot
+/// (`underlying, kind, expiry, strike`) — see `instruments::Catalog`.
+pub const INSTRUMENT_INDEXES: [&str; 3] = [
+    "CREATE INDEX IF NOT EXISTS idx_instruments_symbol ON instruments (symbol)",
+    "CREATE INDEX IF NOT EXISTS idx_instruments_chain ON instruments (underlying, kind, expiry, strike)",
+    "CREATE INDEX IF NOT EXISTS idx_instruments_isin ON instruments (isin)",
+];
+
+/// Opens (or creates) the instrument catalog's database at `path`
+/// (`data/instruments.db`, see `instruments`). Its own file, apart from
+/// trades.db: a rebuild writes 150-200k rows in one transaction, and SQLite
+/// allows one writer at a time, so in trades.db it would hold the engine's
+/// `db_writer` behind the busy timeout. The quote hub's close snapshot
+/// (`quote_eod`) lives here too, for the same reason: its 15:35 write of a
+/// few thousand rows then never queues behind, or holds up, the engine's
+/// single writer. Everything in the file is market data rebuilt or
+/// re-swept from Kotak. Tables are created if missing, never altered.
+/// Returns the pool and whether FTS5 is available (`instruments_fts` could
+/// be created), which the bundled SQLite has.
+pub async fn init_catalog_db(path: &Path) -> Result<(SqlitePool, bool), sqlx::Error> {
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal);
+    let pool = SqlitePoolOptions::new().max_connections(3).connect_with(opts).await?;
+
+    sqlx::query(&format!("CREATE TABLE IF NOT EXISTS instruments ({INSTRUMENTS_COLUMNS})"))
+        .execute(&pool)
+        .await?;
+    for sql in INSTRUMENT_INDEXES {
+        sqlx::query(sql).execute(&pool).await?;
+    }
+    // The search list as the last build left it, so a restart can search
+    // without a rebuild: one row per symbol, with its cash or index row.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS instrument_underlyings (
+            symbol TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            id TEXT,
+            has_fo INTEGER NOT NULL,
+            fo_index INTEGER NOT NULL,
+            fo_segment TEXT,
+            isin TEXT,
+            exchange TEXT,
+            ws_key TEXT,
+            trading_symbol TEXT,
+            lot_size INTEGER NOT NULL DEFAULT 1,
+            tick_size REAL NOT NULL DEFAULT 0.05
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    // One row per segment per build: how many rows, from a file modified
+    // when — what the next build compares to know whether anything changed.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS instrument_load (
+            day TEXT NOT NULL,
+            segment TEXT NOT NULL,
+            rows INTEGER NOT NULL,
+            loaded_at TEXT NOT NULL,
+            source_mtime INTEGER,
+            PRIMARY KEY (day, segment)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    // Rows read per kind (`{"CE": n, "PE": n, "FUT": n}` as JSON), counted
+    // as the file is parsed, so the status never counts the table. Additive,
+    // so a catalog from before the column keeps working.
+    ensure_column(&pool, "ALTER TABLE instrument_load ADD COLUMN kinds TEXT").await;
+    // The close snapshot the quote hub sweeps at 15:35 IST (see
+    // `quotes::eod`): one row per instrument per day. The hub serves a
+    // day's row as the instrument's close whenever the market is shut —
+    // after 15:40, before 09:15, weekends and holidays — in place of any
+    // live quote from that day or earlier, session or no session, until a
+    // later day's quote arrives; never while the market is open.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS quote_eod (
+            key TEXT NOT NULL,
+            day TEXT NOT NULL,
+            ltp REAL NOT NULL,
+            close REAL,
+            open REAL,
+            high REAL,
+            low REAL,
+            volume REAL,
+            taken_at TEXT NOT NULL,
+            PRIMARY KEY (key, day)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    // One row per sweep: how many keys it asked for and how many answered,
+    // so a snapshot cut short by the 15:40 deadline (or short of answers) is
+    // known to be partial after a restart too.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS quote_eod_days (
+            day TEXT PRIMARY KEY,
+            taken_at TEXT NOT NULL,
+            asked INTEGER NOT NULL,
+            answered INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    let fts = match sqlx::query(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS instruments_fts USING fts5(symbol, name, tokenize = 'unicode61')",
+    )
+    .execute(&pool)
+    .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "This SQLite has no FTS5 — instrument name search runs in memory instead");
+            false
+        }
+    };
+    Ok((pool, fts))
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,6 +1465,11 @@ pub(crate) mod test_support {
             format!("sqlite://{}", self.0.display())
         }
 
+        /// The file itself, for `init_catalog_db`.
+        pub(crate) fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
         fn remove(&self) {
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
@@ -1519,12 +1679,12 @@ mod tests {
         let pool = init_db(&db.url()).await;
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: true, chart_stops: false },
+            FeatureFlags { index_options_only: true, chart_stops: false, search: false },
         );
-        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true)]).await.unwrap();
+        save_feature_flags(&pool, &[("index_options_only", false), ("chart_stops", true), ("search", true)]).await.unwrap();
         assert_eq!(
             load_feature_flags(&pool).await,
-            FeatureFlags { index_options_only: false, chart_stops: true },
+            FeatureFlags { index_options_only: false, chart_stops: true, search: true },
         );
         pool.close().await;
     }

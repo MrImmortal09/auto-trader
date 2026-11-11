@@ -61,6 +61,13 @@ const RULES: &[Rule] = &[
     rule(On::Read, "/api/v2/status", Access::SignedIn),
     rule(On::Read, "/api/execute/stream", Access::SignedIn),
     rule(On::Read, "/api/market/*", Access::SignedIn),
+    // The instrument search and its quotes (behind the `search` flag). The
+    // status page is the owner's: it carries the hub's error text, call
+    // times and the catalog's paths — diagnostics, not market data.
+    rule(On::Read, "/api/v2/search", Access::SignedIn),
+    rule(On::Read, "/api/v2/quotes", Access::SignedIn),
+    rule(On::Read, "/api/v2/instruments/status", Access::Admin),
+    rule(On::Read, "/api/v2/instruments/*", Access::SignedIn),
     // A user's own paper portfolio.
     rule(On::Any, "/api/v2/me/*", Access::PhoneUser),
 ];
@@ -210,6 +217,11 @@ mod tests {
         (GET, "/api/v2/mode-check", Access::Admin),
         (GET, "/api/v2/candles", Access::SignedIn),
         (GET, "/api/v2/candles/stream", Access::SignedIn),
+        (GET, "/api/v2/search", Access::SignedIn),
+        (GET, "/api/v2/quotes", Access::SignedIn),
+        (GET, "/api/v2/instruments/status", Access::Admin),
+        (GET, "/api/v2/instruments/nse_cm:2885", Access::SignedIn),
+        (GET, "/api/v2/instruments/nse_cm:Nifty%2050", Access::SignedIn),
         (GET, "/api/v2/me/desk", Access::PhoneUser),
         (GET, "/api/v2/me/history", Access::PhoneUser),
         (GET, "/api/v2/me/marks", Access::PhoneUser),
@@ -238,6 +250,11 @@ mod tests {
         // A prefix rule never matches the bare prefix or an unrelated sibling.
         assert_eq!(required(&GET, "/api/market"), Access::Admin);
         assert_eq!(required(&GET, "/api/v2/me"), Access::Admin);
+        assert_eq!(required(&GET, "/api/v2/instruments"), Access::Admin);
+        // The search routes are read-only: a write to them is nobody's.
+        assert_eq!(required(&POST, "/api/v2/search"), Access::Admin);
+        assert_eq!(required(&PUT, "/api/v2/quotes"), Access::Admin);
+        assert_eq!(required(&DELETE, "/api/v2/instruments/status"), Access::Admin);
         assert_eq!(required(&Method::OPTIONS, "/api/execute/buy"), Access::Public);
     }
 
