@@ -25,7 +25,7 @@ use sqlx::sqlite::SqlitePool;
 use tokio::sync::mpsc;
 use upstox_client::{Candle, UpstoxClient};
 
-use super::symbols::upstox_index_key;
+use super::symbols::{dated_future_name, upstox_index_key};
 use super::UPSTOX_INDEX_FILES;
 
 /// The daily sweep, IST: ten minutes after the 15:40 close, once Upstox's
@@ -138,9 +138,10 @@ async fn symbols(client: &UpstoxClient) -> Vec<(String, String)> {
     out
 }
 
-/// The archive's name for a future: `NIFTY:FUT:2026-11-25`.
+/// The archive's name for a future: `NIFTY:FUT:2026-11-25`, the same
+/// spelling a chart names that contract by (`symbols::dated_future_name`).
 fn future_name(index: &str, expiry: NaiveDate) -> String {
-    format!("{index}:FUT:{}", expiry.format("%Y-%m-%d"))
+    dated_future_name(index, expiry)
 }
 
 /// What to fetch for a symbol last archived on `last_archived`: the past days
@@ -328,6 +329,9 @@ mod tests {
     #[test]
     fn futures_are_named_by_contract() {
         assert_eq!(future_name("NIFTY", date(11, 24)), "NIFTY:FUT:2026-11-24");
+        // A chart names the same contract by the same string.
+        let chart = super::super::symbols::Symbol::parse("NIFTY:FUT:2026-11-24").unwrap();
+        assert_eq!(chart.name(), future_name("NIFTY", date(11, 24)));
     }
 
     #[test]

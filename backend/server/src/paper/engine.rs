@@ -1,6 +1,9 @@
 //! The paper watch loop: every 500 ms, each open paper position's chart stop
 //! and target, and the expiry square-off. Nothing else — no trailing, no
 //! targets of its own, no signals, no sizing. It is handed the desk alone.
+//! An index option and a stock option are watched alike: the premium is the
+//! contract's own tick, and a level on the underlying reads the index's feed
+//! value or the stock's cash row (`PaperPosition::underlying_price_key`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,7 +101,7 @@ pub async fn step(desk: &PaperDesk, now: DateTime<FixedOffset>, trading_day: boo
     let mut seen = Vec::new();
     for (user_id, pos) in open {
         let premium = fresh(&pos.ws_key);
-        let index = shared_domain::kotak_index_feed(&pos.index).and_then(|(_, name)| fresh(&shared_domain::index_price_key(name)));
+        let index = pos.underlying_price_key().and_then(|key| fresh(&key));
         if let Some(p) = premium {
             seen.push((user_id, pos.id.clone(), p));
         }
@@ -136,7 +139,7 @@ pub async fn run(desk: Arc<PaperDesk>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paper::tests::{desk, nifty};
+    use crate::paper::tests::{desk, nifty, reliance};
     use chrono::{NaiveDate, TimeZone};
     use crate::routes::v2::positions::LevelsUpdate;
     use shared_domain::{ChartLevel, ChartLevels, ChartTarget, LevelTrigger};
@@ -168,6 +171,30 @@ mod tests {
             chart,
             opened_at: "2026-10-27 10:00:00".into(),
             last_ltp: Some(101.0),
+            underlying_key: None,
+            segment: "nse_fo".into(),
+        }
+    }
+
+    /// A RELIANCE 1400 CE held, expiring 24 Nov 2026 (its monthly).
+    fn held_stock(chart: ChartLevels) -> PaperPosition {
+        let c = reliance(1_400.0, "CE");
+        PaperPosition {
+            id: "r".into(),
+            index: c.index,
+            trading_symbol: c.trading_symbol,
+            ws_key: c.ws_key,
+            expiry: c.expiry,
+            strike: c.strike,
+            option_type: c.option_type,
+            lot_size: 500,
+            qty: 500,
+            avg_price: 40.0,
+            chart,
+            opened_at: "2026-11-10 10:00:00".into(),
+            last_ltp: Some(41.0),
+            underlying_key: c.underlying_key,
+            segment: c.segment,
         }
     }
 
@@ -248,6 +275,84 @@ mod tests {
         assert_eq!(decide(&session_pos, ist(weekday, (18, 30, 0)), false, Some(95.0), Some(25_050.0)), Some((95.0, all("CHART_STOP"))));
 
         shared_domain::set_special_sessions(vec![]);
+    }
+
+    #[test]
+    fn a_stock_option_squares_off_at_15_38_on_its_own_expiry_day_only() {
+        let p = held_stock(ChartLevels::default());
+        let expiry = (2026, 11, 24);
+        // The day before, and the index expiries around it, leave it alone.
+        assert_eq!(decide(&p, ist((2026, 11, 23), (15, 38, 0)), true, Some(39.0), None), None);
+        assert_eq!(decide(&p, ist(expiry, (15, 37, 59)), true, Some(39.0), None), None);
+        assert_eq!(decide(&p, ist(expiry, (15, 38, 0)), true, Some(39.0), None), Some((39.0, all("EXPIRY_SQUAREOFF"))));
+        assert_eq!(decide(&p, ist(expiry, (15, 38, 0)), true, None, None), Some((41.0, all("EXPIRY_SQUAREOFF"))));
+        // Found after its expiry: settled at once at the last price seen.
+        assert_eq!(decide(&p, ist((2026, 11, 25), (9, 20, 0)), true, Some(1.0), None), Some((41.0, all("EXPIRY_SQUAREOFF"))));
+        assert!(squaring_off(p.expiry, ist(expiry, (15, 38, 0))) && !squaring_off(p.expiry, ist(expiry, (15, 37, 59))));
+    }
+
+    #[test]
+    fn a_stock_options_levels_trigger_on_its_premium_or_on_the_stocks_price() {
+        let _guard = shared_domain::special_sessions_test_guard();
+        let stop = ChartLevel { price: 1_380.0, trigger: LevelTrigger::Index };
+        let target = ChartTarget { id: "t".into(), price: 55.0, trigger: LevelTrigger::Premium, lots: None };
+        let p = held_stock(ChartLevels { stop: Some(stop), targets: vec![target] });
+        let open = ist((2026, 11, 10), (11, 0, 0));
+        // The stock above the stop, the premium below the target: nothing.
+        assert_eq!(decide(&p, open, true, Some(42.0), Some(1_395.0)), None);
+        // A call's stop on the stock is reached as the stock falls.
+        assert_eq!(decide(&p, open, true, Some(38.0), Some(1_379.5)), Some((38.0, all("CHART_STOP"))));
+        // Reached on the stock with no fresh premium to sell at: wait.
+        assert_eq!(decide(&p, open, true, None, Some(1_370.0)), None);
+        // The target on the premium.
+        assert_eq!(decide(&p, open, true, Some(55.5), Some(1_420.0)), Some((55.5, all("CHART_TARGET"))));
+        // A put's stop on the stock is reached as the stock rises.
+        let mut put = p.clone();
+        put.option_type = "PE".into();
+        put.chart.stop = Some(ChartLevel { price: 1_420.0, trigger: LevelTrigger::Index });
+        assert_eq!(decide(&put, open, true, Some(38.0), Some(1_419.0)), None);
+        assert_eq!(decide(&put, open, true, Some(38.0), Some(1_420.0)), Some((38.0, all("CHART_STOP"))));
+        // Outside market hours nothing triggers.
+        assert_eq!(decide(&p, ist((2026, 11, 10), (15, 31, 0)), true, Some(38.0), Some(1_370.0)), None);
+    }
+
+    #[tokio::test]
+    async fn a_step_reads_a_stocks_price_from_its_cash_row() {
+        let (_db, desk) = desk("engine-stock").await;
+        let c = reliance(1_400.0, "CE");
+        let a = desk.buy(2, &c, 1, 40.0).await.unwrap();
+        let stop = LevelsUpdate { stop: Some(Some(ChartLevel { price: 1_380.0, trigger: LevelTrigger::Index })), ..Default::default() };
+        desk.set_levels(2, &a.position_id, &stop).await.unwrap();
+        let mut other = nifty(25_000.0, "CE");
+        other.expiry = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let b = desk.buy(2, &other, 1, 100.0).await.unwrap();
+        // The stock stays above the stop: held, its last price noted.
+        let prices = |key: &str| match key {
+            "nse_fo|R1400CE" => Some(39.0),
+            "nse_cm|2885" => Some(1_390.0),
+            "nse_fo|25000CE" => Some(101.0),
+            _ => None,
+        };
+        step(&desk, ist((2026, 11, 10), (11, 0, 0)), true, prices).await;
+        assert_eq!(desk.open(2).await.len(), 2);
+        assert_eq!(desk.open(2).await[0].last_ltp, Some(39.0));
+        // The stock falls through it: sold at the premium's fresh price; the index option is left alone.
+        let prices = |key: &str| match key {
+            "nse_fo|R1400CE" => Some(37.0),
+            "nse_cm|2885" => Some(1_379.0),
+            "nse_fo|25000CE" => Some(101.0),
+            _ => None,
+        };
+        step(&desk, ist((2026, 11, 10), (11, 0, 1)), true, prices).await;
+        let open = desk.open(2).await;
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, b.position_id);
+        assert_eq!(desk.activity(2)[0].message, "Sold 500 RELIANCE 1400 CE at ₹37.00 (chart stop)");
+        // On the stock option's expiry day at 15:38 the index option (same expiry) goes too — each on its own expiry.
+        step(&desk, ist((2026, 11, 24), (15, 38, 0)), true, prices).await;
+        assert!(desk.open(2).await.is_empty());
+        let legs = crate::history::load_user_legs(&desk.pool, 2, 0).await.unwrap();
+        assert_eq!(legs.last().unwrap().exit_reason.as_deref(), Some("EXPIRY_SQUAREOFF"));
     }
 
     #[tokio::test]

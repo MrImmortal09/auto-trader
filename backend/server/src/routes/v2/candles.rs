@@ -13,7 +13,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    Json,
+    Extension, Json,
 };
 use chrono::NaiveDate;
 use futures::StreamExt as _;
@@ -21,9 +21,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::broadcast;
 
+use crate::auth::Identity;
 use crate::candles::bars::{self, Bar, Tf};
 use crate::candles::symbols::Symbol;
 use crate::candles::{Change, Running, StreamGuard, TrackError};
+use crate::execute::SubPool;
 use crate::AppState;
 
 /// Days shown when the request names none.
@@ -48,14 +50,63 @@ fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() }))).into_response()
 }
 
-const SYMBOL_HELP: &str =
-    "symbol must be an index (NIFTY), its nearest future (NIFTY:FUT) or an option (NIFTY:2026-10-27:22750:CE)";
+/// The grammar while the `stock_charts` switch is off: the six indices.
+const SYMBOL_HELP: &str = "symbol must be an index (NIFTY), its nearest future (NIFTY:FUT), \
+a future by its expiry (NIFTY:FUT:2026-11-24) or an option (NIFTY:2026-10-27:22750:CE)";
+/// The grammar with it on: any F&O underlying or NSE stock in the catalog too.
+const SYMBOL_HELP_STOCKS: &str = "symbol must be an index (NIFTY) or an NSE stock in the catalog (RELIANCE; RELIANCE@BSE names its BSE listing, which is not served), \
+its nearest future (NIFTY:FUT, RELIANCE:FUT), a future by its expiry (NIFTY:FUT:2026-11-24, RELIANCE:FUT:2026-12-29) \
+or an option (NIFTY:2026-10-27:22750:CE, RELIANCE:2026-11-24:1400:CE)";
+
+/// What a chart may name: the indices always; with the `stock_charts` switch
+/// on, any underlying the instrument catalog lists as well. Read once per
+/// request.
+struct Grammar {
+    stocks: bool,
+}
+
+impl Grammar {
+    async fn load(state: &AppState) -> Self {
+        Grammar { stocks: state.flags.read().await.stock_charts }
+    }
+
+    fn help(&self) -> &'static str {
+        if self.stocks { SYMBOL_HELP_STOCKS } else { SYMBOL_HELP }
+    }
+
+    /// `raw` as a symbol, or why not (a 400). With the switch off this is
+    /// `Symbol::parse`, the index-only grammar (which takes an index's
+    /// dated future too). The help is bare for a route that takes one
+    /// symbol, and `named` — `raw` in front of it — for a list, where it
+    /// says which one was refused.
+    fn parse(&self, state: &AppState, raw: &str, named: bool) -> Result<Symbol, Response> {
+        let known = |name: &str| state.instruments.underlying(name).is_some();
+        self.parse_on(raw, named, &known, shared_domain::today_ist()).map_err(bad_request)
+    }
+
+    /// [`Self::parse`] against the catalog check `known`, on `today` (IST):
+    /// the 400's message on a refusal — the grammar's help, a BSE listing,
+    /// or a dated future that has expired.
+    fn parse_on(&self, raw: &str, named: bool, known: &dyn Fn(&str) -> bool, today: NaiveDate) -> Result<Symbol, String> {
+        let parsed = if self.stocks { Symbol::parse_with(raw, known) } else { Symbol::parse(raw) };
+        let symbol = parsed.ok_or_else(|| if named { format!("{raw}: {}", self.help()) } else { self.help().to_string() })?;
+        match symbol.refusal(today) {
+            Some(why) => Err(why),
+            None => Ok(symbol),
+        }
+    }
+}
 
 fn track_error(symbol: &Symbol, e: TrackError) -> Response {
     match e {
         TrackError::NotFound => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("{} is not a contract either broker lists today", symbol.name()) })),
+        )
+            .into_response(),
+        TrackError::NoFeed => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": format!("{}: the feed's chart budget is used up for today and Upstox is not configured — no price source", symbol.name()) })),
         )
             .into_response(),
         TrackError::Stopped => (
@@ -92,10 +143,16 @@ pub struct CandlesQuery {
 /// `GET /api/v2/candles?symbol=NIFTY&tf=5m&from=2026-10-16&to=2026-10-21` —
 /// bars oldest first. Past days are Upstox's candles; today's are the
 /// service's, built from live ticks and corrected with Upstox's official
-/// minutes. `forming` says the last bar is still open.
-pub async fn candles_handler(State(state): State<AppState>, Query(q): Query<CandlesQuery>) -> Response {
-    let Some(symbol) = Symbol::parse(&q.symbol) else {
-        return bad_request(SYMBOL_HELP);
+/// minutes. `forming` says the last bar is still open; `polled` that no
+/// Kotak tick is building today's bars (a stock past the ladder budget, or
+/// one the feed never ticked), which then come from Upstox's minutes alone.
+/// `symbol` is an index, or any catalog underlying with the `stock_charts`
+/// switch on (see `candles::symbols`).
+pub async fn candles_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Query(q): Query<CandlesQuery>) -> Response {
+    let grammar = Grammar::load(&state).await;
+    let symbol = match grammar.parse(&state, &q.symbol, false) {
+        Ok(symbol) => symbol,
+        Err(response) => return response,
     };
     let Some(tf) = parse_tf(q.tf.as_deref()) else {
         return bad_request("tf must be 1m, 5m or 15m");
@@ -122,13 +179,20 @@ pub async fn candles_handler(State(state): State<AppState>, Query(q): Query<Cand
         return bad_request(format!("at most {} days of {} bars per request", max_days(tf), tf.as_str()));
     }
 
-    let (running, tracking) = match state.candles.track(&state, symbol).await {
+    let (running, tracking) = match state.candles.track(&state, symbol.clone(), SubPool::of(&identity)).await {
         Ok(found) => found,
         Err(e) => return track_error(&symbol, e),
     };
 
     let mut bars: Vec<Bar> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    if tracking.polled {
+        notes.push(match (&tracking.kotak, &tracking.upstox) {
+            (None, _) => "no Kotak feed for this instrument: today's bars are Upstox's official minutes".to_string(),
+            (Some(_), Some(_)) => "no Kotak tick since subscribing (the feed is quiet, the ladder budget is full, or the feed did not answer): today's bars are Upstox's official minutes until it ticks".to_string(),
+            (Some(_), None) => "no Kotak tick since subscribing, and Upstox is not configured: today's bars may stay empty".to_string(),
+        });
+    }
     if from < today {
         let until = to.min(today - chrono::Days::new(1));
         match running.history(tracking.upstox.as_deref(), tf, from, until).await {
@@ -148,6 +212,7 @@ pub async fn candles_handler(State(state): State<AppState>, Query(q): Query<Cand
         "bars": bars,
         "forming": forming,
         "feeds": { "kotak": tracking.kotak, "upstox": tracking.upstox },
+        "polled": tracking.polled,
         "notes": notes,
     }))
     .into_response()
@@ -174,6 +239,8 @@ struct Stream {
     changes: broadcast::Receiver<Change>,
     symbols: Vec<Symbol>,
     names: Vec<String>,
+    /// Whose share of the ladder budget a stock's re-subscription draws on.
+    pool: SubPool,
     tf: Tf,
     every: tokio::time::Interval,
     touched_at: i64,
@@ -193,7 +260,7 @@ impl Stream {
         self.touched_at = now;
         for name in self.running().touch(&self.names) {
             if let Some(symbol) = self.symbols.iter().find(|s| s.name() == name) {
-                let _ = self.running().track(*symbol).await;
+                let _ = self.running().track(symbol.clone(), self.pool).await;
             }
         }
     }
@@ -245,14 +312,16 @@ impl Stream {
 /// `{"tf":"5m","updates":[{"symbol","bar":{t,o,h,l,c,v},"forming"}]}`. A first
 /// `error` event lists symbols that could not be followed; when none can be,
 /// the answer is a 404 instead of a stream.
-pub async fn candles_stream_handler(State(state): State<AppState>, Query(q): Query<StreamQuery>) -> Response {
+pub async fn candles_stream_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Query(q): Query<StreamQuery>) -> Response {
     let Some(tf) = parse_tf(q.tf.as_deref()) else {
         return bad_request("tf must be 1m, 5m or 15m");
     };
+    let grammar = Grammar::load(&state).await;
     let mut symbols: Vec<Symbol> = Vec::new();
     for raw in q.symbols.split(',').filter(|s| !s.trim().is_empty()) {
-        let Some(symbol) = Symbol::parse(raw) else {
-            return bad_request(format!("{raw}: {SYMBOL_HELP}"));
+        let symbol = match grammar.parse(&state, raw, true) {
+            Ok(symbol) => symbol,
+            Err(response) => return response,
         };
         if !symbols.contains(&symbol) {
             symbols.push(symbol);
@@ -262,11 +331,12 @@ pub async fn candles_stream_handler(State(state): State<AppState>, Query(q): Que
         return bad_request(format!("symbols must name 1 to {MAX_STREAM_SYMBOLS} instruments"));
     }
 
+    let pool = SubPool::of(&identity);
     let mut followed: Vec<Symbol> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut restarting = false;
     for symbol in symbols {
-        match state.candles.track(&state, symbol).await {
+        match state.candles.track(&state, symbol.clone(), pool).await {
             Ok(_) => followed.push(symbol),
             Err(e) => {
                 restarting |= matches!(e, TrackError::Stopped);
@@ -293,6 +363,7 @@ pub async fn candles_stream_handler(State(state): State<AppState>, Query(q): Que
         guard: running.open_stream(),
         names: followed.iter().map(Symbol::name).collect(),
         symbols: followed,
+        pool,
         tf,
         every,
         touched_at: shared_domain::now_ist().timestamp_millis(),
@@ -313,4 +384,45 @@ pub async fn candles_stream_handler(State(state): State<AppState>, Query(q): Que
     Sse::new(futures::stream::iter(first).chain(updates))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn date(m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, m, d).unwrap()
+    }
+
+    fn reliance(name: &str) -> bool {
+        name == "RELIANCE"
+    }
+
+    #[test]
+    fn a_dated_future_is_charted_by_the_grammar_of_either_switch() {
+        let today = date(11, 11);
+        let (off, on) = (Grammar { stocks: false }, Grammar { stocks: true });
+        // An index's dated future, whatever `stock_charts` says; the echo keeps the date.
+        for grammar in [&off, &on] {
+            let symbol = grammar.parse_on("nifty:fut:2026-11-24", false, &reliance, today).unwrap();
+            assert_eq!(symbol.name(), "NIFTY:FUT:2026-11-24");
+            assert_eq!(grammar.parse_on("NIFTY:FUT", false, &reliance, today).unwrap().name(), "NIFTY:FUT");
+        }
+        // A stock's, only with the switch on (and the catalog listing it).
+        let off_help = off.parse_on("RELIANCE:FUT:2026-12-29", false, &reliance, today).unwrap_err();
+        assert_eq!(off_help, SYMBOL_HELP);
+        assert!(SYMBOL_HELP.contains("NIFTY:FUT:2026-11-24"));
+        assert_eq!(on.parse_on("RELIANCE:FUT:2026-12-29", false, &reliance, today).unwrap().name(), "RELIANCE:FUT:2026-12-29");
+        assert!(SYMBOL_HELP_STOCKS.contains("RELIANCE:FUT:2026-12-29"));
+        let named = on.parse_on("TCS:FUT:2026-12-29", true, &reliance, today).unwrap_err();
+        assert!(named.starts_with("TCS:FUT:2026-12-29: symbol must be"), "{named}");
+
+        // An expired one is refused (a 400), not looked for; its expiry day still charts.
+        let expired = off.parse_on("NIFTY:FUT:2026-10-27", false, &reliance, today).unwrap_err();
+        assert!(expired.contains("expired on 2026-10-27"), "{expired}");
+        assert!(on.parse_on("RELIANCE:FUT:2026-10-27", false, &reliance, today).unwrap_err().contains("expired"));
+        assert!(off.parse_on("NIFTY:FUT:2026-11-11", false, &reliance, today).is_ok());
+        // A BSE listing stays refused with the switch on.
+        assert!(on.parse_on("RELIANCE@BSE", false, &reliance, today).unwrap_err().contains("NSE"));
+    }
 }

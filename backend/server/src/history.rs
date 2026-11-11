@@ -7,7 +7,7 @@
 //! portfolio applies per leg. A call counts once it is fully sold, on the day
 //! of its last sell, so every figure for a range covers the same calls.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{Days, NaiveDate};
 use serde::Serialize;
@@ -42,6 +42,9 @@ pub struct Leg {
     pub chat_title: Option<String>,
     pub option_type: Option<String>,
     pub strike: Option<f64>,
+    /// The contract's expiry, `YYYY-MM-DD`, where the ledger keeps it (a
+    /// user's paper legs); `None` on the owner's rows.
+    pub expiry: Option<String>,
 }
 
 impl Leg {
@@ -79,6 +82,8 @@ pub struct Call {
     /// `CE` or `PE`, when known.
     pub side: Option<String>,
     pub strike: Option<f64>,
+    /// The contract's expiry, `YYYY-MM-DD`, when a leg carries it.
+    pub expiry: Option<String>,
     pub opened_at: String,
     /// The last sell, once everything bought has been sold.
     pub closed_at: Option<String>,
@@ -138,7 +143,7 @@ pub async fn load_legs(pool: &sqlx::SqlitePool, mode: &str) -> Result<Vec<Leg>, 
     sqlx::query_as::<_, Leg>(
         "SELECT id, ticker, action, qty, executed_price, timestamp, net_value,
                 brokerage + stt_charge + sebi_fee + stamp_duty + transaction_charge + gst AS charges,
-                signal_id, raw_message, exit_reason, chat_id, chat_title, option_type, strike
+                signal_id, raw_message, exit_reason, chat_id, chat_title, option_type, strike, NULL AS expiry
          FROM paper_trades WHERE mode = ? ORDER BY id ASC",
     )
     .bind(mode)
@@ -150,7 +155,7 @@ pub async fn load_legs(pool: &sqlx::SqlitePool, mode: &str) -> Result<Vec<Leg>, 
 const USER_LEG_COLUMNS: &str = "id, ticker, action, qty, executed_price, timestamp, net_value,
     brokerage + stt_charge + sebi_fee + stamp_duty + transaction_charge + gst AS charges,
     'manual-' || position_id AS signal_id, label AS raw_message, exit_reason,
-    NULL AS chat_id, NULL AS chat_title, option_type, strike";
+    NULL AS chat_id, NULL AS chat_title, option_type, strike, expiry";
 
 /// A user's paper fills since their last reset (`epoch`), oldest first, read
 /// as the owner's scalps are: one call per position, under "Scalps".
@@ -209,6 +214,7 @@ pub fn calls(legs: Vec<Leg>) -> Vec<Call> {
                 index: first.ticker.clone(),
                 side,
                 strike: legs.iter().find_map(|l| l.strike),
+                expiry: legs.iter().find_map(|l| l.expiry.clone()),
                 opened_at: first.timestamp.clone(),
                 closed_at,
                 bought_qty,
@@ -336,8 +342,26 @@ pub struct DayRow {
     pub calls: usize,
     pub wins: usize,
     pub net: f64,
-    /// The indices whose options expired that day.
-    pub expiries: Vec<&'static str>,
+    /// The underlyings whose options expired that day — see [`expiries_on`].
+    pub expiries: Vec<String>,
+}
+
+/// The underlyings whose options expire on `day` (`YYYY-MM-DD`): the six
+/// indices by their expiry calendar, and any other ticker among `calls` —
+/// a stock's — whose contract expires that day, which only its legs know.
+/// Display only, like `expires_on`.
+pub fn expiries_on(day: &str, calls: &[Call]) -> Vec<String> {
+    let Ok(date) = NaiveDate::parse_from_str(day, "%Y-%m-%d") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = INDEX_NAMES.iter().copied().filter(|i| expires_on(i, date)).map(str::to_string).collect();
+    let stocks: BTreeSet<&str> = calls
+        .iter()
+        .filter(|c| !INDEX_NAMES.contains(&c.index.as_str()) && c.expiry.as_deref() == Some(day))
+        .map(|c| c.index.as_str())
+        .collect();
+    out.extend(stocks.into_iter().map(str::to_string));
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -427,9 +451,7 @@ pub fn report(calls: &[Call], today: NaiveDate, range: Range, group: GroupBy) ->
 
         let date = call.closed_at.as_deref().and_then(|t| t.get(..10)).unwrap_or_default().to_string();
         let day = days.entry(date.clone()).or_insert_with(|| DayRow {
-            expiries: NaiveDate::parse_from_str(&date, "%Y-%m-%d")
-                .map(|d| INDEX_NAMES.iter().copied().filter(|i| expires_on(i, d)).collect())
-                .unwrap_or_default(),
+            expiries: expiries_on(&date, calls),
             date,
             calls: 0,
             wins: 0,
@@ -490,6 +512,7 @@ mod tests {
             chat_title: r.chat.map(|c| c.1.to_string()),
             option_type: r.side.map(Into::into),
             strike: None,
+            expiry: None,
         }
     }
 

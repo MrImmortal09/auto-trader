@@ -6,15 +6,18 @@ pub mod candles;
 pub mod desk;
 pub mod flags;
 pub mod history;
+pub mod instruments;
 pub mod me;
 pub mod positions;
 pub mod scalp;
 pub mod system;
+pub mod watchlists;
 
 pub use candles::{candles_handler, candles_stream_handler};
 pub use desk::{desk_handler, feed_handler, status_handler};
 pub use flags::{get_flags_handler, put_flags_handler};
 pub use history::history_handler;
+pub use instruments::{instrument_handler, instruments_status_handler, quotes_handler, search_handler};
 pub use positions::{chart_index_subscriptions, patch_position_levels_handler};
 pub use scalp::{chain_handler, expiries_handler, marks_handler};
 pub use system::{mode_check_handler, system_handler};

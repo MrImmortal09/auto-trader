@@ -1,7 +1,9 @@
 //! `GET /api/v2/expiries`, `GET /api/v2/chain` and `GET /api/v2/marks` —
-//! what the v2 Trade charts need beyond bars: an index's listed expiries,
-//! one expiry's strikes with each option's delta, and today's fills,
-//! Telegram calls and Telegram positions to draw. Read-only.
+//! what the v2 Trade charts need beyond bars: an underlying's listed
+//! expiries, one expiry's strikes with each option's delta, and today's
+//! fills, Telegram calls and Telegram positions to draw. Read-only. The
+//! underlying is one of the six indices, or, behind the `stock_charts`
+//! switch, any F&O underlying the catalog lists.
 
 use std::collections::HashMap;
 
@@ -13,8 +15,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use shared_domain::{TradeState, INDEX_NAMES};
+use shared_domain::TradeState;
 
+use crate::execute;
 use crate::history;
 use crate::market_data::StrikeRow;
 use crate::AppState;
@@ -30,21 +33,32 @@ pub struct Delta {
     pub assumed: bool,
 }
 
-/// A side's delta: Upstox's from its option chain when it has one for this
-/// strike, else the assumed 0.50.
+/// Upstox's delta for a side, when its chain has one for this strike.
+pub fn upstox_delta(row: Option<&StrikeRow>, call: bool) -> Option<Delta> {
+    row.map(|r| if call { r.call_delta } else { r.put_delta })
+        .filter(|d| d.is_finite() && *d != 0.0)
+        .map(|value| Delta { value, assumed: false })
+}
+
+/// An index side's delta: Upstox's from its option chain when it has one
+/// for this strike, else the assumed 0.50.
 pub fn delta_of(row: Option<&StrikeRow>, call: bool) -> Delta {
-    let upstox = row.map(|r| if call { r.call_delta } else { r.put_delta }).filter(|d| d.is_finite() && *d != 0.0);
-    match upstox {
-        Some(value) => Delta { value, assumed: false },
-        None => Delta { value: if call { ASSUMED_DELTA } else { -ASSUMED_DELTA }, assumed: true },
-    }
+    upstox_delta(row, call).unwrap_or(Delta { value: if call { ASSUMED_DELTA } else { -ASSUMED_DELTA }, assumed: true })
+}
+
+/// A stock side's delta: Upstox's when its chain has one, else none — never
+/// the assumed ±0.50, which is an index's guess.
+pub fn stock_delta_of(row: Option<&StrikeRow>, call: bool) -> Option<Delta> {
+    upstox_delta(row, call)
 }
 
 #[derive(Serialize)]
 struct Side {
     /// The broker's trading symbol — what a Buy sends.
     symbol: String,
-    delta: Delta,
+    /// Always present on an index's chain (Upstox's or the assumed ±0.50);
+    /// on a stock's, Upstox's or `null`.
+    delta: Option<Delta>,
 }
 
 #[derive(Serialize)]
@@ -56,7 +70,12 @@ struct StrikeOut {
 
 #[derive(Serialize)]
 struct ChainAnswer {
+    /// The underlying, under its older name.
     index: String,
+    /// The same as `index`.
+    underlying: String,
+    /// `"index"` or `"stock"`.
+    kind: &'static str,
     /// `YYYY-MM-DD`.
     expiry: String,
     lot_size: u32,
@@ -68,14 +87,29 @@ struct ChainAnswer {
 
 #[derive(Deserialize)]
 pub struct ChainQuery {
-    index: String,
+    /// The underlying: an index, or any catalog F&O underlying with the
+    /// `stock_charts` switch on.
+    index: Option<String>,
+    /// The same as `index`; `index` wins when both are sent.
+    underlying: Option<String>,
     /// `YYYY-MM-DD`; left out, the nearest expiry.
     expiry: Option<String>,
 }
 
-fn index_named(wanted: &str) -> Option<&'static str> {
-    let wanted = wanted.trim().to_uppercase();
-    INDEX_NAMES.iter().copied().find(|i| *i == wanted)
+impl ChainQuery {
+    fn wanted(&self) -> &str {
+        self.index.as_deref().or(self.underlying.as_deref()).unwrap_or("")
+    }
+}
+
+/// The 400 for an underlying nothing serves.
+async fn unknown_underlying(state: &AppState) -> Response {
+    let error = if state.flags.read().await.stock_charts {
+        "index must be one of the six indices or an F&O underlying in the catalog (RELIANCE)"
+    } else {
+        "index must be one of the six indices"
+    };
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
 }
 
 #[derive(Serialize)]
@@ -88,19 +122,25 @@ struct ExpiryOut {
 
 #[derive(Serialize)]
 struct ExpiriesAnswer {
+    /// The underlying, under its older name.
     index: String,
+    /// The same as `index`.
+    underlying: String,
+    /// `"index"` or `"stock"`.
+    kind: &'static str,
     /// `YYYY-MM-DD`, IST.
     today: String,
     /// Earliest first; the first is the nearest.
     expiries: Vec<ExpiryOut>,
 }
 
-/// `GET /api/v2/expiries?index=NIFTY` — every expiry this index's options
-/// are listed for from today, earliest first, with each one's lot size
-/// (read in one pass; no chain is built for it).
+/// `GET /api/v2/expiries?index=NIFTY` (or `?underlying=RELIANCE`) — every
+/// expiry this underlying's options are listed for from today, earliest
+/// first, with each one's lot size (read in one pass; no chain is built for
+/// it).
 pub async fn expiries_handler(State(state): State<AppState>, Query(q): Query<ChainQuery>) -> Response {
-    let Some(index) = index_named(&q.index) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "index must be one of the six indices" }))).into_response();
+    let Some(index) = execute::underlying_named(&state, q.wanted()).await else {
+        return unknown_underlying(&state).await;
     };
     if state.scrip_store.read().await.is_none() {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "no option chain yet — the scrip master loads after the Kotak login" }))).into_response();
@@ -108,42 +148,58 @@ pub async fn expiries_handler(State(state): State<AppState>, Query(q): Query<Cha
     let today = shared_domain::today_ist();
     let expiries = state
         .execute
-        .expiries(&state, index)
+        .expiries(&state, &index)
         .await
         .iter()
         .map(|&(date, lot_size)| ExpiryOut { date: date.format("%Y-%m-%d").to_string(), days_to_expiry: (date - today).num_days(), lot_size })
         .collect();
-    Json(ExpiriesAnswer { index: index.to_string(), today: today.format("%Y-%m-%d").to_string(), expiries }).into_response()
+    Json(ExpiriesAnswer {
+        kind: execute::underlying_kind(&index),
+        underlying: index.clone(),
+        index,
+        today: today.format("%Y-%m-%d").to_string(),
+        expiries,
+    })
+    .into_response()
 }
 
-/// `GET /api/v2/chain?index=NIFTY&expiry=` — one expiry's strikes (the
-/// nearest by default), as the Execute screen trades them, each side with
-/// its symbol and delta (Upstox's, read once a minute, or an assumed ±0.50).
+/// `GET /api/v2/chain?index=NIFTY&expiry=` (or `?underlying=RELIANCE`) —
+/// one expiry's strikes (the nearest by default), as the Execute screen
+/// trades them, each side with its symbol and delta: on an index, Upstox's
+/// (read once a minute) or an assumed ±0.50; on a stock, Upstox's option
+/// chain read at most once a minute per expiry, or `null`.
 pub async fn chain_handler(State(state): State<AppState>, Query(q): Query<ChainQuery>) -> Response {
-    let Some(index) = index_named(&q.index) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "index must be one of the six indices" }))).into_response();
+    let Some(index) = execute::underlying_named(&state, q.wanted()).await else {
+        return unknown_underlying(&state).await;
     };
+    let kind = execute::underlying_kind(&index);
     let chain = match q.expiry.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => {
             let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") else {
                 return (StatusCode::BAD_REQUEST, Json(json!({ "error": "expiry must be YYYY-MM-DD" }))).into_response();
             };
-            match state.execute.chain_at(&state, index, date).await {
+            match state.execute.chain_at(&state, &index, date).await {
                 Some(c) => c,
                 None => return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("no {index} options listed for {s}") }))).into_response(),
             }
         }
-        None => match state.execute.chain(&state, index).await {
+        None => match state.execute.chain(&state, &index).await {
             Some(c) => c,
             None => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no option chain yet — the scrip master loads after the Kotak login" }))).into_response(),
         },
     };
     let expiry = chain.expiry.format("%Y-%m-%d").to_string();
-    // Upstox's deltas only count for the same expiry.
-    let (rows, delta_at): (HashMap<i64, StrikeRow>, Option<String>) = {
+    // Upstox's deltas only count for the same expiry: an index's from the
+    // Market page's poll, a stock's from a read of its own chain.
+    let (rows, delta_at): (HashMap<i64, StrikeRow>, Option<String>) = if kind == "index" {
         let live = state.market.indices.read().await;
-        match live.get(index).filter(|l| l.expiry.as_deref() == Some(expiry.as_str())) {
+        match live.get(index.as_str()).filter(|l| l.expiry.as_deref() == Some(expiry.as_str())) {
             Some(l) => (l.chain.iter().map(|r| ((r.strike * 100.0).round() as i64, r.clone())).collect(), l.updated_at.clone()),
+            None => (HashMap::new(), None),
+        }
+    } else {
+        match state.execute.stock_deltas(&state, &index, chain.expiry).await {
+            Some(d) => ((*d.rows).clone(), Some(d.updated_at)),
             None => (HashMap::new(), None),
         }
     };
@@ -152,15 +208,18 @@ pub async fn chain_handler(State(state): State<AppState>, Query(q): Query<ChainQ
         .iter()
         .map(|s| {
             let row = rows.get(&((s.strike * 100.0).round() as i64));
+            let delta = |call: bool| if kind == "index" { Some(delta_of(row, call)) } else { stock_delta_of(row, call) };
             StrikeOut {
                 strike: s.strike,
-                ce: s.ce.as_ref().map(|r| Side { symbol: r.trading_symbol.clone(), delta: delta_of(row, true) }),
-                pe: s.pe.as_ref().map(|r| Side { symbol: r.trading_symbol.clone(), delta: delta_of(row, false) }),
+                ce: s.ce.as_ref().map(|r| Side { symbol: r.trading_symbol.clone(), delta: delta(true) }),
+                pe: s.pe.as_ref().map(|r| Side { symbol: r.trading_symbol.clone(), delta: delta(false) }),
             }
         })
         .collect();
     Json(ChainAnswer {
-        index: index.to_string(),
+        kind,
+        underlying: index.clone(),
+        index,
         expiry,
         lot_size: chain.lot_size,
         tick_size: chain.tick_size,
@@ -347,5 +406,20 @@ mod tests {
         // Upstox sent none for this strike, or has no chain for the index.
         assert_eq!(delta_of(Some(&row(0.0, 0.0)), true), Delta { value: 0.5, assumed: true });
         assert_eq!(delta_of(None, false), Delta { value: -0.5, assumed: true });
+    }
+
+    #[test]
+    fn a_stocks_delta_is_upstoxs_or_nothing_never_the_assumed_half() {
+        let r = row(0.62, -0.38);
+        assert_eq!(stock_delta_of(Some(&r), true), Some(Delta { value: 0.62, assumed: false }));
+        assert_eq!(stock_delta_of(Some(&r), false), Some(Delta { value: -0.38, assumed: false }));
+        assert_eq!(stock_delta_of(Some(&row(0.0, 0.0)), true), None);
+        assert_eq!(stock_delta_of(Some(&row(f64::NAN, 0.0)), true), None);
+        assert_eq!(stock_delta_of(None, false), None);
+        // The chain answer writes `null` for it, and a plain number otherwise.
+        let side = Side { symbol: "RELIANCE26NOV1400CE".into(), delta: None };
+        assert_eq!(serde_json::to_value(&side).unwrap(), serde_json::json!({ "symbol": "RELIANCE26NOV1400CE", "delta": null }));
+        let side = Side { symbol: "NIFTY26NOV25000CE".into(), delta: Some(delta_of(None, true)) };
+        assert_eq!(serde_json::to_value(&side).unwrap()["delta"], serde_json::json!({ "value": 0.5, "assumed": true }));
     }
 }

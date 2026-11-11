@@ -21,9 +21,6 @@ use axum::{
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use shared_domain::INDEX_NAMES;
-use telegram_ingester::parser::expires_on;
-
 use crate::auth::Role;
 use crate::db;
 use crate::desk::{contract_label, Outcome};
@@ -151,8 +148,9 @@ pub struct Day {
     /// IST timestamps of the day's first and last fill.
     pub first_at: String,
     pub last_at: String,
-    /// The indices whose options expired that day.
-    pub expiries: Vec<&'static str>,
+    /// The underlyings whose options expired that day: the indices by their
+    /// calendar, a stock from its legs' expiry (`history::expiries_on`).
+    pub expiries: Vec<String>,
     /// Every trade with a fill that day, in the order they opened.
     pub trades: Vec<Trade>,
     /// The day's trades left out of `trades`: past the report's limit.
@@ -437,9 +435,7 @@ pub fn report(calls: &[Call], epochs: &HashMap<String, i64>, current: i64, from:
                 Vec::new()
             };
             Day {
-                expiries: NaiveDate::parse_from_str(&date, "%Y-%m-%d")
-                    .map(|d| INDEX_NAMES.iter().copied().filter(|i| expires_on(i, d)).collect())
-                    .unwrap_or_default(),
+                expiries: history::expiries_on(&date, calls),
                 gross: acc.booked.gross,
                 charges: acc.booked.charges,
                 net: acc.booked.net,
@@ -668,10 +664,15 @@ mod tests {
     const D2: &str = "2026-10-28";
 
     fn leg(id: i64, t: &str, action: &str, qty: i64, price: f64, charges: f64, position: &str, strike: f64) -> Leg {
+        stock_leg("NIFTY", None, id, t, action, qty, price, charges, position, strike)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stock_leg(ticker: &str, expiry: Option<&str>, id: i64, t: &str, action: &str, qty: i64, price: f64, charges: f64, position: &str, strike: f64) -> Leg {
         let value = qty as f64 * price;
         Leg {
             id,
-            ticker: "NIFTY".into(),
+            ticker: ticker.into(),
             action: action.into(),
             qty,
             executed_price: price,
@@ -685,6 +686,7 @@ mod tests {
             chat_title: None,
             option_type: Some("CE".into()),
             strike: Some(strike),
+            expiry: expiry.map(Into::into),
         }
     }
 
@@ -762,6 +764,36 @@ mod tests {
         assert_eq!(r.fills.iter().map(|f| f.id).collect::<Vec<_>>(), [7, 6, 5, 4, 3, 2, 1]);
         assert!(close(r.fills[0].pnl.unwrap(), -770.0) && r.fills[1].pnl.is_none());
         assert!(r.fills[6].before_reset);
+    }
+
+    #[test]
+    fn a_stocks_expiry_day_is_marked_from_its_legs_beside_the_indices() {
+        // 24 Nov 2026 is NIFTY's monthly expiry (a Tuesday) and RELIANCE's; 10 Nov is nobody's.
+        let legs = vec![
+            stock_leg("RELIANCE", Some("2026-11-24"), 1, "2026-11-10 10:00:00", "BUY", 500, 40.0, 20.0, "r", 1_400.0),
+            stock_leg("RELIANCE", Some("2026-11-24"), 2, "2026-11-24 15:38:00", "SELL", 500, 30.0, 25.0, "r", 1_400.0),
+            stock_leg("TCS", Some("2026-12-29"), 3, "2026-11-24 11:00:00", "BUY", 175, 50.0, 20.0, "t", 3_000.0),
+            leg(4, "2026-11-24 11:30:00", "BUY", 65, 100.0, 20.0, "n", 25_000.0),
+        ];
+        let calls = history::calls(legs);
+        let r = report(&calls, &HashMap::new(), 0, None, date("2026-11-24"));
+        assert_eq!(r.days.iter().map(|d| d.date.as_str()).collect::<Vec<_>>(), ["2026-11-24", "2026-11-10"]);
+        // The indices by the calendar, then the stock whose legs expire that day; TCS's don't.
+        let indices = |day: &str| -> Vec<String> {
+            shared_domain::INDEX_NAMES
+                .iter()
+                .filter(|i| telegram_ingester::parser::expires_on(i, date(day)))
+                .map(|i| i.to_string())
+                .collect()
+        };
+        let mut want = indices("2026-11-24");
+        want.push("RELIANCE".to_string());
+        assert_eq!(r.days[0].expiries, want);
+        assert_eq!(r.days[1].expiries, indices("2026-11-10"));
+        // Labels and groupings read the stock's ticker as they do an index's.
+        assert_eq!(r.contracts.iter().map(|c| c.contract.as_str()).collect::<Vec<_>>(), ["NIFTY 25000 CE", "TCS 3000 CE", "RELIANCE 1400 CE"]);
+        assert_eq!(r.days[0].trades.iter().map(|t| t.contract.as_str()).collect::<Vec<_>>(), ["RELIANCE 1400 CE", "TCS 3000 CE", "NIFTY 25000 CE"]);
+        assert_eq!(r.fills[0].contract, "RELIANCE 1400 CE");
     }
 
     #[test]
