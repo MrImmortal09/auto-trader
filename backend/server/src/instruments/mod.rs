@@ -27,7 +27,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-use chrono::NaiveDate;
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::Serialize;
 use shared_domain::FeatureFlags;
 use sqlx::SqlitePool;
@@ -105,10 +105,17 @@ impl From<sqlx::Error> for LoadError {
     }
 }
 
-/// What `load_if_changed` did.
+/// What a build attempt (`load_if_changed_at`) did.
 pub enum LoadOutcome {
     /// The CSVs on disk are the ones the catalog was last built from.
     Unchanged,
+    /// The market is open and the CSVs on disk are newer files of the same
+    /// day, and the same segments, the catalog was last built from (a
+    /// relogin's download): rebuilding would change nothing and take both
+    /// of the VM's cores for seconds while the engine ticks, so it is left
+    /// for a trigger outside market hours (`load_if_changed_at`); the next
+    /// day's first download builds that day's files anyway.
+    SameDay,
     Loaded(LoadReport),
 }
 
@@ -365,9 +372,29 @@ impl Catalog {
     }
 
     /// Rebuilds the catalog from the CSVs on disk unless they are the files
-    /// the last build read (same segments, same modification times). One
-    /// build at a time; a second caller waits and then finds nothing to do.
+    /// the last build read (same segments, same modification times),
+    /// whatever the time: the tests' build. The server's goes through
+    /// [`Catalog::load_if_changed_at`].
+    #[cfg(test)]
     pub async fn load_if_changed(&self, reason: &str) -> Result<LoadOutcome, LoadError> {
+        self.load(reason, None).await
+    }
+
+    /// Rebuilds the catalog from the CSVs on disk as of `now`, unless they
+    /// are the files the last build read (same segments, same modification
+    /// times) — or, while the market is open, newer files of the same day
+    /// and the same segments as the last build ([`LoadOutcome::SameDay`]):
+    /// the session watchdog's relogin downloads the day's scrip master
+    /// again, and a rebuild of 150-200k rows during hours would only
+    /// compete with the engine's tick for the VM's two cores. The first
+    /// download of a new day, a segment the last build lacked, and any
+    /// build outside market hours go ahead. One build at a time; a second
+    /// caller waits and then finds nothing to do.
+    pub async fn load_if_changed_at(&self, reason: &str, now: DateTime<FixedOffset>) -> Result<LoadOutcome, LoadError> {
+        self.load(reason, Some(now)).await
+    }
+
+    async fn load(&self, reason: &str, now: Option<DateTime<FixedOffset>>) -> Result<LoadOutcome, LoadError> {
         let _one_at_a_time = self.loading.lock().await;
         let pool = match &self.pool {
             Some(pool) => pool.clone(),
@@ -380,11 +407,16 @@ impl Catalog {
         if sources.is_empty() {
             return Err(LoadError::NoFiles);
         }
-        if let Ok(Some((_, _, last))) = Self::last_load(&pool).await {
-            let same = last.len() == sources.len()
-                && sources.iter().all(|s| last.iter().any(|l| l.segment == s.segment && l.mtime == Some(s.mtime)));
+        if let Ok(Some((built_day, _, last))) = Self::last_load(&pool).await {
+            let same_segments = last.len() == sources.len() && sources.iter().all(|s| last.iter().any(|l| l.segment == s.segment));
+            let same = same_segments && sources.iter().all(|s| last.iter().any(|l| l.segment == s.segment && l.mtime == Some(s.mtime)));
             if same {
                 return Ok(LoadOutcome::Unchanged);
+            }
+            let open = now.is_some_and(crate::quotes::eod::open_at);
+            let files_day = load::files_day(&sources).map(|d| d.format("%Y-%m-%d").to_string());
+            if open && same_segments && files_day.as_deref() == Some(built_day.as_str()) {
+                return Ok(LoadOutcome::SameDay);
             }
         }
 
@@ -437,11 +469,12 @@ impl Catalog {
         }
     }
 
-    /// `load_if_changed` on its own task, its outcome logged — while the
-    /// `search` switch is on. Off, nothing is built: the CSVs on disk are
-    /// still written by every download, and the build they are owed runs
-    /// when the switch is turned on (`PUT /api/v2/flags`) or at the first
-    /// download after that.
+    /// [`Catalog::load_if_changed_at`] now, on its own task, its outcome logged — while
+    /// the `search` switch is on. Off, nothing is built: the CSVs on disk
+    /// are still written by every download, and the build they are owed
+    /// runs when the switch is turned on (`PUT /api/v2/flags`) or at the
+    /// first download after that. During market hours a download of the
+    /// same day's files the catalog already holds is not built again.
     pub fn rebuild_in_background(self: &Arc<Self>, reason: &'static str) {
         let catalog = Arc::clone(self);
         tokio::spawn(async move {
@@ -449,8 +482,12 @@ impl Catalog {
                 tracing::info!(reason, "Instrument catalog rebuild skipped — the `search` switch is off");
                 return;
             }
-            match catalog.load_if_changed(reason).await {
+            match catalog.load_if_changed_at(reason, shared_domain::now_ist()).await {
                 Ok(LoadOutcome::Unchanged) => tracing::info!(reason, "Instrument catalog is already built from the CSVs on disk"),
+                Ok(LoadOutcome::SameDay) => tracing::info!(
+                    reason,
+                    "Instrument catalog rebuild skipped during market hours — it is already built from the same day's scrip master"
+                ),
                 Ok(LoadOutcome::Loaded(report)) => tracing::debug!(reason, day = %report.day, "Instrument catalog build finished"),
                 Err(LoadError::NoFiles) => tracing::info!(reason, "No scrip-master CSV on disk yet — the instrument catalog waits for a download"),
                 // Logged where it failed.
@@ -527,8 +564,10 @@ impl Catalog {
     /// (`nse_cm|Nifty 50` names an index's virtual row but is not its key,
     /// as in `known_keys`). A key with no row is simply absent from the
     /// answer. What the watchlists check keys against and label rows with;
-    /// the row's `ws_key` is what they keep.
-    pub async fn rows_for_keys(&self, keys: &[String]) -> HashMap<String, SearchRow> {
+    /// the row's `ws_key` is what they keep. `Err` when the contracts'
+    /// lookup itself failed, so a broken catalog database is never taken
+    /// for keys it has no row for (an unopened catalog has none, `Ok`).
+    pub async fn rows_for_keys(&self, keys: &[String]) -> Result<HashMap<String, SearchRow>, sqlx::Error> {
         let index = self.index();
         let mut found: HashMap<String, SearchRow> = HashMap::new();
         let mut ids: Vec<String> = Vec::new();
@@ -546,9 +585,9 @@ impl Catalog {
                 ids.push(key.clone());
             }
         }
-        let Some(pool) = &self.pool else { return found };
+        let Some(pool) = &self.pool else { return Ok(found) };
         if ids.is_empty() {
-            return found;
+            return Ok(found);
         }
         ids.sort();
         ids.dedup();
@@ -557,21 +596,29 @@ impl Catalog {
         for id in &ids {
             query = query.bind(id);
         }
-        match query.fetch_all(pool).await {
-            Ok(rows) => {
-                let rows: Vec<SearchRow> = rows.into_iter().map(|r| r.into_row(&index)).collect();
-                for key in keys {
-                    if found.contains_key(key) {
-                        continue;
-                    }
-                    if let Some(row) = rows.iter().find(|r| r.ws_key == *key || r.id == *key) {
-                        found.insert(key.clone(), row.clone());
-                    }
-                }
+        let rows = query.fetch_all(pool).await.map_err(|e| {
+            tracing::error!(error = %e, "Instrument catalog: rows lookup failed");
+            e
+        })?;
+        let rows: Vec<SearchRow> = rows.into_iter().map(|r| r.into_row(&index)).collect();
+        for key in keys {
+            if found.contains_key(key) {
+                continue;
             }
-            Err(e) => tracing::error!(error = %e, "Instrument catalog: rows lookup failed"),
+            if let Some(row) = rows.iter().find(|r| r.ws_key == *key || r.id == *key) {
+                found.insert(key.clone(), row.clone());
+            }
         }
-        found
+        Ok(found)
+    }
+
+    /// Closes the catalog database's pool, so every lookup that reaches it
+    /// fails from then on: the tests' broken catalog.
+    #[cfg(test)]
+    pub(crate) async fn close_db_for_tests(&self) {
+        if let Some(pool) = &self.pool {
+            pool.close().await;
+        }
     }
 
     /// The instrument with `id` (`<segment>:<token>`), with its underlying's

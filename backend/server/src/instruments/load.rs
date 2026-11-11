@@ -134,6 +134,12 @@ impl Source {
     }
 }
 
+/// The data day a build from `sources` is stamped with: the IST date of
+/// the oldest file. `None` when there is none.
+pub fn files_day(sources: &[Source]) -> Option<NaiveDate> {
+    sources.iter().map(Source::day).min()
+}
+
 /// What one file's pass produced, for the log and `instrument_load`.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SegmentReport {
@@ -773,13 +779,7 @@ pub async fn rebuild(pool: &SqlitePool, sources: Vec<Source>, fts: bool, now: Da
 
 async fn build(mut conn: PoolConnection<Sqlite>, sources: Vec<Source>, fts: bool, now: DateTime<FixedOffset>) -> Result<LoadReport, LoadError> {
     let started = Instant::now();
-    let day = sources
-        .iter()
-        .map(Source::day)
-        .min()
-        .unwrap_or_else(|| now.date_naive())
-        .format("%Y-%m-%d")
-        .to_string();
+    let day = files_day(&sources).unwrap_or_else(|| now.date_naive()).format("%Y-%m-%d").to_string();
     let loaded_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
 
     let mut tx = conn.begin().await?;

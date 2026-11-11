@@ -1,15 +1,18 @@
-//! What a v2 chart can draw — an index or a stock, its nearest future, or
+//! What a v2 chart can draw — an index or a stock, one of its futures, or
 //! one of its option contracts — named in a form neither broker owns, and
 //! found in each broker's contract list by what it is: underlying, expiry,
 //! strike and side.
 //!
 //! The grammar: `NIFTY` or `RELIANCE` (the spot; `RELIANCE@BSE` names a BSE
 //! listing, which is read but refused while the catalog is NSE-only),
-//! `NIFTY:FUT` / `RELIANCE:FUT` (the nearest future still trading) and
-//! `NIFTY:2026-10-27:22750:CE` / `RELIANCE:2026-11-24:1400:CE`. The six
-//! indices always parse; any other name only when the caller's `known`
-//! check accepts it, which the routes answer from the instrument catalog
-//! behind the `stock_charts` switch.
+//! `NIFTY:FUT` / `RELIANCE:FUT` (the nearest future still trading),
+//! `NIFTY:FUT:2026-11-24` / `RELIANCE:FUT:2026-12-29` (the future expiring
+//! that day, spelt as the candle archive names it — see
+//! [`dated_future_name`]) and `NIFTY:2026-10-27:22750:CE` /
+//! `RELIANCE:2026-11-24:1400:CE`. The six indices always parse, the dated
+//! future included; any other name only when the caller's `known` check
+//! accepts it, which the routes answer from the instrument catalog behind
+//! the `stock_charts` switch.
 
 use chrono::NaiveDate;
 use shared_domain::INDEX_NAMES;
@@ -62,8 +65,11 @@ pub enum Symbol {
     Index(String),
     /// `RELIANCE` (NSE) or `RELIANCE@BSE`: a stock's cash price.
     Equity { symbol: String, exchange: Exchange },
-    /// `NIFTY:FUT`, `RELIANCE:FUT`: the nearest future still trading.
-    Future(String),
+    /// `NIFTY:FUT`, `RELIANCE:FUT` (`expiry: None`): the nearest future
+    /// still trading. `NIFTY:FUT:2026-11-24`, `RELIANCE:FUT:2026-12-29`:
+    /// the one expiring that day, and only that one — a later month's
+    /// contract is never charted as the nearest.
+    Future { underlying: String, expiry: Option<NaiveDate> },
     /// `NIFTY:2026-10-27:22750:CE`, `RELIANCE:2026-11-24:1400:CE`.
     Option { underlying: String, expiry: NaiveDate, strike: f64, side: Side },
 }
@@ -110,7 +116,11 @@ impl Symbol {
             (Underlying::Index(index), (None, ..)) => Some(Symbol::Index(index)),
             (Underlying::Stock(symbol), (None, ..)) => Some(Symbol::Equity { symbol, exchange: exchange.unwrap_or(Exchange::Nse) }),
             (_, (Some(_), ..)) if exchange.is_some() => None,
-            (u, (Some("FUT"), None, ..)) => Some(Symbol::Future(u.into_name())),
+            (u, (Some("FUT"), None, ..)) => Some(Symbol::Future { underlying: u.into_name(), expiry: None }),
+            (u, (Some("FUT"), Some(expiry), None, ..)) => {
+                let expiry = NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok()?;
+                Some(Symbol::Future { underlying: u.into_name(), expiry: Some(expiry) })
+            }
             (u, (Some(expiry), Some(strike), Some(side), None)) => {
                 let expiry = NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok()?;
                 let strike = strike.parse::<f64>().ok().filter(|s| s.is_finite() && *s > 0.0)?;
@@ -133,7 +143,8 @@ impl Symbol {
             Symbol::Index(index) => index.to_string(),
             Symbol::Equity { symbol, exchange: Exchange::Nse } => symbol.to_string(),
             Symbol::Equity { symbol, exchange } => format!("{symbol}@{}", exchange.as_str()),
-            Symbol::Future(underlying) => format!("{underlying}:FUT"),
+            Symbol::Future { underlying, expiry: None } => format!("{underlying}:FUT"),
+            Symbol::Future { underlying, expiry: Some(expiry) } => dated_future_name(underlying, *expiry),
             Symbol::Option { underlying, expiry, strike, side } => {
                 format!("{underlying}:{}:{strike}:{}", expiry.format("%Y-%m-%d"), side.as_str())
             }
@@ -143,7 +154,7 @@ impl Symbol {
     /// The index or stock this is, or is a contract on.
     pub fn underlying(&self) -> &str {
         match self {
-            Symbol::Index(u) | Symbol::Future(u) | Symbol::Option { underlying: u, .. } => u,
+            Symbol::Index(u) | Symbol::Future { underlying: u, .. } | Symbol::Option { underlying: u, .. } => u,
             Symbol::Equity { symbol, .. } => symbol,
         }
     }
@@ -153,16 +164,34 @@ impl Symbol {
         INDEX_NAMES.contains(&self.underlying())
     }
 
-    /// Why this symbol cannot be charted although it parsed: a listing the
-    /// catalog does not carry. `None` when it can.
-    pub fn refusal(&self) -> Option<String> {
+    /// Why this symbol cannot be charted on `today` (IST) although it
+    /// parsed: a listing the catalog does not carry, or a dated future that
+    /// has expired (it traded until its expiry day's close; neither broker
+    /// lists it any more, and the archive keeps its minutes under the same
+    /// name). `None` when it can.
+    pub fn refusal(&self, today: NaiveDate) -> Option<String> {
         match self {
             Symbol::Equity { symbol, exchange: Exchange::Bse } => {
                 Some(format!("{symbol}@BSE: only NSE listings are charted (the catalog is NSE-only)"))
             }
+            Symbol::Future { expiry: Some(expiry), .. } if *expiry < today => Some(format!(
+                "{}: this future expired on {}; only a future still trading is charted",
+                self.name(),
+                expiry.format("%Y-%m-%d")
+            )),
             _ => None,
         }
     }
+}
+
+/// The one spelling of a dated future, `NIFTY:FUT:2026-11-24`: what
+/// [`Symbol::name`] gives a [`Symbol::Future`] with an expiry, and the name
+/// the candle archive keeps that contract's minutes under
+/// (`candles::archive`). The live service's minutes of the day go to the
+/// `candles` table and the archive's to `candle_archive`, so the two never
+/// write over each other under the shared name.
+pub fn dated_future_name(underlying: &str, expiry: NaiveDate) -> String {
+    format!("{underlying}:FUT:{}", expiry.format("%Y-%m-%d"))
 }
 
 /// What the first segment of a symbol named.
@@ -203,13 +232,16 @@ fn same_strike(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
 
-/// The contract `symbol` names among Upstox's derivatives on `today`.
+/// The contract `symbol` names among Upstox's derivatives on `today`: a
+/// dated future by that exact expiry (never another month's), the bare one
+/// as the nearest still trading; neither once expired.
 pub fn find_upstox<'a>(symbol: &Symbol, derivatives: &'a [Derivative], today: NaiveDate) -> Option<&'a Derivative> {
     match symbol {
         Symbol::Index(_) | Symbol::Equity { .. } => None,
-        Symbol::Future(underlying) => derivatives
+        Symbol::Future { underlying, expiry } => derivatives
             .iter()
             .filter(|d| d.underlying == *underlying && d.kind == "FUT" && d.expiry >= today)
+            .filter(|d| expiry.is_none_or(|e| d.expiry == e))
             .min_by_key(|d| d.expiry),
         Symbol::Option { underlying, expiry, strike, side } => derivatives.iter().find(|d| {
             d.underlying == *underlying && d.kind == side.as_str() && d.expiry == *expiry && same_strike(d.strike, *strike)
@@ -218,15 +250,17 @@ pub fn find_upstox<'a>(symbol: &Symbol, derivatives: &'a [Derivative], today: Na
 }
 
 /// The contract `symbol` names in Kotak's scrip master on `today`, in the
-/// underlying's own F&O segment.
+/// underlying's own F&O segment: a dated future by that exact expiry, the
+/// bare one as the nearest still trading; neither once expired.
 pub fn find_kotak<'a>(symbol: &Symbol, store: &'a ScripStore, today: NaiveDate) -> Option<&'a ScripRecord> {
     let underlying = symbol.underlying();
     let segment = fo_segment(underlying);
     let records = store.records.get(underlying)?.iter().filter(move |r| r.exchange_segment_code == segment);
     match symbol {
         Symbol::Index(_) | Symbol::Equity { .. } => None,
-        Symbol::Future(_) => records
+        Symbol::Future { expiry, .. } => records
             .filter(|r| r.trading_symbol.trim().ends_with("FUT") && r.expiry_date >= today)
+            .filter(|r| expiry.is_none_or(|e| r.expiry_date == e))
             .min_by_key(|r| r.expiry_date),
         Symbol::Option { expiry, strike, side, .. } => {
             let mut matches = records.filter(|r| r.option_type == side.as_str() && r.expiry_date == *expiry);
@@ -248,7 +282,11 @@ mod tests {
     }
 
     fn future(name: &str) -> Symbol {
-        Symbol::Future(name.into())
+        Symbol::Future { underlying: name.into(), expiry: None }
+    }
+
+    fn future_at(name: &str, expiry: NaiveDate) -> Symbol {
+        Symbol::Future { underlying: name.into(), expiry: Some(expiry) }
     }
 
     fn option(underlying: &str, expiry: NaiveDate, strike: f64, side: Side) -> Symbol {
@@ -290,9 +328,10 @@ mod tests {
         assert_eq!(bse.name(), "RELIANCE@BSE");
         assert_eq!(Symbol::parse_with(&bse.name(), &catalog), Some(bse.clone()));
         // Parsed, but refused: the catalog is NSE-only.
-        assert!(nse.refusal().is_none());
-        assert!(bse.refusal().unwrap().contains("NSE"));
-        assert!(index("NIFTY").refusal().is_none());
+        let today = date(11, 11);
+        assert!(nse.refusal(today).is_none());
+        assert!(bse.refusal(today).unwrap().contains("NSE"));
+        assert!(index("NIFTY").refusal(today).is_none());
 
         assert_eq!(Symbol::parse_with("RELIANCE:FUT", &catalog), Some(future("RELIANCE")));
         let call = option("RELIANCE", date(11, 24), 1400.0, Side::Ce);
@@ -316,6 +355,59 @@ mod tests {
         // Without the catalog, a stock is still not a symbol.
         assert_eq!(Symbol::parse("RELIANCE:FUT"), None);
         assert_eq!(Symbol::parse("RELIANCE@BSE"), None);
+    }
+
+    #[test]
+    fn a_future_is_named_by_its_expiry_beside_the_nearest_one() {
+        let (nov, dec) = (date(11, 24), date(12, 29));
+        // An index's dated future is in the index-only grammar: it needs no
+        // catalog and no `stock_charts`.
+        assert_eq!(Symbol::parse("NIFTY:FUT:2026-11-24"), Some(future_at("NIFTY", nov)));
+        assert_eq!(Symbol::parse(" nifty:fut:2026-11-24 "), Some(future_at("NIFTY", nov)));
+        assert_eq!(Symbol::parse_with("NIFTY:FUT:2026-11-24", &catalog), Some(future_at("NIFTY", nov)));
+        // The canonical echo keeps the date, and reads back.
+        assert_eq!(future_at("NIFTY", nov).name(), "NIFTY:FUT:2026-11-24");
+        let sensex = future_at("SENSEX", date(11, 26));
+        assert_eq!(Symbol::parse(&sensex.name()), Some(sensex.clone()));
+        assert_eq!((sensex.underlying(), sensex.is_index()), ("SENSEX", true));
+        // The bare form keeps meaning the nearest future, a different name.
+        assert_eq!(Symbol::parse("NIFTY:FUT"), Some(future("NIFTY")));
+        assert_eq!(future("NIFTY").name(), "NIFTY:FUT");
+        assert_ne!(future("NIFTY").name(), future_at("NIFTY", nov).name());
+
+        // A stock's, only when the catalog knows the stock (behind `stock_charts`).
+        let reliance = future_at("RELIANCE", dec);
+        assert_eq!(Symbol::parse_with("reliance:fut:2026-12-29", &catalog), Some(reliance.clone()));
+        assert_eq!(reliance.name(), "RELIANCE:FUT:2026-12-29");
+        assert_eq!(Symbol::parse_with(&reliance.name(), &catalog), Some(reliance.clone()));
+        assert_eq!(Symbol::parse_with("BAJAJ-AUTO:FUT:2026-12-29", &catalog).unwrap().name(), "BAJAJ-AUTO:FUT:2026-12-29");
+        assert_eq!(Symbol::parse("RELIANCE:FUT:2026-12-29"), None, "no catalog: no stock");
+
+        for bad in [
+            "NIFTY:FUT:", "NIFTY:FUT:2026-13-01", "NIFTY:FUT:2026-11-31", "NIFTY:FUT:24-NOV-2026", "NIFTY:FUT:2026-11-24:CE",
+            "NIFTY:FUT:2026-11-24:1", "NIFTY@NSE:FUT:2026-11-24", "RELIANCE@BSE:FUT:2026-12-29", "TCS:FUT:2026-12-29",
+        ] {
+            assert_eq!(Symbol::parse_with(bad, &catalog), None, "{bad}");
+        }
+
+        // The archive keeps a future's minutes under this same spelling.
+        assert_eq!(dated_future_name("NIFTY", nov), future_at("NIFTY", nov).name());
+        assert_eq!(Symbol::parse(&dated_future_name("BANKNIFTY", nov)), Some(future_at("BANKNIFTY", nov)));
+    }
+
+    #[test]
+    fn an_expired_dated_future_is_refused() {
+        let nov = date(11, 24);
+        // It trades until its expiry day's close; from the next day, refused.
+        assert!(future_at("NIFTY", nov).refusal(date(11, 20)).is_none());
+        assert!(future_at("NIFTY", nov).refusal(nov).is_none());
+        let why = future_at("NIFTY", nov).refusal(date(11, 25)).unwrap();
+        assert!(why.contains("NIFTY:FUT:2026-11-24") && why.contains("expired on 2026-11-24"), "{why}");
+        assert!(future_at("RELIANCE", nov).refusal(date(12, 1)).is_some());
+        // The bare form never expires: it rolls to the next month.
+        assert!(future("NIFTY").refusal(date(11, 25)).is_none());
+        // An option is left to the brokers' lists, as before (a 404).
+        assert!(option("NIFTY", date(10, 27), 22750.0, Side::Ce).refusal(date(11, 25)).is_none());
     }
 
     #[test]
@@ -366,6 +458,16 @@ mod tests {
         assert!(find_upstox(&option("RELIANCE", date(11, 24), 1400.0, Side::Pe), &list, today).is_none());
         let equity = Symbol::Equity { symbol: "RELIANCE".into(), exchange: Exchange::Nse };
         assert!(find_upstox(&equity, &list, today).is_none(), "an equity is not a derivative");
+
+        // A dated future is that contract, never the nearest one instead.
+        assert_eq!(find_upstox(&future_at("NIFTY", date(11, 23)), &list, today).unwrap().instrument_key, "NSE_FO|2");
+        assert_eq!(find_upstox(&future_at("NIFTY", date(10, 27)), &list, today).unwrap().instrument_key, "NSE_FO|48704");
+        assert_eq!(find_upstox(&future_at("RELIANCE", date(11, 24)), &list, today).unwrap().instrument_key, "NSE_FO|35001");
+        // A date with no listed future, or an option's expiry, finds nothing.
+        assert!(find_upstox(&future_at("NIFTY", date(12, 29)), &list, today).is_none());
+        assert!(find_upstox(&future_at("BANKNIFTY", date(10, 27)), &list, today).is_none(), "BANKNIFTY lists only an option that day");
+        // One past its expiry is not found, even while a stale list holds it.
+        assert!(find_upstox(&future_at("NIFTY", date(10, 27)), &list, date(10, 28)).is_none());
     }
 
     fn record(symbol: &str, segment: &str, raw_strike: f64, opt: &str, expiry: NaiveDate, token: &str) -> ScripRecord {
@@ -398,6 +500,16 @@ mod tests {
         let other_strike = option("NIFTY", date(10, 27), 22800.0, Side::Ce);
         assert!(find_kotak(&other_strike, &store, today).is_none());
         assert!(find_kotak(&future("SENSEX"), &store, today).is_none());
+
+        // A dated future is that contract: November's by its date, though
+        // October's is the nearest.
+        assert_eq!(find_kotak(&future_at("NIFTY", date(11, 23)), &store, today).unwrap().instrument_token, "48705");
+        assert_eq!(find_kotak(&future_at("NIFTY", date(10, 27)), &store, today).unwrap().instrument_token, "48704");
+        // An option's expiry or a date nothing expires on names no future.
+        assert!(find_kotak(&future_at("NIFTY", date(11, 3)), &store, today).is_none());
+        assert!(find_kotak(&future_at("NIFTY", date(12, 29)), &store, today).is_none());
+        // Past its expiry it is gone, even while the scrip master still lists it.
+        assert!(find_kotak(&future_at("NIFTY", date(10, 27)), &store, date(10, 28)).is_none());
     }
 
     #[test]
@@ -422,6 +534,11 @@ mod tests {
         // On its expiry day the November future still trades; the day after, December's.
         assert_eq!(find_kotak(&future("RELIANCE"), &store, date(11, 24)).unwrap().ws_key(), "nse_fo|43001");
         assert_eq!(find_kotak(&future("RELIANCE"), &store, date(11, 25)).unwrap().ws_key(), "nse_fo|43002");
+        // December's by its date, in nse_fo, while November's is the nearest.
+        assert_eq!(find_kotak(&future_at("RELIANCE", date(12, 29)), &store, today).unwrap().ws_key(), "nse_fo|43002");
+        assert_eq!(find_kotak(&future_at("RELIANCE", date(11, 24)), &store, today).unwrap().ws_key(), "nse_fo|43001");
+        assert!(find_kotak(&future_at("RELIANCE", date(1, 26)), &store, today).is_none());
+        assert_eq!(find_kotak(&future_at("SENSEX", date(11, 26)), &store, today).unwrap().ws_key(), "bse_fo|874003");
         let call = option("RELIANCE", date(11, 24), 1400.0, Side::Ce);
         assert_eq!(find_kotak(&call, &store, today).unwrap().ws_key(), "nse_fo|41222");
         let put = option("RELIANCE", date(11, 24), 1400.0, Side::Pe);

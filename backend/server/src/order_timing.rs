@@ -9,6 +9,12 @@
 //!
 //! The push stream only runs with `KOTAK_ORDER_STREAM=on`: Kotak documents
 //! its login two ways, so it is tried first with `server order-feed-probe`.
+//!
+//! Each order also ends in one `ORDER_TIMING` line in the engine log (and the
+//! server log): every stage counted from the send, up to when the engine's
+//! own order-book poll saw it finished — see `timeline`.
+
+mod timeline;
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -27,6 +33,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::AppState;
+use timeline::{Push, Timelines};
 
 /// How often a missing session is looked for, and a live one checked for a
 /// re-login.
@@ -64,36 +71,88 @@ pub struct PushStatus {
 
 pub struct OrderTiming {
     push: StdMutex<PushStatus>,
+    timelines: StdMutex<Timelines>,
 }
 
 impl OrderTiming {
     pub fn new(enabled: bool) -> Self {
-        Self { push: StdMutex::new(PushStatus { enabled, ..PushStatus::default() }) }
+        Self {
+            push: StdMutex::new(PushStatus { enabled, ..PushStatus::default() }),
+            timelines: StdMutex::new(Timelines::default()),
+        }
     }
 
     fn push(&self) -> std::sync::MutexGuard<'_, PushStatus> {
         self.push.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn timelines(&self) -> std::sync::MutexGuard<'_, Timelines> {
+        self.timelines.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn status(&self) -> PushStatus {
         self.push().clone()
     }
+
+    /// The lines of the orders whose timeline is complete now.
+    fn due(&self) -> Vec<serde_json::Value> {
+        let push = {
+            let p = self.push();
+            match (p.enabled, p.connected) {
+                (false, _) => Push::Off,
+                (true, false) => Push::NotConnected,
+                (true, true) => Push::Live,
+            }
+        };
+        self.timelines().due(now_ms(), push)
+    }
 }
 
-/// Records every timed send. Subscribed at startup, before any order can go.
-pub async fn run_recorder(db_tx: mpsc::Sender<DbWriteMessage>) {
-    let mut rx = kotak_client::subscribe_orders();
-    loop {
-        match rx.recv().await {
-            Ok(sent) => {
-                if db_tx.send(DbWriteMessage::OrderSent(sent)).await.is_err() {
-                    return;
-                }
+/// How often finished timelines are looked for.
+const TIMELINE_EVERY: Duration = Duration::from_millis(500);
+
+/// Records every timed send and every order the engine's poll first sees
+/// finished, and writes each order's `ORDER_TIMING` line once its timeline is
+/// complete. Both taps are subscribed here, before any order can go.
+pub fn start_recorder(me: Arc<OrderTiming>, db_tx: mpsc::Sender<DbWriteMessage>, log_tx: broadcast::Sender<String>) {
+    let mut sends = kotak_client::subscribe_orders();
+    let mut finished = kotak_client::orders::subscribe_book_finished();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(TIMELINE_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let mut lines = Vec::new();
+            tokio::select! {
+                sent = sends.recv() => match sent {
+                    Ok(sent) => {
+                        lines.extend(me.timelines().on_sent(&sent));
+                        if db_tx.send(DbWriteMessage::OrderSent(sent)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(missed = n, "Order timing fell behind the send tap"),
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                seen = finished.recv() => match seen {
+                    Ok(seen) => {
+                        if me.timelines().on_seen(&seen) {
+                            let _ = db_tx.send(DbWriteMessage::OrderSeen { order_no: seen.order_no, at_ms: seen.at_ms }).await;
+                        }
+                    }
+                    // A poll that just started lists the whole day's orders at once.
+                    Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(missed = n, "Order timing fell behind the engine's poll tap"),
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                _ = tick.tick() => {}
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(missed = n, "Order timing fell behind the send tap"),
-            Err(broadcast::error::RecvError::Closed) => return,
+            lines.extend(me.due());
+            for line in lines {
+                let text = line.get("message").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+                tracing::info!("{text}");
+                crate::routes::auth_kotak::send_log(&db_tx, &log_tx, "INFO", line).await;
+            }
         }
-    }
+    });
 }
 
 /// The session's login, cloned out of the Kotak mutex (never held across I/O).
@@ -114,7 +173,7 @@ async fn current_login(kotak: &Mutex<Option<kotak_client::KotakClient>>) -> Opti
 /// records each update, and reconnects on a re-login or a drop. A login Kotak
 /// doesn't acknowledge is tried the other documented way next time.
 pub async fn run_push_stream(me: Arc<OrderTiming>, kotak: Arc<Mutex<Option<kotak_client::KotakClient>>>, db_tx: mpsc::Sender<DbWriteMessage>) {
-    let mut style = AuthStyle::Json;
+    let mut style = AuthStyle::FIRST;
     let mut backoff = BACKOFF_START;
     loop {
         let Some(login) = current_login(&kotak).await else {
@@ -159,6 +218,7 @@ pub async fn run_push_stream(me: Arc<OrderTiming>, kotak: Arc<Mutex<Option<kotak
                             orders += 1;
                             tracing::info!(?update, "Kotak order stream update");
                         }
+                        me.timelines().on_update(&update);
                         if db_tx.send(DbWriteMessage::OrderUpdate(update)).await.is_err() {
                             conn.abort();
                             return;
@@ -236,7 +296,7 @@ pub async fn probe(pool: &SqlitePool, seconds: u64) -> i32 {
         return 1;
     };
     println!("Session base URL {} (sid …{})", row.base_url, row.sid.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>());
-    for style in [AuthStyle::Json, AuthStyle::Raw] {
+    for style in [AuthStyle::FIRST, AuthStyle::FIRST.other()] {
         println!("--- trying the {} login", style.name());
         let (tx, mut rx) = mpsc::channel::<FeedEvent>(256);
         let (base_url, token, sid) = (row.base_url.clone(), row.auth_token.clone(), row.sid.clone());

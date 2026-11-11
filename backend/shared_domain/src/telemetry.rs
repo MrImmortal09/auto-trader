@@ -542,6 +542,7 @@ impl DbWriteMessage {
             DbWriteMessage::TelegramMessage { .. } => "telegram_message",
             DbWriteMessage::OrderSent(_) => "order_sent",
             DbWriteMessage::OrderUpdate(_) => "order_update",
+            DbWriteMessage::OrderSeen { .. } => "order_seen",
         }
     }
 }
