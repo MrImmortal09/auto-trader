@@ -52,6 +52,9 @@ const RULES: &[Rule] = &[
     rule(On::Write, "/api/auth/otp/verify", Access::Public),
     rule(On::Read, "/api/auth/me", Access::Public),
     rule(On::Read, "/api/auth/session", Access::Public),
+    // The view-only page: the closed trades of a number the admin has made
+    // public, for anyone. A POST so the number isn't kept in access logs.
+    rule(On::Write, "/api/public/trades", Access::Public),
     // Market data, for anyone signed in. The expiries, chain, candles and
     // ladder stream take any catalog F&O underlying behind the
     // `stock_charts` switch (Phase 3) — the same routes, no new ones.
@@ -194,6 +197,7 @@ mod tests {
         (POST, "/api/auth/otp/request", Access::Public),
         (POST, "/api/auth/otp/verify", Access::Public),
         (GET, "/api/auth/me", Access::Public),
+        (POST, "/api/public/trades", Access::Public),
         (GET, "/api/admin/users", Access::Admin),
         (POST, "/api/admin/users", Access::Admin),
         (PATCH, "/api/admin/users/3", Access::Admin),

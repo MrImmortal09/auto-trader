@@ -383,6 +383,9 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             last_login_at TEXT
         )",
     ).execute(&pool).await.unwrap();
+    // Whether the number's closed trades are shown, with no sign-in, on the
+    // view-only page (`routes::public_view`). The admin's switch, off by default.
+    ensure_column(&pool, "ALTER TABLE users ADD COLUMN public INTEGER NOT NULL DEFAULT 0").await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS otp_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1426,6 +1429,8 @@ pub struct UserRow {
     pub enabled: i64,
     pub created_at: String,
     pub last_login_at: Option<String>,
+    /// Shown on the view-only page (`routes::public_view`).
+    pub public: i64,
 }
 
 impl UserRow {
@@ -1440,7 +1445,7 @@ impl UserRow {
     }
 }
 
-const USER_COLUMNS: &str = "id, phone, name, role, enabled, created_at, last_login_at";
+const USER_COLUMNS: &str = "id, phone, name, role, enabled, created_at, last_login_at, public";
 
 /// Make the owner's phone (`ADMIN_PHONE`) the one admin — run at every
 /// start. Its row is put back as an enabled admin whatever it says now, and
