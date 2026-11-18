@@ -2,8 +2,8 @@ name: Deploy script test
 
 # deploy.yml restarts the live server on every merge, so its VM script is
 # tested on a pull request before it can run against the real VM: a good
-# release, the same release again, and a release that must roll back
-# (.github/deploy-test/run.sh).
+# release, the same release again, and a release that must roll back, each
+# with its frontend build (.github/deploy-test/run.sh).
 
 on:
   pull_request:

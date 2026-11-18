@@ -9,6 +9,9 @@ lerna-debug.log*
 
 node_modules
 dist
+# The deploy's staged frontend build and the one it replaced (deploy.yml).
+.dist_new
+.dist_prev
 dist-ssr
 *.local
 

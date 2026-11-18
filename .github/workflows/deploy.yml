@@ -2,9 +2,12 @@ name: Deploy server
 
 # Deploys a server release to the VM over SSH, in place of the old
 # backend/server/update.sh: syncs ~/auto-trader to the release's tag (the Kotak
-# bridge is plain JS read at spawn), installs that release's binary, restarts it
-# in tmux pane 0:0, checks it answers with the new version, and rolls back —
-# binary and source — if it doesn't.
+# bridge is plain JS read at spawn), installs that release's binary and its
+# frontend build (frontend-<version>.tar.gz, as frontend/dist, which the server
+# serves from disk), restarts it in tmux pane 0:0, checks it answers with the
+# new version, and rolls back — binary, frontend and source — if it doesn't.
+# A release from before the frontend build was added leaves frontend/dist as
+# it is.
 #
 # Runs after every release (release-server.yml calls it), at any time of day.
 # The engine is down from the stop until the new server answers: a few seconds,
@@ -33,6 +36,10 @@ on:
       asset_name:
         required: true
         type: string
+      frontend_asset:
+        required: false
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       release_tag:
@@ -60,6 +67,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.release_tag }}
           ASSET: ${{ inputs.asset_name }}
+          FRONTEND_ASSET: ${{ inputs.frontend_asset }}
         shell: bash
         run: |
           set -euo pipefail
@@ -69,6 +77,10 @@ jobs:
           if [ -z "$ASSET" ]; then
             ASSET=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -E '^server-.*-x86_64-unknown-linux-gnu$' | head -n1 || true)
           fi
+          # Empty for a release from before the frontend build was added.
+          if [ -z "$FRONTEND_ASSET" ]; then
+            FRONTEND_ASSET=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -E '^frontend-[0-9.]+\.tar\.gz$' | head -n1 || true)
+          fi
           if [ -z "$TAG" ] || [ -z "$ASSET" ]; then
             echo "::error::Could not resolve the release (tag '$TAG', asset '$ASSET')"
             exit 1
@@ -76,15 +88,24 @@ jobs:
           # Only names a release would have: they end up in a shell on the VM.
           [[ "$TAG" =~ ^server-v[0-9.]+$ ]] || { echo "::error::Unexpected tag '$TAG'"; exit 1; }
           [[ "$ASSET" =~ ^server-[0-9.]+-x86_64-unknown-linux-gnu$ ]] || { echo "::error::Unexpected asset '$ASSET'"; exit 1; }
-          # GitHub's SHA-256 of the binary, checked on the VM before it is used.
-          DIGEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$ASSET\") | .digest // empty")
+          [[ -z "$FRONTEND_ASSET" || "$FRONTEND_ASSET" =~ ^frontend-[0-9.]+\.tar\.gz$ ]] || { echo "::error::Unexpected frontend asset '$FRONTEND_ASSET'"; exit 1; }
+          # GitHub's SHA-256 of each asset, checked on the VM before it is used.
+          digest_of() { gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$1\") | .digest // empty"; }
+          DIGEST=$(digest_of "$ASSET")
           [[ -z "$DIGEST" || "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::Unexpected digest '$DIGEST'"; exit 1; }
+          FRONTEND_DIGEST=""
+          if [ -n "$FRONTEND_ASSET" ]; then
+            FRONTEND_DIGEST=$(digest_of "$FRONTEND_ASSET")
+            [[ -z "$FRONTEND_DIGEST" || "$FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::Unexpected frontend digest '$FRONTEND_DIGEST'"; exit 1; }
+          fi
           {
             echo "tag=$TAG"
             echo "asset=$ASSET"
             echo "digest=$DIGEST"
+            echo "frontend_asset=$FRONTEND_ASSET"
+            echo "frontend_digest=$FRONTEND_DIGEST"
           } >> "$GITHUB_OUTPUT"
-          echo "Deploying $TAG ($ASSET)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploying $TAG ($ASSET, ${FRONTEND_ASSET:-no frontend build})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Deploy on the VM
         # v1.2.5, pinned: this step holds the deploy key.
@@ -93,13 +114,15 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
           ASSET: ${{ steps.release.outputs.asset }}
           DIGEST: ${{ steps.release.outputs.digest }}
+          FRONTEND_ASSET: ${{ steps.release.outputs.frontend_asset }}
+          FRONTEND_DIGEST: ${{ steps.release.outputs.frontend_digest }}
           REPO_SLUG: ${{ github.repository }}
         with:
           host: ${{ secrets.ORACLE_VM_HOST }}
           username: ${{ secrets.ORACLE_VM_USER }}
           key: ${{ secrets.ORACLE_VM_SSH_KEY }}
           fingerprint: ${{ secrets.ORACLE_VM_FINGERPRINT }}
-          envs: TAG,ASSET,DIGEST,REPO_SLUG
+          envs: TAG,ASSET,DIGEST,FRONTEND_ASSET,FRONTEND_DIGEST,REPO_SLUG
           command_timeout: 28m
           script: |
             set -euo pipefail
@@ -118,7 +141,16 @@ jobs:
             # before the server answers: give it time before calling it failed.
             HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
             NEW_BIN="$BACKEND/.$ASSET.new"
-            trap 'rc=$?; rm -f "$NEW_BIN" "$RUN_DIR/download"; cat "$RUN_DIR/log" >> /tmp/deploy.log 2>/dev/null; echo "$rc" > "$RUN_DIR/status"' EXIT
+            # The frontend the server serves from disk (../frontend/dist), the
+            # release's build staged beside it, and the one it replaced.
+            FRONT="$REPO/frontend"
+            NEW_DIST="$FRONT/.dist_new"
+            PREV_DIST="$FRONT/.dist_prev"
+            FRONTEND_ASSET="${FRONTEND_ASSET:-}"
+            FRONTEND_DIGEST="${FRONTEND_DIGEST:-}"
+            FRONTEND_STAGED=no
+            FRONTEND_SWAPPED=no
+            trap 'rc=$?; rm -rf "$NEW_BIN" "$NEW_DIST" "$RUN_DIR/download" "$RUN_DIR/frontend.tar.gz"; cat "$RUN_DIR/log" >> /tmp/deploy.log 2>/dev/null; echo "$rc" > "$RUN_DIR/status"' EXIT
 
             say() { echo "[$(date '+%F %T')] $*"; }
             fatal() { say "FATAL: $*"; exit 1; }
@@ -191,6 +223,31 @@ jobs:
               tmux_ send-keys -t "$PANE" C-u
               tmux_ send-keys -t "$PANE" "cd $BACKEND && ./$1" C-m
             }
+            # The staged frontend build in place of the live one, which is kept
+            # as .dist_prev. The same build as the live one is left alone, so
+            # .dist_prev stays the last different one.
+            install_frontend() {
+              [ "$FRONTEND_STAGED" = yes ] || return 0
+              if [ -d "$FRONT/dist" ] && diff -rq "$NEW_DIST" "$FRONT/dist" >/dev/null 2>&1; then
+                say "Frontend build unchanged"
+                return 0
+              fi
+              rm -rf "$PREV_DIST"
+              if [ -d "$FRONT/dist" ] && ! mv "$FRONT/dist" "$PREV_DIST"; then return 1; fi
+              if ! mv "$NEW_DIST" "$FRONT/dist"; then
+                if [ -d "$PREV_DIST" ]; then mv "$PREV_DIST" "$FRONT/dist"; fi
+                return 1
+              fi
+              FRONTEND_SWAPPED=yes
+              say "Frontend build $FRONTEND_ASSET in place"
+            }
+            restore_frontend() {
+              [ "$FRONTEND_SWAPPED" = yes ] || return 0
+              rm -rf "$FRONT/dist"
+              if [ -d "$PREV_DIST" ]; then mv "$PREV_DIST" "$FRONT/dist"; fi
+              FRONTEND_SWAPPED=no
+              say "Frontend build put back"
+            }
             # `server-0.1.163-x86_64-unknown-linux-gnu` -> `0.1.163`; empty
             # for any other name.
             version_of() { basename "$1" | sed -nE 's/^server-([0-9.]+)-x86_64-unknown-linux-gnu$/\1/p'; }
@@ -245,6 +302,26 @@ jobs:
             fi
             { cp "$RUN_DIR/download" "$NEW_BIN" && chmod +x "$NEW_BIN"; } || fatal "can't stage the binary in $BACKEND"
 
+            #    And its frontend build, unpacked beside the live one (the swap
+            #    is then a rename on the same filesystem).
+            if [ -n "$FRONTEND_ASSET" ]; then
+              FRONTEND_URL="${RELEASES_BASE:-https://github.com/$REPO_SLUG/releases/download}/$TAG/$FRONTEND_ASSET"
+              curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 "$FRONTEND_URL" -o "$RUN_DIR/frontend.tar.gz" \
+                || fatal "frontend download failed; the running server is untouched"
+              if [ -n "$FRONTEND_DIGEST" ]; then
+                got="sha256:$(sha256sum "$RUN_DIR/frontend.tar.gz" | cut -d ' ' -f1)"
+                [ "$got" = "$FRONTEND_DIGEST" ] || fatal "frontend checksum $got isn't GitHub's $FRONTEND_DIGEST; the running server is untouched"
+              fi
+              rm -rf "$NEW_DIST"
+              { mkdir -p "$NEW_DIST" && tar -xzf "$RUN_DIR/frontend.tar.gz" -C "$NEW_DIST" --no-same-owner; } \
+                || fatal "can't unpack the frontend build in $FRONT; the running server is untouched"
+              [ -f "$NEW_DIST/index.html" ] || fatal "the frontend build has no index.html; the running server is untouched"
+              FRONTEND_STAGED=yes
+              say "Frontend build staged"
+            else
+              say "This release has no frontend build; frontend/dist is left as it is"
+            fi
+
             # 2. What runs now: the binary behind the live process.
             CURRENT_PID=$(server_pids | head -n1)
             CURRENT_BIN=""
@@ -257,7 +334,10 @@ jobs:
             fi
             say "Running now: ${CURRENT_BIN:-nothing}${CURRENT_PID:+ (pid $CURRENT_PID)}"
             if [ -n "$CURRENT_PID" ] && [ "$CURRENT_BIN" = "$BACKEND/$ASSET" ] && [ "$(running_version)" = "$(version_of "$ASSET")" ]; then
-              say "Already running $ASSET; nothing to do."
+              # No restart, but its frontend build is put back if it isn't the
+              # one in place: deploying a release again repairs frontend/dist.
+              install_frontend || fatal "couldn't put the frontend build in place; the running server is untouched"
+              say "Already running $ASSET; nothing else to do."
               exit 0
             fi
 
@@ -287,10 +367,15 @@ jobs:
             say "Source at $(git rev-parse --short HEAD) ($TAG)"
             ensure_pane
 
-            # 5. The downtime: stop, swap (an atomic rename), start, check.
+            # 5. The downtime: stop, swap the binary (an atomic rename) and the
+            #    frontend, start, check.
             say "Stopping the server"
             stop_server
-            if mv -f "$NEW_BIN" "$BACKEND/$ASSET"; then
+            if ! mv -f "$NEW_BIN" "$BACKEND/$ASSET"; then
+              say "FAILED: couldn't put $ASSET in place"
+            elif ! install_frontend; then
+              say "FAILED: couldn't put the frontend build in place"
+            else
               say "Starting $ASSET in tmux $PANE"
               start_server "$ASSET"
               if healthy "$(version_of "$ASSET")"; then
@@ -303,15 +388,14 @@ jobs:
                 exit 0
               fi
               say "FAILED: $ASSET didn't come up"
-            else
-              say "FAILED: couldn't put $ASSET in place"
             fi
 
-            # 6. Put the previous binary and source back.
+            # 6. Put the previous binary, frontend and source back.
             stop_server
             if [ -n "$PREV_HEAD" ] && git reset --hard "$PREV_HEAD" >/dev/null; then
               say "Source back at $(git rev-parse --short HEAD)"
             fi
+            restore_frontend
             if [ -n "$CURRENT_BIN" ] && [ -f "$BACKUP" ] \
               && cp "$BACKUP" "$CURRENT_BIN.rollback" && chmod +x "$CURRENT_BIN.rollback" \
               && mv -f "$CURRENT_BIN.rollback" "$CURRENT_BIN"; then
@@ -353,5 +437,6 @@ jobs:
         if: success()
         env:
           TAG: ${{ steps.release.outputs.tag }}
+          FRONTEND_ASSET: ${{ steps.release.outputs.frontend_asset }}
         run: |
-          echo "Live on the VM: ${TAG#server-v} (its GET /api/version agrees)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Live on the VM: ${TAG#server-v} (its GET /api/version agrees)${FRONTEND_ASSET:+, with its frontend build}" >> "$GITHUB_STEP_SUMMARY"
