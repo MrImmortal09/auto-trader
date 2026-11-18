@@ -237,6 +237,8 @@ export interface AdminUser {
   /** IST `YYYY-MM-DD HH:MM:SS`. */
   created_at: string;
   last_login_at: string | null;
+  /** Anyone may see this number's closed trades on the view-only page. */
+  public: boolean;
   /** A user's paper figures; null for the admin. */
   paper: AdminPaper | null;
 }
@@ -788,6 +790,37 @@ export interface HistoryAnswer {
   days: DayRow[];
   /** Newest first. */
   calls: Call[];
+  more_calls: number;
+}
+
+/** A closed call on the view-only page: no message, channel or signal id. */
+export interface PublicCall {
+  index: string;
+  side: string | null;
+  strike: number | null;
+  expiry: string | null;
+  opened_at: string;
+  closed_at: string | null;
+  qty: number;
+  pnl: number | null;
+  charges: number;
+  exit_reason: string | null;
+  legs: { t: string; action: string; qty: number; price: number }[];
+}
+
+/** `POST /api/public/trades`: a public number's closed trades over a range. */
+export interface PublicTrades {
+  name: string | null;
+  mode: Mode;
+  range: RangeId;
+  from: string | null;
+  to: string;
+  kpis: Kpis;
+  curve: CurvePoint[];
+  groups: GroupRow[];
+  days: DayRow[];
+  /** Newest first. */
+  calls: PublicCall[];
   more_calls: number;
 }
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { CalendarPlus, ChartLine, Trash2, UserPlus } from 'lucide-react';
+import { CalendarPlus, ChartLine, Eye, Trash2, UserPlus } from 'lucide-react';
 import { formatPhone, normalizePhone } from '../auth/phone';
 import { createUser, deleteSpecialSession, deleteUser, listSpecialSessions, listUsers, patchUser, putSpecialSession } from '../lib/api';
 import { dayLabel, hhmm, plural, shortDate, todayIst } from '../lib/format';
@@ -156,6 +156,11 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
   const setEnabled = (u: AdminUser, enabled: boolean) =>
     act(u.id, () => guard('Changing a user needs the admin sign-in.', () => patchUser(serverBase, u.id, { enabled }), `Couldn't ${enabled ? 'enable' : 'disable'} ${formatPhone(u.phone)}`, 'admin'));
 
+  const setPublic = (u: AdminUser, on: boolean) =>
+    act(u.id, () =>
+      guard('Changing a user needs the admin sign-in.', () => patchUser(serverBase, u.id, { public: on }), `Couldn't ${on ? 'share' : 'hide'} the trades of ${formatPhone(u.phone)}`, 'admin'),
+    );
+
   async function remove(u: AdminUser) {
     setRemoving(null);
     await act(u.id, async () => {
@@ -188,6 +193,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
                 )}
                 {isAdmin && <Chip kind="accent">Admin</Chip>}
                 {!u.enabled && <Chip kind="loss">Disabled</Chip>}
+                {u.public && <Chip kind="outline">Public</Chip>}
               </span>
             }
             caption={
@@ -202,6 +208,18 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
                 {large ? null : 'P&L'}
               </Button>
             )}
+            <Button
+              size={size}
+              kind={u.public ? 'accent' : 'ghost'}
+              icon={<Eye size={14} />}
+              disabled={!!busy[u.id]}
+              aria-pressed={u.public}
+              aria-label={`${u.public ? 'Stop showing' : 'Show'} the closed trades of ${who} on the view-only page`}
+              title={u.public ? `Anyone with this number can see ${isAdmin ? "the owner's" : 'their'} closed trades at /view. Click to stop.` : `Let anyone with this number see ${isAdmin ? "the owner's" : 'their'} closed trades at /view`}
+              onClick={() => void setPublic(u, !u.public)}
+            >
+              {large ? null : u.public ? 'Public' : 'Private'}
+            </Button>
             <Toggle checked={u.enabled} disabled={isAdmin || !!busy[u.id]} label={`${u.enabled ? 'Disable' : 'Enable'} ${formatPhone(u.phone)}`} onChange={(on) => void setEnabled(u, on)} />
             {!isAdmin && (
               <Button

@@ -1297,6 +1297,7 @@ async fn main() {
         .route("/api/auth/session",                 get(routes::session_status_handler))
         .route("/api/auth/otp/request",             post(routes::otp_request_handler))
         .route("/api/auth/otp/verify",              post(routes::otp_verify_handler))
+        .route("/api/public/trades",                post(routes::public_view::public_trades_handler))
         .route("/api/auth/me",                      get(routes::me_handler))
         .route("/api/admin/users",                  get(routes::list_users_handler)
                                                    .post(routes::create_user_handler))

@@ -26,6 +26,9 @@ pub struct UserOut {
     pub enabled: bool,
     pub created_at: String,
     pub last_login_at: Option<String>,
+    /// Whether anyone may see this number's closed trades on the view-only
+    /// page, with no sign-in.
+    pub public: bool,
     /// A user's paper wallet, positions and P&L — in the list only, and
     /// never for the admin, who trades on the owner's desk.
     pub paper: Option<PaperSummary>,
@@ -41,6 +44,7 @@ impl From<UserRow> for UserOut {
             enabled: r.enabled != 0,
             created_at: r.created_at,
             last_login_at: r.last_login_at,
+            public: r.public != 0,
             paper: None,
         }
     }
@@ -122,7 +126,7 @@ pub async fn create_user_handler(
     tracing::info!(user_id = id, role = role.as_str(), by = identity.kind(), "User added to the allow-list");
     (
         StatusCode::CREATED,
-        Json(UserOut { id, phone, name, role: role.as_str(), enabled: true, created_at: now, last_login_at: None, paper: None }),
+        Json(UserOut { id, phone, name, role: role.as_str(), enabled: true, created_at: now, last_login_at: None, public: false, paper: None }),
     )
         .into_response()
 }
@@ -134,6 +138,11 @@ pub struct UserPatch {
     pub name: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Show (or stop showing) the number's closed trades on the view-only
+    /// page. The admin's own number may be made public too: the owner's
+    /// trades, by the owner's choice.
+    #[serde(default)]
+    pub public: Option<bool>,
 }
 
 /// Whether `record` is the owner's own seeded row.
@@ -141,7 +150,7 @@ fn is_seeded_admin(record: &UserRecord) -> bool {
     admin_phone().is_some_and(|p| p == record.phone)
 }
 
-/// `PATCH /api/admin/users/:id {name?, enabled?}`.
+/// `PATCH /api/admin/users/:id {name?, enabled?, public?}`.
 pub async fn patch_user_handler(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -158,9 +167,10 @@ pub async fn patch_user_handler(
         None => current.name.clone(),
     };
     let enabled = patch.enabled.unwrap_or(current.enabled);
-    if let Err(e) = sqlx::query("UPDATE users SET name = ?, enabled = ? WHERE id = ?")
+    if let Err(e) = sqlx::query("UPDATE users SET name = ?, enabled = ?, public = COALESCE(?, public) WHERE id = ?")
         .bind(&name)
         .bind(enabled as i64)
+        .bind(patch.public.map(i64::from))
         .bind(id)
         .execute(&state.db_pool)
         .await
@@ -170,6 +180,9 @@ pub async fn patch_user_handler(
     state.auth.users.upsert(UserRecord { name, enabled, ..current });
     if !enabled {
         tracing::info!(user_id = id, "User disabled");
+    }
+    if let Some(public) = patch.public {
+        tracing::info!(user_id = id, public, "User's view-only page switched");
     }
     match db::load_user(&state.db_pool, id).await {
         Ok(Some(row)) => Json(UserOut::from(row)).into_response(),

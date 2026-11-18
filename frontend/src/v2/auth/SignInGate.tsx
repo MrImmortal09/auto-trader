@@ -4,14 +4,18 @@ import { ServerDialog } from '../settings/dialogs';
 import { Mark } from '../shell/Mark';
 import { useIdentity } from './identity';
 import { SignInForm } from './SignInSheet';
+import { ViewerPage } from './ViewerPage';
+import { isViewPath, VIEW_PATH } from './viewPath';
 
 /**
  * Nothing opens without a sign-in: until there's one, the whole page is the
  * sign-in, and nothing else is fetched. A sign-out, a refused token or a
- * disabled user comes back here.
+ * disabled user comes back here. The one page that opens without it is the
+ * view-only page (`/view`), for anyone, signed in or not.
  */
 export function SignInGate({ children }: { children: ReactNode }) {
   const { role } = useIdentity();
+  if (isViewPath()) return <ViewerPage />;
   return role === 'anon' ? <SignInPage /> : children;
 }
 
@@ -33,6 +37,16 @@ function SignInPage() {
         <div className="rounded-16 border border-line bg-panel shadow-lg">
           <SignInForm reason={signInReason} />
         </div>
+        <a
+          href={VIEW_PATH}
+          className="flex items-center justify-between gap-3 rounded-12 border border-line bg-panel px-4 py-3 transition-colors duration-120 hover:border-accent"
+        >
+          <span>
+            <span className="block type-body-strong text-fg">View someone's trades</span>
+            <span className="block type-caption text-fg-subtle">View only, by mobile number. No code needed.</span>
+          </span>
+          <span className="type-body text-accent">→</span>
+        </a>
         <p className="type-caption text-fg-subtle">
           Server {server} ·{' '}
           <button type="button" className="text-accent underline-offset-2 transition-colors duration-120 hover:text-accent-strong hover:underline" onClick={() => setServerOpen(true)}>

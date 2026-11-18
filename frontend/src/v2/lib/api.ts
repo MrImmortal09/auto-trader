@@ -33,6 +33,7 @@ import type {
   SearchAnswer,
   ModeCheck,
   OptionChainAnswer,
+  PublicTrades,
   RangeId,
   RawPosition,
   SessionUser,
@@ -262,6 +263,21 @@ export async function verifyOtp(base: string, phone: string, code: string): Prom
   }
 }
 
+/** The view-only page's lookup: no sign-in is sent, none is needed. */
+export async function lookupPublicTrades(base: string, phone: string, range: RangeId): Promise<PublicTrades | { error: string; status: number }> {
+  try {
+    const res = await apiFetchWith(null, base, '/api/public/trades', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone, range }),
+    });
+    if (res.ok) return (await res.json()) as PublicTrades;
+    return { error: await errorOf(res), status: res.status };
+  } catch {
+    return { error: 'Could not reach the server', status: 0 };
+  }
+}
+
 export const listUsers = (base: string) => getJson<AdminUser[]>(base, '/api/admin/users');
 /** Every user's paper fills (or `user`'s), on or after `from` (`YYYY-MM-DD`; all without it). */
 export function getAdminTrades(base: string, user: number | null, from: string | null) {
@@ -286,7 +302,7 @@ export function getUserReport(base: string, user: number, from: string | null, t
 }
 // The Admin page's allow-list.
 export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name });
-export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean }) =>
+export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean; public?: boolean }) =>
   send(base, `/api/admin/users/${id}`, 'PATCH', patch);
 export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE');
 
