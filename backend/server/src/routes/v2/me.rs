@@ -77,24 +77,12 @@ fn fresh_price(state: &AppState, p: &PaperPosition) -> Option<f64> {
         .filter(|_| execute::contract_age_secs(&p.ws_key).is_some_and(|age| age <= execute::MAX_CONTRACT_AGE_SECS))
 }
 
-fn paper_buy_closed_message() -> String {
-    if let Some(session) = shared_domain::special_session_on(shared_domain::today_ist()) {
-        format!(
-            "Market is closed — today's special session runs {}–{} IST",
-            shared_domain::format_hhmm(session.start),
-            shared_domain::format_hhmm(session.end)
-        )
-    } else {
-        "Market is closed — paper trades run 09:15–15:30 IST".to_string()
-    }
-}
-
 /// Sells run in the same hours as buys: there is no price to fill at outside them.
 fn market_open() -> Result<(), Response> {
     if execute::manual_buy_window_open() {
         Ok(())
     } else {
-        Err(refuse(StatusCode::CONFLICT, paper_buy_closed_message()))
+        Err(refuse(StatusCode::CONFLICT, execute::paper_buy_closed_message()))
     }
 }
 
@@ -246,7 +234,7 @@ pub async fn buy_handler(
         return refuse(StatusCode::BAD_REQUEST, format!("Lots must be between 1 and {}", paper::MAX_LOTS_PER_TAP));
     }
     if !execute::manual_buy_window_open() || trading_engine::is_entry_cutoff_passed() {
-        return refuse(StatusCode::CONFLICT, paper_buy_closed_message());
+        return refuse(StatusCode::CONFLICT, execute::paper_buy_closed_message());
     }
     if !execute::feed_fresh() {
         return refuse(StatusCode::CONFLICT, "Price feed is stale — not buying blind");

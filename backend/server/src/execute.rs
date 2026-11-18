@@ -641,8 +641,13 @@ pub struct ExecuteFrame {
     ts: i64,
     mode: String,
     kill_switch: bool,
-    /// Manual buys are accepted: 09:15–15:30 IST on a weekday.
+    /// Manual buys are accepted: 09:15–15:30 IST on a weekday, or during
+    /// today's special session.
     market_open: bool,
+    /// While `market_open` is false, the buy route's own refusal (today's
+    /// special session window if one is set, else regular hours): the
+    /// owner's desk's for the owner, the paper desk's for everyone else.
+    closed_message: Option<String>,
     feed: FeedStatus,
     /// LIVE: a Kotak session is held and its last probe succeeded.
     kotak_ready: bool,
@@ -801,18 +806,29 @@ pub fn manual_buy_window_open() -> bool {
     manual_buy_window_open_at(shared_domain::now_ist())
 }
 
-/// Refusal message for when manual buys are closed: mentions today's special session
-/// window if one is set for today, else regular weekday hours.
-pub fn manual_buy_closed_message() -> String {
-    if let Some(session) = shared_domain::special_session_on(shared_domain::today_ist()) {
+/// Refusal message for when buys are closed on `date`: mentions that day's
+/// special session window if one is set, else regular weekday hours. `what`
+/// names the desk's trades ("manual buys", "paper trades").
+fn buy_closed_message_on(date: NaiveDate, what: &str) -> String {
+    if let Some(session) = shared_domain::special_session_on(date) {
         format!(
             "Market is closed — today's special session runs {}–{} IST",
             shared_domain::format_hhmm(session.start),
             shared_domain::format_hhmm(session.end)
         )
     } else {
-        "Market is closed — manual buys run 09:15–15:30 IST".to_string()
+        format!("Market is closed — {what} run 09:15–15:30 IST")
     }
+}
+
+/// The owner's desk: why `POST /api/execute/buy` refuses a buy right now.
+pub fn manual_buy_closed_message() -> String {
+    buy_closed_message_on(shared_domain::today_ist(), "manual buys")
+}
+
+/// The users' paper desk: why `/api/v2/me/*` refuses a trade right now.
+pub fn paper_buy_closed_message() -> String {
+    buy_closed_message_on(shared_domain::today_ist(), "paper trades")
 }
 
 /// Live index value and its % change on the previous close, from Kotak's feed.
@@ -1118,11 +1134,14 @@ pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, exp
     };
 
     let ts = shared_domain::now_ist().timestamp_millis();
+    let market_open = manual_buy_window_open();
+    let closed_message = (!market_open).then(|| if owner_view { manual_buy_closed_message() } else { paper_buy_closed_message() });
     ExecuteFrame {
         ts,
         mode,
         kill_switch,
-        market_open: manual_buy_window_open(),
+        market_open,
+        closed_message,
         feed: feed_status(),
         kotak_ready: owner_view && kotak_ready(state),
         indices,
@@ -1139,6 +1158,21 @@ mod tests {
 
     fn strike(k: f64) -> ChainStrike {
         ChainStrike { strike: k, ce: None, pe: None }
+    }
+
+    #[test]
+    fn the_closed_message_names_todays_special_session() {
+        let _guard = shared_domain::special_sessions_test_guard();
+        let day = NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        shared_domain::set_special_sessions(Vec::new());
+        assert_eq!(buy_closed_message_on(day, "manual buys"), "Market is closed — manual buys run 09:15–15:30 IST");
+        assert_eq!(buy_closed_message_on(day, "paper trades"), "Market is closed — paper trades run 09:15–15:30 IST");
+
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession { date: day, start: 18 * 60, end: 19 * 60 + 15 }]);
+        assert_eq!(buy_closed_message_on(day, "paper trades"), "Market is closed — today's special session runs 18:00–19:15 IST");
+        // Another day keeps the regular hours.
+        assert_eq!(buy_closed_message_on(day.succ_opt().unwrap(), "manual buys"), "Market is closed — manual buys run 09:15–15:30 IST");
+        shared_domain::set_special_sessions(Vec::new());
     }
 
     #[test]

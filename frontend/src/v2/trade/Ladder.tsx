@@ -77,12 +77,15 @@ function Quote({ q, kind, label, position, flashes, marketOpen, onChart }: {
       <span key={flash.key} className={`-mx-1 rounded-4 px-1 num-medium ${q?.ltp == null ? 'text-fg-muted' : 'text-fg'} ${flash.className}`}>
         {q?.ltp == null ? '—' : price(q.ltp)}
       </span>
+      {/* One line each, cut with an ellipsis when the column is narrow: the
+       * row's height is fixed, so a wrapped second line spilled into the
+       * next row. The button's title carries the whole of it. */}
       {position ? (
-        <span className={`type-caption tnum ${position.pnl != null && position.pnl < 0 ? 'text-loss' : 'text-profit'}`}>
+        <span className={`max-w-full truncate type-caption tnum ${position.pnl != null && position.pnl < 0 ? 'text-loss' : 'text-profit'}`}>
           {position.qty} · {position.pnl == null ? '—' : signedMoney(position.pnl, 0)}
         </span>
       ) : (
-        polled && <span className="type-caption text-fg-muted tnum">{polledMarker(q.age_ms, marketOpen)}</span>
+        polled && <span className="max-w-full truncate type-caption text-fg-muted tnum">{polledMarker(q.age_ms, marketOpen)}</span>
       )}
     </button>
   );
@@ -220,7 +223,8 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
     // A held contract is tinted profit; one in the money is shaded.
     const shade = position ? 'bg-profit-subtle' : itm ? 'bg-itm' : '';
     return (
-      <div className={`flex min-w-0 flex-1 items-center gap-3 px-2 ${shade}`}>
+      // Desktop's narrower column keeps the gaps tight so "polled · close" fits on its line.
+      <div className={`flex min-w-0 flex-1 items-center ${desktop ? 'gap-2 px-1.5' : 'gap-3 px-2'} ${shade}`}>
         {kind === 'CE' ? (
           <>
             {button}
