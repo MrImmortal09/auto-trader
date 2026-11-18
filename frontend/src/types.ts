@@ -569,6 +569,23 @@ export interface ExecutePosition {
   halted: boolean;
   /** Chart stop and targets, when set from a v2 chart. */
   chart?: ChartLevels;
+  /** A line order's buy line, while it waits on it (armed, or crossed and
+   * being bought). */
+  line?: EntryLine | null;
+  /** Lots held, or a waiting buy is for; absent from an older server. */
+  lots?: number;
+}
+
+/** A line order's buy line on the index chart: bought at market once the
+ * index reaches `price` — rising to it, or falling to it. */
+export interface EntryLine {
+  price: number;
+  /** The index was below the line when it was armed: it buys as it rises to it. */
+  rising: boolean;
+  /** IST `YYYY-MM-DD HH:MM:SS` it is dropped at, unbought; `null`: till close. */
+  valid_until: string | null;
+  /** When the index reached it: it is being bought. Absent while armed. */
+  triggered_at?: string | null;
 }
 
 /** One index at the top of the Trade screen. */

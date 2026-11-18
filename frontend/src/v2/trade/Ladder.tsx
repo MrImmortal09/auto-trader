@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { Check } from 'lucide-react';
 import type { ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
 import { buyMaxAgeMs, expiryLabel, fmtAgeLimit } from '../../lib/execute';
 import { level, price, signedMoney } from '../lib/format';
@@ -19,6 +20,26 @@ function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: 
   if (quotePolled(q)) return ladder === 'stock' ? 'No live tick for this strike' : 'Polled price — this strike is past the feed budget, so it can’t be bought yet';
   if (q.age_ms != null && q.age_ms > maxAgeMs) return `This contract's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}`;
   return null;
+}
+
+/** "Buy on a line": the ladder's Buy places a line order on the index chart
+ * instead of buying at market. */
+function LineToggle({ on, onChange }: { on: boolean; onChange: (on: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={on}
+      onClick={() => onChange(!on)}
+      title="Buy places a buy line on the index chart, then its stop and targets; it buys at market when the index crosses the line"
+      className="flex shrink-0 items-center gap-1.5 rounded-6 px-1.5 py-1 transition-colors duration-120 hover:bg-raised"
+    >
+      <span className={`grid size-4 shrink-0 place-items-center rounded-4 border ${on ? 'border-accent bg-accent text-on-accent' : 'border-line-strong bg-panel'}`}>
+        {on && <Check size={12} strokeWidth={3} />}
+      </span>
+      <span className="whitespace-nowrap type-label text-fg">Buy on a line</span>
+    </button>
+  );
 }
 
 /** How long the ladder rests after a scroll before asking for prices there. */
@@ -80,7 +101,12 @@ function Quote({ q, kind, label, position, flashes, marketOpen, onChart }: {
       {/* One line each, cut with an ellipsis when the column is narrow: the
        * row's height is fixed, so a wrapped second line spilled into the
        * next row. The button's title carries the whole of it. */}
-      {position ? (
+      {position?.placing && position.line ? (
+        // A line order waiting on its buy line: when it buys, not a holding.
+        <span className="max-w-full truncate type-caption text-fg-muted tnum">
+          {position.line.triggered_at ? 'buying…' : `line ${position.line.rising ? '≥' : '≤'} ${level(position.line.price)}`}
+        </span>
+      ) : position ? (
         <span className={`max-w-full truncate type-caption tnum ${position.pnl != null && position.pnl < 0 ? 'text-loss' : 'text-profit'}`}>
           {position.qty} · {position.pnl == null ? '—' : signedMoney(position.pnl, 0)}
         </span>
@@ -98,7 +124,7 @@ function Quote({ q, kind, label, position, flashes, marketOpen, onChart }: {
  * ATM; scrolling away asks the stream to follow, so any strike can be bought
  * once its price shows.
  */
-export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = null, marketOpen = true, sending, onBuy, onChart, onCentre, desktop, header }: {
+export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = null, marketOpen = true, sending, onBuy, onChart, onCentre, desktop, header, lineBuy = null }: {
   board: ExecuteBoard;
   /** The full strike list of the board's expiry, once loaded. */
   chain: ChainAnswer | undefined;
@@ -118,7 +144,7 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
   marketOpen?: boolean;
   /** Symbols with a buy in flight. */
   sending: Record<string, boolean>;
-  onBuy: (sym: string, label: string) => void;
+  onBuy: (sym: string, label: string, strike: number, side: 'CE' | 'PE') => void;
   onChart: (strike: number, side: 'CE' | 'PE') => void;
   /** The ladder rests on a strike outside the priced window: stream prices
    * around it. `null` is back at ATM. */
@@ -126,7 +152,11 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
   desktop: boolean;
   /** Phone: next to the lots stepper (the expiry picker). */
   header?: ReactNode;
+  /** "Buy on a line", where this ladder can take line orders (an index's,
+   * with chart stops on); null hides it. */
+  lineBuy?: { on: boolean; set: (on: boolean) => void } | null;
 }) {
+  const lineMode = lineBuy?.on === true;
   const rows = ladderRows(chain, board);
   const ladderKind = boardKind(board);
   const spot = board.spot;
@@ -204,7 +234,13 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
   const side = (q: ExecuteQuote | null, strike: number, kind: 'CE' | 'PE', itm: boolean, near: boolean) => {
     const label = `${board.index} ${strike} ${kind} (${expiryLabel(board.expiry)})`;
     const position = q ? held.get(q.sym) : undefined;
-    const why = readOnly ?? quoteBlocked(q, blocked, buyMaxAgeMs(board), ladderKind);
+    // On a line, a contract held or waiting can't take another order: Add
+    // stays a market buy, so it waits until the line mode is off.
+    const why =
+      readOnly ??
+      (position?.placing && position.line ? 'A buy line is armed on it — cancel it from its × on the chart, or the Waiting tab' : null) ??
+      (lineMode && position ? 'Held already — turn off “Buy on a line” to add at market' : null) ??
+      quoteBlocked(q, blocked, buyMaxAgeMs(board), ladderKind);
     const busy = q ? !!sending[q.sym] : false;
     const button = (
       <Button
@@ -212,8 +248,8 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
         kind="profit"
         size={desktop ? 'sm' : 'lg'}
         disabled={!q || why != null || busy}
-        title={why ?? (position ? `Add ${lots * board.lot_size} at market` : `Buy ${lots * board.lot_size} at market`)}
-        onClick={() => q && onBuy(q.sym, label)}
+        title={why ?? (position ? `Add ${lots * board.lot_size} at market` : lineMode ? `Place a buy line for ${lots * board.lot_size} on the ${board.index} chart` : `Buy ${lots * board.lot_size} at market`)}
+        onClick={() => q && onBuy(q.sym, label, strike, kind)}
         className={desktop ? 'w-12' : 'w-16'}
       >
         {position ? 'Add' : 'Buy'}
@@ -248,14 +284,16 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {desktop ? (
-        <div className="flex items-center gap-3 px-3 pb-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 pb-3">
           <LotsStepper lots={lots} lotSize={board.lot_size} onChange={onLots} size="sm" />
+          {lineBuy && <LineToggle on={lineBuy.on} onChange={lineBuy.set} />}
           <span className="ml-auto type-caption text-fg-subtle">Lot size {board.lot_size}</span>
         </div>
       ) : (
         // One row, so the strikes get the room; the qty beside the stepper says the lot size.
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 pb-2">
           <LotsStepper lots={lots} lotSize={board.lot_size} onChange={onLots} size="lg" label={false} />
+          {lineBuy && <LineToggle on={lineBuy.on} onChange={lineBuy.set} />}
           {header && <div className="ml-auto">{header}</div>}
         </div>
       )}
@@ -308,7 +346,11 @@ export function Ladder({ board, chain, held, lots, onLots, blocked, readOnly = n
       </div>
       {desktop && (
         <p className="shrink-0 px-3 pt-3 type-caption text-fg-subtle">
-          {readOnly ? `${readOnly} · tap a price to chart it · prices follow where you scroll` : 'One tap = market order, no confirm · tap a price to chart it · prices follow where you scroll'}
+          {readOnly
+            ? `${readOnly} · tap a price to chart it · prices follow where you scroll`
+            : lineMode
+              ? `Buy = place the buy line, stop and targets on the ${board.index} chart; it buys at market when ${board.index} crosses the line · tap a price to chart it`
+              : 'One tap = market order, no confirm · tap a price to chart it · prices follow where you scroll'}
         </p>
       )}
     </div>

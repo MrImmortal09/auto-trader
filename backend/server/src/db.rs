@@ -447,6 +447,15 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             updated_at TEXT NOT NULL
         )",
     ).execute(&pool).await.unwrap();
+    // Each user's armed line orders (`paper::lines`): buy lines waiting on
+    // their index, one JSON list per user like `user_positions`.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_line_orders (
+            user_id INTEGER PRIMARY KEY,
+            json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
 
     // Each signed-in person's watchlists (`watchlists`, `/api/v2/watchlists`):
     // up to five named lists of up to fifty price-map keys, kept by user id

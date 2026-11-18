@@ -19,12 +19,13 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::Serialize;
-use shared_domain::{telemetry, ChartLevels, MonitoredPosition, TradeState, INDEX_NAMES};
+use shared_domain::{telemetry, ChartLevels, EntryLine, MonitoredPosition, TradeState, INDEX_NAMES};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use trading_engine::{index_fo_segment, ChainStrike, OptionChain, ScripRecord};
 
 use crate::auth::Identity;
 use crate::market_data::StrikeRow;
+use crate::paper::lines::PaperLineOrder;
 use crate::paper::PaperPosition;
 use crate::quotes::hub::Source as QuoteSource;
 use crate::AppState;
@@ -757,6 +758,12 @@ struct PositionRow {
     /// A scalp's stop and target set from a v2 chart; left out while unset.
     #[serde(skip_serializing_if = "ChartLevels::is_empty")]
     chart: ChartLevels,
+    /// A line order's buy line while it waits on it (armed, or crossed and
+    /// being bought); left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<EntryLine>,
+    /// Lots it holds, or a waiting buy is for.
+    lots: i32,
 }
 
 pub(crate) fn price(state: &AppState, key: &str) -> Option<f64> {
@@ -793,13 +800,10 @@ pub fn kotak_ready(state: &AppState) -> bool {
     present && state.kotak_session_healthy.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Manual buys are accepted 09:15–15:30 IST on a weekday — the exchange's
-/// normal session, inside the engine's own 09:15–15:40 window — or throughout
-/// an active special session on its date.
+/// Manual buys are accepted 09:15–15:30 IST on a weekday, or throughout an
+/// active special session — see [`shared_domain::manual_buy_window_open_at`].
 pub fn manual_buy_window_open_at(now: chrono::DateTime<chrono::FixedOffset>) -> bool {
-    use chrono::Timelike;
-    shared_domain::in_special_session_at(now)
-        || (shared_domain::is_regular_market_hours_at(now) && (now.hour(), now.minute()) < (15, 30))
+    shared_domain::manual_buy_window_open_at(now)
 }
 
 pub fn manual_buy_window_open() -> bool {
@@ -1043,6 +1047,8 @@ fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
         exiting: p.sell_in_flight(),
         halted: p.live_halt.is_some(),
         chart: p.chart.clone(),
+        line: p.entry_line.clone().filter(|_| matches!(p.state, TradeState::WaitingForEntry)),
+        lots: p.order_lots(lot_size),
     }
 }
 
@@ -1068,6 +1074,33 @@ fn paper_row(state: &AppState, p: &PaperPosition) -> PositionRow {
         exiting: false,
         halted: false,
         chart: p.chart.clone(),
+        line: None,
+        lots: p.lots(),
+    }
+}
+
+/// A user's armed line order, as the stream's row: a buy still waiting.
+fn paper_line_row(state: &AppState, o: &PaperLineOrder) -> PositionRow {
+    PositionRow {
+        id: o.id.clone(),
+        manual: true,
+        index: o.index.clone(),
+        strike: Some(o.strike),
+        option_type: Some(o.option_type.clone()),
+        expiry: Some(o.expiry.format("%Y-%m-%d").to_string()),
+        symbol: o.trading_symbol.clone(),
+        lot_size: o.lot_size.max(1),
+        qty: 0,
+        avg: 0.0,
+        ltp: price(state, &o.ws_key),
+        pnl: None,
+        placing: true,
+        adding: false,
+        exiting: false,
+        halted: false,
+        chart: o.chart.clone(),
+        line: Some(o.line.clone()),
+        lots: o.lots,
     }
 }
 
@@ -1129,7 +1162,11 @@ pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, exp
             })
             .map(|p| position_row(state, p))
             .collect(),
-        Identity::User { user_id } => state.paper.open(*user_id).await.iter().map(|p| paper_row(state, p)).collect(),
+        Identity::User { user_id } => {
+            let mut rows: Vec<PositionRow> = state.paper.open(*user_id).await.iter().map(|p| paper_row(state, p)).collect();
+            rows.extend(state.paper.lines(*user_id).await.iter().map(|o| paper_line_row(state, o)));
+            rows
+        }
         Identity::Anonymous => Vec::new(),
     };
 

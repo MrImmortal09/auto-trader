@@ -26,6 +26,7 @@
 pub mod engine;
 pub mod feed;
 pub mod fill;
+pub mod lines;
 pub mod resolve;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -152,7 +153,7 @@ impl PaperPosition {
 pub struct Activity {
     /// IST `YYYY-MM-DD HH:MM:SS`.
     pub t: String,
-    /// `buy`, `sell`, `levels` or `reset`.
+    /// `buy`, `sell`, `levels`, `line` (a buy line armed, moved, cancelled or dropped) or `reset`.
     pub kind: &'static str,
     pub position_id: Option<String>,
     pub message: String,
@@ -267,6 +268,9 @@ pub struct PaperDesk {
     /// Every user's open positions — one lock for every fill, so the caps
     /// across users hold exactly.
     book: Mutex<Book>,
+    /// Every user's armed line orders (`lines`). Taken after `book` wherever
+    /// both are held.
+    lines: Mutex<HashMap<i64, Vec<lines::PaperLineOrder>>>,
     activity: std::sync::Mutex<HashMap<i64, VecDeque<Activity>>>,
     /// Woken by a buy that brings a stock's cash row onto the books, so the
     /// feed keeper (`feed`) subscribes it at once rather than on its next
@@ -296,7 +300,20 @@ impl PaperDesk {
         if held > 0 {
             tracing::info!("Paper desk: {held} open position(s) across {} user(s) restored", book.len());
         }
-        Ok(PaperDesk { pool, prices, book: Mutex::new(book), activity: Default::default(), feed_wake: Notify::new() })
+        let rows = sqlx::query_as::<_, (i64, String)>("SELECT user_id, json FROM user_line_orders")
+            .fetch_all(&pool)
+            .await?;
+        let mut lines = HashMap::new();
+        for (user_id, json) in rows {
+            match serde_json::from_str::<Vec<lines::PaperLineOrder>>(&json) {
+                Ok(list) if !list.is_empty() => {
+                    lines.insert(user_id, list);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(user_id, "paper desk: unreadable buy lines, left out: {e}"),
+            }
+        }
+        Ok(PaperDesk { pool, prices, book: Mutex::new(book), lines: Mutex::new(lines), activity: Default::default(), feed_wake: Notify::new() })
     }
 
     /// The live price behind feed key `key`, however old.
@@ -339,13 +356,18 @@ impl PaperDesk {
     /// subscribed, and what the ladder's band release never drops.
     pub async fn feed_keys(&self) -> (BTreeSet<String>, BTreeSet<String>) {
         let book = self.book.lock().await;
-        let scrips = book
+        let mut scrips: BTreeSet<String> = book
             .values()
             .flatten()
             .flat_map(|p| [Some(p.ws_key.clone()), p.underlying_key.clone()])
             .flatten()
             .collect();
-        let indices = book.values().flatten().filter(|p| p.is_index()).map(|p| p.index.clone()).collect();
+        let mut indices: BTreeSet<String> = book.values().flatten().filter(|p| p.is_index()).map(|p| p.index.clone()).collect();
+        // An armed buy line: its contract to buy at, its index to watch.
+        for order in self.lines.lock().await.values().flatten() {
+            scrips.insert(order.ws_key.clone());
+            indices.insert(order.index.clone());
+        }
         (scrips, indices)
     }
 
@@ -367,7 +389,8 @@ impl PaperDesk {
     /// position while their rows are being deleted.
     pub async fn hold_flat(&self, user_id: i64) -> Option<HeldFlat<'_>> {
         let book = self.book.lock().await;
-        (!book.get(&user_id).is_some_and(|l| !l.is_empty())).then_some(HeldFlat(book))
+        let waiting = self.lines.lock().await.get(&user_id).is_some_and(|l| !l.is_empty());
+        (!waiting && !book.get(&user_id).is_some_and(|l| !l.is_empty())).then_some(HeldFlat(book))
     }
 
     /// Drop what is kept in memory for a removed user.
@@ -407,14 +430,28 @@ impl PaperDesk {
         }
         let qty = lots * contract.lot_size;
         let mut book = self.book.lock().await;
+        // Armed buy lines: theirs to count against the caps, as `arm_line`
+        // does — each will be a position, and its contract is on the feed.
+        let (my_lines, line_keys) = {
+            let lines = self.lines.lock().await;
+            let mine = lines.get(&user_id).map(Vec::as_slice).unwrap_or_default();
+            // A buy line armed on it buys it when crossed: one trade per contract.
+            if mine.iter().any(|o| o.trading_symbol == contract.trading_symbol) {
+                return Err(Refusal::conflict(format!(
+                    "A buy line is armed on {} — cancel it first",
+                    contract_label(&contract.index, Some(contract.strike), Some(&contract.option_type))
+                )));
+            }
+            (mine.len(), lines.values().flatten().map(|o| o.ws_key.clone()).collect::<HashSet<String>>())
+        };
         let mut next = book.get(&user_id).cloned().unwrap_or_default();
         let held = next.iter().position(|p| p.trading_symbol == contract.trading_symbol);
         // A stock no book holds yet: its cash row isn't on the keeper's list.
         let mut new_cash_row = false;
         if held.is_none() {
-            if next.len() >= MAX_OPEN_POSITIONS_PER_USER {
+            if next.len() + my_lines >= MAX_OPEN_POSITIONS_PER_USER {
                 return Err(Refusal::conflict(format!(
-                    "You hold {MAX_OPEN_POSITIONS_PER_USER} contracts already — close one before opening another"
+                    "You hold or wait on {MAX_OPEN_POSITIONS_PER_USER} contracts already — close one, or cancel a buy line, before opening another"
                 )));
             }
             // Every feed subscription the users' books keep: each held
@@ -426,6 +463,7 @@ impl PaperDesk {
                 .flatten()
                 .flat_map(|p| [Some(p.ws_key.as_str()), p.underlying_key.as_deref()])
                 .flatten()
+                .chain(line_keys.iter().map(String::as_str))
                 .collect();
             new_cash_row = contract.underlying_key.as_deref().is_some_and(|k| !subscribed.contains(k));
             let needed = usize::from(!subscribed.contains(contract.ws_key.as_str())) + usize::from(new_cash_row);
@@ -617,6 +655,10 @@ impl PaperDesk {
         } else {
             next[i].qty = held;
             next[i].chart.take_targets(sold_targets);
+            // A lot sold by hand comes off the farthest target.
+            let lots_left = if next[i].lot_size > 0 { held / next[i].lot_size } else { held };
+            let option_type = next[i].option_type.clone();
+            next[i].chart.trim_targets(lots_left, Some(&option_type));
         }
         let lots = if pos.lot_size > 0 { qty / pos.lot_size } else { qty };
         let leg = LegOut {
@@ -714,6 +756,9 @@ impl PaperDesk {
         let book = self.book.lock().await;
         if book.get(&user_id).is_some_and(|l| !l.is_empty()) {
             return Err(Refusal::conflict("Close every position before resetting your portfolio"));
+        }
+        if self.lines.lock().await.get(&user_id).is_some_and(|l| !l.is_empty()) {
+            return Err(Refusal::conflict("Cancel your buy lines before resetting your portfolio"));
         }
         let now = shared_domain::current_ist_timestamp_string();
         let write = async {

@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChartCandlestick, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Columns2, Columns3, Square } from 'lucide-react';
-import type { ChartLevel, ChartTarget, ExecutePosition } from '../../types';
+import type { ChartLevel, ChartTarget, EntryLine, ExecutePosition } from '../../types';
 import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
 import { useIdentity } from '../auth/identity';
 import {
+  cancelLineBuy,
   cancelPosition,
   executeBuy,
+  executeLineBuy,
   executeExitAll,
   exitPosition,
   getChain,
@@ -22,12 +24,15 @@ import {
   getMyMarks,
   paperBuy,
   paperClose,
+  paperCancelLineBuy,
   paperExitAll,
+  paperLineBuy,
   paperSellLots,
   sellQty,
   setChartLevels,
   setPaperLevels,
   streamToken,
+  LINE_CROSSED,
   type LevelsAnswer,
   type LevelsUpdate,
   type PaperFill,
@@ -46,14 +51,14 @@ import { ResizeHandle } from '../ui/ResizeHandle';
 import { Segment } from '../ui/Segment';
 import { useToast } from '../ui/toast';
 import { C, type OrderLineData } from './chartSetup';
-import { ChartPanel, type LotsPick } from './ChartPanel';
+import { ChartPanel, type PlacingPrompt } from './ChartPanel';
 import { CrosshairBus } from './bus';
 import { ExpiryPicker } from './ExpiryPicker';
-import type { Placing } from './KChart';
 import { HeaderSwitch, HeaderTabs, HeaderTicker, ListPicker } from './header';
 import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from './headerModel';
 import { Ladder } from './Ladder';
-import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, firstBuy, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
+import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, draftLines, draftWhat, firstBuy, MAX_TARGETS, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
+import { armedLine, crossWords, draftStep, entryMisfit, linePnl, lotsLeft, orderOf, sideOf, validityOf, validityWords, VALIDITY_CHOICES, wrongSide, type LineDraft } from './lineOrder';
 import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isTicker, istClock, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
@@ -111,13 +116,17 @@ interface Saved {
   deskWidth: number;
   /** Desktop: that column folded away. */
   deskHidden: boolean;
+  /** The ladder's Buy places a line order on the index chart ("Buy on a line"). */
+  lineBuy: boolean;
+  /** How long a buy line stays armed, in minutes; `null` till close. */
+  lineValidity: number | null;
 }
 
 const STORE_KEY = TRADE_KEY;
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', stock: null, header: 'indices', headerList: null, lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', stock: null, header: 'indices', headerList: null, lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false, lineBuy: false, lineValidity: 30 };
 
 /** An option or a dated future that has expired goes back to its
  * underlying's own chart (the server refuses an expired future's name; a
@@ -179,6 +188,8 @@ function loadSaved(): Saved {
     ),
     deskWidth: savedWidth(saved.deskWidth, MIN_DESK_WIDTH, MAX_DESK_WIDTH, DEFAULT_DESK_WIDTH),
     deskHidden: saved.deskHidden === true,
+    lineBuy: saved.lineBuy === true,
+    lineValidity: validityOf(saved.lineValidity),
   };
 }
 
@@ -187,6 +198,8 @@ function loadSaved(): Saved {
 interface Pending {
   stop?: ChartLevel | null;
   target?: ChartTarget | null;
+  /** Under `ID:line`: a line order's buy line, moved. */
+  line?: EntryLine;
   at: number;
 }
 
@@ -213,7 +226,8 @@ function withPending(p: ExecutePosition, pending: Record<string, Pending>, now: 
     const t = pend.target;
     if (key.startsWith(prefix) && t && now - pend.at < PENDING_FOR_MS && !shown.some((s) => s.id === t.id)) targets.push(t);
   }
-  return { ...p, chart: { stop, targets } };
+  const line = p.line ? (fresh(`${p.id}:line`)?.line ?? p.line) : p.line;
+  return { ...p, chart: { stop, targets }, line };
 }
 
 /** `NIFTY:2026-11-03`: how a chain other than an index's nearest is keyed. */
@@ -241,6 +255,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // The last placement dropped because its chart stopped showing its
   // instrument (see `placingFits`), for the toast that says so.
   const [lostPlacing, setLostPlacing] = useState<{ p: ExecutePosition; kind: LevelKind; trigger: ChartLevel['trigger']; stockOff: boolean } | null>(null);
+  // A line order being placed: buy line, stop, then targets (`lineOrder`).
+  const [draft, setDraft] = useState<LineDraft | null>(null);
+  const [lostDraft, setLostDraft] = useState<LineDraft | null>(null);
   const [sheet, setSheet] = useState(false);
   // The strike the ladder scrolled to, for the ladder it was scrolled on.
   const [centreAt, setCentreAt] = useState<{ key: string; strike: number } | null>(null);
@@ -464,13 +481,18 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const blocked = buyBlockedReason(frame, stale);
   const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[ladderIndex] ?? 1));
 
-  // Escape drops a "+ Stop" that hasn't been placed yet.
+  // Escape drops a "+ Stop", or a line order, that hasn't been placed yet.
+  const placingSomething = placingAt != null || (draft != null && !draft.sending);
   useEffect(() => {
-    if (!placingAt) return;
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setPlacingAt(null);
+    if (!placingSomething) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      setPlacingAt(null);
+      setDraft((d) => (d?.sending ? d : null));
+    };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [placingAt]);
+  }, [placingSomething]);
 
   async function busy(id: string, run: () => Promise<Sent | null>): Promise<Sent | null> {
     setSending((s) => ({ ...s, [id]: true }));
@@ -518,6 +540,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       const label = contractLabel(p.index, p.strike, p.option_type);
       void busy(p.id, () => guard('Cancelling needs write access.', () => cancelPosition(serverBase, p.id), `${label} not cancelled`));
     },
+    onCancelLine: (p) => cancelLine(p),
     onExitAll: () => {
       setExitAllBusy(true);
       const exitAll = () => (paper ? paperExitAll(serverBase) : executeExitAll(serverBase));
@@ -603,14 +626,62 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   /** "+ Stop" / "+ Target": the next tap on chart `slot` places it — a target
    * selling all the lots no other target has, until the picker says fewer. */
-  const startPlacing = (slot: number, p: ExecutePosition, kind: LevelKind, trigger: ChartLevel['trigger']) =>
+  const startPlacing = (slot: number, p: ExecutePosition, kind: LevelKind, trigger: ChartLevel['trigger']) => {
+    setDraft(null);
     setPlacingAt({ slot, id: p.id, kind, trigger, lots: targetRoom(p) ?? 1 });
+  };
+
+  /** Why a stop or target of a line order still waiting can't go at `at`:
+   * a call's stop below its buy line and targets above, a put's the other
+   * way round. Says so in a toast. */
+  function lineRefuses(p: ExecutePosition, kind: LevelKind, at: number): boolean {
+    const line = armedLine(p);
+    const off = line ? wrongSide(kind, p.option_type, line.price, at) : null;
+    if (off) toast({ tone: 'loss', title: `${contractLabel(p.index, p.strike, p.option_type)}: ${kind} not ${kind === 'stop' ? 'moved' : 'placed'} there`, body: off, key: `line-side-${p.id}` });
+    return off != null;
+  }
+
+  /** A line order's buy line dragged to `at`: which way the index crosses
+   * it is where it sits against the index now. One dropped on the index, or
+   * past its stop or a target, stays where it was. */
+  function moveLine(p: ExecutePosition, at: number) {
+    const label = contractLabel(p.index, p.strike, p.option_type);
+    const indexNow = spot[p.index] ?? null;
+    const to = toTick(at, 0.05);
+    const why =
+      indexNow == null
+        ? `No live ${p.index} value — can't tell which way the line is crossed.`
+        : Math.abs(to - indexNow) < 0.05
+          ? `That is where ${p.index} is now — put the line above or below it.`
+          : entryMisfit(p.option_type, p.chart?.stop?.price ?? null, chartTargets(p.chart), to);
+    if (why || indexNow == null || !p.line) {
+      if (why) toast({ tone: 'loss', title: `${label}: buy line not moved`, body: why, key: `line-move-${p.id}` });
+      return;
+    }
+    const entry = { price: to, rising: to > indexNow };
+    void sendLevels(p, { entry }, { [`${p.id}:line`]: { line: { ...p.line, ...entry } } }, `${label}: buy line not moved`);
+  }
+
+  /** Give up a line order still waiting on its line: nothing was sent for it. */
+  function cancelLine(p: ExecutePosition) {
+    const label = contractLabel(p.index, p.strike, p.option_type);
+    const cancel = () => (paper ? paperCancelLineBuy(serverBase, p.id) : cancelLineBuy(serverBase, p.id));
+    void busy(p.id, () => guard('Cancelling needs write access.', cancel, `${label}: buy line not cancelled`, scope)).then((sent) => {
+      if (sent?.ok) toast({ tone: 'neutral', title: `${label}: buy line cancelled`, body: 'Nothing was bought.' });
+    });
+  }
 
   const actions = (slot: number): LevelActions => ({
     canSet: chartStopsOn,
-    move: (p, ref, lvl) => (ref.kind === 'stop' ? setStop(p, lvl) : void setTarget(p, ref.target, lvl)),
+    move: (p, ref, lvl) => {
+      if (lineRefuses(p, ref.kind, lvl.price)) return;
+      if (ref.kind === 'stop') setStop(p, lvl);
+      else void setTarget(p, ref.target, lvl);
+    },
     clear: clearLevel,
     place: (p, kind, trigger) => startPlacing(slot, p, kind, trigger),
+    moveLine,
+    cancelLine,
   });
 
   // What "+ Stop" is placing, rebuilt each render so its checks see the
@@ -628,7 +699,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // A target's lots: up to what no other target has; the top is "all left".
   // With every lot covered meanwhile, there is nothing to place.
   const room = placingPos ? targetRoom(placingPos) : null;
-  const placing = ((): (Placing & { what: string; lots?: LotsPick }) | null => {
+  const placing = ((): PlacingPrompt | null => {
     if (!placingAt || !placingPos || !placingFits) return null;
     const { kind, trigger } = placingAt;
     const p = placingPos;
@@ -639,11 +710,20 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     const color = kind === 'stop' ? C.loss : C.profit;
     const delta = deltaFor(p, chainFor(p)).value;
     const count = chartTargets(p.chart).length + 1;
+    // A line order still waiting: its amounts are against its buy line.
+    const line = armedLine(p);
     const data: OrderLineData = {
       color,
       dashed: true,
       draggable: false,
       parts: (at) => {
+        if (line) {
+          const off = wrongSide(kind, p.option_type, line.price, at) != null;
+          const qty = (isTarget ? chosen : room ?? 0) * p.lot_size;
+          const approx = approxMoney(linePnl(at, line.price, delta, qty));
+          const text = off ? `${isTarget ? 'Target' : 'Stop'} · ${sideOf(kind, p.option_type)} the buy line only` : isTarget ? `Target · ${targetLotsLabel(chosen)} ${approx}` : `Stop ${approx}`;
+          return [{ key: 'label', text, color, filled: off }];
+        }
         const lvl = { price: at, trigger };
         const indexNow = spot[p.index] ?? null;
         const past = levelCrossed(kind, lvl, p.option_type, p.ltp, indexNow) === true;
@@ -664,7 +744,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         ? { value: chosen, max: room!, others: count > 1, set: (n) => setPlacingAt((a) => a && { ...a, lots: Math.max(1, Math.min(n, room!)) }) }
         : undefined,
       onPlace: (at) => {
-        if (isTarget) void setTarget(p, null, { price: at, trigger }, lots);
+        if (lineRefuses(p, kind, at)) return false;
+        // A line order's targets sell exact lots: its holding is the order's.
+        if (isTarget) void setTarget(p, null, { price: at, trigger }, line ? chosen : lots);
         else setStop(p, { price: at, trigger });
         return true;
       },
@@ -692,6 +774,199 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       key: `placing-lost-${p.id}-${kind}`,
     });
   }, [lostPlacing, toast]);
+
+  // ── Line orders: Buy on a line ─────────────────────────────────────── //
+
+  // Line orders are for the six indices' options, set on the index's chart,
+  // with chart stops on (a paper book always has them).
+  const lineAllowed = board != null && boardKind(board) === 'index' && isIndex(board.index) && chartStopsOn && readOnly == null;
+  const lineMode = saved.lineBuy && lineAllowed;
+  const lineUntilWords = validityWords(saved.lineValidity, now);
+
+  /** Buy on a line: the next taps on `index`'s own chart place the buy line,
+   * the stop, then the targets — the first chart is put on it when no chart
+   * shows it. */
+  function startDraft(sym: string, label: string, strike: number, side: 'CE' | 'PE') {
+    if (!board) return;
+    let slot = shownSlots.findIndex((s) => isOwnChart(s.sym, board.index));
+    if (slot < 0) {
+      slot = 0;
+      setSlot(0, { sym: ownChartOf(board.index) });
+    }
+    if (!desktop) showChart(true);
+    setPlacingAt(null);
+    setDraft({ slot, sym, label, index: board.index, strike, side, expiry: board.expiry, lots, lotSize: board.lot_size, entry: null, stop: null, targets: [], pick: lots, sending: false });
+  }
+
+  const refuseTap = (d: LineDraft, what: string, body: string) => {
+    toast({ tone: 'loss', title: `${d.label}: ${what} not placed there`, body, key: `draft-${d.sym}` });
+    return false;
+  };
+
+  /** Send `d` as one order, now that every lot has a target. A line the
+   * index crossed meanwhile is placed again, the stop and targets kept. */
+  async function submitDraft(d: LineDraft) {
+    const order = orderOf(d, saved.lineValidity);
+    if (!order) return;
+    setDraft({ ...d, sending: true });
+    const send = () => (paper ? paperLineBuy(serverBase, order) : executeLineBuy(serverBase, order));
+    const sent = await guard('Sign in to place paper orders.', send, `${d.label}: buy line not armed`, scope);
+    if (sent?.ok) {
+      setDraft(null);
+      toast({
+        tone: 'neutral',
+        title: `Buy line armed: ${d.label}`,
+        body: `Buys ${d.lots * d.lotSize} at market when ${d.index} ${crossWords(order.line)} · ${lineUntilWords}. Stop and ${order.targets.length === 1 ? 'target' : `${order.targets.length} targets`} set.`,
+      });
+      return;
+    }
+    // Crossed while it was placed: the buy line again, nothing bought.
+    setDraft(sent?.code === LINE_CROSSED ? { ...d, entry: null, sending: false } : null);
+  }
+
+  /** Back one tap: the last target, else the stop, else the buy line. */
+  const undoDraft = (d: LineDraft): LineDraft => {
+    if (d.targets.length) {
+      const targets = d.targets.slice(0, -1);
+      return { ...d, targets, pick: lotsLeft({ lots: d.lots, targets }) };
+    }
+    if (d.stop != null) return { ...d, stop: null };
+    return { ...d, entry: null };
+  };
+
+  // The draft goes only on its index's own chart, as the slot is drawn now.
+  const draftFits = draft != null && shownSlots[draft.slot] != null && isOwnChart(shownSlots[draft.slot].sym, draft.index);
+  if (draft && !draftFits && !draft.sending) {
+    setDraft(null);
+    setLostDraft(draft);
+  }
+  useEffect(() => {
+    if (!lostDraft) return;
+    toast({ tone: 'neutral', title: `${lostDraft.label}: no buy line placed`, body: `The chart it was going on no longer shows ${lostDraft.index}. Tap Buy again.`, key: `draft-lost-${lostDraft.sym}` });
+  }, [lostDraft, toast]);
+
+  const draftDelta = draft ? deltaFor({ strike: draft.strike, option_type: draft.side }, chainAt(draft.index, draft.expiry)).value : 0;
+  const draftPlacing = ((): PlacingPrompt | null => {
+    if (!draft || !draftFits || draft.sending) return null;
+    const d = draft;
+    const step = draftStep(d);
+    const indexNow = spot[d.index] ?? null;
+    const qty = (n: number) => n * d.lotSize;
+    const words = draftWhat(d);
+    const again = step === 'entry' && d.stop != null;
+    const hint = again ? `${d.index} crossed the last one before it was armed — place the buy line again; the stop and targets stay` : words.hint;
+    const undo = (
+      <button type="button" disabled={!d.entry && d.stop == null} onClick={() => setDraft((x) => x && undoDraft(x))} className="type-label text-fg-muted hover:text-fg disabled:opacity-40">
+        Undo
+      </button>
+    );
+    const key = `draft:${d.sym}:${step}:${d.targets.length}:${d.stop ?? ''}`;
+    if (step === 'entry') {
+      const validity = (
+        <Segment
+          label="Valid for"
+          size="xs"
+          value={saved.lineValidity == null ? 'close' : String(saved.lineValidity)}
+          onChange={(v) => save((s) => ({ ...s, lineValidity: v === 'close' ? null : Number(v) }))}
+          options={VALIDITY_CHOICES.map((c) => ({ value: c.minutes == null ? 'close' : String(c.minutes), label: c.label }))}
+        />
+      );
+      return {
+        key,
+        what: words.what,
+        hint,
+        extra: (
+          <>
+            {validity}
+            {again && undo}
+          </>
+        ),
+        data: {
+          color: C.fg,
+          dashed: true,
+          draggable: false,
+          parts: (at) => {
+            const rising = indexNow == null || at > indexNow;
+            return [{ key: 'label', text: `Buy ${d.lots} ${d.lots === 1 ? 'lot' : 'lots'} ${d.side} · ${crossWords({ price: at, rising })} · ${lineUntilWords}`, color: C.fg }];
+          },
+          axisText: (at) => price(at),
+        },
+        onPlace: (at) => {
+          const to = toTick(at, 0.05);
+          if (indexNow == null) return refuseTap(d, 'buy line', `No live ${d.index} value — can't tell which way the line is crossed.`);
+          if (Math.abs(to - indexNow) < 0.05) return refuseTap(d, 'buy line', `That is where ${d.index} is now — put the line above or below it.`);
+          const misfit = entryMisfit(d.side, d.stop, d.targets, to);
+          if (misfit) return refuseTap(d, 'buy line', misfit);
+          const next = { ...d, entry: { price: to, rising: to > indexNow } };
+          // Placed again after a refusal: the stop and targets are there, send it.
+          if (orderOf(next, saved.lineValidity)) void submitDraft(next);
+          else setDraft(next);
+          return true;
+        },
+      };
+    }
+    const entry = d.entry!;
+    if (step === 'stop') {
+      return {
+        key,
+        what: words.what,
+        hint,
+        extra: undo,
+        data: {
+          color: C.loss,
+          dashed: true,
+          draggable: false,
+          parts: (at) => {
+            const off = wrongSide('stop', d.side, entry.price, at) != null;
+            const text = off ? `Stop · ${sideOf('stop', d.side)} the buy line only` : `Stop ${approxMoney(linePnl(at, entry.price, draftDelta, qty(d.lots)))}`;
+            return [{ key: 'label', text, color: C.loss, filled: off }];
+          },
+          axisText: (at) => price(at),
+        },
+        onPlace: (at) => {
+          const to = toTick(at, 0.05);
+          const off = wrongSide('stop', d.side, entry.price, to);
+          if (off) return refuseTap(d, 'stop', off);
+          setDraft({ ...d, stop: to, pick: lotsLeft(d) });
+          return true;
+        },
+      };
+    }
+    const left = lotsLeft(d);
+    // The last target a trade may have sells every lot left.
+    const last = d.targets.length >= MAX_TARGETS - 1;
+    const chosen = last ? left : Math.max(1, Math.min(d.pick, left));
+    const n = d.targets.length + 1;
+    return {
+      key,
+      what: words.what,
+      hint: last && left > 1 ? `${words.hint} · the last target sells all ${left}` : hint,
+      lots: last ? undefined : { value: chosen, max: left, others: d.targets.length > 0, set: (v) => setDraft((x) => x && { ...x, pick: Math.max(1, Math.min(v, lotsLeft(x))) }) },
+      extra: undo,
+      data: {
+        color: C.profit,
+        dashed: true,
+        draggable: false,
+        parts: (at) => {
+          const off = wrongSide('target', d.side, entry.price, at) != null;
+          const text = off ? `Target · ${sideOf('target', d.side)} the buy line only` : `Target ${n} · ${chosen} ${chosen === 1 ? 'lot' : 'lots'} ${approxMoney(linePnl(at, entry.price, draftDelta, qty(chosen)))}`;
+          return [{ key: 'label', text, color: C.profit, filled: off }];
+        },
+        axisText: (at) => price(at),
+      },
+      onPlace: (at) => {
+        const to = toTick(at, 0.05);
+        const off = wrongSide('target', d.side, entry.price, to);
+        if (off) return refuseTap(d, 'target', off);
+        const targets = [...d.targets, { price: to, lots: chosen }];
+        const next = { ...d, targets, pick: lotsLeft({ lots: d.lots, targets }) };
+        // Every lot has a target: the order goes now, as one.
+        if (lotsLeft(next) === 0) void submitDraft(next);
+        else setDraft(next);
+        return true;
+      },
+    };
+  })();
 
   const setSlot = (i: number, change: Partial<Slot>) =>
     save((s) => ({ ...s, slots: s.slots.map((slot, n) => (n === i ? { ...slot, ...change } : slot)) }));
@@ -883,11 +1158,17 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           expiries={expiries[index]?.expiries}
           chainAt={(expiry) => chainAt(index, expiry)}
           onNeedChain={(expiry) => needChain(index, expiry)}
-          lines={chartLines(cx)}
+          lines={draft && draftFits && draft.slot === i ? [...chartLines(cx), ...draftLines(draft, draftDelta, lineUntilWords)] : chartLines(cx)}
           markers={chartMarkers(cx)}
-          placing={placingAt?.slot === i ? placing : null}
-          onPlacingDone={() => setPlacingAt(null)}
-          onCancelPlacing={() => setPlacingAt(null)}
+          placing={draft ? (draft.slot === i ? draftPlacing : null) : placingAt?.slot === i ? placing : null}
+          // A line order moves on to its next line by itself.
+          onPlacingDone={() => {
+            if (!draft) setPlacingAt(null);
+          }}
+          onCancelPlacing={() => {
+            setPlacingAt(null);
+            setDraft((d) => (d?.sending ? d : null));
+          }}
           bus={bus}
           lib={saved.chartLib}
           onLib={desktop ? undefined : setLib}
@@ -919,11 +1200,12 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       readOnly={readOnly}
       marketOpen={frame?.market_open ?? true}
       sending={sending}
-      onBuy={(sym, label) => void buy(sym, label)}
+      onBuy={(sym, label, strike, side) => (lineMode ? startDraft(sym, label, strike, side) : void buy(sym, label))}
       onChart={chartContract}
       onCentre={(strike) => setCentreAt(strike == null ? null : { key: ladderKey, strike })}
       desktop={desktop}
       header={desktop ? undefined : expiryPicker('lg', true)}
+      lineBuy={lineAllowed ? { on: saved.lineBuy, set: (on) => save((s) => ({ ...s, lineBuy: on })) } : null}
     />
   ) : (
     <p className="px-4 py-6 type-body text-fg-subtle">

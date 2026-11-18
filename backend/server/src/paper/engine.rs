@@ -13,6 +13,7 @@ use chrono::{DateTime, FixedOffset, NaiveTime};
 
 use shared_domain::ChartHit;
 
+use super::lines::PaperLineOrder;
 use super::{PaperDesk, PaperPosition};
 
 const EVERY: Duration = Duration::from_millis(500);
@@ -120,6 +121,89 @@ pub async fn step(desk: &PaperDesk, now: DateTime<FixedOffset>, trading_day: boo
     desk.note_prices(&seen).await;
 }
 
+/// What the watch loop does with an armed line order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LineMove {
+    /// Drop it unbought, for this reason.
+    Drop(String),
+    /// The index crossed its line but the option has no live price: mark it
+    /// crossed, and buy at the first live price within 15 s.
+    Crossed,
+    /// Buy it now at this price.
+    Fill(f64),
+}
+
+/// What happens to `order` at `now` (`now_ts` the same, as an IST
+/// timestamp), with its index at `index` and its option at `premium` —
+/// fresh prices only. The engine's rules for the owner's line orders: it is
+/// dropped once its validity runs out, past the 15:39 cutoff, on a later
+/// day, on its contract's square-off, or when the index jumps past the line
+/// and its stop or a target at once; it buys at market when the index
+/// reaches the line, and once crossed is dropped if it can't be bought
+/// within 15 s.
+pub fn decide_line(order: &PaperLineOrder, now: DateTime<FixedOffset>, now_ts: &str, index: Option<f64>, premium: Option<f64>) -> Option<LineMove> {
+    let line = &order.line;
+    let armed_today = order.armed_at.get(..10) == Some(&now_ts[..10.min(now_ts.len())]);
+    if !armed_today {
+        return Some(LineMove::Drop("it was armed on an earlier day".to_string()));
+    }
+    if trading_engine::is_entry_cutoff_passed_at(now) {
+        return Some(LineMove::Drop("no new buys after the 15:39 cutoff".to_string()));
+    }
+    if squaring_off(order.expiry, now) {
+        return Some(LineMove::Drop("its contract expires today and is being squared off".to_string()));
+    }
+    if let Some(at) = line.triggered_at.as_deref() {
+        if let Some(p) = premium {
+            return Some(LineMove::Fill(p));
+        }
+        let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok();
+        let late = match (parse(at), parse(now_ts)) {
+            (Some(at), Some(now)) => (now - at).num_seconds() > shared_domain::MANUAL_ORDER_TTL_SECS,
+            _ => true,
+        };
+        return late.then(|| LineMove::Drop(format!("no live price within {} s of the crossing", shared_domain::MANUAL_ORDER_TTL_SECS)));
+    }
+    if line.expired(now_ts) {
+        let until = line.valid_until.as_deref().and_then(|t| t.get(11..16)).unwrap_or("?");
+        return Some(LineMove::Drop(format!("its line wasn't reached by {until}")));
+    }
+    if !crate::execute::manual_buy_window_open_at(now) {
+        return None;
+    }
+    let index = index?;
+    if !line.reached(index) {
+        return None;
+    }
+    if let Some(what) = shared_domain::line_levels_reached(Some(&order.option_type), &order.chart, index) {
+        return Some(LineMove::Drop(format!("{} jumped to {index:.2}, past the line and the {what} at once", order.index)));
+    }
+    Some(premium.map_or(LineMove::Crossed, LineMove::Fill))
+}
+
+/// One pass over every armed line order at `now`.
+pub async fn step_lines(desk: &PaperDesk, now: DateTime<FixedOffset>, fresh: impl Fn(&str) -> Option<f64>) {
+    let orders = desk.all_lines().await;
+    if orders.is_empty() {
+        return;
+    }
+    let now_ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    for (user_id, order) in orders {
+        let index = order.index_key().and_then(|key| fresh(&key));
+        let premium = fresh(&order.ws_key);
+        match decide_line(&order, now, &now_ts, index, premium) {
+            None => {}
+            Some(LineMove::Drop(why)) => desk.drop_line(user_id, &order.id, &why).await,
+            Some(LineMove::Crossed) => desk.line_crossed(user_id, &order.id, &now_ts).await,
+            Some(LineMove::Fill(price)) => match desk.fill_line(user_id, &order.id, price).await {
+                Ok(f) => tracing::info!(user_id, "Paper buy line crossed: bought {} {} at {:.2}", f.qty, f.contract, f.price),
+                Err(r) if r.status == StatusCode::NOT_FOUND => {}
+                Err(r) => tracing::warn!(user_id, "Paper buy line on {} crossed but not bought: {}", order.label(), r.message),
+            },
+        }
+    }
+}
+
 /// The watch loop, for as long as the server runs.
 pub async fn run(desk: Arc<PaperDesk>) {
     let mut tick = tokio::time::interval(EVERY);
@@ -133,6 +217,9 @@ pub async fn run(desk: Arc<PaperDesk>) {
         let now = shared_domain::now_ist();
         let trading_day = !telegram_ingester::parser::is_trading_holiday(now.date_naive());
         step(&desk, now, trading_day, fresh).await;
+        if trading_day {
+            step_lines(&desk, now, fresh).await;
+        }
     }
 }
 
@@ -379,5 +466,114 @@ mod tests {
         let sell = legs.last().unwrap();
         assert_eq!((sell.action.as_str(), sell.executed_price, sell.exit_reason.as_deref()), ("SELL", 94.0, Some("CHART_STOP")));
         assert_eq!(desk.activity(1)[0].message, "Sold 75 NIFTY 25000 CE at ₹94.00 (chart stop)");
+    }
+
+    // ── Line orders ───────────────────────────────────────────────────── //
+
+    /// A 2-lot NIFTY 25000 CE line order armed at 11:00 on 18 Nov 2026 (a
+    /// Wednesday; the contract expires on the 24th): buys when NIFTY falls
+    /// to 25,980, stop 25,950, a target at 26,050.
+    fn armed() -> PaperLineOrder {
+        let c = nifty(25_000.0, "CE");
+        let index = |price| ChartLevel { price, trigger: LevelTrigger::Index };
+        PaperLineOrder {
+            id: "l".into(),
+            index: c.index,
+            trading_symbol: c.trading_symbol,
+            ws_key: c.ws_key,
+            expiry: NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            strike: c.strike,
+            option_type: c.option_type,
+            lot_size: 75,
+            segment: c.segment,
+            lots: 2,
+            line: shared_domain::EntryLine { price: 25_980.0, rising: false, valid_until: Some("2026-11-18 11:30:00".into()), triggered_at: None },
+            chart: ChartLevels { stop: Some(index(25_950.0)), targets: vec![ChartTarget { id: "a".into(), price: 26_050.0, trigger: LevelTrigger::Index, lots: Some(2) }] },
+            armed_at: "2026-11-18 11:00:00".into(),
+        }
+    }
+
+    fn at(h: u32, m: u32, s: u32) -> (DateTime<FixedOffset>, String) {
+        let now = ist((2026, 11, 18), (h, m, s));
+        (now, now.format("%Y-%m-%d %H:%M:%S").to_string())
+    }
+
+    #[test]
+    fn a_line_order_fills_when_its_index_reaches_the_line_and_not_before() {
+        let order = armed();
+        let (now, ts) = at(11, 10, 0);
+        assert_eq!(decide_line(&order, now, &ts, Some(26_000.0), Some(120.0)), None);
+        assert_eq!(decide_line(&order, now, &ts, None, Some(120.0)), None);
+        assert_eq!(decide_line(&order, now, &ts, Some(25_975.0), Some(120.0)), Some(LineMove::Fill(120.0)));
+        // Crossed with no live price: marked, then bought within 15 s or dropped.
+        assert_eq!(decide_line(&order, now, &ts, Some(25_975.0), None), Some(LineMove::Crossed));
+        let mut crossed = order.clone();
+        crossed.line.triggered_at = Some(ts.clone());
+        let (soon, soon_ts) = at(11, 10, 10);
+        assert_eq!(decide_line(&crossed, soon, &soon_ts, Some(26_100.0), None), None);
+        assert_eq!(decide_line(&crossed, soon, &soon_ts, Some(26_100.0), Some(118.0)), Some(LineMove::Fill(118.0)));
+        let (late, late_ts) = at(11, 10, 20);
+        assert!(matches!(decide_line(&crossed, late, &late_ts, Some(26_100.0), None), Some(LineMove::Drop(_))));
+    }
+
+    #[test]
+    fn a_line_order_is_dropped_when_it_runs_out_jumps_a_level_or_outlives_the_day() {
+        let order = armed();
+        // Its validity.
+        let (now, ts) = at(11, 30, 0);
+        assert!(matches!(decide_line(&order, now, &ts, Some(26_000.0), Some(120.0)), Some(LineMove::Drop(_))));
+        // Past the line and the stop at once.
+        let (now, ts) = at(11, 10, 0);
+        match decide_line(&order, now, &ts, Some(25_940.0), Some(90.0)) {
+            Some(LineMove::Drop(why)) => assert!(why.contains("stop"), "{why}"),
+            other => panic!("expected the gap to drop it, got {other:?}"),
+        }
+        // Armed on an earlier day, or past the cutoff.
+        let mut yesterday = order.clone();
+        yesterday.armed_at = "2026-11-17 15:00:00".into();
+        yesterday.line.valid_until = None;
+        assert!(matches!(decide_line(&yesterday, now, &ts, Some(26_000.0), None), Some(LineMove::Drop(_))));
+        let mut till_close = order.clone();
+        till_close.line.valid_until = None;
+        let (closing, closing_ts) = at(15, 39, 0);
+        assert!(matches!(decide_line(&till_close, closing, &closing_ts, Some(26_000.0), None), Some(LineMove::Drop(_))));
+        // Before the open nothing is bought, but nothing is dropped either.
+        let mut early = till_close.clone();
+        early.armed_at = "2026-11-18 09:00:00".into();
+        let (pre, pre_ts) = at(9, 10, 0);
+        assert_eq!(decide_line(&early, pre, &pre_ts, Some(25_970.0), Some(120.0)), None);
+    }
+
+    #[tokio::test]
+    async fn the_watch_fills_a_crossed_line_with_its_levels() {
+        let (_db, desk) = desk("line-step").await;
+        let order = armed();
+        // Armed now (`arm_line` stamps the clock), on a contract a month out.
+        let today = shared_domain::now_ist();
+        let mut contract = nifty(25_000.0, "CE");
+        contract.expiry = today.date_naive() + chrono::Duration::days(30);
+        let mut line = order.line.clone();
+        line.valid_until = None;
+        desk.arm_line(1, &contract, 2, line, order.chart.clone()).await.unwrap();
+        let now = today.with_time(chrono::NaiveTime::from_hms_opt(11, 10, 0).unwrap()).unwrap();
+        // A weekend or a holiday has no session to buy in.
+        if !crate::execute::manual_buy_window_open_at(now) {
+            return;
+        }
+        let ws_key = contract.ws_key.clone();
+        let quiet = |key: &str| (key == ws_key).then_some(121.0);
+        step_lines(&desk, now, quiet).await;
+        assert_eq!(desk.lines(1).await.len(), 1, "no index value: still armed");
+        let crossed = |key: &str| match key {
+            "idx|NIFTY 50" => Some(25_975.0),
+            k if k == ws_key => Some(121.0),
+            _ => None,
+        };
+        step_lines(&desk, now, crossed).await;
+        let open = desk.open(1).await;
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].qty, open[0].avg_price), (150, 121.0));
+        assert_eq!(open[0].chart, order.chart);
+        assert!(desk.lines(1).await.is_empty());
     }
 }

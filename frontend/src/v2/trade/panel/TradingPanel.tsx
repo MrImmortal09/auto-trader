@@ -14,7 +14,7 @@ import { ResizeHandle } from '../../ui/ResizeHandle';
 import { chartTargets, targetLotsLabel } from '../../../lib/format';
 import { targetRoom, type LevelKind, type LevelRef } from '../lines';
 import type { PaperAccount, PositionHandlers } from '../Positions';
-import { busyNote, levelWords } from '../words';
+import { busyNote, levelWords, lineSummary } from '../words';
 import { activityEvents, type EngineError } from './activity';
 import { MIN_CHART_HEIGHT, MIN_PANEL_HEIGHT } from './height';
 import { DEFAULT_DESK_WIDTH, MAX_DESK_WIDTH, MIN_DESK_WIDTH, MIN_PANEL_BODY, useWidth } from '../paneSizes';
@@ -240,7 +240,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   // A position opening or closing changes the sum without a tick.
   const flash = useTickFlash(openPnl, true, active.map((p) => p.id).join());
   const closed = history.filter((c) => c.channel === 'Scalps');
-  const shown: TabId = paper && (tab === 'waiting' || tab === 'orders') ? 'positions' : tab;
+  // A paper book has no orders at Kotak, and waits only on buy lines.
+  const shown: TabId = paper && (tab === 'orders' || (tab === 'waiting' && waiting.length === 0)) ? 'positions' : tab;
   // Orders only matter while that tab is open: Kotak's book, and the engine's
   // own sends it may not list yet.
   const ordersOpen = !paper && open && shown === 'orders';
@@ -383,10 +384,28 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
 
   const waitingRows =
     waiting.length === 0 ? (
-      <p className="px-1 py-3 type-body text-fg-subtle">No buy waiting. A tap on the ladder shows here until its order is sent.</p>
+      <p className="px-1 py-3 type-body text-fg-subtle">No buy waiting. A tap on the ladder shows here until its order is sent, and a buy line until the index crosses it.</p>
     ) : (
       <ul className="flex flex-col">
-        {waiting.map((p) => (
+        {waiting.map((p) =>
+          p.line ? (
+            // A line order: what it buys when; cancelled while its line waits.
+            <li key={p.id} className="flex items-center gap-3 border-b border-line px-1 py-2">
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
+                <span className="truncate type-caption text-fg-muted tnum" title={lineSummary(p, p.line)}>
+                  {lineSummary(p, p.line)}
+                </span>
+              </span>
+              {p.line.triggered_at ? (
+                <span className="type-caption text-fg">Line crossed — buying at market…</span>
+              ) : (
+                <Button pointerOnly kind="neutral" disabled={!!h.sending[p.id]} onClick={() => h.onCancelLine(p)}>
+                  Cancel
+                </Button>
+              )}
+            </li>
+          ) : (
           <li key={p.id} className="flex items-center gap-3 border-b border-line px-1 py-2">
             <span className="min-w-0 flex-1 type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
             <span className="type-caption text-fg">{p.halted ? 'Halted by the engine — see System' : 'Buying at market…'}</span>
@@ -400,7 +419,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
               </Button>
             )}
           </li>
-        ))}
+          ),
+        )}
       </ul>
     );
 
@@ -481,7 +501,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
       {open ? (
         <div role="tablist" aria-label="Trading panel" className="flex min-w-0 items-stretch overflow-x-auto">
           <PanelTab id="positions" label="Positions" count={active.length} active={shown === 'positions'} onSelect={setTab} />
-          {!paper && <PanelTab id="waiting" label="Waiting" count={waiting.length} active={shown === 'waiting'} onSelect={setTab} />}
+          {(!paper || waiting.length > 0) && <PanelTab id="waiting" label="Waiting" count={waiting.length} active={shown === 'waiting'} onSelect={setTab} />}
           {!paper && <PanelTab id="orders" label="Orders" count={null} active={shown === 'orders'} onSelect={setTab} />}
           <PanelTab id="history" label="History" count={closed.length} active={shown === 'history'} onSelect={setTab} />
           <PanelTab id="activity" label="Activity" count={null} active={shown === 'activity'} onSelect={setTab} />
