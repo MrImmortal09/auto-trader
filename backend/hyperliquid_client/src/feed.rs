@@ -17,6 +17,10 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::{AssetCtx, Candle, Network, RawCandle, RawCtx};
 
 const PING_EVERY: Duration = Duration::from_secs(30);
+/// A connect, or its subscribes, that takes longer than this has stalled
+/// (a TLS or WebSocket handshake that never ends): it counts as a failed
+/// attempt and is retried.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Nothing at all for this long (not even a pong): the connection is dead.
 const SILENT_FOR: Duration = Duration::from_secs(75);
 const BACKOFF_START: Duration = Duration::from_secs(1);
@@ -94,19 +98,24 @@ pub async fn run(network: Network, subs: Vec<Sub>, tx: mpsc::Sender<FeedMsg>, mu
         if *stop.borrow() || tx.is_closed() {
             return;
         }
-        let why = match tokio_tungstenite::connect_async(network.ws_url()).await {
-            Err(e) => format!("connect: {e}"),
-            Ok((ws, _)) => {
+        let why = match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(network.ws_url())).await {
+            Err(_) => "connect timed out".to_string(),
+            Ok(Err(e)) => format!("connect: {e}"),
+            Ok(Ok((ws, _))) => {
                 let (mut sink, mut stream) = ws.split();
-                let mut sent = true;
-                for sub in &subs {
-                    if sink.send(Message::Text(sub.message().to_string())).await.is_err() {
-                        sent = false;
-                        break;
+                let subscribed = tokio::time::timeout(CONNECT_TIMEOUT, async {
+                    for sub in &subs {
+                        sink.send(Message::Text(sub.message().to_string())).await?;
                     }
-                }
-                if !sent {
-                    "subscribe failed".to_string()
+                    Ok::<_, tokio_tungstenite::tungstenite::Error>(())
+                })
+                .await;
+                if let Some(why) = match subscribed {
+                    Err(_) => Some("subscribe timed out".to_string()),
+                    Ok(Err(e)) => Some(format!("subscribe: {e}")),
+                    Ok(Ok(())) => None,
+                } {
+                    why
                 } else {
                     if tx.send(FeedMsg::Up).await.is_err() {
                         return;

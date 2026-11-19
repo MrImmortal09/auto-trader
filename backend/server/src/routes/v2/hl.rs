@@ -48,7 +48,8 @@ fn forming(bar: &Bar, tf: Tf, now: i64) -> bool {
 }
 
 /// `GET /api/v2/candles?symbol=HL:BTC&tf=5m&from=…&to=…` — a perp's bars
-/// over IST days `from..=to`, oldest first, from Hyperliquid. The same
+/// over IST days `from..=to`, oldest first: the kept series, with only what
+/// it lacks read from Hyperliquid (see `crate::hyperliquid`). The same
 /// answer's shape as any chart's; perps trade around the clock, so every
 /// day is whole.
 pub async fn candles(state: &AppState, raw: &str, tf: Option<&str>, from: Option<&str>, to: Option<&str>) -> Response {
@@ -110,12 +111,17 @@ struct Update {
     forming: bool,
 }
 
+/// How often an open stream tells the market data its series are still
+/// watched (so closed bars keep being corrected).
+const TOUCH_EVERY_MS: i64 = 30_000;
+
 struct Follow {
     rx: broadcast::Receiver<crate::hyperliquid::BarChange>,
     keys: Vec<&'static str>,
     tf: Tf,
     every: tokio::time::Interval,
     hl: std::sync::Arc<crate::hyperliquid::HlMarketData>,
+    touched_at: i64,
 }
 
 impl Follow {
@@ -123,6 +129,11 @@ impl Follow {
     async fn next_updates(&mut self) -> Option<Vec<Update>> {
         loop {
             self.every.tick().await;
+            let now = shared_domain::now_ist().timestamp_millis();
+            if now - self.touched_at >= TOUCH_EVERY_MS {
+                self.touched_at = now;
+                self.hl.touch(&self.keys, self.tf);
+            }
             let mut changed: BTreeMap<(&'static str, i64), Bar> = BTreeMap::new();
             loop {
                 match self.rx.try_recv() {
@@ -159,7 +170,8 @@ impl Follow {
 }
 
 /// `GET /api/v2/candles/stream?symbols=HL:BTC&tf=5m` — SSE, as for any
-/// chart: every 250 ms the perps' bars that changed, as event `bars`
+/// chart: every 250 ms the perps' bars that changed — the forming bar, and a
+/// closed one corrected from Hyperliquid's candles — as event `bars`
 /// (`{"tf","updates":[{"symbol","bar","forming"}]}`). Perps only: a list
 /// mixing them with Indian instruments is refused.
 pub async fn stream(state: &AppState, raw: &str, tf: Tf) -> Response {
@@ -180,7 +192,8 @@ pub async fn stream(state: &AppState, raw: &str, tf: Tf) -> Response {
     }
     let mut every = tokio::time::interval(STREAM_EVERY);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let follow = Follow { rx: state.hl.subscribe(), keys, tf, every, hl: state.hl.clone() };
+    state.hl.touch(&keys, tf);
+    let follow = Follow { rx: state.hl.subscribe(), keys, tf, every, hl: state.hl.clone(), touched_at: shared_domain::now_ist().timestamp_millis() };
     let updates = futures::stream::unfold(follow, |mut f| async move {
         let updates = f.next_updates().await?;
         let data = json!({ "tf": f.tf.as_str(), "updates": updates });
