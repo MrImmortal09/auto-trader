@@ -7,7 +7,7 @@ use kotak_client::KotakClient;
 use shared_domain::entry_gate::{self, Agreement, IndicatorFeed, SizingVerdict};
 use shared_domain::telemetry::{self, SignalOutcome};
 use shared_domain::{
-    ChartHit, DbWriteMessage, MonitoredPosition, TradeSignal, TradeState, TradeTag, TradingConfig,
+    ChartHit, DbWriteMessage, LimitClose, MonitoredPosition, TradeSignal, TradeState, TradeTag, TradingConfig,
 };
 use tokio::sync::{broadcast, mpsc, RwLock};
 
@@ -50,6 +50,11 @@ enum PosAction {
     Expire { reason: String },
     /// A manual add that won't be booked — see `manual_add_verdict`.
     DropManualAdd { reason: String },
+    /// PAPER: the scalp's limit close filled — sell `qty` at `price`.
+    LimitFill { qty: i32, price: f64 },
+    /// PAPER: let go of the scalp's limit close (cancelled by hand, or the
+    /// market closed), selling nothing.
+    LimitDrop { reason: String },
 }
 
 struct Pending {
@@ -127,6 +132,53 @@ async fn book_paper_sell(
     tracing::info!(instrument = %instrument, reason, price, pnl, "Exit executed");
     send_trade(db_tx, instrument, "SELL", qty, price, &fees, &TradeTag::of(&pos.signal), Some(reason.to_string()), &cfg.mode).await;
     send_log(db_tx, log_tx, "INFO", &msg).await;
+}
+
+/// PAPER: why a scalp's limit close goes now, selling nothing: the user
+/// cancelled it, or the market is shut (it is a DAY order).
+fn paper_limit_drop_reason(pos: &MonitoredPosition, now: chrono::DateTime<chrono::FixedOffset>) -> Option<String> {
+    let lc = pos.limit_close.as_ref()?;
+    if lc.cancel_requested {
+        return Some("cancelled by hand".to_string());
+    }
+    (!shared_domain::is_market_open_at(now)).then(|| "the market closed — a limit sell lasts the day".to_string())
+}
+
+/// PAPER: the fill of a scalp's resting limit close, once the last price
+/// `ltp` has reached its price — at that price, or at `ltp` for one placed
+/// at or below the price then (it fills at once, as a marketable limit
+/// does). A forced exit (Close, exit all, the kill switch) or the expiry
+/// square-off goes first: it drops the limit and sells everything.
+fn paper_limit_fill(pos: &MonitoredPosition, ltp: f64, now: chrono::DateTime<chrono::FixedOffset>) -> Option<PosAction> {
+    let lc = pos.limit_close.as_ref()?;
+    if !matches!(pos.state, TradeState::Active | TradeState::Target1Hit)
+        || pos.force_exit.is_some()
+        || is_expiry_squareoff_due(pos, now)
+        || !(ltp >= lc.price)
+    {
+        return None;
+    }
+    let qty = lc.left().min(pos.executed_qty);
+    (qty > 0).then(|| PosAction::LimitFill { qty, price: if lc.marketable { ltp } else { lc.price } })
+}
+
+/// PAPER: another sell (`reason`) of a position with a limit close cancels
+/// the limit first.
+async fn drop_paper_limit_for(
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    pos: &mut MonitoredPosition,
+    reason: &str,
+) {
+    if pos.limit_close.take().is_none() {
+        return;
+    }
+    send_log(db_tx, log_tx, "INFO", &json!({
+        "event": "LIMIT_CLOSE_CANCELLED",
+        "instrument": pos.signal.instrument_name,
+        "reason": format!("cancelled before the {reason} sell"),
+        "mode": "PAPER",
+    }).to_string()).await;
 }
 
 /// True when `now` is at/after 15:38 IST on this position's *resolved*
@@ -1164,6 +1216,20 @@ fn build_ioc_limit_order(
     order
 }
 
+/// DAY limit order (`L`, validity `DAY`) at `price`: rests at the exchange
+/// until it fills, is cancelled, or the session ends. Only a scalp's limit
+/// close uses it. `price` must already be tick-rounded.
+fn build_day_limit_order(
+    base: &shared_domain::OrderRequest,
+    txn: shared_domain::TransactionType,
+    qty: i32,
+    price: f64,
+) -> shared_domain::OrderRequest {
+    let mut order = build_ioc_limit_order(base, txn, qty, price);
+    order.validity = shared_domain::Validity::Day;
+    order
+}
+
 /// The IOC-limit price for an entry retry: a protection band above the touch,
 /// never above the entry buy window's far edge (when one is configured), tick-
 /// rounded down. `None` if there is no usable reference price.
@@ -1391,7 +1457,9 @@ async fn sellable_qty(
         }
         tracked_total += p.executed_qty;
         if p.id != pos_id {
-            committed_elsewhere += p.sl_order_qty + p.pending_exit_qty;
+            // A limit close at Kotak (or that may be) is a sell resting too.
+            let limit = p.limit_close.as_ref().filter(|l| l.at_broker()).map_or(0, LimitClose::left);
+            committed_elsewhere += p.sl_order_qty + p.pending_exit_qty + limit;
         }
     }
     (tracked_total - committed_elsewhere).max(0).min(qty)
@@ -1544,6 +1612,48 @@ struct LiveLeg {
     topup_send_uncertain: bool,
     topup_uncertain_qty: Option<i32>,
     topup_uncertain_poll: Option<u64>,
+    /// A limit close that is, or may be, at Kotak.
+    limit_close: Option<LimitClose>,
+}
+
+impl LiveLeg {
+    /// The reconciler's snapshot of `p`.
+    fn of(p: &MonitoredPosition) -> Self {
+        LiveLeg {
+            pos_id: p.id.clone(),
+            instrument: p.signal.instrument_name.clone(),
+            trading_symbol: p
+                .resolved_order
+                .as_ref()
+                .map(|o| o.trading_symbol.clone())
+                .unwrap_or_default(),
+            is_options: p.signal.option_type.is_some(),
+            tag: TradeTag::of(&p.signal),
+            avg_buy_price: p.avg_buy_price,
+            entry_price: p.signal.entry_price,
+            at_target1: matches!(p.state, TradeState::Target1Hit),
+            entry_order_id: p.entry_order_id.clone(),
+            entry_cancel_sent: p.entry_cancel_sent,
+            entry_send_uncertain: p.entry_send_uncertain && p.entry_order_id.is_none(),
+            entry_uncertain_qty: p.entry_uncertain_qty,
+            entry_uncertain_poll: p.entry_uncertain_poll,
+            entry_attempt_secs: secs_since_ist(&p.entry_attempt_at),
+            entry_retry_as_limit: p.entry_retry_as_limit,
+            sl_order_id: p.sl_order_id.clone(),
+            pending_exit_order_id: p.pending_exit_order_id.clone(),
+            pending_exit_qty: p.pending_exit_qty,
+            pending_exit_reason: p.pending_exit_reason.clone(),
+            topup_order_id: p.sizing.topup_order_id.clone(),
+            topup_cancel_sent: p.sizing.topup_cancel_sent,
+            topup_retry_as_limit: p.sizing.topup_retry_as_limit,
+            topup_attempt_secs: secs_since_ist(&p.sizing.topup_attempt_at),
+            manual: p.manual,
+            topup_send_uncertain: p.sizing.topup_send_uncertain,
+            topup_uncertain_qty: p.sizing.topup_uncertain_qty,
+            topup_uncertain_poll: p.sizing.topup_uncertain_poll,
+            limit_close: p.limit_close.clone().filter(LimitClose::at_broker),
+        }
+    }
 }
 
 /// Settle every tracked order against the broker's order book.
@@ -1559,7 +1669,7 @@ async fn reconcile_live_orders(
     brokerage: f64,
     book_memory: &mut OrderBookMemory,
 ) -> bool {
-    let (legs, claimed_entry_ids): (Vec<LiveLeg>, Vec<String>) = {
+    let (legs, claimed_entry_ids, claimed_sell_ids): (Vec<LiveLeg>, Vec<String>, Vec<String>) = {
         let g = positions.read().await;
         let legs = g.iter()
             .filter(|p| {
@@ -1569,40 +1679,9 @@ async fn reconcile_live_orders(
                     || p.pending_exit_order_id.is_some()
                     || p.sizing.topup_order_id.is_some()
                     || p.sizing.topup_send_uncertain
+                    || p.limit_close.as_ref().is_some_and(LimitClose::at_broker)
             })
-            .map(|p| LiveLeg {
-                pos_id: p.id.clone(),
-                instrument: p.signal.instrument_name.clone(),
-                trading_symbol: p
-                    .resolved_order
-                    .as_ref()
-                    .map(|o| o.trading_symbol.clone())
-                    .unwrap_or_default(),
-                is_options: p.signal.option_type.is_some(),
-                tag: TradeTag::of(&p.signal),
-                avg_buy_price: p.avg_buy_price,
-                entry_price: p.signal.entry_price,
-                at_target1: matches!(p.state, TradeState::Target1Hit),
-                entry_order_id: p.entry_order_id.clone(),
-                entry_cancel_sent: p.entry_cancel_sent,
-                entry_send_uncertain: p.entry_send_uncertain && p.entry_order_id.is_none(),
-                entry_uncertain_qty: p.entry_uncertain_qty,
-                entry_uncertain_poll: p.entry_uncertain_poll,
-                entry_attempt_secs: secs_since_ist(&p.entry_attempt_at),
-                entry_retry_as_limit: p.entry_retry_as_limit,
-                sl_order_id: p.sl_order_id.clone(),
-                pending_exit_order_id: p.pending_exit_order_id.clone(),
-                pending_exit_qty: p.pending_exit_qty,
-                pending_exit_reason: p.pending_exit_reason.clone(),
-                topup_order_id: p.sizing.topup_order_id.clone(),
-                topup_cancel_sent: p.sizing.topup_cancel_sent,
-                topup_retry_as_limit: p.sizing.topup_retry_as_limit,
-                topup_attempt_secs: secs_since_ist(&p.sizing.topup_attempt_at),
-                manual: p.manual,
-                topup_send_uncertain: p.sizing.topup_send_uncertain,
-                topup_uncertain_qty: p.sizing.topup_uncertain_qty,
-                topup_uncertain_poll: p.sizing.topup_uncertain_poll,
-            })
+            .map(LiveLeg::of)
             .collect();
         // Every entry order number the engine already owns — the uncertain-entry
         // hunt below must not adopt an order that belongs to another position.
@@ -1613,7 +1692,14 @@ async fn reconcile_live_orders(
             .flatten()
             .filter(|s| !s.trim().is_empty())
             .collect();
-        (legs, claimed)
+        // Every sell order number the engine already owns, likewise for the
+        // search for a limit close whose send got no verdict.
+        let claimed_sells = g.iter()
+            .flat_map(|p| [p.sl_order_id.clone(), p.pending_exit_order_id.clone(), p.limit_close.as_ref().and_then(|l| l.order_id.clone())])
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        (legs, claimed, claimed_sells)
     };
     if legs.is_empty() {
         return false;
@@ -2043,6 +2129,11 @@ async fn reconcile_live_orders(
             }
         }
 
+        // ── Limit close leg ──────────────────────────────────────────── //
+        if let Some(lc) = &leg.limit_close {
+            mutated |= settle_limit_close(positions, db_tx, log_tx, brokerage, &book, book_memory, &claimed_sell_ids, leg, lc).await;
+        }
+
         // ── Engine-initiated exit leg ────────────────────────────────── //
         if let (Some(oid), Some(reason)) =
             (leg.pending_exit_order_id.clone(), leg.pending_exit_reason.clone())
@@ -2162,6 +2253,195 @@ async fn reconcile_live_orders(
     mutated
 }
 
+/// Sell orders in `book` that could be the limit close `lc` whose send got
+/// no verdict: a sell on `sym` of its quantity at its price, not already
+/// some position's order, and first seen after it went out when that is
+/// known.
+fn unconfirmed_limit_candidates<'a>(
+    book: &'a [kotak_client::KotakOrder],
+    sym: &str,
+    lc: &LimitClose,
+    claimed: &[String],
+    memory: &OrderBookMemory,
+) -> Vec<&'a kotak_client::KotakOrder> {
+    let sym = sym.trim();
+    if sym.is_empty() {
+        return Vec::new();
+    }
+    book.iter()
+        .filter(|o| {
+            o.is_sell()
+                && o.trading_symbol.trim() == sym
+                && !claimed.iter().any(|c| c.trim() == o.order_no.trim())
+                && o.ordered_qty() == lc.qty
+                && (o.limit_price() - lc.price).abs() < 0.001
+                && lc.sent_poll.is_none_or(|poll| memory.appeared_after(&o.order_no, poll))
+        })
+        .collect()
+}
+
+/// Settle one position's limit close against the order book: find a send
+/// that got no verdict, book what has filled since the last read (it can
+/// fill in parts), and let go of it once Kotak shows it finished. Returns
+/// `true` if the position changed.
+#[allow(clippy::too_many_arguments)]
+async fn settle_limit_close(
+    positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    brokerage: f64,
+    book: &[kotak_client::KotakOrder],
+    book_memory: &OrderBookMemory,
+    claimed_sells: &[String],
+    leg: &LiveLeg,
+    lc: &LimitClose,
+) -> bool {
+    let sym = leg.trading_symbol.trim();
+    if lc.send_uncertain {
+        let matches = unconfirmed_limit_candidates(book, sym, lc, claimed_sells, book_memory);
+        match matches.as_slice() {
+            [ord] => {
+                let adopted = ord.order_no.trim().to_string();
+                let status = ord.status.trim().to_string();
+                with_position(positions, &leg.pos_id, |p| {
+                    if let Some(l) = p.limit_close.as_mut() {
+                        l.order_id = Some(adopted.clone());
+                        l.send_uncertain = false;
+                    }
+                }).await;
+                loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
+                    "found order {adopted} ({status}) for {sym} in the book and adopted it as the limit sell whose placement was unconfirmed — it settles from the next read; verify against your broker app"
+                )).await;
+                return true;
+            }
+            [] => {
+                let waited = secs_since_ist(&lc.sent_at).unwrap_or(i64::MAX);
+                if waited >= UNCERTAIN_ENTRY_GRACE.as_secs() as i64 {
+                    with_position(positions, &leg.pos_id, |p| p.limit_close = None).await;
+                    live_info(db_tx, log_tx, json!({
+                        "event": "LIMIT_CLOSE_UNCONFIRMED_CLEARED",
+                        "instrument": leg.instrument,
+                        "note": format!("no matching sell in the book {waited}s after an unconfirmed limit-sell send — treating it as never placed"),
+                        "mode": "LIVE",
+                    })).await;
+                    return true;
+                }
+                // Still inside the grace window: Kotak may not show it yet.
+                return false;
+            }
+            many => {
+                let n = many.len();
+                with_position(positions, &leg.pos_id, |p| {
+                    p.live_halt = Some("unconfirmed limit sell matched multiple broker orders".to_string());
+                }).await;
+                loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
+                    "an unconfirmed limit sell for {sym} matches {n} sell orders in the book — cannot tell which is ours, so this position is halted; resolve it at the broker terminal"
+                )).await;
+                return true;
+            }
+        }
+    }
+
+    let Some(oid) = lc.order_id.clone() else { return false };
+    let Some(ord) = book.iter().find(|o| o.order_no.trim() == oid.trim()) else {
+        // Kotak's book holds the day's orders: one from an earlier day
+        // ended at that day's close (a DAY order).
+        let today = shared_domain::today_ist().format("%Y-%m-%d").to_string();
+        if !lc.requested_at.starts_with(&today) {
+            with_position(positions, &leg.pos_id, |p| p.limit_close = None).await;
+            live_info(db_tx, log_tx, json!({
+                "event": "LIMIT_CLOSE_EXPIRED",
+                "instrument": leg.instrument,
+                "order_id": oid,
+                "note": "a limit sell from an earlier day — it ended at that day's close",
+                "mode": "LIVE",
+            })).await;
+            return true;
+        }
+        let waited = secs_since_ist(&lc.sent_at).or_else(|| secs_since_ist(&Some(lc.requested_at.clone()))).unwrap_or(0);
+        if !lc.missing_noted && waited >= UNCERTAIN_ENTRY_GRACE.as_secs() as i64 {
+            with_position(positions, &leg.pos_id, |p| {
+                if let Some(l) = p.limit_close.as_mut() {
+                    l.missing_noted = true;
+                }
+            }).await;
+            loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
+                "limit sell {oid} isn't in Kotak's order book — it may still be resting, so no other sell goes out for this position until it shows. Check the Kotak app"
+            )).await;
+            return true;
+        }
+        return false;
+    };
+
+    let mut changed = false;
+    let filled = ord.filled_qty().clamp(0, lc.qty);
+    let fresh = filled - lc.filled;
+    if fresh > 0 {
+        // Kotak's average is over everything filled so far: the new fill is
+        // what that adds to what was already booked.
+        let avg = ord.avg_price();
+        let (price, value) = if avg > 0.0 {
+            let value = avg * f64::from(filled);
+            ((value - lc.filled_value) / f64::from(fresh), value)
+        } else {
+            loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
+                "limit sell {oid} filled {fresh} more but Kotak reported no average price — booking it at the limit ₹{:.2}, verify against the contract note",
+                lc.price
+            )).await;
+            (lc.price, lc.filled_value + lc.price * f64::from(fresh))
+        };
+        record_live_sell(db_tx, log_tx, leg, fresh, price, "LIMIT_CLOSE", brokerage).await;
+        with_position(positions, &leg.pos_id, |p| {
+            p.executed_qty = (p.executed_qty - fresh).max(0);
+            if let Some(l) = p.limit_close.as_mut() {
+                l.filled = filled;
+                l.filled_value = value;
+            }
+            // The targets never add up past what is held.
+            if p.manual && p.executed_qty > 0 {
+                let lot = lot_size_of(p);
+                let option_type = p.signal.option_type.clone();
+                p.chart.trim_targets(p.executed_qty / lot, option_type.as_deref());
+            }
+        }).await;
+        changed = true;
+    }
+
+    if ord.is_terminal() {
+        with_position(positions, &leg.pos_id, |p| {
+            p.limit_close = None;
+            if p.executed_qty <= 0
+                && p.pending_exit_order_id.is_none()
+                && p.sl_order_id.is_none()
+                && p.sizing.topup_order_id.is_none()
+                && !p.sizing.topup_send_uncertain
+            {
+                p.state = TradeState::Closed;
+                p.force_exit = None;
+            }
+        }).await;
+        if ord.is_rejected() {
+            loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
+                "limit sell {oid} came back {} ({}) — {}",
+                ord.status,
+                ord.reject_reason,
+                if filled > 0 { format!("{filled} of {} sold, nothing more rests", lc.qty) } else { "nothing sold, nothing rests".to_string() }
+            )).await;
+        } else {
+            live_info(db_tx, log_tx, json!({
+                "event": if ord.is_complete() { "LIMIT_CLOSE_DONE" } else { "LIMIT_CLOSE_CANCELLED" },
+                "instrument": leg.instrument,
+                "order_id": oid,
+                "filled": filled,
+                "qty": lc.qty,
+                "mode": "LIVE",
+            })).await;
+        }
+        changed = true;
+    }
+    changed
+}
+
 // ---------------------------------------------------------------------------
 // LIVE mode — startup reconciliation (plan §7)
 // ---------------------------------------------------------------------------
@@ -2206,6 +2486,22 @@ async fn reconcile_on_startup(
         let mut g = positions.write().await;
         for p in g.iter_mut().filter(|p| p.entry_send_uncertain) {
             p.entry_attempt_at = Some(now.clone());
+        }
+        // 0a. A limit close: one whose send went out with no answer kept is
+        //     searched for like an unconfirmed send, on a fresh grace clock;
+        //     one never sent is not sent after a restart (like a manual tap).
+        for p in g.iter_mut() {
+            let Some(lc) = p.limit_close.as_mut() else { continue };
+            if lc.order_id.is_some() {
+                continue;
+            }
+            if lc.send_uncertain || lc.sent_at.is_some() {
+                lc.send_uncertain = true;
+                lc.sent_at = Some(now.clone());
+                lc.sent_poll = None;
+            } else {
+                p.limit_close = None;
+            }
         }
     }
 
@@ -2270,6 +2566,9 @@ async fn reconcile_on_startup(
         executed_qty: i32,
         entry_order_id: Option<String>,
         sl_order_id: Option<String>,
+        /// Its limit close at Kotak, and whether its send is unconfirmed.
+        limit_order_id: Option<String>,
+        limit_uncertain: bool,
     }
     // Computed before the broker calls: whether there is anything at all for a
     // failed positions-read to have gotten wrong. Held positions are the only
@@ -2292,6 +2591,8 @@ async fn reconcile_on_startup(
                 executed_qty: p.executed_qty,
                 entry_order_id: p.entry_order_id.clone(),
                 sl_order_id: p.sl_order_id.clone(),
+                limit_order_id: p.limit_close.as_ref().and_then(|l| l.order_id.clone()),
+                limit_uncertain: p.limit_close.as_ref().is_some_and(|l| l.send_uncertain),
             })
             .collect()
     };
@@ -2414,15 +2715,32 @@ async fn reconcile_on_startup(
             with_position(positions, &t.pos_id, |p| p.executed_qty = held_at_broker).await;
         }
 
-        // Adopt, rather than duplicate, whatever sell is already resting.
+        // Adopt, rather than duplicate, whatever sell is already resting —
+        // but for its own limit close, which is already tracked.
+        let ours = t.limit_order_id.as_deref().map(str::trim);
         let resting: Vec<&kotak_client::KotakOrder> = book
             .iter()
             .filter(|o| {
                 o.is_sell()
                     && !o.is_terminal()
                     && o.trading_symbol.trim() == t.trading_symbol.trim()
+                    && Some(o.order_no.trim()) != ours
             })
             .collect();
+        let ours_resting = ours.is_some_and(|id| book.iter().any(|o| o.order_no.trim() == id && !o.is_terminal()));
+        if !resting.is_empty() && (ours_resting || t.limit_uncertain) {
+            // Its limit close and another sell, both resting (or one that may
+            // be): the engine can't keep both under what is held.
+            let n = resting.len() + 1;
+            loud_error(db_tx, log_tx, &t.instrument, &format!(
+                "{n} sell orders are resting against {} (one of them its limit sell) — the engine cannot keep them under what is held, so it will not act on this position at all; resolve it at the broker terminal",
+                t.trading_symbol
+            )).await;
+            with_position(positions, &t.pos_id, |p| {
+                p.live_halt = Some(format!("{n} resting sell orders found at startup"));
+            }).await;
+            continue;
+        }
 
         match resting.len() {
             0 => {
@@ -2929,6 +3247,7 @@ async fn adopt_manual(
         manual_add: None,
         chart: Default::default(),
         chart_targets_selling: Vec::new(),
+        limit_close: None,
         entry_line: None,
     };
 
@@ -2949,7 +3268,7 @@ fn resolved_adopt_avg(user_entered: f64, broker_avg: f64) -> f64 {
 // LIVE mode — decision pass
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum LiveAction {
     /// Entry condition met — check funds, then buy `qty`. `ltp` is the price
     /// that triggered it, used to size the funds check. `limit_price` is `None`
@@ -3001,6 +3320,15 @@ enum LiveAction {
     /// A manual add that won't be sent (`manual_add_verdict`): clear it and
     /// say why. No broker call.
     DropManualAdd { reason: String },
+    /// Send the scalp's limit close to Kotak: a DAY limit sell of `qty` at
+    /// `price` — see [`limit_close_gate`].
+    PlaceLimitClose { qty: i32, price: f64 },
+    /// Ask Kotak to cancel the resting limit close, to make way for the sell
+    /// `reason` names, or because the user asked (`by_hand`). Nothing else
+    /// sells until the order book shows it closed.
+    CancelLimitClose { reason: String, by_hand: bool },
+    /// Let go of a limit close that never reached Kotak. No broker call.
+    DropLimitClose { reason: String, loud: bool },
 }
 
 struct LivePending {
@@ -3017,6 +3345,125 @@ struct LivePending {
 /// hold. This account has no margin, so an accidental oversell would be a naked
 /// short, not just a bad fill.
 fn decide_live(
+    pos: &MonitoredPosition,
+    ltp_map: &Arc<DashMap<String, f64>>,
+    cfg: &TradingConfig,
+    entry_cutoff: bool,
+    retry_window: bool,
+    gate: &EntryGate,
+) -> Option<LiveAction> {
+    let action = decide_live_core(pos, ltp_map, cfg, entry_cutoff, retry_window, gate);
+    limit_close_gate(pos, action, &gate.now_ts)
+}
+
+/// Whether `action` sells some of the holding, and what for.
+fn live_sell_reason(action: &LiveAction) -> Option<String> {
+    match action {
+        LiveAction::ExitAll { reason, .. } => Some(reason.clone()),
+        LiveAction::ManualSell { .. } => Some("MANUAL_SELL".to_string()),
+        LiveAction::ChartTarget { .. } => Some("CHART_TARGET".to_string()),
+        LiveAction::Target1 { slice, .. } if *slice > 0 => Some("TGT1_PARTIAL".to_string()),
+        _ => None,
+    }
+}
+
+/// Seconds after a limit close's cancel before it is sent again, if the
+/// order book still shows the order open (a cancel Kotak took but didn't
+/// act on, or one it refused).
+const LIMIT_CANCEL_RESEND_SECS: i64 = 5;
+
+/// LIVE: what a scalp's limit close lets happen this tick, given `action`,
+/// what [`decide_live_core`] would do without it (see [`LimitClose`]).
+///
+/// The rule that keeps it from ever selling more than is held: while it is
+/// (or may be) at Kotak, no other sell goes out. A sell that is due — the
+/// user's Close or −1 lot, a chart stop or target, exit all, the kill
+/// switch, the expiry square-off — cancels it first and waits until the
+/// order book shows it closed, with whatever it filled booked; that sell is
+/// decided again on the tick after, for what is then held. A send with no
+/// verdict blocks every sell until the order book settles it. One not sent
+/// yet is simply dropped, and is sent only while nothing else is selling.
+fn limit_close_gate(pos: &MonitoredPosition, action: Option<LiveAction>, now_ts: &str) -> Option<LiveAction> {
+    let Some(lc) = pos.limit_close.as_ref() else { return action };
+    // Halted: the engine sends nothing for it (the order book still books
+    // what the limit fills).
+    if pos.live_halt.is_some() || !matches!(pos.state, TradeState::Active | TradeState::Target1Hit) {
+        return None;
+    }
+    let sell = action.as_ref().and_then(live_sell_reason);
+    if lc.send_uncertain {
+        // It may be resting at Kotak: the order book decides first.
+        return action.filter(|_| sell.is_none());
+    }
+    // A limit for more than is now held (the broker's holding was adopted
+    // lower at startup) can't stay.
+    let oversized = lc.order_id.is_some() && lc.left() > pos.executed_qty;
+    let cancel_for = sell
+        .clone()
+        .or_else(|| lc.cancel_requested.then(|| "cancelled by hand".to_string()))
+        .or_else(|| oversized.then(|| "it is for more than is now held".to_string()));
+    if let Some(reason) = cancel_for {
+        if lc.order_id.is_none() {
+            return Some(LiveAction::DropLimitClose { reason: format!("dropped before it was sent — {reason}"), loud: false });
+        }
+        let waiting = lc
+            .cancel_sent_at
+            .as_deref()
+            .is_some_and(|at| secs_between(at, now_ts).is_some_and(|s| s < LIMIT_CANCEL_RESEND_SECS));
+        if waiting {
+            return None;
+        }
+        return Some(LiveAction::CancelLimitClose { reason, by_hand: sell.is_none() });
+    }
+    if lc.order_id.is_some() {
+        // Resting; nothing it stands in the way of.
+        return action;
+    }
+    if manual_order_stale(&lc.requested_at, now_ts) {
+        return Some(LiveAction::DropLimitClose {
+            reason: format!("not sent within {} s of the request — nothing rests at Kotak", shared_domain::MANUAL_ORDER_TTL_SECS),
+            loud: true,
+        });
+    }
+    if action.is_some() {
+        // Something else first (an add); sent on a later tick.
+        return action;
+    }
+    // A sell already asked for (one held back between retries shows no
+    // action here): the limit has nothing left to do.
+    if pos.force_exit.is_some() || pos.manual_sell_qty.is_some() {
+        return Some(LiveAction::DropLimitClose { reason: "dropped before it was sent — a sell is already due".to_string(), loud: false });
+    }
+    // A sell at Kotak, or a failed exit being retried: it waits (and the
+    // 15 s rule above lets it go if that lasts).
+    if pos.pending_exit_order_id.is_some() || pos.exit_attempts > 0 {
+        return None;
+    }
+    if pos.sl_order_id.is_some() {
+        return Some(LiveAction::DropLimitClose {
+            reason: "a sell order already rests at Kotak for this position — not placing another".to_string(),
+            loud: true,
+        });
+    }
+    let lot = lot_size_of(pos);
+    if lc.qty <= 0 || lc.qty % lot != 0 || lc.qty > pos.executed_qty || !(lc.price > 0.0) {
+        return Some(LiveAction::DropLimitClose {
+            reason: format!("{} at ₹{:.2} is no longer whole lots of what is held ({})", lc.qty, lc.price, pos.executed_qty),
+            loud: true,
+        });
+    }
+    Some(LiveAction::PlaceLimitClose { qty: lc.qty, price: lc.price })
+}
+
+/// Seconds from IST timestamp `from` to `to`, both `%Y-%m-%d %H:%M:%S`.
+fn secs_between(from: &str, to: &str) -> Option<i64> {
+    let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok();
+    Some((parse(to)? - parse(from)?).num_seconds())
+}
+
+/// Decide the next LIVE action for one position as if it had no limit
+/// close — [`decide_live`] then lets [`limit_close_gate`] have its say.
+fn decide_live_core(
     pos: &MonitoredPosition,
     ltp_map: &Arc<DashMap<String, f64>>,
     cfg: &TradingConfig,
@@ -4213,6 +4660,155 @@ async fn exec_live_action(
                 "add not placed — {reason}; nothing bought, the position is unchanged"
             )).await;
         }
+
+        LiveAction::PlaceLimitClose { qty, price } => {
+            // Same cross-leg cap as any other live sell (see `sellable_qty`):
+            // a resting limit on top of another leg's sell could sell more
+            // than is held, so it is not trimmed, it is not placed.
+            let safe = sellable_qty(positions, &pending.pos_id, &ctx.trading_symbol, *qty).await;
+            if safe < *qty {
+                with_position(positions, &pending.pos_id, |p| p.limit_close = None).await;
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                    "limit sell of {qty} @ ₹{price:.2} not placed — another tracked leg on {} already has a sell resting or in flight; nothing rests at Kotak",
+                    ctx.trading_symbol
+                )).await;
+                return true;
+            }
+            // Cancelled by hand since it was decided: not sent.
+            let mut still_wanted = false;
+            let now = shared_domain::current_ist_timestamp_string();
+            with_position(positions, &pending.pos_id, |p| {
+                if let Some(lc) = p.limit_close.as_mut().filter(|l| !l.at_broker() && !l.cancel_requested) {
+                    lc.sent_at = Some(now.clone());
+                    lc.sent_poll = Some(book_polls);
+                    still_wanted = true;
+                }
+            }).await;
+            if !still_wanted {
+                return false;
+            }
+            let order = build_day_limit_order(&ctx.base, shared_domain::TransactionType::Sell, *qty, *price);
+            match kotak_place(kotak, &order).await {
+                Ok(order_id) => {
+                    with_position(positions, &pending.pos_id, |p| {
+                        // Never lose the number of an order resting at
+                        // Kotak: had the request gone meanwhile, it comes
+                        // back as one to cancel.
+                        let lc = p.limit_close.get_or_insert_with(|| {
+                            let mut lc = LimitClose::new(*qty, *price, now.clone(), false);
+                            lc.cancel_requested = true;
+                            lc
+                        });
+                        lc.order_id = Some(order_id.clone());
+                        lc.send_uncertain = false;
+                    }).await;
+                    tracing::info!(instrument = %ctx.instrument, %order_id, qty, price, "LIVE limit close placed");
+                    live_info(db_tx, log_tx, json!({
+                        "event": "LIMIT_CLOSE_PLACED",
+                        "instrument": ctx.instrument,
+                        "order_id": order_id,
+                        "qty": qty,
+                        "limit_price": round2(*price),
+                        "mode": "LIVE",
+                    })).await;
+                }
+                Err(e) if e.is_ambiguous() => {
+                    // It may be resting at Kotak. The order book is searched
+                    // for it, and no other sell goes out until that settles.
+                    with_position(positions, &pending.pos_id, |p| {
+                        let lc = p.limit_close.get_or_insert_with(|| {
+                            let mut lc = LimitClose::new(*qty, *price, now.clone(), false);
+                            lc.cancel_requested = true;
+                            lc
+                        });
+                        lc.send_uncertain = true;
+                        lc.sent_at = Some(now.clone());
+                        lc.sent_poll = Some(book_polls);
+                    }).await;
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                        "limit sell of {qty} @ ₹{price:.2} got no answer from Kotak ({e}) — it MAY be resting there. Reconciling against the order book; no other sell goes out for this position until that settles. Check your broker app"
+                    )).await;
+                }
+                Err(e) => {
+                    with_position(positions, &pending.pos_id, |p| p.limit_close = None).await;
+                    loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                        "limit sell of {qty} @ ₹{price:.2} was not placed: {e} — nothing rests at Kotak, the position is unchanged"
+                    )).await;
+                }
+            }
+        }
+
+        LiveAction::CancelLimitClose { reason, by_hand } => {
+            let order_id = {
+                let g = positions.read().await;
+                g.iter().find(|p| p.id == pending.pos_id).and_then(|p| p.limit_close.as_ref()).and_then(|l| l.order_id.clone())
+            };
+            let Some(order_id) = order_id else { return false };
+            let now = shared_domain::current_ist_timestamp_string();
+            // Stamped either way: a cancel is not sent again until the order
+            // book has had a few seconds to show how the order ended.
+            with_position(positions, &pending.pos_id, |p| {
+                if let Some(lc) = p.limit_close.as_mut() {
+                    lc.cancel_sent_at = Some(now.clone());
+                }
+            }).await;
+            match kotak_cancel(kotak, &order_id, &ctx.trading_symbol).await {
+                Ok(()) => {
+                    live_info(db_tx, log_tx, json!({
+                        "event": "LIMIT_CLOSE_CANCEL_SENT",
+                        "instrument": ctx.instrument,
+                        "order_id": order_id,
+                        "reason": reason,
+                        "mode": "LIVE",
+                    })).await;
+                }
+                Err(e) => {
+                    // Already finished at Kotak (filled, or cancelled)? Then
+                    // the order book settles it on its next read.
+                    let still_open = match current_kotak(kotak).await {
+                        Some(client) => client
+                            .get_order_book()
+                            .await
+                            .ok()
+                            .map(|book| book.iter().any(|o| o.order_no.trim() == order_id.trim() && !o.is_terminal()))
+                            .unwrap_or(true), // couldn't check — stay conservative
+                        None => true,
+                    };
+                    if !still_open {
+                        live_info(db_tx, log_tx, json!({
+                            "event": "LIMIT_CLOSE_ALREADY_DONE",
+                            "instrument": ctx.instrument,
+                            "order_id": order_id,
+                            "note": format!("cancel refused ({e}) but the order has already finished at Kotak — the order book settles it"),
+                            "mode": "LIVE",
+                        })).await;
+                    } else if *by_hand {
+                        loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                            "could not cancel limit sell {order_id} ({e}) — it still rests at Kotak; trying again in {LIMIT_CANCEL_RESEND_SECS} s"
+                        )).await;
+                    } else {
+                        loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                            "could not cancel limit sell {order_id} before the {reason} sell ({e}) — holding that sell back so the position cannot be oversold"
+                        )).await;
+                        bump_exit_attempts(positions, db_tx, log_tx, &pending.pos_id, &ctx.instrument).await;
+                    }
+                }
+            }
+        }
+
+        LiveAction::DropLimitClose { reason, loud } => {
+            with_position(positions, &pending.pos_id, |p| p.limit_close = None).await;
+            if *loud {
+                loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!("limit sell not placed — {reason}")).await;
+            } else {
+                live_info(db_tx, log_tx, json!({
+                    "event": "LIMIT_CLOSE_DROPPED",
+                    "instrument": ctx.instrument,
+                    "reason": reason,
+                    "mode": "LIVE",
+                })).await;
+            }
+        }
     }
 
     true
@@ -4304,7 +4900,8 @@ async fn live_tick(
                 .as_ref()
                 .map(|o| o.trading_symbol.clone())
                 .unwrap_or_default();
-            for oid in [&p.entry_order_id, &p.sl_order_id, &p.pending_exit_order_id, &p.sizing.topup_order_id]
+            let limit = p.limit_close.as_ref().and_then(|l| l.order_id.clone());
+            for oid in [&p.entry_order_id, &p.sl_order_id, &p.pending_exit_order_id, &p.sizing.topup_order_id, &limit]
                 .into_iter()
                 .flatten()
             {
@@ -4902,6 +5499,7 @@ pub async fn start_position_monitor(
                                     manual_add: None,
                                     chart: Default::default(),
                                     chart_targets_selling: Vec::new(),
+                                    limit_close: None,
                                     entry_line: None,
                                 });
                                 telemetry::signal(SignalOutcome::Accepted);
@@ -5037,6 +5635,13 @@ pub async fn start_position_monitor(
                         if line_buy_waits_for_price(pos, telemetry::scrip_last_tick, telemetry::unix_now()) {
                             continue;
                         }
+                    }
+
+                    // A limit close cancelled by hand, or past the close (a
+                    // DAY order), goes before anything else, priced or not.
+                    if let Some(reason) = paper_limit_drop_reason(pos, shared_domain::now_ist()) {
+                        pending.push(Pending { idx: i, ltp: 0.0, action: PosAction::LimitDrop { reason } });
+                        continue;
                     }
 
                     let lookup_key = pos.ws_scrip_key.as_ref().unwrap_or(&pos.signal.instrument_name);
@@ -5212,6 +5817,10 @@ pub async fn start_position_monitor(
                         TradeState::Closed => None,
                     }
                     };
+                    // A resting limit close the price has reached fills before
+                    // anything but a forced exit; any other sell drops it
+                    // first (Pass 2).
+                    let pa = paper_limit_fill(pos, ltp, shared_domain::now_ist()).or(pa);
 
                     if let Some(a) = pa {
                         pending.push(Pending { idx: i, ltp, action: a });
@@ -5307,6 +5916,7 @@ pub async fn start_position_monitor(
                         }
 
                         PosAction::ExitSell { qty, reason, new_sl, exec_price } => {
+                            drop_paper_limit_for(&db_tx, &log_tx, pos, &reason).await;
                             let price = exec_price.unwrap_or(pa.ltp);
                             book_paper_sell(&db_tx, &log_tx, pos, &cfg, qty, price, &reason).await;
 
@@ -5325,6 +5935,7 @@ pub async fn start_position_monitor(
                         }
 
                         PosAction::ChartTargetSell { qty, ids } => {
+                            drop_paper_limit_for(&db_tx, &log_tx, pos, "CHART_TARGET").await;
                             let qty = qty.min(pos.executed_qty);
                             if qty > 0 {
                                 book_paper_sell(&db_tx, &log_tx, pos, &cfg, qty, pa.ltp, "CHART_TARGET").await;
@@ -5342,6 +5953,7 @@ pub async fn start_position_monitor(
                             // than one lot is held. A one-lot runner and every
                             // later rung book no trade at all.
                             if sell > 0 {
+                                drop_paper_limit_for(&db_tx, &log_tx, pos, "TGT1_PARTIAL").await;
                                 book_paper_sell(&db_tx, &log_tx, pos, &cfg, sell, pa.ltp, "TGT1_PARTIAL").await;
                                 pos.executed_qty -= sell;
                             }
@@ -5393,6 +6005,34 @@ pub async fn start_position_monitor(
                             .to_string();
                             tracing::info!(instrument = %instrument, reason = %reason, "Waiting position dropped");
                             send_log(&db_tx, &log_tx, "INFO", &msg).await;
+                        }
+
+                        PosAction::LimitFill { qty, price } => {
+                            let qty = qty.min(pos.executed_qty);
+                            pos.limit_close = None;
+                            if qty > 0 {
+                                book_paper_sell(&db_tx, &log_tx, pos, &cfg, qty, price, "LIMIT_CLOSE").await;
+                                pos.executed_qty -= qty;
+                            }
+                            if pos.executed_qty <= 0 {
+                                pos.state = TradeState::Closed;
+                            } else if pos.manual {
+                                let lot = lot_size_of(pos);
+                                let option_type = pos.signal.option_type.clone();
+                                pos.chart.trim_targets(pos.executed_qty / lot, option_type.as_deref());
+                            }
+                            positions_mutated = true;
+                        }
+
+                        PosAction::LimitDrop { reason } => {
+                            pos.limit_close = None;
+                            positions_mutated = true;
+                            send_log(&db_tx, &log_tx, "INFO", &json!({
+                                "event": "LIMIT_CLOSE_CANCELLED",
+                                "instrument": instrument,
+                                "reason": reason,
+                                "mode": cfg.mode.as_str(),
+                            }).to_string()).await;
                         }
 
                         PosAction::DropManualAdd { reason } => {
@@ -5553,6 +6193,7 @@ mod tests {
             manual_add: None,
             chart: Default::default(),
             chart_targets_selling: Vec::new(),
+            limit_close: None,
             entry_line: None,
         }
     }
@@ -8026,5 +8667,389 @@ mod tests {
         let g = positions.read().await;
         let a = g.iter().find(|p| p.signal.chat == chat(-100)).expect("chat -100's position is still open");
         assert_eq!((a.signal.targets.as_slice(), a.current_sl), (&[145.0, 170.0][..], 105.0));
+    }
+
+    // ── Limit close ─────────────────────────────────────────────────── //
+
+    const LIMIT_SYM: &str = "NIFTY24JUL25000CE";
+
+    fn now_ts() -> String {
+        shared_domain::current_ist_timestamp_string()
+    }
+
+    fn secs_later(ts: &str, secs: i64) -> String {
+        (chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").unwrap() + chrono::Duration::seconds(secs))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    /// A LIVE-resolved manual scalp holding 4 lots (4 × 75).
+    fn held_scalp() -> MonitoredPosition {
+        let mut pos = active_position();
+        pos.manual = true;
+        pos.executed_qty = 300;
+        pos.resolved_order = Some(dummy_order_request());
+        pos
+    }
+
+    /// A limit close of `qty` at `price`, placed at Kotak as `LIM1`.
+    fn resting(qty: i32, price: f64) -> LimitClose {
+        let mut lc = LimitClose::new(qty, price, now_ts(), false);
+        lc.order_id = Some("LIM1".into());
+        lc.sent_at = Some(now_ts());
+        lc
+    }
+
+    fn limit_row(status: &str, qty: i32, filled: i32, avg: &str) -> kotak_client::KotakOrder {
+        serde_json::from_value(json!({
+            "nOrdNo": "LIM1",
+            "ordSt": status,
+            "trdSym": LIMIT_SYM,
+            "trnsTp": "S",
+            "prcTp": "L",
+            "qty": qty.to_string(),
+            "fldQty": filled.to_string(),
+            "avgPrc": avg,
+            "prc": "152.00",
+        }))
+        .unwrap()
+    }
+
+    /// Settle the first position's limit close against `book`.
+    async fn settle(
+        positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
+        db_tx: &mpsc::Sender<DbWriteMessage>,
+        book: &[kotak_client::KotakOrder],
+        memory: &OrderBookMemory,
+    ) -> bool {
+        let leg = LiveLeg::of(&positions.read().await[0]);
+        let lc = leg.limit_close.clone().expect("a limit close at Kotak");
+        let (log_tx, _) = broadcast::channel(64);
+        settle_limit_close(positions, db_tx, &log_tx, 20.0, book, memory, &[], &leg, &lc).await
+    }
+
+    /// Every sell booked so far, as (qty, price, reason).
+    fn sells_booked(rx: &mut mpsc::Receiver<DbWriteMessage>) -> Vec<(i32, f64, String)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let DbWriteMessage::Trade { action, qty, executed_price, exit_reason, .. } = m {
+                if action == "SELL" {
+                    out.push((qty, executed_price, exit_reason.unwrap_or_default()));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_limit_close_is_sent_only_while_nothing_else_sells() {
+        let mut pos = held_scalp();
+        pos.limit_close = Some(LimitClose::new(150, 152.0, now_ts(), false));
+        assert!(matches!(limit_close_gate(&pos, None, &now_ts()), Some(LiveAction::PlaceLimitClose { qty: 150, price }) if price == 152.0));
+        // An add goes first; the limit on a later tick.
+        let add = LiveAction::TopUp { qty: 75, ltp: 130.0, limit_price: None, note: "MANUAL_ADD".into(), rearm: false };
+        assert!(matches!(limit_close_gate(&pos, Some(add), &now_ts()), Some(LiveAction::TopUp { .. })));
+        // A sell already at Kotak: it waits.
+        pos.pending_exit_order_id = Some("EXIT1".into());
+        assert!(limit_close_gate(&pos, None, &now_ts()).is_none());
+        pos.pending_exit_order_id = None;
+        // A sell due before it was sent: it is let go, and the sell goes on the next tick.
+        let stop = LiveAction::ExitAll { qty: 300, reason: "CHART_STOP".into() };
+        assert!(matches!(limit_close_gate(&pos, Some(stop), &now_ts()), Some(LiveAction::DropLimitClose { loud: false, .. })));
+        // Not sent within 15 s of the request: dropped, never sent late.
+        pos.limit_close = Some(LimitClose::new(150, 152.0, "2026-01-05 10:00:00".into(), false));
+        assert!(matches!(limit_close_gate(&pos, None, &now_ts()), Some(LiveAction::DropLimitClose { loud: true, .. })));
+        // More than is held, or not whole lots.
+        for qty in [375, 100] {
+            pos.limit_close = Some(LimitClose::new(qty, 152.0, now_ts(), false));
+            assert!(matches!(limit_close_gate(&pos, None, &now_ts()), Some(LiveAction::DropLimitClose { loud: true, .. })), "{qty}");
+        }
+        // A sell already asked for, held back between retries: let go.
+        pos.limit_close = Some(LimitClose::new(150, 152.0, now_ts(), false));
+        pos.force_exit = Some("CLOSED_VIA_FRONTEND".into());
+        assert!(matches!(limit_close_gate(&pos, None, &now_ts()), Some(LiveAction::DropLimitClose { loud: false, .. })));
+        pos.force_exit = None;
+        // A failed exit being retried: it waits.
+        pos.exit_attempts = 1;
+        assert!(limit_close_gate(&pos, None, &now_ts()).is_none());
+        pos.exit_attempts = 0;
+        // A sell order adopted from Kotak at startup already rests.
+        pos.sl_order_id = Some("SL1".into());
+        assert!(matches!(limit_close_gate(&pos, None, &now_ts()), Some(LiveAction::DropLimitClose { loud: true, .. })));
+    }
+
+    #[test]
+    fn every_other_sell_cancels_a_resting_limit_close_first_and_waits_for_kotak() {
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(150, 152.0));
+        // Resting, nothing else due: nothing.
+        assert!(limit_close_gate(&pos, None, &now_ts()).is_none());
+        for sell in [
+            LiveAction::ExitAll { qty: 300, reason: "CLOSED_VIA_FRONTEND".into() },
+            LiveAction::ExitAll { qty: 300, reason: "SL_HIT".into() },
+            LiveAction::ExitAll { qty: 300, reason: "EXPIRY_SQUAREOFF".into() },
+            LiveAction::ManualSell { qty: 75 },
+            LiveAction::ChartTarget { qty: 75, ids: vec!["t1".into()] },
+        ] {
+            assert!(
+                matches!(limit_close_gate(&pos, Some(sell.clone()), &now_ts()), Some(LiveAction::CancelLimitClose { by_hand: false, .. })),
+                "{:?} goes out beside a resting limit",
+                live_sell_reason(&sell)
+            );
+        }
+        // Asked: no sell until the order book shows it closed, and no second cancel at once.
+        let now = now_ts();
+        pos.limit_close.as_mut().unwrap().cancel_sent_at = Some(now.clone());
+        let stop = || Some(LiveAction::ExitAll { qty: 300, reason: "SL_HIT".into() });
+        assert!(limit_close_gate(&pos, stop(), &now).is_none());
+        assert!(limit_close_gate(&pos, stop(), &secs_later(&now, 4)).is_none());
+        // Still open a while later: asked again.
+        assert!(matches!(limit_close_gate(&pos, stop(), &secs_later(&now, 6)), Some(LiveAction::CancelLimitClose { .. })));
+
+        // The user's ×.
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(150, 152.0));
+        pos.limit_close.as_mut().unwrap().cancel_requested = true;
+        assert!(matches!(limit_close_gate(&pos, None, &now_ts()), Some(LiveAction::CancelLimitClose { by_hand: true, .. })));
+        // For more than is now held (the broker's holding adopted lower at startup): cancelled.
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(300, 152.0));
+        pos.executed_qty = 150;
+        assert!(matches!(limit_close_gate(&pos, None, &now_ts()), Some(LiveAction::CancelLimitClose { .. })));
+        // A buy only adds: it goes beside a resting limit.
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(150, 152.0));
+        let add = LiveAction::TopUp { qty: 75, ltp: 130.0, limit_price: None, note: "MANUAL_ADD".into(), rearm: false };
+        assert!(matches!(limit_close_gate(&pos, Some(add), &now_ts()), Some(LiveAction::TopUp { .. })));
+    }
+
+    #[test]
+    fn a_limit_close_with_no_answer_from_kotak_blocks_every_sell() {
+        let mut pos = held_scalp();
+        let mut lc = LimitClose::new(150, 152.0, now_ts(), false);
+        lc.send_uncertain = true;
+        pos.limit_close = Some(lc);
+        assert!(limit_close_gate(&pos, Some(LiveAction::ExitAll { qty: 300, reason: "SL_HIT".into() }), &now_ts()).is_none());
+        assert!(limit_close_gate(&pos, Some(LiveAction::ManualSell { qty: 75 }), &now_ts()).is_none());
+        assert!(limit_close_gate(&pos, None, &now_ts()).is_none());
+        // Even the user's ×: the order book has to find it first.
+        pos.limit_close.as_mut().unwrap().cancel_requested = true;
+        assert!(limit_close_gate(&pos, None, &now_ts()).is_none());
+        // Halted: the engine sends nothing at all.
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(150, 152.0));
+        pos.live_halt = Some("test".into());
+        assert!(limit_close_gate(&pos, Some(LiveAction::ExitAll { qty: 300, reason: "SL_HIT".into() }), &now_ts()).is_none());
+    }
+
+    #[tokio::test]
+    async fn another_legs_resting_limit_close_counts_as_a_sell_already_out() {
+        let mut a = held_scalp();
+        a.id = "a".into();
+        let mut b = held_scalp();
+        b.id = "b".into();
+        b.limit_close = Some(resting(150, 152.0));
+        let positions = Arc::new(RwLock::new(vec![a, b]));
+        // 600 held across both, 150 resting on b: a may sell 450 at most.
+        assert_eq!(sellable_qty(&positions, "a", LIMIT_SYM, 600).await, 450);
+        // A request not at Kotak yet commits nothing.
+        positions.write().await[1].limit_close = Some(LimitClose::new(150, 152.0, now_ts(), false));
+        assert_eq!(sellable_qty(&positions, "a", LIMIT_SYM, 600).await, 600);
+        // One whose send got no answer may be resting: it counts.
+        positions.write().await[1].limit_close.as_mut().unwrap().send_uncertain = true;
+        assert_eq!(sellable_qty(&positions, "a", LIMIT_SYM, 600).await, 450);
+    }
+
+    #[tokio::test]
+    async fn a_limit_close_books_each_part_as_it_fills_and_closes_the_position_when_all_is_sold() {
+        let (db_tx, mut db_rx) = mpsc::channel(64);
+        let memory = OrderBookMemory::default();
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(150, 152.0));
+        let positions = Arc::new(RwLock::new(vec![pos]));
+
+        // Resting, nothing filled: nothing changes.
+        assert!(!settle(&positions, &db_tx, &[limit_row("open", 150, 0, "0")], &memory).await);
+        // 75 of 150 at 152.
+        assert!(settle(&positions, &db_tx, &[limit_row("open", 150, 75, "152.00")], &memory).await);
+        {
+            let g = positions.read().await;
+            assert_eq!((g[0].executed_qty, g[0].limit_close.as_ref().map(|l| l.filled)), (225, Some(75)));
+        }
+        // The same read again books nothing more.
+        assert!(!settle(&positions, &db_tx, &[limit_row("open", 150, 75, "152.00")], &memory).await);
+        // The rest at 153 — Kotak's average over all of it is 152.50 — and it is done.
+        assert!(settle(&positions, &db_tx, &[limit_row("complete", 150, 150, "152.50")], &memory).await);
+        {
+            let g = positions.read().await;
+            assert_eq!(g[0].executed_qty, 150);
+            assert!(g[0].limit_close.is_none());
+            assert!(matches!(g[0].state, TradeState::Active), "half is still held");
+        }
+        let booked = sells_booked(&mut db_rx);
+        assert_eq!(booked.len(), 2);
+        assert_eq!((booked[0].0, booked[0].2.as_str()), (75, "LIMIT_CLOSE"));
+        assert!((booked[0].1 - 152.0).abs() < 1e-9 && (booked[1].1 - 153.0).abs() < 1e-9, "{booked:?}");
+
+        // A limit for the whole holding, filled: the position is closed.
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(300, 152.0));
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        assert!(settle(&positions, &db_tx, &[limit_row("complete", 300, 300, "152.00")], &memory).await);
+        assert!(matches!(positions.read().await[0].state, TradeState::Closed));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_limit_close_books_what_it_filled_before_it_goes() {
+        let (db_tx, mut db_rx) = mpsc::channel(64);
+        let memory = OrderBookMemory::default();
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(150, 152.0));
+        pos.force_exit = Some("CLOSED_VIA_FRONTEND".into());
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        // Cancelled to make way for Close, after 75 had filled.
+        assert!(settle(&positions, &db_tx, &[limit_row("cancelled", 150, 75, "152.00")], &memory).await);
+        let g = positions.read().await;
+        assert_eq!(g[0].executed_qty, 225, "the next sell is for what is left");
+        assert!(g[0].limit_close.is_none());
+        assert_eq!(g[0].force_exit.as_deref(), Some("CLOSED_VIA_FRONTEND"), "Close still goes, for the rest");
+        assert_eq!(sells_booked(&mut db_rx).iter().map(|b| b.0).collect::<Vec<_>>(), [75]);
+        drop(g);
+        // Rejected outright: nothing sold, nothing rests.
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(150, 152.0));
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        assert!(settle(&positions, &db_tx, &[limit_row("rejected", 150, 0, "0")], &memory).await);
+        let g = positions.read().await;
+        assert_eq!((g[0].executed_qty, g[0].limit_close.is_none()), (300, true));
+        assert!(sells_booked(&mut db_rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_limit_close_whose_send_got_no_answer_is_found_in_the_book_or_let_go() {
+        let (db_tx, _db_rx) = mpsc::channel(64);
+        let mut memory = OrderBookMemory::default();
+        let earlier = vec![book_order("1", "S", 150)];
+        memory.record(&earlier);
+        let mut lc = LimitClose::new(150, 152.0, now_ts(), false);
+        lc.send_uncertain = true;
+        lc.sent_at = Some(now_ts());
+        lc.sent_poll = Some(memory.polls());
+        let mut pos = held_scalp();
+        pos.limit_close = Some(lc);
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        // Not there yet (an older sell on the contract is not it): still waiting.
+        assert!(!settle(&positions, &db_tx, &earlier, &memory).await);
+        assert!(positions.read().await[0].limit_close.as_ref().is_some_and(|l| l.send_uncertain));
+        // It shows up: adopted.
+        let mut book = earlier.clone();
+        book.push(limit_row("open", 150, 0, "0"));
+        memory.record(&book);
+        assert!(settle(&positions, &db_tx, &book, &memory).await);
+        let lc = positions.read().await[0].limit_close.clone().unwrap();
+        assert_eq!((lc.order_id.as_deref(), lc.send_uncertain), (Some("LIM1"), false));
+
+        // Past the grace window with nothing in the book: never placed.
+        let mut lc = LimitClose::new(150, 152.0, now_ts(), false);
+        lc.send_uncertain = true;
+        lc.sent_at = Some("2026-01-05 10:00:00".into());
+        let mut pos = held_scalp();
+        pos.limit_close = Some(lc);
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        assert!(settle(&positions, &db_tx, &earlier, &memory).await);
+        assert!(positions.read().await[0].limit_close.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_limit_close_from_an_earlier_day_ended_at_that_close() {
+        let (db_tx, _db_rx) = mpsc::channel(64);
+        let mut pos = held_scalp();
+        let mut lc = resting(150, 152.0);
+        lc.requested_at = "2026-01-05 10:00:00".into();
+        pos.limit_close = Some(lc);
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        assert!(settle(&positions, &db_tx, &[], &OrderBookMemory::default()).await);
+        assert!(positions.read().await[0].limit_close.is_none());
+        // Today's, missing from the book: kept — it may still be resting.
+        let mut pos = held_scalp();
+        pos.limit_close = Some(resting(150, 152.0));
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        settle(&positions, &db_tx, &[], &OrderBookMemory::default()).await;
+        assert!(positions.read().await[0].limit_close.is_some());
+    }
+
+    fn ist_at(day: (i32, u32, u32), h: u32, m: u32) -> chrono::DateTime<chrono::FixedOffset> {
+        use chrono::TimeZone;
+        chrono::FixedOffset::east_opt(5 * 3600 + 1800).unwrap().with_ymd_and_hms(day.0, day.1, day.2, h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn a_paper_limit_close_fills_at_its_price_once_the_price_reaches_it() {
+        let open = ist_at((2026, 11, 18), 10, 0);
+        let mut pos = held_scalp();
+        pos.limit_close = Some(LimitClose::new(150, 152.0, now_ts(), false));
+        assert!(paper_limit_fill(&pos, 151.95, open).is_none());
+        assert!(matches!(paper_limit_fill(&pos, 152.4, open), Some(PosAction::LimitFill { qty: 150, price }) if price == 152.0));
+        // One at or below the price when it was placed fills at the price now.
+        pos.limit_close.as_mut().unwrap().marketable = true;
+        assert!(matches!(paper_limit_fill(&pos, 152.4, open), Some(PosAction::LimitFill { qty: 150, price }) if price == 152.4));
+        // Never more than is held.
+        pos.executed_qty = 75;
+        assert!(matches!(paper_limit_fill(&pos, 152.4, open), Some(PosAction::LimitFill { qty: 75, .. })));
+        // A forced exit (Close, exit all, the kill switch) goes first.
+        pos.force_exit = Some("CLOSED_VIA_FRONTEND".into());
+        assert!(paper_limit_fill(&pos, 152.4, open).is_none());
+    }
+
+    #[test]
+    fn a_paper_limit_close_goes_when_cancelled_or_once_the_market_shuts() {
+        let mut pos = held_scalp();
+        pos.limit_close = Some(LimitClose::new(150, 152.0, now_ts(), false));
+        assert_eq!(paper_limit_drop_reason(&pos, ist_at((2026, 11, 18), 10, 0)), None);
+        assert!(paper_limit_drop_reason(&pos, ist_at((2026, 11, 18), 15, 45)).is_some());
+        pos.limit_close.as_mut().unwrap().cancel_requested = true;
+        assert!(paper_limit_drop_reason(&pos, ist_at((2026, 11, 18), 10, 0)).is_some());
+    }
+
+    #[test]
+    fn a_limit_price_goes_on_the_tick_never_below_what_was_typed() {
+        assert_eq!(shared_domain::limit_price_on_tick(152.03, 0.05), 152.05);
+        assert_eq!(shared_domain::limit_price_on_tick(152.05, 0.05), 152.05);
+        assert_eq!(shared_domain::limit_price_on_tick(152.1, 0.05), 152.1);
+        assert_eq!(shared_domain::limit_price_on_tick(0.07, 0.05), 0.1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_monitor_fills_a_resting_limit_close_and_an_exit_cancels_one_first() {
+        let mut run = PaperRun::start(cfg_with_lots(1, 3), 150);
+        {
+            let mut g = run.positions.write().await;
+            g[0].manual = true;
+            g[0].signal.targets.clear();
+            g[0].limit_close = Some(LimitClose::new(75, 138.0, now_ts(), false));
+        }
+        let pos = run.step(137.0).await.unwrap();
+        // The clock here is real: outside market hours a limit sell lapses.
+        if !shared_domain::is_market_open() {
+            assert!(pos.limit_close.is_none(), "a limit sell lasts the day");
+            assert!(run.sells().is_empty());
+            return;
+        }
+        assert!(pos.limit_close.is_some());
+        assert!(run.sells().is_empty());
+        // Reached: one lot sold at its price, the other still held.
+        let pos = run.step(138.5).await.unwrap();
+        assert_eq!((pos.executed_qty, pos.limit_close.is_none()), (75, true));
+        assert_eq!(run.sells(), [(75, 138.0, "LIMIT_CLOSE".to_string())]);
+
+        // Another limit, then Close: it is cancelled, and the whole holding sells at market.
+        {
+            let mut g = run.positions.write().await;
+            g[0].limit_close = Some(LimitClose::new(75, 150.0, now_ts(), false));
+            g[0].force_exit = Some("CLOSED_VIA_FRONTEND".into());
+        }
+        let pos = run.step(139.0).await;
+        assert!(pos.is_none(), "closed and dropped");
+        assert_eq!(run.sells(), [(75, 139.0, "CLOSED_VIA_FRONTEND".to_string())]);
     }
 }

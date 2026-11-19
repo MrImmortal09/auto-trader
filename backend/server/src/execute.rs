@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::Serialize;
-use shared_domain::{telemetry, ChartLevels, EntryLine, MonitoredPosition, TradeState, INDEX_NAMES};
+use shared_domain::{telemetry, ChartLevels, EntryLine, LimitClose, MonitoredPosition, TradeState, INDEX_NAMES};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use trading_engine::{index_fo_segment, ChainStrike, OptionChain, ScripRecord};
 
@@ -761,6 +761,27 @@ struct PositionRow {
     line: Option<EntryLine>,
     /// Lots it holds, or a waiting buy is for.
     lots: i32,
+    /// Its limit close, while there is one; left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_close: Option<LimitCloseRow>,
+}
+
+/// A scalp's limit close, as the Trade panel shows it.
+#[derive(Serialize)]
+struct LimitCloseRow {
+    qty: i32,
+    price: f64,
+    /// Units of it sold so far (LIVE fills can come in parts).
+    filled: i32,
+    /// `sending`, `unconfirmed`, `cancelling` or `resting` — see
+    /// [`LimitClose::status`].
+    status: &'static str,
+}
+
+impl LimitCloseRow {
+    fn of(lc: &LimitClose, live: bool) -> Self {
+        LimitCloseRow { qty: lc.qty, price: lc.price, filled: lc.filled, status: lc.status(live) }
+    }
 }
 
 pub(crate) fn price(state: &AppState, key: &str) -> Option<f64> {
@@ -1014,7 +1035,7 @@ async fn build_board(state: &AppState, index: &str, expiry: Option<NaiveDate>, c
     })
 }
 
-fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
+fn position_row(state: &AppState, p: &MonitoredPosition, live: bool) -> PositionRow {
     let ltp = p
         .ws_scrip_key
         .as_deref()
@@ -1046,6 +1067,7 @@ fn position_row(state: &AppState, p: &MonitoredPosition) -> PositionRow {
         chart: p.chart.clone(),
         line: p.entry_line.clone().filter(|_| matches!(p.state, TradeState::WaitingForEntry)),
         lots: p.order_lots(lot_size),
+        limit_close: p.limit_close.as_ref().map(|lc| LimitCloseRow::of(lc, live)),
     }
 }
 
@@ -1073,6 +1095,7 @@ fn paper_row(state: &AppState, p: &PaperPosition) -> PositionRow {
         chart: p.chart.clone(),
         line: None,
         lots: p.lots(),
+        limit_close: p.limit_close.as_ref().map(|lc| LimitCloseRow::of(lc, false)),
     }
 }
 
@@ -1098,6 +1121,7 @@ fn paper_line_row(state: &AppState, o: &PaperLineOrder) -> PositionRow {
         chart: o.chart.clone(),
         line: Some(o.line.clone()),
         lots: o.lots,
+        limit_close: None,
     }
 }
 
@@ -1157,7 +1181,7 @@ pub async fn build_frame(state: &AppState, identity: &Identity, index: &str, exp
                 TradeState::WaitingForEntry => p.manual,
                 _ => true,
             })
-            .map(|p| position_row(state, p))
+            .map(|p| position_row(state, p, mode == "LIVE"))
             .collect(),
         Identity::User { user_id } => {
             let mut rows: Vec<PositionRow> = state.paper.open(*user_id).await.iter().map(|p| paper_row(state, p)).collect();

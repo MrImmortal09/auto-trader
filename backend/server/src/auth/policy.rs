@@ -218,6 +218,8 @@ mod tests {
         (GET, "/api/v2/flags", Access::SignedIn),
         (PUT, "/api/v2/flags", Access::Admin),
         (PATCH, "/api/v2/positions/abc-123", Access::Admin),
+        (POST, "/api/v2/positions/abc-123/limit-close", Access::Admin),
+        (DELETE, "/api/v2/positions/abc-123/limit-close", Access::Admin),
         (GET, "/api/v2/history", Access::Admin),
         (GET, "/api/v2/desk", Access::Admin),
         (GET, "/api/v2/orders", Access::Admin),
@@ -253,6 +255,8 @@ mod tests {
         (PATCH, "/api/v2/me/positions/abc", Access::PhoneUser),
         (POST, "/api/v2/me/positions/abc/sell", Access::PhoneUser),
         (POST, "/api/v2/me/positions/abc/close", Access::PhoneUser),
+        (POST, "/api/v2/me/positions/abc/limit-close", Access::PhoneUser),
+        (DELETE, "/api/v2/me/positions/abc/limit-close", Access::PhoneUser),
         (POST, "/api/v2/me/exit-all", Access::PhoneUser),
         (POST, "/api/v2/me/reset", Access::PhoneUser),
     ];

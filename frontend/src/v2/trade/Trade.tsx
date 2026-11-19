@@ -6,6 +6,7 @@ import { useExecuteStream } from '../../hooks/useExecuteStream';
 import { buyBlockedReason, contractLabel, MAX_LOTS, readStored, writeStored } from '../../lib/execute';
 import { useIdentity } from '../auth/identity';
 import {
+  cancelLimitClose,
   cancelLineBuy,
   cancelPosition,
   executeBuy,
@@ -24,10 +25,13 @@ import {
   getMyMarks,
   paperBuy,
   paperClose,
+  paperCancelLimitClose,
   paperCancelLineBuy,
   paperExitAll,
+  paperLimitClose,
   paperLineBuy,
   paperSellLots,
+  placeLimitClose,
   sellQty,
   setChartLevels,
   setPaperLevels,
@@ -57,6 +61,7 @@ import { ExpiryPicker } from './ExpiryPicker';
 import { HeaderSwitch, HeaderTabs, HeaderTicker, ListPicker } from './header';
 import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from './headerModel';
 import { Ladder } from './Ladder';
+import { LimitCloseDialog } from './LimitCloseDialog';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, draftLines, draftWhat, firstBuy, MAX_TARGETS, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
 import { armedLine, crossWords, draftStep, entryMisfit, linePnl, lotsLeft, orderOf, sideOf, validityOf, validityWords, VALIDITY_CHOICES, wrongSide, type LineDraft } from './lineOrder';
 import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isTicker, istClock, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
@@ -259,6 +264,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [draft, setDraft] = useState<LineDraft | null>(null);
   const [lostDraft, setLostDraft] = useState<LineDraft | null>(null);
   const [sheet, setSheet] = useState(false);
+  // The scalp whose limit close is being asked for (the Limit button).
+  const [limitFor, setLimitFor] = useState<string | null>(null);
   // The strike the ladder scrolled to, for the ladder it was scrolled on.
   const [centreAt, setCentreAt] = useState<{ key: string; strike: number } | null>(null);
   // Chains the chart pickers asked for, beyond the nearest: `INDEX:EXPIRY`.
@@ -541,6 +548,12 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       void busy(p.id, () => guard('Cancelling needs write access.', () => cancelPosition(serverBase, p.id), `${label} not cancelled`));
     },
     onCancelLine: (p) => cancelLine(p),
+    onLimit: (p) => setLimitFor(p.id),
+    onCancelLimit: (p) => {
+      const label = contractLabel(p.index, p.strike, p.option_type);
+      const cancel = () => (paper ? paperCancelLimitClose(serverBase, p.id) : cancelLimitClose(serverBase, p.id));
+      void busy(p.id, () => guard('Cancelling needs write access.', cancel, `${label}: limit sell not cancelled`, scope));
+    },
     onExitAll: () => {
       setExitAllBusy(true);
       const exitAll = () => (paper ? paperExitAll(serverBase) : executeExitAll(serverBase));
@@ -1213,6 +1226,40 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     </p>
   );
 
+  /** Send a limit close of `lots` of `p` at `at`; `true` once the server took it. */
+  async function placeLimit(p: ExecutePosition, lots: number, at: number): Promise<boolean> {
+    const label = contractLabel(p.index, p.strike, p.option_type);
+    const order = () => (paper ? paperLimitClose(serverBase, p.id, lots, at) : placeLimitClose(serverBase, p.id, lots, at));
+    const sent = await busy(p.id, () => guard('Selling needs write access.', order, `${label}: limit sell not placed`, scope));
+    if (!sent?.ok) return false;
+    const qty = lots * p.lot_size;
+    const body = (sent.body ?? {}) as { filled?: PaperFill | null; fills_now?: boolean };
+    // A paper fill's toast, with the P&L, comes from the status bar.
+    if (body.filled) return true;
+    const live = !paper && frame?.mode === 'LIVE';
+    toast(
+      body.fills_now
+        ? { tone: 'loss', title: `Selling ${qty} ${label} now`, body: `₹${price(at)} is already at or under the price — ${live ? 'Kotak fills it at the best bids' : 'it fills at the last price'}.` }
+        : {
+            tone: 'neutral',
+            title: `Limit sell: ${qty} ${label} at ₹${price(at)}`,
+            body: live ? 'Sent to Kotak as a day order — it shows on the row, and in Orders once Kotak has it.' : 'It fills when the price reaches it, and lapses at the close.',
+          },
+    );
+    return true;
+  }
+  const limitTarget = limitFor ? scalps.find((p) => p.id === limitFor && !p.placing) : undefined;
+  const limitEl = limitTarget && (
+    <LimitCloseDialog
+      p={limitTarget}
+      tick={tick(limitTarget)}
+      live={!paper && frame?.mode === 'LIVE'}
+      large={!desktop}
+      onClose={() => setLimitFor(null)}
+      onPlace={(lots, at) => placeLimit(limitTarget, lots, at)}
+    />
+  );
+
   const sheetEl = sheet && (
     <PositionSheet
       scalps={scalps}
@@ -1275,6 +1322,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         </div>
         <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />
         {sheetEl}
+        {limitEl}
       </div>
     );
   }
@@ -1442,6 +1490,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         <p className="shrink-0 border-t border-line px-3 py-1 type-caption text-fg-subtle">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>
       )}
       {sheetEl}
+      {limitEl}
     </div>
   );
 }

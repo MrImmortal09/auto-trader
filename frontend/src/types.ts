@@ -574,6 +574,23 @@ export interface ExecutePosition {
   line?: EntryLine | null;
   /** Lots held, or a waiting buy is for; absent from an older server. */
   lots?: number;
+  /** Its limit close — a limit sell of some of it at a price or better —
+   * while there is one; absent otherwise. */
+  limit_close?: LimitClose | null;
+}
+
+/** A scalp's limit close, from the Trade panel: `qty` at `price` or better,
+ * until it fills, is cancelled, or the market closes. LIVE it is a DAY limit
+ * sell at Kotak and can fill in parts; on paper it fills at its price once
+ * the price reaches it. Any other sell of the position cancels it first. */
+export interface LimitClose {
+  qty: number;
+  price: number;
+  /** Units of it sold so far. */
+  filled: number;
+  /** `sending` (LIVE, not at Kotak yet), `unconfirmed` (sent, no answer from
+   * Kotak yet), `cancelling`, or `resting`. */
+  status: 'sending' | 'unconfirmed' | 'cancelling' | 'resting';
 }
 
 /** A line order's buy line on the index chart: bought at market once the

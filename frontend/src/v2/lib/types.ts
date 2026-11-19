@@ -603,7 +603,9 @@ export interface UserReport {
 export interface PaperActivity {
   /** IST `YYYY-MM-DD HH:MM:SS`. */
   t: string;
-  kind: 'buy' | 'sell' | 'levels' | 'reset';
+  /** `line`: a buy line armed, moved, cancelled or dropped; `limit`: a limit
+   * sell placed, cancelled or lapsed (its fill is a `sell`). */
+  kind: 'buy' | 'sell' | 'levels' | 'line' | 'limit' | 'reset';
   position_id: string | null;
   message: string;
 }
@@ -656,6 +658,8 @@ export interface RawPosition {
   sl_order_id?: string | null;
   sl_order_qty?: number;
   sl_order_trigger?: number;
+  /** A scalp's limit close; `order_id` once it is at Kotak. */
+  limit_close?: { qty: number; price: number; filled?: number; order_id?: string | null } | null;
 }
 
 /** `GET /api/v2/expiries?index=`: every expiry the underlying's options are

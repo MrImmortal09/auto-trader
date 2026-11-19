@@ -74,14 +74,7 @@ pub fn decide(
         }
         return None;
     }
-    let in_window = if shared_domain::special_session_on(now.date_naive()).is_some() {
-        use chrono::Datelike;
-        let is_weekend = matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
-        shared_domain::in_special_session_at(now) || (trading_day && !is_weekend && t >= at(9, 15, 0) && t < close)
-    } else {
-        trading_day && t >= at(9, 15, 0) && t < close
-    };
-    if !in_window {
+    if !in_window(now, trading_day) {
         return None;
     }
     let hit = shared_domain::chart_hit(Some(&pos.option_type), &pos.chart, premium, index, pos.lots())?;
@@ -90,6 +83,46 @@ pub fn decide(
         ChartHit::Part { ids, .. } => Sell::Targets(ids),
     };
     Some((premium?, sell))
+}
+
+/// Whether the desk's chart levels and limit sells act at `now`: 09:15–15:30
+/// IST on a trading day, or inside a special session.
+fn in_window(now: DateTime<FixedOffset>, trading_day: bool) -> bool {
+    let t = now.time();
+    let close = at(15, 30, 0);
+    if shared_domain::special_session_on(now.date_naive()).is_some() {
+        use chrono::Datelike;
+        let is_weekend = matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        shared_domain::in_special_session_at(now) || (trading_day && !is_weekend && t >= at(9, 15, 0) && t < close)
+    } else {
+        trading_day && t >= at(9, 15, 0) && t < close
+    }
+}
+
+/// What the watch loop does with a position's resting limit sell.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LimitMove {
+    /// Let it go, selling nothing: the market closed (it lasts the day).
+    Drop,
+    /// Sell it at this price.
+    Fill(f64),
+}
+
+/// What happens to `pos`'s limit sell at `now`, with `premium` its fresh
+/// price: past the session it goes; reached, it fills at its price (or at
+/// the price now, for one that was already reached when it was placed). On
+/// its expiry day's square-off it is left to the square-off, which cancels
+/// it before it sells everything.
+pub fn limit_move(pos: &PaperPosition, now: DateTime<FixedOffset>, trading_day: bool, premium: Option<f64>) -> Option<LimitMove> {
+    let lc = pos.limit_close.as_ref()?;
+    if squaring_off(pos.expiry, now) {
+        return None;
+    }
+    if !in_window(now, trading_day) {
+        return Some(LimitMove::Drop);
+    }
+    let p = premium.filter(|p| *p >= lc.price)?;
+    Some(LimitMove::Fill(if lc.marketable { p } else { lc.price }))
 }
 
 /// One pass over every open position at `now`. `fresh` gives a feed key's
@@ -105,6 +138,23 @@ pub async fn step(desk: &PaperDesk, now: DateTime<FixedOffset>, trading_day: boo
         let index = pos.underlying_price_key().and_then(|key| fresh(&key));
         if let Some(p) = premium {
             seen.push((user_id, pos.id.clone(), p));
+        }
+        // A resting limit sell first: what it sells, the levels below see
+        // gone on the next pass.
+        match limit_move(&pos, now, trading_day, premium) {
+            Some(LimitMove::Drop) => {
+                let _ = desk.cancel_limit(user_id, &pos.id, "lapsed at the close (a limit sell lasts the day)").await;
+                continue;
+            }
+            Some(LimitMove::Fill(price)) => {
+                match desk.fill_limit(user_id, &pos.id, price).await {
+                    Ok(f) => tracing::info!(user_id, "Paper limit sell: sold {} {} at {:.2}", f.qty, f.contract, f.price),
+                    Err(r) if r.status == StatusCode::NOT_FOUND => {}
+                    Err(r) => tracing::warn!(user_id, "Paper limit sell of {} not filled: {}", pos.label(), r.message),
+                }
+                continue;
+            }
+            None => {}
         }
         let Some((price, sell)) = decide(&pos, now, trading_day, premium, index) else { continue };
         let (sold, reason) = match &sell {
@@ -269,6 +319,7 @@ mod tests {
             last_ltp: Some(101.0),
             underlying_key: None,
             segment: "nse_fo".into(),
+            limit_close: None,
         }
     }
 
@@ -291,6 +342,7 @@ mod tests {
             last_ltp: Some(41.0),
             underlying_key: c.underlying_key,
             segment: c.segment,
+            limit_close: None,
         }
     }
 
@@ -615,5 +667,28 @@ mod tests {
         assert_eq!((open[0].qty, open[0].avg_price), (150, 121.0));
         assert_eq!(open[0].chart, order.chart);
         assert!(desk.lines(1).await.is_empty());
+    }
+
+    #[test]
+    fn a_limit_sell_fills_once_reached_and_lapses_at_the_close() {
+        let mut p = held("CE", ChartLevels::default());
+        p.expiry = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        p.limit_close = Some(shared_domain::LimitClose::new(75, 120.0, "2026-11-18 10:00:00".into(), false));
+        let day = (2026, 11, 18);
+        assert_eq!(limit_move(&p, ist(day, (10, 5, 0)), true, Some(119.95)), None);
+        assert_eq!(limit_move(&p, ist(day, (10, 5, 0)), true, None), None);
+        assert_eq!(limit_move(&p, ist(day, (10, 5, 0)), true, Some(121.0)), Some(LimitMove::Fill(120.0)));
+        // One the price had already reached when it was placed fills at the price.
+        p.limit_close.as_mut().unwrap().marketable = true;
+        assert_eq!(limit_move(&p, ist(day, (10, 5, 0)), true, Some(121.0)), Some(LimitMove::Fill(121.0)));
+        // Past the session, or a holiday: it goes.
+        assert_eq!(limit_move(&p, ist(day, (15, 31, 0)), true, Some(121.0)), Some(LimitMove::Drop));
+        assert_eq!(limit_move(&p, ist(day, (10, 5, 0)), false, Some(121.0)), Some(LimitMove::Drop));
+        // On its expiry day's square-off it is the square-off's to cancel.
+        p.expiry = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        assert_eq!(limit_move(&p, ist(day, (15, 38, 0)), true, Some(121.0)), None);
+        // None rests: nothing.
+        p.limit_close = None;
+        assert_eq!(limit_move(&p, ist(day, (10, 5, 0)), true, Some(121.0)), None);
     }
 }

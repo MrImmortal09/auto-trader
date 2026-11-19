@@ -5,7 +5,7 @@ import { Minus, Plus } from 'lucide-react';
 export const MAX_STEPPER_LOTS = 10;
 
 // Figma "Lots stepper": "Lots [− 2 +] 130 qty", the count in an inset well.
-export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 'sm', label = true }: {
+export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 'sm', label = true, max = MAX_STEPPER_LOTS }: {
   lots: number;
   lotSize: number;
   onChange: (lots: number) => void;
@@ -13,10 +13,12 @@ export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 
   size?: 'sm' | 'lg';
   /** The "Lots" word before it; off where room is short (the buttons still say what they do). */
   label?: boolean;
+  /** The most it goes to; {@link MAX_STEPPER_LOTS} unless the lots are bounded otherwise (what is held). */
+  max?: number;
 }) {
   const lg = size === 'lg';
   const step = (by: number) => {
-    const next = Math.min(MAX_STEPPER_LOTS, Math.max(1, lots + by));
+    const next = Math.min(max, Math.max(1, lots + by));
     if (next !== lots) onChange(next);
   };
   const button = `grid place-items-center text-fg transition-colors duration-120 hover:bg-raised-strong disabled:opacity-40 disabled:hover:bg-transparent ${lg ? 'size-11 rounded-8' : 'size-7 rounded-6'}`;
@@ -31,7 +33,7 @@ export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 
         <span className={`text-center text-fg ${lg ? 'w-11 num-large' : 'w-8 num-medium'}`} aria-live="polite">
           {lots}
         </span>
-        <button type="button" aria-label="One lot more" className={button} disabled={disabled || lots >= MAX_STEPPER_LOTS} onClick={() => step(1)}>
+        <button type="button" aria-label="One lot more" className={button} disabled={disabled || lots >= max} onClick={() => step(1)}>
           <Plus size={lg ? 18 : 14} />
         </button>
       </div>

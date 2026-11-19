@@ -42,7 +42,14 @@ export function ActivityList({ events, large = false }: { events: ActivityEvent[
   );
 }
 
-const PAPER_TEXT: Record<PaperActivity['kind'], string> = { buy: 'text-fg', sell: 'text-fg', levels: 'text-fg-muted', reset: 'text-fg-muted' };
+const PAPER_TEXT: Record<PaperActivity['kind'], string> = {
+  buy: 'text-fg',
+  sell: 'text-fg',
+  levels: 'text-fg-muted',
+  line: 'text-fg-muted',
+  limit: 'text-fg-muted',
+  reset: 'text-fg-muted',
+};
 
 /** "10:42:05", or "27 Oct 10:42:05" on another day. */
 function when(ts: string): string {
