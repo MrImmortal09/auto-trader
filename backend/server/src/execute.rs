@@ -111,13 +111,10 @@ pub const MAX_FEED_AGE_SECS: f64 = 5.0;
 /// even while the feed itself is alive. Near-the-money index options tick
 /// about once a second.
 pub const MAX_CONTRACT_AGE_SECS: f64 = 10.0;
-/// A contract whose own price hasn't ticked for this long isn't bought by
-/// hand on the owner's desk. Illiquid options trade minutes apart, so this is
-/// far longer than [`MAX_CONTRACT_AGE_SECS`] — the owner's call. The buy goes
-/// in at market, so the fill may be well away from the price on screen. A
-/// paper desk fills at the price it reads, where a stale one would be free
-/// P&L, so it keeps [`MAX_CONTRACT_AGE_SECS`].
-pub const MAX_BUY_PRICE_AGE_SECS: f64 = 300.0;
+/// How old a contract's price may be for a buy on the owner's desk — see
+/// [`shared_domain::MAX_BUY_PRICE_AGE_SECS`] (the engine checks it too, when
+/// a buy line is crossed).
+pub const MAX_BUY_PRICE_AGE_SECS: f64 = shared_domain::MAX_BUY_PRICE_AGE_SECS;
 
 /// How old a contract's price may be for a buy from `pool`'s desk.
 pub fn buy_max_age_secs(pool: SubPool) -> f64 {

@@ -204,6 +204,15 @@ pub async fn step_lines(desk: &PaperDesk, now: DateTime<FixedOffset>, fresh: imp
     }
 }
 
+/// Whether the watch loop looks at armed buy lines on `now`'s day: a trading
+/// day, or any day with a special session, weekends and holidays included —
+/// the line route arms a line in one (`manual_buy_window_open` takes a
+/// special session), and left unwatched it would neither buy nor drop until
+/// the next trading day. `decide_line` keeps to the session's hours.
+fn lines_watched(now: DateTime<FixedOffset>, trading_day: bool) -> bool {
+    trading_day || shared_domain::special_session_on(now.date_naive()).is_some()
+}
+
 /// The watch loop, for as long as the server runs.
 pub async fn run(desk: Arc<PaperDesk>) {
     let mut tick = tokio::time::interval(EVERY);
@@ -217,7 +226,7 @@ pub async fn run(desk: Arc<PaperDesk>) {
         let now = shared_domain::now_ist();
         let trading_day = !telegram_ingester::parser::is_trading_holiday(now.date_naive());
         step(&desk, now, trading_day, fresh).await;
-        if trading_day {
+        if lines_watched(now, trading_day) {
             step_lines(&desk, now, fresh).await;
         }
     }
@@ -542,6 +551,37 @@ mod tests {
         early.armed_at = "2026-11-18 09:00:00".into();
         let (pre, pre_ts) = at(9, 10, 0);
         assert_eq!(decide_line(&early, pre, &pre_ts, Some(25_970.0), Some(120.0)), None);
+    }
+
+    #[test]
+    fn line_orders_are_watched_in_a_special_session_on_a_weekend() {
+        let _guard = shared_domain::special_sessions_test_guard();
+        let sunday = |h, m, s| {
+            let now = ist((2026, 11, 8), (h, m, s));
+            (now, now.format("%Y-%m-%d %H:%M:%S").to_string())
+        };
+        let mut order = armed();
+        order.armed_at = "2026-11-08 14:25:00".into();
+        order.line.valid_until = None;
+        let (during, during_ts) = sunday(14, 30, 0);
+        // No session that Sunday: not a day the lines are looked at.
+        shared_domain::set_special_sessions(vec![]);
+        assert!(!lines_watched(during, false));
+        assert!(lines_watched(during, true));
+
+        shared_domain::set_special_sessions(vec![shared_domain::SpecialSession {
+            date: NaiveDate::from_ymd_opt(2026, 11, 8).unwrap(),
+            start: 14 * 60 + 20,
+            end: 15 * 60 + 30,
+        }]);
+        assert!(lines_watched(during, false));
+        // Inside the session the line buys when its index reaches it ...
+        assert_eq!(decide_line(&order, during, &during_ts, Some(26_000.0), Some(120.0)), None);
+        assert_eq!(decide_line(&order, during, &during_ts, Some(25_975.0), Some(120.0)), Some(LineMove::Fill(120.0)));
+        // ... and is dropped at the session's end, not left armed.
+        let (end, end_ts) = sunday(15, 30, 0);
+        assert!(matches!(decide_line(&order, end, &end_ts, Some(26_000.0), Some(120.0)), Some(LineMove::Drop(_))));
+        shared_domain::set_special_sessions(vec![]);
     }
 
     #[tokio::test]

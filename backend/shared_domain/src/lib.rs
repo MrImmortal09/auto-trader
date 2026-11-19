@@ -1318,6 +1318,15 @@ pub struct ManualAdd {
 /// user never saw.
 pub const MANUAL_ORDER_TTL_SECS: i64 = 15;
 
+/// A contract whose own price hasn't ticked for this long isn't bought by
+/// hand on the owner's desk, nor by the owner's buy line when it is crossed.
+/// Illiquid options trade minutes apart, so this is far longer than the
+/// server's `MAX_CONTRACT_AGE_SECS` — the owner's call. The buy goes in at
+/// market, so the fill may be well away from the price on screen. A paper
+/// desk fills at the price it reads, where a stale one would be free P&L, so
+/// it keeps `MAX_CONTRACT_AGE_SECS`.
+pub const MAX_BUY_PRICE_AGE_SECS: f64 = 300.0;
+
 /// Per-position state of the indicator entry gate
 /// (`TradingConfig::indicator_sizing`): the wait-on-disagree log marker and
 /// the aggressive top-up's order tracking.

@@ -691,6 +691,25 @@ fn line_step(pos: &MonitoredPosition, index: Option<f64>, now: chrono::DateTime<
     Some(LineStep::Trigger { index })
 }
 
+/// Whether a crossed buy line is still waiting for its contract's price to be
+/// live — ticked within the owner's tap limit
+/// ([`shared_domain::MAX_BUY_PRICE_AGE_SECS`]) — before it buys. The arm
+/// route checks that age when the line is placed, but the crossing can come
+/// hours later, on a far strike that hasn't traded since, and the entry paths
+/// buy at whatever `ltp_map` holds (a PAPER fill is booked at it). Meanwhile
+/// nothing is sent, and the 15 s rule from the crossing
+/// ([`manual_entry_expired_reason`]) drops it if no live price comes — as the
+/// users' paper desk does. `last_tick` gives a feed key's last tick and `now`
+/// the clock, both in Unix seconds.
+fn line_buy_waits_for_price(pos: &MonitoredPosition, last_tick: impl Fn(&str) -> Option<f64>, now: f64) -> bool {
+    let crossed = pos.manual && pos.entry_line.as_ref().is_some_and(|l| l.triggered_at.is_some());
+    if !crossed {
+        return false;
+    }
+    let Some(key) = pos.ws_scrip_key.as_deref() else { return true };
+    last_tick(key).is_none_or(|t| now - t > shared_domain::MAX_BUY_PRICE_AGE_SECS)
+}
+
 /// Watch every armed buy line (line orders, both modes): drop one whose
 /// validity ran out, whose contract is being squared off, or whose index
 /// jumped past its stop or a target, and turn one the index reached into a
@@ -3064,6 +3083,11 @@ fn decide_live(
                     loud: true,
                 });
             }
+            // A crossed buy line buys only on a live price; the 15 s rule
+            // above drops it if none comes.
+            if line_buy_waits_for_price(pos, telemetry::scrip_last_tick, telemetry::unix_now()) {
+                return None;
+            }
             let ltp = ltp?;
             if !entry_triggered(&pos.signal, ltp, cfg) {
                 return None;
@@ -5006,6 +5030,11 @@ pub async fn start_position_monitor(
                         }
                         if let Some(reason) = manual_entry_expired_reason(pos, &gate.now_ts) {
                             pending.push(Pending { idx: i, ltp: 0.0, action: PosAction::Cancel { reason } });
+                            continue;
+                        }
+                        // A crossed buy line is filled only at a live price;
+                        // the 15 s rule above drops it if none comes.
+                        if line_buy_waits_for_price(pos, telemetry::scrip_last_tick, telemetry::unix_now()) {
                             continue;
                         }
                     }
@@ -7165,6 +7194,13 @@ mod tests {
         pos.signal.entry_condition = "MARKET".into();
         assert!(!pos.line_armed());
         assert_eq!(line_step(&pos, Some(25_979.0), at), None);
+        // Its own feed key, so no other test's tick makes its price live.
+        let key = "nse_fo|line-buy-test";
+        pos.ws_scrip_key = Some(key.to_string());
+        ltp.insert(key.to_string(), 121.0);
+        // A price that hasn't ticked: nothing is sent yet.
+        assert_eq!(decide_live(&pos, &ltp, &cfg, false, true, &gate), None);
+        telemetry::feed_tick(key);
         match decide_live(&pos, &ltp, &cfg, false, true, &gate) {
             Some(LiveAction::PlaceEntry { qty: 150, limit_price: None, .. }) => {}
             other => panic!("expected a 2-lot market entry, got {other:?}"),
@@ -7174,6 +7210,27 @@ mod tests {
             Some(LiveAction::AbandonEntry { reason, loud: true }) => assert!(reason.contains("buy line was crossed"), "{reason}"),
             other => panic!("expected the late send to be dropped, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_crossed_line_buys_only_on_a_contract_price_within_the_tap_limit() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = line_order(&ltp, &format!("{} 10:55:00", ist_today()));
+        let now = 1_000_000.0;
+        let ticked = |age: f64| move |_: &str| Some(now - age);
+        // Armed, not crossed: the line watch decides, not this.
+        assert!(!line_buy_waits_for_price(&pos, |_| None, now));
+        pos.entry_line.as_mut().unwrap().triggered_at = Some(format!("{} 11:04:55", ist_today()));
+        pos.signal.entry_condition = "MARKET".into();
+        assert!(!line_buy_waits_for_price(&pos, ticked(1.0), now));
+        assert!(!line_buy_waits_for_price(&pos, ticked(shared_domain::MAX_BUY_PRICE_AGE_SECS), now));
+        assert!(line_buy_waits_for_price(&pos, ticked(shared_domain::MAX_BUY_PRICE_AGE_SECS + 1.0), now));
+        assert!(line_buy_waits_for_price(&pos, |_| None, now), "never ticked");
+        pos.ws_scrip_key = None;
+        assert!(line_buy_waits_for_price(&pos, ticked(1.0), now), "no feed key to read");
+        // A tap's buy, with no line, is left to the route's own check.
+        let tap = manual_position(&ltp);
+        assert!(!line_buy_waits_for_price(&tap, |_| None, now));
     }
 
     #[test]
