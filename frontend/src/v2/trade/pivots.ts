@@ -1,7 +1,9 @@
 // Standard pivot points: TradingView's "Pivot Points Standard", Traditional
 // type, daily — each day's levels from the day before's high, low and close.
+// An Indian instrument's day is its IST session; a perp's, trading around the
+// clock, is the UTC day, as Hyperliquid's own chart (TradingView) counts it.
 
-import { inSession, istDay, type Bar } from './model';
+import { inSession, istDay, utcDay, type Bar } from './model';
 
 export interface PivotLevels {
   p: number;
@@ -21,17 +23,27 @@ export function standardPivots(h: number, l: number, c: number): PivotLevels {
   };
 }
 
+/** The day number a bar's pivots go by: its IST day, or a perp's (`allDay`) UTC day. */
+export function pivotDay(allDay: boolean): (t: number) => number {
+  return allDay ? utcDay : istDay;
+}
+
 /**
- * Each day's pivots, by IST day number, from the session bars of the trading
- * day before it: its high, low and last close. The first day in `bars` has
- * nothing before it, so no levels. `allDay` (a perp, trading around the
- * clock) counts every bar of the IST day.
+ * Each day's pivots, by day number (`pivotDay`), from the session bars of
+ * the trading day before it: its high, low and last close. The first day in
+ * `bars` has nothing before it, so no levels. `allDay` (a perp, trading
+ * around the clock) counts every bar of the UTC day; the bars, read from an
+ * IST midnight, start part-way into their first UTC day, which then gives
+ * the next day no levels rather than wrong ones.
  */
 export function pivotsByDay(bars: Bar[], allDay = false): Map<number, PivotLevels> {
+  const dayOf = pivotDay(allDay);
   const days = new Map<number, { h: number; l: number; c: number; t: number }>();
+  let first = Infinity;
   for (const b of bars) {
     if (!allDay && !inSession(b.t)) continue;
-    const d = istDay(b.t);
+    first = Math.min(first, b.t);
+    const d = dayOf(b.t);
     const day = days.get(d);
     if (!day) days.set(d, { h: b.h, l: b.l, c: b.c, t: b.t });
     else {
@@ -46,6 +58,8 @@ export function pivotsByDay(bars: Bar[], allDay = false): Map<number, PivotLevel
   const order = [...days.keys()].sort((a, b) => a - b);
   const out = new Map<number, PivotLevels>();
   for (let i = 1; i < order.length; i++) {
+    // A perp's day before must be there whole, from its 00:00 UTC.
+    if (allDay && first > order[i - 1] * 86_400_000) continue;
     const prev = days.get(order[i - 1])!;
     out.set(order[i], standardPivots(prev.h, prev.l, prev.c));
   }
