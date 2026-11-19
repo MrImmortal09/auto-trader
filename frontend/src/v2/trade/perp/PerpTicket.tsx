@@ -176,12 +176,32 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
 
   // ── Buy on a line: the line, then its stop, then its target, each a tap ── //
 
-  // What the taps read when they land (the ticket may have changed since the first).
-  const latest = useRef({ side, usedLev, validity, amount, sizeIn });
+  // What the taps read when they land: the ticket as it stands then — the
+  // line and stop as its fields show them, corrected by hand between taps
+  // or not, so what arms is what the ticket and the chart show.
+  const fieldLine = typed(priceText) == null ? null : roundPrice(k, typed(priceText)!);
+  const latest = useRef({ side, usedLev, validity, amount, sizeIn, line: fieldLine, stop });
   useEffect(() => {
-    latest.current = { side, usedLev, validity, amount, sizeIn };
+    latest.current = { side, usedLev, validity, amount, sizeIn, line: fieldLine, stop };
   });
   const step = perps.placing?.kind === 'pick' && perps.placing.key === k ? (perps.placing.options?.step ?? null) : null;
+
+  // A pick this ticket started ends with it: closed, or switched to another
+  // perp, it leaves no chart taking taps into a ticket that isn't there.
+  const placingNow = useRef(perps.placing);
+  useEffect(() => {
+    placingNow.current = perps.placing;
+  });
+  const cancelPlacing = perps.cancelPlacing;
+  useEffect(
+    () => () => {
+      if (placingNow.current?.kind === 'pick') cancelPlacing();
+    },
+    [k, cancelPlacing],
+  );
+
+  /** The line as the ticket's field has it now, else where it was tapped. */
+  const lineNow = (tapped: number) => latest.current.line ?? tapped;
 
   /** The coin size the amount comes to on a line at `line`, as the ticket stands now. */
   const coinsOn = (line: number): number | null => {
@@ -195,7 +215,8 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
     const t = latest.current;
     const coins = coinsOn(line);
     if (coins == null || coins <= 0) {
-      toast({ tone: 'loss', title: 'Line order not armed', body: 'Type the amount first.' });
+      const step_ = `${(10 ** -rules.szDecimals).toFixed(rules.szDecimals)} ${rules.unit}`;
+      toast({ tone: 'loss', title: 'Line order not armed', body: t.amount == null ? 'Type the amount first.' : `The amount is too small: at this line it comes to less than one size step (${step_}).` });
       return;
     }
     setSending(true);
@@ -225,21 +246,24 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   };
 
   /** A tap's words on the chart: the price, and the P&L there from the line. */
-  const tapLabel = (what: string, line: number) => (at: number) => {
+  const tapLabel = (what: string, tapped: number) => (at: number) => {
+    const line = lineNow(tapped);
     const coins = coinsOn(line);
     return `${what} · ${perpPrice(at)}${coins != null && coins > 0 ? ` · ${signedUsd(pnlAt(latest.current.side, coins, line, at))}` : ''}`;
   };
 
-  function askTarget(line: number, stopAt: number | null) {
+  function askTarget(tapped: number) {
     perps.pick(
       k,
       'Target',
       (at) => {
+        const line = lineNow(tapped);
         if (!onSide(latest.current.side, 'target', line, at)) return wrongSide('target', line);
         setTargetText(String(at));
-        void armLine(line, stopAt, at);
+        // The line and stop as the fields have them now.
+        void armLine(line, latest.current.stop, at);
       },
-      { step: 'target', color: C.profit, label: tapLabel('Target (optional)', line) },
+      { step: 'target', color: C.profit, label: tapLabel('Target (optional)', tapped) },
     );
   }
 
@@ -261,9 +285,9 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           k,
           'Stop',
           (at) => {
-            if (!onSide(latest.current.side, 'stop', line, at)) return wrongSide('stop', line);
+            if (!onSide(latest.current.side, 'stop', lineNow(line), at)) return wrongSide('stop', lineNow(line));
             setStopText(String(at));
-            askTarget(line, at);
+            askTarget(line);
             return true;
           },
           { step: 'stop', color: C.loss, label: tapLabel('Stop (optional)', line) },
@@ -390,7 +414,11 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           {sizeIn === 'usd'
             ? size != null && price != null
               ? `Margin · ${sizeText(k, size)}, a ${usd(size * price)} position at ${usedLev}x`
-              : 'Margin · the size follows from the line'
+              : isLine
+                ? 'Margin · the size follows from the line'
+                : kind === 'limit'
+                  ? 'Margin · the size follows from the limit price'
+                  : 'Margin · the size follows once the price is in'
             : margin != null
               ? `≈ ${usd(margin)} of margin at ${usedLev}x`
               : ''}
