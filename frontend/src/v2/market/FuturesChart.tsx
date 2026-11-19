@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { dispose, init, type AxisCreateRangeCallback, type Chart, type KLineData } from 'klinecharts';
 import { ChevronDown, Layers as LayersIcon } from 'lucide-react';
-import { apiUrl } from '../../lib/api';
-import { streamToken } from '../lib/api';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { MarketIndex } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
-import { fetchBars, toK, upsert } from '../trade/bars';
+import { fetchBars, fetchDays, followCandles, putOnChart, toK, upsert } from '../trade/bars';
 import { CHART_STYLES, showOscillator, THOUSANDS, VWAP_SERIES } from '../trade/chartSetup';
 import { DrawBanner, DrawMenu } from '../trade/DrawMenu';
 import { KlineDrawings, useDrawing } from '../trade/drawings';
@@ -146,25 +144,30 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
     drawings.current?.hide();
     c.setSymbol({ ticker: symbol, pricePrecision: 2, volumePrecision: 0 });
     c.setPeriod({ type: 'minute', span: TF_MS[tf] / 60_000 });
-    const token = streamToken();
-    const params = new URLSearchParams({ symbols: symbol, tf });
-    if (token) params.set('token', token);
-    const es = new EventSource(`${apiUrl(serverBase, '/api/v2/candles/stream')}?${params}`);
-    es.addEventListener('bars', (e) => {
-      let body: { updates: { symbol: string; bar: Bar }[] };
-      try {
-        body = JSON.parse((e as MessageEvent<string>).data);
-      } catch {
-        return;
-      }
-      for (const u of body.updates) {
-        if (u.symbol !== symbol) continue;
-        setBars((prev) => (prev ? upsert(prev, u.bar) : prev));
-        pushBar.current?.(toK(u.bar));
-      }
-    });
+    let live = true;
+    // Bars (oldest first) into the kept list and onto the chart, older ones
+    // included (see `putOnChart`); none before the chart has loaded.
+    const take = (list: Bar[]) => {
+      if (list.length === 0) return;
+      setBars((prev) => (prev ? list.reduce(upsert, prev) : prev));
+      const push = pushBar.current;
+      if (push) putOnChart(c, push, list);
+    };
+    const stop = followCandles(
+      serverBase,
+      [symbol],
+      tf,
+      (updates) => take(updates.filter((u) => u.symbol === symbol).map((u) => u.bar)),
+      // Back after a gap: today's bars again, for what changed meanwhile.
+      () => {
+        fetchDays(serverBase, symbol, tf, 1)
+          .then((today) => live && take(today))
+          .catch(() => {});
+      },
+    );
     return () => {
-      es.close();
+      live = false;
+      stop();
       setBars(null);
       setError(null);
     };
