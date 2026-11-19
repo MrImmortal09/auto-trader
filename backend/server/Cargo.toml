@@ -13,6 +13,7 @@ trading_engine     = { path = "../trading_engine" }
 kotak_client       = { path = "../kotak_client" }
 telegram_ingester  = { path = "../telegram_ingester" }
 upstox_client      = { path = "../upstox_client" }
+hyperliquid_client = { path = "../hyperliquid_client" }
 
 tokio              = { version = "1", features = ["full"] }
 axum               = { version = "0.7", features = ["macros"] }

@@ -12,6 +12,7 @@ import {
   daySummary,
   futureFor,
   inSession,
+  allDay,
   hasVolume,
   symbolName,
   TF_MS,
@@ -126,6 +127,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   const [futureBars, setFutureBars] = useState<Bar[]>([]);
   const [error, setError] = useState<string | null>(null);
   const tfRef = useRef(tf);
+  const allDayRef = useRef(allDay(sym));
   // What the chart should be showing; a slow answer for anything else is dropped.
   const want = useRef({ base: serverBase, symbol: symbolName(sym), tf });
   // Line callbacks by overlay id, so overlays never hold stale closures.
@@ -153,11 +155,13 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
 
   const symbol = symbolName(sym);
   const future = futureFor(sym);
+  const wholeDay = allDay(sym);
 
   useEffect(() => {
     tfRef.current = tf;
+    allDayRef.current = wholeDay;
     want.current = { base: serverBase, symbol, tf };
-  }, [serverBase, symbol, tf]);
+  }, [serverBase, symbol, tf, wholeDay]);
 
   // The chart itself, for the component's lifetime.
   useLayoutEffect(() => {
@@ -173,7 +177,8 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       formatter: {
         formatExtendText: ({ data }) => {
           const now = Date.now();
-          return inSession(now) ? countdown(data.timestamp + TF_MS[tfRef.current], now) : '';
+          // A perp's bars run around the clock; an Indian one's only in session.
+          return allDayRef.current || inSession(now) ? countdown(data.timestamp + TF_MS[tfRef.current], now) : '';
         },
       },
     });
@@ -410,7 +415,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       fetchDays(serverBase, symbol, '15m', 8)
         .then((bars) => {
           if (!live) return;
-          PIVOT_SERIES.set(chartId, pivotsByDay(bars));
+          PIVOT_SERIES.set(chartId, pivotsByDay(bars, wholeDay));
           show();
         })
         .catch(() => {});
@@ -420,7 +425,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       live = false;
       window.clearInterval(timer);
     };
-  }, [pivots, symbol, serverBase, chartId]);
+  }, [pivots, symbol, serverBase, chartId, wholeDay]);
 
   // Order lines and markers, kept in step with what the screen says.
   useEffect(() => {
