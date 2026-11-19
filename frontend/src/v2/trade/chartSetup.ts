@@ -126,6 +126,8 @@ function iconFigures(icon: 'grip' | 'lock', x: number, y: number, color: string)
 export interface OrderLineData {
   color: string;
   dashed: boolean;
+  /** Dotted, finer than dashed: an estimate (a perp's liquidation), not an order. */
+  dotted?: boolean;
   /** The pills, left to right, right-aligned against the axis. Called on every
    * draw with the line's price, so a dragged line's label follows it. */
   parts: (price: number) => LinePart[];
@@ -154,7 +156,7 @@ registerOverlay<OrderLineData>({
         key: 'line',
         type: 'line',
         attrs: { coordinates: [{ x: 0, y }, { x: bounding.width, y }] },
-        styles: { style: d.dashed ? 'dashed' : 'solid', dashedValue: [4, 4], color: d.color, size: 1 },
+        styles: { style: d.dashed || d.dotted ? 'dashed' : 'solid', dashedValue: d.dotted ? [1, 3] : [4, 4], color: d.color, size: 1 },
         // The hairline never drags: pressing near it pans the chart, so a
         // stop can only move from its label.
         ignoreEvent: NO_DRAG,
