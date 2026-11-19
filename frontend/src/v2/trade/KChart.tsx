@@ -1,8 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import { dispose, init, type AxisCreateRangeCallback, type Chart, type KLineData, type OverlayEvent } from 'klinecharts';
-import { apiUrl } from '../../lib/api';
-import { streamToken } from '../lib/api';
-import { fetchBars, fetchDays, putOnChart, toK, upsert } from './bars';
+import { fetchBars, fetchDays, followCandles, putOnChart, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
 import { CHART_STYLES, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
 import { DRAW_PREFIX, KlineDrawings, NO_DRAW_PREFS, useDrawPrefs, type DrawApi } from './drawings';
@@ -303,40 +301,29 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     const takeFuture = (list: Bar[]) => {
       if (list.length > 0) setFutureBars((prev) => list.reduce(upsert, prev));
     };
-    const token = streamToken();
-    const params = new URLSearchParams({ symbols: [symbol, future].filter(Boolean).join(','), tf });
-    if (token) params.set('token', token);
-    const es = new EventSource(`${apiUrl(serverBase, '/api/v2/candles/stream')}?${params}`);
-    // EventSource reconnects by itself, and the stream sends only what changes
-    // after it is open: what changed while it was down is today's bars again.
-    let opened = false;
-    es.addEventListener('open', () => {
-      if (!opened) {
-        opened = true;
-        return;
-      }
-      fetchDays(serverBase, symbol, tf, 1)
-        .then((today) => live && take(today))
-        .catch(() => {});
-      if (future) {
-        fetchDays(serverBase, future, tf, 1)
-          .then((today) => live && takeFuture(today))
+    const stop = followCandles(
+      serverBase,
+      [symbol, future].filter((s): s is string => !!s),
+      tf,
+      (updates) => {
+        take(updates.filter((u) => u.symbol === symbol).map((u) => u.bar));
+        if (future) takeFuture(updates.filter((u) => u.symbol === future).map((u) => u.bar));
+      },
+      // Back after a gap: today's bars again, for what changed meanwhile.
+      () => {
+        fetchDays(serverBase, symbol, tf, 1)
+          .then((today) => live && take(today))
           .catch(() => {});
-      }
-    });
-    es.addEventListener('bars', (e) => {
-      let body: { updates: { symbol: string; bar: Bar }[] };
-      try {
-        body = JSON.parse((e as MessageEvent<string>).data);
-      } catch {
-        return;
-      }
-      take(body.updates.filter((u) => u.symbol === symbol).map((u) => u.bar));
-      if (future) takeFuture(body.updates.filter((u) => u.symbol === future).map((u) => u.bar));
-    });
+        if (future) {
+          fetchDays(serverBase, future, tf, 1)
+            .then((today) => live && takeFuture(today))
+            .catch(() => {});
+        }
+      },
+    );
     return () => {
       live = false;
-      es.close();
+      stop();
       // The next symbol starts from nothing.
       setBars(null);
       setFutureBars([]);

@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { dispose, init, type AxisCreateRangeCallback, type Chart, type KLineData } from 'klinecharts';
 import { ChevronDown, Layers as LayersIcon } from 'lucide-react';
-import { apiUrl } from '../../lib/api';
-import { streamToken } from '../lib/api';
 import { price, signedPct, toneOf } from '../lib/format';
 import type { MarketIndex } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
-import { fetchBars, fetchDays, putOnChart, toK, upsert } from '../trade/bars';
+import { fetchBars, fetchDays, followCandles, putOnChart, toK, upsert } from '../trade/bars';
 import { CHART_STYLES, showOscillator, THOUSANDS, VWAP_SERIES } from '../trade/chartSetup';
 import { DrawBanner, DrawMenu } from '../trade/DrawMenu';
 import { KlineDrawings, useDrawing } from '../trade/drawings';
@@ -155,34 +153,21 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
       const push = pushBar.current;
       if (push) putOnChart(c, push, list);
     };
-    const token = streamToken();
-    const params = new URLSearchParams({ symbols: symbol, tf });
-    if (token) params.set('token', token);
-    const es = new EventSource(`${apiUrl(serverBase, '/api/v2/candles/stream')}?${params}`);
-    // EventSource reconnects by itself, and the stream sends only what changes
-    // after it is open: what changed while it was down is today's bars again.
-    let opened = false;
-    es.addEventListener('open', () => {
-      if (!opened) {
-        opened = true;
-        return;
-      }
-      fetchDays(serverBase, symbol, tf, 1)
-        .then((today) => live && take(today))
-        .catch(() => {});
-    });
-    es.addEventListener('bars', (e) => {
-      let body: { updates: { symbol: string; bar: Bar }[] };
-      try {
-        body = JSON.parse((e as MessageEvent<string>).data);
-      } catch {
-        return;
-      }
-      take(body.updates.filter((u) => u.symbol === symbol).map((u) => u.bar));
-    });
+    const stop = followCandles(
+      serverBase,
+      [symbol],
+      tf,
+      (updates) => take(updates.filter((u) => u.symbol === symbol).map((u) => u.bar)),
+      // Back after a gap: today's bars again, for what changed meanwhile.
+      () => {
+        fetchDays(serverBase, symbol, tf, 1)
+          .then((today) => live && take(today))
+          .catch(() => {});
+      },
+    );
     return () => {
       live = false;
-      es.close();
+      stop();
       setBars(null);
       setError(null);
     };
