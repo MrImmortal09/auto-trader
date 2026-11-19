@@ -589,8 +589,10 @@ export interface LimitClose {
   /** Units of it sold so far. */
   filled: number;
   /** `sending` (LIVE, not at Kotak yet), `unconfirmed` (sent, no answer from
-   * Kotak yet), `cancelling`, or `resting`. */
-  status: 'sending' | 'unconfirmed' | 'cancelling' | 'resting';
+   * Kotak yet), `missing` (not in Kotak's order book past the grace window:
+   * it still holds every other sell back, and × releases it), `cancelling`,
+   * or `resting`. */
+  status: 'sending' | 'unconfirmed' | 'missing' | 'cancelling' | 'resting';
 }
 
 /** A line order's buy line on the index chart: bought at market once the

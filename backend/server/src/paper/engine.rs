@@ -109,12 +109,19 @@ pub enum LimitMove {
 }
 
 /// What happens to `pos`'s limit sell at `now`, with `premium` its fresh
-/// price: past the session it goes; reached, it fills at its price (or at
+/// price: past the session, or from an earlier day, it goes; reached, it
+/// fills at its price (or at
 /// the price now, for one that was already reached when it was placed). On
 /// its expiry day's square-off it is left to the square-off, which cancels
 /// it before it sells everything.
 pub fn limit_move(pos: &PaperPosition, now: DateTime<FixedOffset>, trading_day: bool, premium: Option<f64>) -> Option<LimitMove> {
     let lc = pos.limit_close.as_ref()?;
+    // One placed on an earlier day lapsed at that day's close, even if the
+    // server was down through it and first sees it in today's session.
+    let today = now.date_naive().format("%Y-%m-%d").to_string();
+    if !lc.requested_at.starts_with(&today) {
+        return Some(LimitMove::Drop);
+    }
     if squaring_off(pos.expiry, now) {
         return None;
     }
@@ -143,7 +150,7 @@ pub async fn step(desk: &PaperDesk, now: DateTime<FixedOffset>, trading_day: boo
         // gone on the next pass.
         match limit_move(&pos, now, trading_day, premium) {
             Some(LimitMove::Drop) => {
-                let _ = desk.cancel_limit(user_id, &pos.id, "lapsed at the close (a limit sell lasts the day)").await;
+                let _ = desk.cancel_limit(user_id, &pos.id, "lapsed at the close (a limit sell lasts the day it is placed)").await;
                 continue;
             }
             Some(LimitMove::Fill(price)) => {
@@ -687,6 +694,10 @@ mod tests {
         // On its expiry day's square-off it is the square-off's to cancel.
         p.expiry = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
         assert_eq!(limit_move(&p, ist(day, (15, 38, 0)), true, Some(121.0)), None);
+        // The server down through the close: the next morning it goes, unfilled,
+        // even with the market open and the price past it.
+        p.expiry = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        assert_eq!(limit_move(&p, ist((2026, 11, 19), (9, 20, 0)), true, Some(121.0)), Some(LimitMove::Drop));
         // None rests: nothing.
         p.limit_close = None;
         assert_eq!(limit_move(&p, ist(day, (10, 5, 0)), true, Some(121.0)), None);

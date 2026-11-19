@@ -141,6 +141,12 @@ fn paper_limit_drop_reason(pos: &MonitoredPosition, now: chrono::DateTime<chrono
     if lc.cancel_requested {
         return Some("cancelled by hand".to_string());
     }
+    // One placed on an earlier day lapsed at that day's close, even if the
+    // server was down through it and first sees it with the market open.
+    let today = now.date_naive().format("%Y-%m-%d").to_string();
+    if !lc.requested_at.starts_with(&today) {
+        return Some("placed on an earlier day — a limit sell lasts the day it is placed".to_string());
+    }
     (!shared_domain::is_market_open_at(now)).then(|| "the market closed — a limit sell lasts the day".to_string())
 }
 
@@ -2307,6 +2313,7 @@ async fn settle_limit_close(
                     if let Some(l) = p.limit_close.as_mut() {
                         l.order_id = Some(adopted.clone());
                         l.send_uncertain = false;
+                        l.missing_noted = false;
                     }
                 }).await;
                 loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
@@ -2315,19 +2322,39 @@ async fn settle_limit_close(
                 return true;
             }
             [] => {
-                let waited = secs_since_ist(&lc.sent_at).unwrap_or(i64::MAX);
-                if waited >= UNCERTAIN_ENTRY_GRACE.as_secs() as i64 {
+                // A DAY order sent on an earlier day ended at that day's
+                // close, whether or not it was ever placed.
+                let today = shared_domain::today_ist().format("%Y-%m-%d").to_string();
+                if !lc.requested_at.starts_with(&today) {
                     with_position(positions, &leg.pos_id, |p| p.limit_close = None).await;
                     live_info(db_tx, log_tx, json!({
-                        "event": "LIMIT_CLOSE_UNCONFIRMED_CLEARED",
+                        "event": "LIMIT_CLOSE_EXPIRED",
                         "instrument": leg.instrument,
-                        "note": format!("no matching sell in the book {waited}s after an unconfirmed limit-sell send — treating it as never placed"),
+                        "note": "an unconfirmed limit sell from an earlier day — whatever it was, it ended at that day's close",
                         "mode": "LIVE",
                     })).await;
                     return true;
                 }
-                // Still inside the grace window: Kotak may not show it yet.
-                return false;
+                // Not found yet. It may still be resting at Kotak (a slow
+                // book, or one that spells its price or quantity in a way
+                // the match misses), and a DAY order rests: so it is never
+                // taken as unplaced. Every other sell stays held back and
+                // the owner hears it once; the search goes on, and the ×
+                // releases it once they have checked Kotak.
+                let waited = secs_since_ist(&lc.sent_at).unwrap_or(i64::MAX);
+                if waited < UNCERTAIN_ENTRY_GRACE.as_secs() as i64 || lc.missing_noted {
+                    return false;
+                }
+                with_position(positions, &leg.pos_id, |p| {
+                    if let Some(l) = p.limit_close.as_mut() {
+                        l.missing_noted = true;
+                    }
+                }).await;
+                loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
+                    "limit sell of {} @ ₹{:.2} on {sym} got no answer and isn't in Kotak's order book after {waited}s — it may still be resting, so no other sell goes out for this position. Check the Kotak app: cancel it there if it is resting, then release it with × on the row",
+                    lc.qty, lc.price
+                )).await;
+                return true;
             }
             many => {
                 let n = many.len();
@@ -2366,7 +2393,7 @@ async fn settle_limit_close(
                 }
             }).await;
             loud_error_at(db_tx, log_tx, &leg.instrument, &leg.pos_id, &format!(
-                "limit sell {oid} isn't in Kotak's order book — it may still be resting, so no other sell goes out for this position until it shows. Check the Kotak app"
+                "limit sell {oid} isn't in Kotak's order book — it may still be resting, so no other sell goes out for this position until it shows. Check the Kotak app: cancel it there if it is resting, then release it with × on the row"
             )).await;
             return true;
         }
@@ -2374,6 +2401,15 @@ async fn settle_limit_close(
     };
 
     let mut changed = false;
+    // Missing once, in the book now.
+    if lc.missing_noted {
+        with_position(positions, &leg.pos_id, |p| {
+            if let Some(l) = p.limit_close.as_mut() {
+                l.missing_noted = false;
+            }
+        }).await;
+        changed = true;
+    }
     let filled = ord.filled_qty().clamp(0, lc.qty);
     let fresh = filled - lc.filled;
     if fresh > 0 {
@@ -3329,6 +3365,10 @@ enum LiveAction {
     CancelLimitClose { reason: String, by_hand: bool },
     /// Let go of a limit close that never reached Kotak. No broker call.
     DropLimitClose { reason: String, loud: bool },
+    /// The owner's × on a limit close missing from Kotak's order book past
+    /// the grace window (`LimitClose::missing_noted`), after checking Kotak:
+    /// a best-effort cancel if its number is known, then it is let go.
+    ReleaseLimitClose,
 }
 
 struct LivePending {
@@ -3389,6 +3429,11 @@ fn limit_close_gate(pos: &MonitoredPosition, action: Option<LiveAction>, now_ts:
     // what the limit fills).
     if pos.live_halt.is_some() || !matches!(pos.state, TradeState::Active | TradeState::Target1Hit) {
         return None;
+    }
+    // Missing from Kotak's book, and the owner, having checked Kotak, asks
+    // to let it go: the one way out of the hold below.
+    if lc.missing_noted && lc.cancel_requested && lc.at_broker() {
+        return Some(LiveAction::ReleaseLimitClose);
     }
     let sell = action.as_ref().and_then(live_sell_reason);
     if lc.send_uncertain {
@@ -4794,6 +4839,24 @@ async fn exec_live_action(
                     }
                 }
             }
+        }
+
+        LiveAction::ReleaseLimitClose => {
+            let order_id = {
+                let g = positions.read().await;
+                g.iter().find(|p| p.id == pending.pos_id).and_then(|p| p.limit_close.as_ref()).and_then(|l| l.order_id.clone())
+            };
+            let cancel = match &order_id {
+                Some(oid) => match kotak_cancel(kotak, oid, &ctx.trading_symbol).await {
+                    Ok(()) => format!("a cancel for {oid} was sent too"),
+                    Err(e) => format!("a cancel for {oid} was refused ({e})"),
+                },
+                None => "its order number was never known".to_string(),
+            };
+            with_position(positions, &pending.pos_id, |p| p.limit_close = None).await;
+            loud_error_at(db_tx, log_tx, &ctx.instrument, &ctx.pos_id, &format!(
+                "limit sell released by hand — it wasn't in Kotak's order book, and {cancel}. The engine no longer counts it: if it is still resting at Kotak, cancel it there now, or it can sell more than is held"
+            )).await;
         }
 
         LiveAction::DropLimitClose { reason, loud } => {
@@ -8949,8 +9012,43 @@ mod tests {
         let lc = positions.read().await[0].limit_close.clone().unwrap();
         assert_eq!((lc.order_id.as_deref(), lc.send_uncertain), (Some("LIM1"), false));
 
-        // Past the grace window with nothing in the book: never placed.
+        // Past the grace window with nothing in the book: never taken as
+        // unplaced (a DAY order may still rest). It is kept, said once, and
+        // goes on holding every other sell back.
         let mut lc = LimitClose::new(150, 152.0, now_ts(), false);
+        lc.send_uncertain = true;
+        lc.sent_at = Some(secs_later(&now_ts(), -60));
+        let mut pos = held_scalp();
+        pos.limit_close = Some(lc);
+        let positions = Arc::new(RwLock::new(vec![pos]));
+        assert!(settle(&positions, &db_tx, &earlier, &memory).await);
+        let kept = positions.read().await[0].clone();
+        let lc = kept.limit_close.clone().expect("kept");
+        assert!(lc.send_uncertain && lc.missing_noted);
+        assert_eq!(lc.status(true), "missing");
+        assert!(!settle(&positions, &db_tx, &earlier, &memory).await, "said once");
+        assert!(limit_close_gate(&kept, Some(LiveAction::ExitAll { qty: 300, reason: "SL_HIT".into() }), &now_ts()).is_none());
+        // The owner checks Kotak and presses ×: released.
+        let mut released = kept.clone();
+        released.limit_close.as_mut().unwrap().cancel_requested = true;
+        assert_eq!(limit_close_gate(&released, None, &now_ts()), Some(LiveAction::ReleaseLimitClose));
+        assert_eq!(limit_close_gate(&released, Some(LiveAction::ExitAll { qty: 300, reason: "SL_HIT".into() }), &now_ts()), Some(LiveAction::ReleaseLimitClose));
+        // The × before the grace window ran out does nothing yet.
+        let mut early = held_scalp();
+        let mut lc = LimitClose::new(150, 152.0, now_ts(), false);
+        lc.send_uncertain = true;
+        lc.cancel_requested = true;
+        early.limit_close = Some(lc);
+        assert!(limit_close_gate(&early, None, &now_ts()).is_none());
+        // It shows up after all: adopted, and no longer missing.
+        let mut book = earlier.clone();
+        book.push(limit_row("open", 150, 0, "0"));
+        assert!(settle(&positions, &db_tx, &book, &memory).await);
+        let lc = positions.read().await[0].limit_close.clone().unwrap();
+        assert_eq!((lc.order_id.as_deref(), lc.send_uncertain, lc.missing_noted), (Some("LIM1"), false, false));
+
+        // One from an earlier day ended at that day's close, placed or not.
+        let mut lc = LimitClose::new(150, 152.0, "2026-01-05 10:00:00".into(), false);
         lc.send_uncertain = true;
         lc.sent_at = Some("2026-01-05 10:00:00".into());
         let mut pos = held_scalp();
@@ -8976,6 +9074,18 @@ mod tests {
         let positions = Arc::new(RwLock::new(vec![pos]));
         settle(&positions, &db_tx, &[], &OrderBookMemory::default()).await;
         assert!(positions.read().await[0].limit_close.is_some());
+        // Past the grace window: said once, and the × releases it.
+        let mut lc = resting(150, 152.0);
+        lc.sent_at = Some(secs_later(&now_ts(), -60));
+        positions.write().await[0].limit_close = Some(lc);
+        assert!(settle(&positions, &db_tx, &[], &OrderBookMemory::default()).await);
+        let mut missing = positions.read().await[0].clone();
+        assert_eq!(missing.limit_close.as_ref().map(|l| l.status(true)), Some("missing"));
+        missing.limit_close.as_mut().unwrap().cancel_requested = true;
+        assert_eq!(limit_close_gate(&missing, None, &now_ts()), Some(LiveAction::ReleaseLimitClose));
+        // It shows up after all: no longer missing.
+        assert!(settle(&positions, &db_tx, &[limit_row("open", 150, 0, "0")], &OrderBookMemory::default()).await);
+        assert!(!positions.read().await[0].limit_close.as_ref().unwrap().missing_noted);
     }
 
     fn ist_at(day: (i32, u32, u32), h: u32, m: u32) -> chrono::DateTime<chrono::FixedOffset> {
@@ -9004,9 +9114,12 @@ mod tests {
     #[test]
     fn a_paper_limit_close_goes_when_cancelled_or_once_the_market_shuts() {
         let mut pos = held_scalp();
-        pos.limit_close = Some(LimitClose::new(150, 152.0, now_ts(), false));
+        pos.limit_close = Some(LimitClose::new(150, 152.0, "2026-11-18 09:30:00".into(), false));
         assert_eq!(paper_limit_drop_reason(&pos, ist_at((2026, 11, 18), 10, 0)), None);
         assert!(paper_limit_drop_reason(&pos, ist_at((2026, 11, 18), 15, 45)).is_some());
+        // The server down through the close: the next morning, with the
+        // market open, it still goes.
+        assert!(paper_limit_drop_reason(&pos, ist_at((2026, 11, 19), 9, 20)).is_some());
         pos.limit_close.as_mut().unwrap().cancel_requested = true;
         assert!(paper_limit_drop_reason(&pos, ist_at((2026, 11, 18), 10, 0)).is_some());
     }

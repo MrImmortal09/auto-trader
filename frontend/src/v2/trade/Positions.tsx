@@ -276,7 +276,7 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                           <div className="type-caption text-fg-subtle">{limitStatus(p.limit_close, mode === 'LIVE')}</div>
                         </div>
                         <Button size="lg" kind="ghost" disabled={!limitCancellable(p.limit_close) || !!h.sending[p.id]} onClick={() => h.onCancelLimit(p)}>
-                          Cancel
+                          {p.limit_close.status === 'missing' ? 'Release' : 'Cancel'}
                         </Button>
                       </div>
                     ) : (

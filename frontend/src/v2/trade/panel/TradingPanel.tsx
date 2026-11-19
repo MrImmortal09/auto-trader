@@ -331,7 +331,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   // ("BANKNIFTY ≥ 57,890.00 ×") 158, the three buttons 176, and the panel at
   // 1440 px holds 1042 of columns and gaps.
   const GRID = 'grid grid-cols-[minmax(158px,1.3fr)_88px_120px_88px_88px_minmax(160px,1fr)_minmax(160px,1fr)_184px] items-center gap-2';
-  const SHORT_STATUS = { sending: 'sending…', unconfirmed: 'checking Kotak…', cancelling: 'cancelling…', resting: null } as const;
+  const SHORT_STATUS = { sending: 'sending…', unconfirmed: 'checking Kotak…', missing: "not in Kotak's book — check Kotak", cancelling: 'cancelling…', resting: null } as const;
   const positions =
     active.length === 0 ? (
       <p className="px-1 py-3 type-body text-fg-subtle">No open trade. Tap Buy on the ladder to open one.</p>
@@ -368,8 +368,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
                     <button
                       type="button"
                       disabled={!limitCancellable(p.limit_close) || !!h.sending[p.id]}
-                      title="Cancel the limit sell"
-                      aria-label="Cancel the limit sell"
+                      title={p.limit_close.status === 'missing' ? "Release it — after checking it doesn't rest at Kotak" : 'Cancel the limit sell'}
+                      aria-label={p.limit_close.status === 'missing' ? 'Release the limit sell' : 'Cancel the limit sell'}
                       onClick={() => h.onCancelLimit(p)}
                       className="grid size-5 shrink-0 place-items-center rounded-4 border border-current/40 hover:bg-raised disabled:opacity-40"
                     >

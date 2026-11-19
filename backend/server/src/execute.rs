@@ -773,7 +773,7 @@ struct LimitCloseRow {
     price: f64,
     /// Units of it sold so far (LIVE fills can come in parts).
     filled: i32,
-    /// `sending`, `unconfirmed`, `cancelling` or `resting` — see
+    /// `sending`, `unconfirmed`, `missing`, `cancelling` or `resting` — see
     /// [`LimitClose::status`].
     status: &'static str,
 }

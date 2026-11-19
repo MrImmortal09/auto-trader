@@ -51,6 +51,8 @@ export function limitStatus(lc: LimitClose, live: boolean): string {
       return 'Sending to Kotak…';
     case 'unconfirmed':
       return 'No answer from Kotak — checking its order book; nothing else sells meanwhile';
+    case 'missing':
+      return "Not in Kotak's order book — it may still rest there, so nothing else sells. Check the Kotak app (cancel it there if it rests), then × releases it";
     case 'cancelling':
       return 'Cancelling…';
     default:
@@ -59,7 +61,8 @@ export function limitStatus(lc: LimitClose, live: boolean): string {
 }
 
 /** Whether its × can cancel it now: not while it is being cancelled, or
- * while Kotak hasn't answered its send. */
+ * while Kotak hasn't answered its send — until it is `missing`, when the ×
+ * releases it (after the owner has checked Kotak). */
 export function limitCancellable(lc: LimitClose): boolean {
-  return lc.status === 'resting' || lc.status === 'sending';
+  return lc.status === 'resting' || lc.status === 'sending' || lc.status === 'missing';
 }

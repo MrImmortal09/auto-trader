@@ -125,7 +125,9 @@ pub async fn place_handler(State(state): State<AppState>, Path(id): Path<String>
 
 /// `DELETE /api/v2/positions/:id/limit-close` — cancel a scalp's limit
 /// sell. The engine does it on its next tick (LIVE: asks Kotak, and books
-/// whatever filled before the cancel landed).
+/// whatever filled before the cancel landed). One missing from Kotak's order
+/// book past the grace window is released instead (the owner has checked
+/// Kotak): a best-effort cancel, then the engine stops counting it.
 pub async fn cancel_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let mut positions = state.positions.write().await;
     let Some(pos) = positions.iter_mut().find(|p| p.id == id) else {

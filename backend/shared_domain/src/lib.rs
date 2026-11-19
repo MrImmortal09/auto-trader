@@ -1368,8 +1368,9 @@ pub struct LimitClose {
     /// book says how the order ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_sent_at: Option<String>,
-    /// LIVE: it was missing from Kotak's order book past the grace window,
-    /// and that was said (once).
+    /// LIVE: it was missing from Kotak's order book past the grace window
+    /// (a known order, or a send with no answer), and that was said, once.
+    /// It still holds every other sell back; the owner's × releases it.
     #[serde(default)]
     pub missing_noted: bool,
 }
@@ -1404,9 +1405,13 @@ impl LimitClose {
     }
 
     /// How the Trade panel words it: `sending` (LIVE, not at Kotak yet),
-    /// `unconfirmed` (sent with no verdict), `cancelling`, or `resting`.
+    /// `unconfirmed` (sent with no verdict), `missing` (not in Kotak's order
+    /// book past the grace window: its × releases it), `cancelling`, or
+    /// `resting`.
     pub fn status(&self, live: bool) -> &'static str {
-        if self.send_uncertain {
+        if self.missing_noted && self.at_broker() && !self.cancel_requested {
+            "missing"
+        } else if self.send_uncertain {
             "unconfirmed"
         } else if self.cancel_requested || self.cancel_sent_at.is_some() {
             "cancelling"
