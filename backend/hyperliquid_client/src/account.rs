@@ -285,11 +285,54 @@ impl InfoClient {
         let v: Value = self.post(json!({ "type": "extraAgents", "user": user })).await?;
         serde_json::from_value(v).map_err(|e| HlError::Decode(format!("extraAgents: {e}")))
     }
+
+    /// What Hyperliquid knows `address` as: an account, an API wallet (with
+    /// the account it trades for), a vault, a sub-account, or nothing.
+    pub async fn user_role(&self, address: &str) -> Result<UserRole, HlError> {
+        read_role(&self.post(json!({ "type": "userRole", "user": address })).await?)
+    }
+}
+
+/// An address as Hyperliquid knows it (`userRole`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserRole {
+    /// An account: its own key can withdraw.
+    User,
+    /// An API wallet, approved by `user`.
+    Agent { user: String },
+    Vault,
+    SubAccount { master: String },
+    /// Never seen on this network.
+    Missing,
+    Other(String),
+}
+
+fn read_role(v: &Value) -> Result<UserRole, HlError> {
+    let role = v.get("role").and_then(Value::as_str).ok_or_else(|| HlError::Decode(format!("userRole without a role: {v}")))?;
+    let field = |name: &str| v.get("data").and_then(|d| d.get(name)).and_then(Value::as_str).map(str::to_ascii_lowercase);
+    Ok(match role {
+        "user" => UserRole::User,
+        "agent" => UserRole::Agent { user: field("user").ok_or_else(|| HlError::Decode("an agent's userRole without its user".into()))? },
+        "vault" => UserRole::Vault,
+        "subAccount" => UserRole::SubAccount { master: field("master").unwrap_or_default() },
+        "missing" => UserRole::Missing,
+        other => UserRole::Other(other.to_string()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_role_says_whose_api_wallet_it_is() {
+        let role = |raw: &str| read_role(&serde_json::from_str(raw).unwrap()).unwrap();
+        assert_eq!(role(r#"{"role":"user"}"#), UserRole::User);
+        assert_eq!(role(r#"{"role":"agent","data":{"user":"0xAbC0000000000000000000000000000000000001"}}"#), UserRole::Agent { user: "0xabc0000000000000000000000000000000000001".into() });
+        assert_eq!(role(r#"{"role":"missing"}"#), UserRole::Missing);
+        assert_eq!(role(r#"{"role":"vault"}"#), UserRole::Vault);
+        assert!(read_role(&serde_json::from_str(r#"{"role":"agent"}"#).unwrap()).is_err(), "an agent without its account");
+    }
 
     #[test]
     fn a_clearinghouse_state_reads_its_positions() {
