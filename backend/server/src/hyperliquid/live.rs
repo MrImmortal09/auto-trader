@@ -18,7 +18,9 @@
 //!   and cached a few seconds, inside Hyperliquid's request limits. Nothing
 //!   about it is kept here. A read that doesn't answer in a few seconds has
 //!   failed, and a failure is answered again at once for a moment, so a
-//!   stalled Hyperliquid never piles up waiting requests.
+//!   stalled Hyperliquid never piles up waiting requests. It is read on the
+//!   core perps and on each builder dex a perp on the app's list trades on
+//!   (trade.xyz's for gold): each dex keeps its own USDC margin.
 //! - **LIVE starts and ends flat**: entering or leaving it needs the
 //!   Hyperliquid account to hold and rest nothing (on every dex, coins the
 //!   app doesn't trade included), and entering it needs the owner's paper
@@ -46,13 +48,12 @@ use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 
 use super::paper::{AccountView, FillRow, PositionView, Refusal, Venue};
 use super::perp::{PerpLevels, PerpLine, PerpOrder, PerpPosition, PerpTarget, Side};
-use super::Market;
-
-/// The dex gold trades on, with its own margin.
-const GOLD_DEX: &str = "xyz";
+use super::{markets, Market};
 /// How long each part of the LIVE account is reused before it is read again.
 /// An open Trade screen costs about 120 (states) + 240 (orders) + 20 to 40
-/// (fills) of the 1,200 request weight Hyperliquid allows an IP a minute.
+/// (fills) of the 1,200 request weight Hyperliquid allows an IP a minute,
+/// on the core perps and one builder dex; each further dex with a listed
+/// perp adds about 60 + 120.
 const STATE_TTL: Duration = Duration::from_secs(2);
 const ORDERS_TTL: Duration = Duration::from_secs(10);
 const FILLS_TTL: Duration = Duration::from_secs(60);
@@ -180,6 +181,29 @@ async fn timed<T>(what: &str, read: impl Future<Output = Result<T, hyperliquid_c
     }
 }
 
+/// Each dex's account state: the core perps' (`None`) first.
+type States = Vec<(Option<&'static str>, AccountState)>;
+
+/// The dexes the LIVE account is read on: the core perps, and each builder
+/// dex a perp on the app's list trades on.
+fn live_dexes() -> Vec<Option<&'static str>> {
+    let mut dexes: Vec<Option<&'static str>> = vec![None];
+    for e in markets::entries() {
+        if e.market.dex.is_some() && !dexes.contains(&e.market.dex) {
+            dexes.push(e.market.dex);
+        }
+    }
+    dexes
+}
+
+/// "Core perps", "trade.xyz (xyz)".
+fn venue_label(dex: Option<&str>) -> String {
+    match dex {
+        None => "Core perps".to_string(),
+        Some(d) => format!("{} ({d})", markets::venue(Some(d))),
+    }
+}
+
 /// What the LIVE account was last read as, per part — for one account: a
 /// different one starts afresh.
 #[derive(Default)]
@@ -188,7 +212,7 @@ struct LiveCache {
     /// The last read failed, and why: answered again until [`FAILURE_TTL`].
     failed: Option<(Instant, String)>,
     /// With when they were read, in IST, for the screens' "as of".
-    states: Option<(Instant, String, AccountState, AccountState)>,
+    states: Option<(Instant, String, States)>,
     orders: Option<(Instant, Vec<HlOpenOrder>)>,
     fills: Option<(Instant, Vec<HlFill>)>,
 }
@@ -297,7 +321,8 @@ impl LiveDesk {
         let read = async {
             let mut positions = Vec::new();
             let mut orders: Vec<HlOpenOrder> = Vec::new();
-            for dex in [None, Some(GOLD_DEX)] {
+            // Every dex must read flat: one that can't be read can't say so.
+            for dex in live_dexes() {
                 positions.extend(timed("the account", info.account_state(&account, dex)).await?.positions);
                 orders.extend(timed("the open orders", info.open_orders(&account, dex)).await?);
             }
@@ -479,11 +504,12 @@ impl LiveDesk {
             Ok(Answer::Err(why)) => return (false, format!("the exchange refused a signed check: {why}")),
             Ok(Answer::Ok(_)) => {}
         }
-        let core = info.account_state(account, None).await;
-        let gold = info.account_state(account, Some(GOLD_DEX)).await;
-        match (core, gold) {
-            (Ok(core), Ok(gold)) => (true, format!("Approved and accepted. Core perps ${:.2}, gold's dex ${:.2}", core.account_value, gold.account_value)),
-            (Err(e), _) | (_, Err(e)) => (false, format!("approved and accepted, but the balances couldn't be read: {e}")),
+        match read_states(info, account).await {
+            Ok(states) => {
+                let balances: Vec<String> = states.iter().map(|(dex, s)| format!("{} ${:.2}", venue_label(*dex), s.account_value)).collect();
+                (true, format!("Approved and accepted. {}", balances.join(", ")))
+            }
+            Err(e) => (false, format!("approved and accepted, but {e}")),
         }
     }
 
@@ -509,25 +535,42 @@ impl LiveDesk {
             return Err(Refusal::conflict(why));
         }
         cache.failed = None;
-        let (_, as_of, core, gold) = cache.states.as_ref().expect("just read");
+        let (_, as_of, states) = cache.states.as_ref().expect("just read");
         let orders = &cache.orders.as_ref().expect("just read").1;
         let fills = cache.fills.as_ref().map(|(_, f)| f.as_slice()).unwrap_or_default();
-        let mut view = live_account_view(network, core, gold, orders, fills);
+        let mut view = live_account_view(network, states, orders, fills);
         view.as_of = Some(as_of.clone());
         Ok(view)
     }
 }
 
+/// The account's state on each of [`live_dexes`]: the core perps' must be
+/// read; a builder dex's that can't be (one the network doesn't have) is
+/// left out.
+async fn read_states(info: &InfoClient, account: &str) -> Result<States, String> {
+    let mut out = vec![(None, timed("the LIVE account", info.account_state(account, None)).await?)];
+    for dex in live_dexes().into_iter().flatten() {
+        match timed("the LIVE account", info.account_state(account, Some(dex))).await {
+            Ok(s) => out.push((Some(dex), s)),
+            Err(e) => tracing::warn!("Hyperliquid {dex}: {e}"),
+        }
+    }
+    Ok(out)
+}
+
 /// Read what `cache` holds too old a copy of (each part on its own TTL).
 async fn read_into(cache: &mut LiveCache, info: &InfoClient, account: &str) -> Result<(), String> {
     if cache.states.as_ref().is_none_or(|(at, ..)| at.elapsed() > STATE_TTL) {
-        let core = timed("the LIVE account", info.account_state(account, None)).await?;
-        let gold = timed("the LIVE account", info.account_state(account, Some(GOLD_DEX))).await?;
-        cache.states = Some((Instant::now(), shared_domain::current_ist_timestamp_string(), core, gold));
+        cache.states = Some((Instant::now(), shared_domain::current_ist_timestamp_string(), read_states(info, account).await?));
     }
     if cache.orders.as_ref().is_none_or(|(at, _)| at.elapsed() > ORDERS_TTL) {
         let mut orders = timed("the LIVE orders", info.open_orders(account, None)).await?;
-        orders.extend(timed("the LIVE orders", info.open_orders(account, Some(GOLD_DEX))).await?);
+        for dex in live_dexes().into_iter().flatten() {
+            match timed("the LIVE orders", info.open_orders(account, Some(dex))).await {
+                Ok(more) => orders.extend(more),
+                Err(e) => tracing::warn!("Hyperliquid {dex}: {e}"),
+            }
+        }
         cache.orders = Some((Instant::now(), orders));
     }
     if cache.fills.as_ref().is_none_or(|(at, _)| at.elapsed() > FILLS_TTL) {
@@ -568,14 +611,14 @@ fn levels_of(orders: &[&HlOpenOrder]) -> PerpLevels {
     levels
 }
 
-/// Hyperliquid's account (the core perps' and gold's dex) in the paper
-/// desk's shape: positions with the stops and targets resting against
+/// Hyperliquid's account (the core perps' and each builder dex's) in the
+/// paper desk's shape: positions with the stops and targets resting against
 /// them, resting limits, stop entries (as line orders) with their children,
-/// and the latest fills of the three perps.
-pub fn live_account_view(network: Network, core: &AccountState, gold: &AccountState, orders: &[HlOpenOrder], fills: &[HlFill]) -> AccountView {
+/// and the latest fills of the perps on the app's list.
+pub fn live_account_view(network: Network, states: &[(Option<&'static str>, AccountState)], orders: &[HlOpenOrder], fills: &[HlFill]) -> AccountView {
     let ours = |coin: &str| Market::of_coin(coin);
     let mut positions = Vec::new();
-    for p in core.positions.iter().chain(gold.positions.iter()) {
+    for p in states.iter().flat_map(|(_, s)| s.positions.iter()) {
         let Some(m) = ours(&p.coin) else { continue };
         let size = p.szi.abs();
         let side = if p.szi >= 0.0 { Side::Long } else { Side::Short };
@@ -658,13 +701,13 @@ pub fn live_account_view(network: Network, core: &AccountState, gold: &AccountSt
             timestamp: ist(f.time),
         })
         .collect();
-    let margin = core.margin_used + gold.margin_used;
+    let margin: f64 = states.iter().map(|(_, s)| s.margin_used).sum();
     let upnl: f64 = positions.iter().filter_map(|p| p.upnl).sum();
-    let equity = core.account_value + gold.account_value;
+    let equity: f64 = states.iter().map(|(_, s)| s.account_value).sum();
     AccountView {
         mode: "live",
         start: equity,
-        cash: core.withdrawable + gold.withdrawable,
+        cash: states.iter().map(|(_, s)| s.withdrawable).sum(),
         margin,
         upnl,
         equity,
@@ -675,10 +718,10 @@ pub fn live_account_view(network: Network, core: &AccountState, gold: &AccountSt
         activity: Vec::new(),
         fills,
         network: Some(net_str(network)),
-        venues: vec![
-            Venue { dex: "core", label: "Core perps (BTC, ETH)", account_value: core.account_value, withdrawable: core.withdrawable, margin_used: core.margin_used },
-            Venue { dex: GOLD_DEX, label: "Gold (trade.xyz dex)", account_value: gold.account_value, withdrawable: gold.withdrawable, margin_used: gold.margin_used },
-        ],
+        venues: states
+            .iter()
+            .map(|(dex, s)| Venue { dex: dex.unwrap_or("core"), label: venue_label(*dex), account_value: s.account_value, withdrawable: s.withdrawable, margin_used: s.margin_used })
+            .collect(),
         as_of: None,
     }
 }
@@ -755,7 +798,7 @@ mod tests {
             order("ETH", 3, true, None, false),
             order("ETH", 4, true, Some((105.0, "Stop Market")), false),
         ];
-        let v = live_account_view(Network::Testnet, &core, &gold, &orders, &[]);
+        let v = live_account_view(Network::Testnet, &[(None, core), (Some("xyz"), gold)], &orders, &[]);
         assert_eq!((v.mode, v.network, v.equity), ("live", Some("testnet"), 1_500.0));
         // SOL is no perp of the app's.
         assert_eq!(v.positions.iter().map(|p| p.position.market.as_str()).collect::<Vec<_>>(), ["BTC", "GOLD"]);

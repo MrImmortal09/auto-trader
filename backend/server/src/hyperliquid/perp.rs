@@ -491,10 +491,8 @@ pub fn wrong_side(kind: &str, side: Side, reference: f64, price: f64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hyperliquid::MARKETS;
-
     fn btc() -> &'static Market {
-        &MARKETS[0]
+        &crate::hyperliquid::markets::BUILTIN[0]
     }
 
     fn req<'a>(side: Side, size: f64, price: f64, reduce_only: bool) -> FillReq<'a> {

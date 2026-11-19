@@ -19,6 +19,8 @@ import type {
   FeedAnswer,
   Flags,
   HlLiveView,
+  HlAdminMarkets,
+  HlCatalogAnswer,
   HlMarketsAnswer,
   PerpAccount,
   GroupId,
@@ -461,8 +463,20 @@ export const saveSettings = (base: string, cfg: TradingConfig) => send(base, '/a
 /** The paper wallet's balance — v1's virtual balance. */
 export const setWalletBalance = (base: string, balance: number) => send(base, '/api/wallet/balance', 'POST', { balance });
 export const putFlags = (base: string, change: Partial<Flags>) => send(base, '/api/v2/flags', 'PUT', change);
-/** The Hyperliquid perps' prices and funding (behind the `hyperliquid` switch). */
-export const getHlMarkets = (base: string) => getJson<HlMarketsAnswer>(base, '/api/v2/hl/markets');
+/** The Hyperliquid perps' prices and funding (behind the `hyperliquid`
+ * switch): the header's, and `keys` (the ones a screen charts, trades or holds). */
+export const getHlMarkets = (base: string, keys: string[] = []) =>
+  getJson<HlMarketsAnswer>(base, `/api/v2/hl/markets${keys.length ? `?keys=${encodeURIComponent(keys.join(','))}` : ''}`);
+/** The perps on the app's list, with their rules. */
+export const getHlCatalog = (base: string) => getJson<HlCatalogAnswer>(base, '/api/v2/hl/catalog');
+/** Admin → Hyperliquid markets: every perp Hyperliquid lists, and the app's. */
+export const getHlAdminMarkets = (base: string) => getJson<HlAdminMarkets>(base, '/api/v2/hl/admin/markets');
+export interface HlMarketsChange {
+  add?: string[];
+  remove?: string[];
+  header?: { coin: string; on: boolean }[];
+}
+export const putHlAdminMarkets = (base: string, change: HlMarketsChange) => send(base, '/api/v2/hl/admin/markets', 'PUT', change);
 
 // ── Hyperliquid perps on paper: the caller's own account ───────────────── //
 
@@ -488,7 +502,7 @@ export const perpOrder = (base: string, body: PerpOrderBody) => send(base, '/api
 export const perpMoveOrder = (base: string, id: string, price: number) => send(base, `/api/v2/hl/orders/${encodeURIComponent(id)}`, 'PATCH', { price });
 export const perpCancelOrder = (base: string, id: string) => send(base, `/api/v2/hl/orders/${encodeURIComponent(id)}`, 'DELETE');
 /** Close `size` of the market's position (all of it when left out) at the mid. */
-export const perpClose = (base: string, market: string, size?: number) => send(base, `/api/v2/hl/positions/${market}/close`, 'POST', size == null ? {} : { size });
+export const perpClose = (base: string, market: string, size?: number) => send(base, `/api/v2/hl/positions/${encodeURIComponent(market)}/close`, 'POST', size == null ? {} : { size });
 /** A change to a stop and targets; anything left out stays. `stop: null`
  * clears it; `set_target` adds one (no `id`) or moves and resizes one;
  * `price` moves a line order (lines only). */
@@ -498,7 +512,7 @@ export interface PerpLevelsUpdate {
   remove_target?: string;
   price?: number;
 }
-export const perpLevels = (base: string, market: string, update: PerpLevelsUpdate) => send(base, `/api/v2/hl/positions/${market}`, 'PATCH', update);
+export const perpLevels = (base: string, market: string, update: PerpLevelsUpdate) => send(base, `/api/v2/hl/positions/${encodeURIComponent(market)}`, 'PATCH', update);
 export interface PerpLineBody {
   market: string;
   side: 'buy' | 'sell';

@@ -69,8 +69,10 @@ async fn paper_only(state: &AppState, identity: &Identity) -> Result<Option<Owne
     }
 }
 
+/// The perp `key` names (any case): one on the app's list, added or
+/// close-only (whether it takes an order is the desk's call).
 fn market(key: &str) -> Result<&'static Market, Response> {
-    Market::of_key(&key.to_ascii_uppercase()).ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "market must be BTC, ETH or GOLD"))
+    Market::of_key(key.trim()).ok_or_else(|| refuse(StatusCode::BAD_REQUEST, format!("{key} isn't a perp the app trades")))
 }
 
 fn side(raw: &str) -> Result<Side, Response> {

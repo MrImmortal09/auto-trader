@@ -1,9 +1,10 @@
-// Hyperliquid perps on the Trade screen: each perp's rules (as the server
-// keeps them, `hyperliquid::MARKETS`) and the arithmetic the ticket, the
-// panel and the chart lines share.
+// Hyperliquid perps on the Trade screen: each perp's rules (the server's
+// list, `catalog.ts`) and the arithmetic the ticket, the panel and the chart
+// lines share.
 
 import type { PerpSide } from '../../lib/types';
 import type { PerpKey } from '../model';
+import { perpInfo } from './catalog';
 
 export interface PerpRules {
   /** Decimals a size may carry. */
@@ -12,26 +13,39 @@ export interface PerpRules {
   maxLeverage: number;
   taker: number;
   maker: number;
+  /** The size's unit: `BTC`, `NVDA`. */
+  unit: string;
+  /** On the list: until it is read (or for a key no longer on it), the
+   * stand-in rules below, and nothing should be sent. */
+  known: boolean;
+  /** Added: takes orders that open. False: close-only. */
+  tradable: boolean;
 }
 
-/** Hyperliquid's rules for the three perps; gold (builder-deployed) pays double fees. */
-export const PERP_RULES: Record<PerpKey, PerpRules> = {
-  BTC: { szDecimals: 5, maxLeverage: 40, taker: 0.00045, maker: 0.00015 },
-  ETH: { szDecimals: 4, maxLeverage: 25, taker: 0.00045, maker: 0.00015 },
-  GOLD: { szDecimals: 4, maxLeverage: 25, taker: 0.0009, maker: 0.0003 },
-};
+/** `k`'s rules, from the server's list; conservative stand-ins (two size
+ * decimals, 1x) for a perp not on it. */
+export function rulesOf(k: PerpKey): PerpRules {
+  const r = perpInfo(k);
+  if (!r) return { szDecimals: 2, maxLeverage: 1, taker: 0.00045, maker: 0.00015, unit: k.split(':').pop() ?? k, known: false, tradable: false };
+  return { szDecimals: r.sz_decimals, maxLeverage: r.max_leverage, taker: r.taker_fee, maker: r.maker_fee, unit: r.base, known: true, tradable: r.tradable };
+}
+
+/** What the screens call `k`: "BTC-PERP", "NVDA-PERP (io)". */
+export function perpLabel(k: PerpKey): string {
+  return perpInfo(k)?.label ?? `${k.split(':').pop() ?? k}-PERP`;
+}
 
 /** The most leverage the app takes on any perp, whatever Hyperliquid allows. */
 export const MAX_LEVERAGE = 20;
 
-export const leverageCap = (k: PerpKey) => Math.min(MAX_LEVERAGE, PERP_RULES[k].maxLeverage);
+export const leverageCap = (k: PerpKey) => Math.min(MAX_LEVERAGE, rulesOf(k).maxLeverage);
 
 /** Maintenance margin as a fraction of notional: half the initial margin at max leverage. */
-export const maintenance = (k: PerpKey) => 1 / (2 * PERP_RULES[k].maxLeverage);
+export const maintenance = (k: PerpKey) => 1 / (2 * rulesOf(k).maxLeverage);
 
 /** `size` on the perp's size grid, rounded down. */
 export function roundSize(k: PerpKey, size: number): number {
-  const f = 10 ** PERP_RULES[k].szDecimals;
+  const f = 10 ** rulesOf(k).szDecimals;
   return Math.floor(size * f + 1e-9) / f;
 }
 
@@ -39,7 +53,7 @@ export function roundSize(k: PerpKey, size: number): number {
  * `6 - szDecimals` decimals (an integer always passes). */
 export function roundPrice(k: PerpKey, price: number): number {
   if (!(Number.isFinite(price) && price > 0)) return price;
-  const maxDecimals = 6 - PERP_RULES[k].szDecimals;
+  const maxDecimals = 6 - rulesOf(k).szDecimals;
   const magnitude = Math.floor(Math.log10(price)) + 1;
   const decimals = Math.max(0, Math.min(5 - magnitude, maxDecimals));
   if (decimals === 0) return Math.round(price);
@@ -73,9 +87,10 @@ export function perpPrice(n: number): string {
   return n.toLocaleString('en-US', { maximumFractionDigits: 5 });
 }
 
-/** A size in the coin, without trailing zeros: "0.015 BTC". */
+/** A size in the coin, without trailing zeros: "0.015 BTC", "2.5 NVDA". */
 export function sizeText(k: PerpKey, size: number): string {
-  return `${Number(size.toFixed(PERP_RULES[k].szDecimals))} ${k}`;
+  const r = rulesOf(k);
+  return `${Number(size.toFixed(r.szDecimals))} ${r.unit}`;
 }
 
 /** How long a line order stays armed, as the ticket offers it. */

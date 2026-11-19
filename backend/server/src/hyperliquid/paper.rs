@@ -11,8 +11,13 @@
 //!
 //! An account's wallet, its ledger rows and its book are written in one
 //! transaction; a write that fails changes nothing in memory either.
+//!
+//! A perp the admin has removed is close-only ([`super::markets`]): an order
+//! that would open or add to a position is refused, a resting one and a line
+//! order are cancelled at the next tick, and a held position keeps its stop,
+//! targets and liquidation until it is closed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +27,7 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
 use super::perp::{apply_fill, exit_at, funding_payment, wrong_side, Book, Exit, FillReq, Leg, PerpLevels, PerpLine, PerpOrder, PerpPosition, PerpTarget, Side, MIN_NOTIONAL};
-use super::{HlMarketData, Market, MARKETS};
+use super::{HlMarketData, Market};
 
 /// What every paper wallet starts with, and starts over with.
 pub const START_USDC: f64 = 10_000.0;
@@ -107,7 +112,12 @@ fn now_ts() -> String {
 }
 
 fn market(key: &str) -> Result<&'static Market, Refusal> {
-    Market::of_key(key).ok_or_else(|| Refusal::bad("market must be BTC, ETH or GOLD"))
+    Market::of_key(key).ok_or_else(|| Refusal::bad(format!("{key} isn't a perp the app trades")))
+}
+
+/// The refusal for an order that would open or add on a close-only perp.
+fn close_only(m: &Market) -> Refusal {
+    Refusal::conflict(format!("{} is close-only: it was removed from the app's markets, so only orders that reduce a position are taken", m.label))
 }
 
 /// "0.1 BTC-PERP at 63,856.0".
@@ -266,11 +276,18 @@ pub struct Stepped {
     pub changed: bool,
 }
 
+/// [`step_book_with`] on the app's list of perps.
+pub fn step_book(book: &mut Book, cash: &mut f64, price: &dyn Fn(&str) -> Option<Px>, now_ms: i64, now: &str) -> Stepped {
+    step_book_with(book, cash, price, &super::markets::tradable, now_ms, now)
+}
+
 /// One watch tick over `book` with `cash` free: funding on a new hour, then
 /// each position's liquidation, stop and targets, then resting limits and
 /// line orders. `price` gives a perp's fresh prices (`None`: none fresh —
-/// nothing of it moves). Pure, so the rules are tested here.
-pub fn step_book(book: &mut Book, cash: &mut f64, price: &dyn Fn(&str) -> Option<Px>, now_ms: i64, now: &str) -> Stepped {
+/// nothing of it moves); `tradable` says whether a perp still takes orders
+/// that open (a close-only one's opening orders and line orders are
+/// cancelled). Pure, so the rules are tested here.
+pub fn step_book_with(book: &mut Book, cash: &mut f64, price: &dyn Fn(&str) -> Option<Px>, tradable: &dyn Fn(&str) -> bool, now_ms: i64, now: &str) -> Stepped {
     let mut out = Stepped::default();
     // Funding, once an hour (an hour the server was down is not charged).
     let hour = now_ms.div_euclid(HOUR_MS);
@@ -329,8 +346,15 @@ pub fn step_book(book: &mut Book, cash: &mut f64, price: &dyn Fn(&str) -> Option
     }
 
     // Resting limits: at their price, as a maker, once the mid reaches them.
+    // A close-only perp's are cancelled, but for one that only reduces.
     let orders = std::mem::take(&mut book.orders);
     for o in orders {
+        if !o.reduce_only && !tradable(&o.market) {
+            let label = Market::of_key(&o.market).map_or(o.market.as_str(), |m| m.label);
+            out.notes.push(("order", Some(o.market.clone()), format!("{label} is close-only now: limit {} {} at {} cancelled", o.side.action().to_lowercase(), o.size, o.price)));
+            out.changed = true;
+            continue;
+        }
         let (Some(m), Some(px)) = (Market::of_key(&o.market), price(&o.market)) else {
             book.orders.push(o);
             continue;
@@ -346,10 +370,16 @@ pub fn step_book(book: &mut Book, cash: &mut f64, price: &dyn Fn(&str) -> Option
         }
     }
 
-    // Line orders: lapsed ones go; a crossed one buys or sells at the mid.
+    // Line orders: lapsed ones go, and a close-only perp's; a crossed one
+    // buys or sells at the mid.
     let lines = std::mem::take(&mut book.lines);
     for l in lines {
         let Some(m) = Market::of_key(&l.market) else { continue };
+        if !tradable(&l.market) {
+            out.notes.push(("line", Some(l.market.clone()), format!("{} is close-only now: line order at {} cancelled", m.label, l.price)));
+            out.changed = true;
+            continue;
+        }
         if l.valid_until.as_deref().is_some_and(|until| now >= until) {
             out.notes.push(("line", Some(l.market.clone()), format!("{} line order at {} lapsed, unfilled", m.label, l.price)));
             out.changed = true;
@@ -425,8 +455,9 @@ pub struct AccountView {
     /// LIVE: `testnet` or `mainnet`; left out on paper.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<&'static str>,
-    /// LIVE: each Hyperliquid balance behind it — the core perps', and gold's
-    /// dex (`xyz`), which keeps its own margin. Left out on paper.
+    /// LIVE: each Hyperliquid balance behind it — the core perps', and each
+    /// builder dex's (`xyz` for gold and trade.xyz's stocks), which keeps its
+    /// own margin. Left out on paper.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub venues: Vec<Venue>,
     /// LIVE: when it was read from Hyperliquid (IST); left out on paper,
@@ -438,9 +469,10 @@ pub struct AccountView {
 /// One Hyperliquid balance: the core perps' or a builder dex's.
 #[derive(Debug, Clone, Serialize)]
 pub struct Venue {
-    /// `core` or `xyz`.
+    /// `core`, or a builder dex's name (`xyz`).
     pub dex: &'static str,
-    pub label: &'static str,
+    /// "Core perps", "trade.xyz (xyz)".
+    pub label: String,
     pub account_value: f64,
     pub withdrawable: f64,
     pub margin_used: f64,
@@ -460,6 +492,8 @@ struct Prepared {
     /// Through the mid already: fills now, as a taker, at `mid`.
     now_fill: bool,
     mid: f64,
+    /// The perp is added (not close-only).
+    tradable: bool,
 }
 
 /// Place `p` on `acc`: fill it now, or rest it. The ledger legs it made
@@ -467,6 +501,19 @@ struct Prepared {
 /// which is why it only ever runs on a copy (`PerpDesk::with_account`).
 fn place(acc: &mut Account, p: &Prepared, now: &str, now_ms: i64) -> Result<(OrderAnswer, Vec<Leg>), Refusal> {
     let m = p.market;
+    // A close-only perp takes an order only if it reduces what is held: it
+    // goes in as reduce-only, with no stop or targets of its own.
+    let reducing;
+    let p = if p.tradable || p.reduce_only {
+        p
+    } else {
+        let held = acc.book.position(m.key).ok_or_else(|| close_only(m))?;
+        if held.side == p.side || p.size > held.size + 1e-12 {
+            return Err(close_only(m));
+        }
+        reducing = Prepared { reduce_only: true, levels: PerpLevels::default(), ..p.clone() };
+        &reducing
+    };
     if p.now_fill {
         // A book with nothing held was not stepped, so its funding clock
         // stands at its last position: a position opened now pays at the
@@ -532,7 +579,9 @@ impl PerpDesk {
         (age <= QUOTE_FRESH_MS && q.ctx.mark > 0.0).then(|| Px { mark: q.ctx.mark, mid: q.ctx.mid.filter(|m| *m > 0.0).unwrap_or(q.ctx.mark), oracle: q.ctx.oracle, funding: q.ctx.funding })
     }
 
-    fn need_px(&self, m: &Market) -> Result<Px, Refusal> {
+    fn need_px(&self, m: &'static Market) -> Result<Px, Refusal> {
+        // Asked for now, so the feed follows it from here on.
+        self.hl.ask(&[m.key]);
         self.px(m.key).ok_or_else(|| Refusal::conflict(format!("{}'s price isn't live — not trading blind", m.label)))
     }
 
@@ -646,7 +695,7 @@ impl PerpDesk {
             Side::Long => p >= px.mid,
             Side::Short => p <= px.mid,
         });
-        Ok(Prepared { market: m, side: req.side, size, leverage: req.leverage, limit, reduce_only: req.reduce_only, levels, now_fill, mid: px.mid })
+        Ok(Prepared { market: m, side: req.side, size, leverage: req.leverage, limit, reduce_only: req.reduce_only, levels, now_fill, mid: px.mid, tradable: m.tradable() })
     }
 
     /// Send an order: a market order fills now at the mid; a limit fills now
@@ -748,6 +797,9 @@ impl PerpDesk {
     /// of the line from the stop, as a position opened there takes them.
     #[allow(clippy::too_many_arguments)]
     pub async fn arm_line(&self, user_id: i64, m: &'static Market, side: Side, size: f64, leverage: u32, price: f64, valid_minutes: Option<i64>, stop: Option<f64>, targets: Vec<(f64, Option<f64>)>) -> Result<PerpLine, Refusal> {
+        if !m.tradable() {
+            return Err(close_only(m));
+        }
         let px = self.need_px(m)?;
         let size = m.round_size(size);
         if size <= 0.0 {
@@ -798,7 +850,11 @@ impl PerpDesk {
             let mut map = self.accounts.lock().await;
             let acc = self.account(&mut map, user_id).await?;
             let l = acc.book.lines.iter().find(|l| l.id == line_id).ok_or_else(|| Refusal::not_found("No such line order"))?;
-            self.need_px(market(&l.market)?)?.mark
+            let m = market(&l.market)?;
+            if !m.tradable() {
+                return Err(close_only(m));
+            }
+            self.need_px(m)?.mark
         };
         let now = now_ts();
         self.with_account(user_id, |acc| {
@@ -844,6 +900,12 @@ impl PerpDesk {
             Ok(((), Vec::new()))
         })
         .await
+    }
+
+    /// The perps any paper book holds, rests or arms something in, now.
+    pub async fn in_use(&self) -> HashSet<&'static str> {
+        let map = self.accounts.lock().await;
+        in_use_of(&map)
     }
 
     /// Whether `user_id` holds, rests and arms nothing on paper.
@@ -929,9 +991,12 @@ impl PerpDesk {
     pub async fn step(&self) {
         let now_ms = shared_domain::now_ist().timestamp_millis();
         let now = now_ts();
-        let prices: HashMap<&'static str, Px> = MARKETS.iter().filter_map(|m| self.px(m.key).map(|px| (m.key, px))).collect();
-        let price = |key: &str| prices.get(key).copied();
         let mut map = self.accounts.lock().await;
+        // The perps the books use: the feed follows them, and they are priced.
+        let in_use = in_use_of(&map);
+        let prices: HashMap<&'static str, Px> = in_use.iter().filter_map(|k| self.px(k).map(|px| (*k, px))).collect();
+        self.hl.set_in_use(in_use);
+        let price = |key: &str| prices.get(key).copied();
         let ids: Vec<i64> = map.iter().filter(|(_, a)| !a.book.is_flat()).map(|(id, _)| *id).collect();
         for user_id in ids {
             let Some(acc) = map.get_mut(&user_id) else { continue };
@@ -949,6 +1014,16 @@ impl PerpDesk {
             }
         }
     }
+}
+
+/// The perps `accounts` hold, rest or arm something in.
+fn in_use_of(accounts: &HashMap<i64, Account>) -> HashSet<&'static str> {
+    accounts
+        .values()
+        .flat_map(|a| a.book.positions.iter().map(|p| p.market.as_str()).chain(a.book.orders.iter().map(|o| o.market.as_str())).chain(a.book.lines.iter().map(|l| l.market.as_str())))
+        .filter_map(Market::of_key)
+        .map(|m| m.key)
+        .collect()
 }
 
 /// "BTC-PERP: stop 61,000, targets 64,000 (0.05), 65,000 (all left)".
@@ -1086,7 +1161,7 @@ mod tests {
     }
 
     fn prepared(side: Side, size: f64, limit: Option<f64>, mid: f64) -> Prepared {
-        Prepared { market: btc(), side, size, leverage: 10, limit, reduce_only: false, levels: PerpLevels::default(), now_fill: limit.is_none(), mid }
+        Prepared { market: btc(), side, size, leverage: 10, limit, reduce_only: false, levels: PerpLevels::default(), now_fill: limit.is_none(), mid, tradable: true }
     }
 
     fn account() -> Account {
@@ -1120,6 +1195,39 @@ mod tests {
         resting.now_fill = false;
         let (answer, legs) = place(&mut acc, &resting, "t", 0).unwrap();
         assert!(legs.is_empty() && answer.resting.is_some());
+    }
+
+    #[test]
+    fn a_close_only_perp_takes_only_what_reduces_the_position() {
+        let mut acc = account();
+        place(&mut acc, &prepared(Side::Long, 0.1, None, 60_000.0), "t", 0).unwrap();
+        let close_only = |p: Prepared| Prepared { tradable: false, ..p };
+        // Adding to it, or opening the other way, is refused.
+        let err = place(&mut acc, &close_only(prepared(Side::Long, 0.05, None, 60_000.0)), "t", 0).unwrap_err();
+        assert!(err.message.contains("close-only"), "{}", err.message);
+        assert!(place(&mut acc, &close_only(prepared(Side::Short, 0.2, None, 60_000.0)), "t", 0).is_err(), "more than held would flip it");
+        // Selling part of it is taken, as a reduce-only fill.
+        let (answer, _) = place(&mut acc, &close_only(prepared(Side::Short, 0.04, None, 60_000.0)), "t", 0).unwrap();
+        assert_eq!(answer.filled.len(), 1);
+        assert!((acc.book.position("BTC").unwrap().size - 0.06).abs() < 1e-12);
+        // Nothing held: nothing to reduce.
+        assert!(place(&mut account(), &close_only(prepared(Side::Short, 0.01, None, 60_000.0)), "t", 0).is_err());
+    }
+
+    #[test]
+    fn a_close_only_perps_opening_orders_and_lines_are_cancelled_and_its_position_kept() {
+        let (mut book, mut cash) = (Book::default(), START_USDC);
+        open_long(&mut book, &mut cash, 0.1, 60_000.0, None);
+        book.funded_hour = Some(0);
+        book.orders.push(PerpOrder { id: "add".into(), market: "BTC".into(), side: Side::Long, size: 0.1, price: 55_000.0, leverage: 5, reduce_only: false, placed_at: "t".into(), levels: PerpLevels::default() });
+        book.orders.push(PerpOrder { id: "tp".into(), market: "BTC".into(), side: Side::Short, size: 0.05, price: 70_000.0, leverage: 5, reduce_only: true, placed_at: "t".into(), levels: PerpLevels::default() });
+        book.lines.push(PerpLine { id: "l".into(), market: "BTC".into(), side: Side::Long, size: 0.1, leverage: 5, price: 61_000.0, rising: true, valid_until: None, placed_at: "t".into(), levels: PerpLevels::default() });
+        let s = step_book_with(&mut book, &mut cash, &|_: &str| Some(px(60_000.0)), &|_: &str| false, 0, "t");
+        assert!(s.changed && s.legs.is_empty());
+        assert_eq!(book.orders.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["tp"], "the reduce-only limit rests on");
+        assert!(book.lines.is_empty(), "the line order is cancelled");
+        assert!(book.position("BTC").is_some(), "the position is kept");
+        assert_eq!(s.notes.iter().filter(|(_, _, m)| m.contains("close-only now")).count(), 2);
     }
 
     #[test]

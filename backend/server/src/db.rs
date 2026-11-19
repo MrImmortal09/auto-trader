@@ -522,6 +522,25 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    // The Hyperliquid perps the app charts and trades (`hyperliquid::markets`):
+    // every perp the admin has added, with Hyperliquid's rules for it as last
+    // read. A removed one keeps its row (`added = 0`): positions still held in
+    // it are watched and can be closed. Seeded with BTC, ETH and gold when
+    // empty. A new table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hl_markets (
+            coin TEXT PRIMARY KEY,
+            added INTEGER NOT NULL,
+            header INTEGER NOT NULL DEFAULT 0,
+            sz_decimals INTEGER NOT NULL,
+            max_leverage INTEGER NOT NULL,
+            taker_fee REAL NOT NULL,
+            maker_fee REAL NOT NULL,
+            position INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+
     // Each signed-in person's watchlists (`watchlists`, `/api/v2/watchlists`):
     // up to five named lists of up to fifty price-map keys, kept by user id
     // (the admin is a `users` row too). Nothing here is read by the engine;

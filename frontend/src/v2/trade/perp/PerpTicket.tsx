@@ -6,7 +6,7 @@ import { Button } from '../../ui/Button';
 import { Segment } from '../../ui/Segment';
 import { Toggle } from '../../ui/Toggle';
 import type { PerpKey } from '../model';
-import { estLiq, leverageCap, PERP_RULES, perpPrice, roundPrice, roundSize, signedUsd, sizeText, usd, VALIDITIES } from './model';
+import { estLiq, leverageCap, perpLabel, perpPrice, roundPrice, roundSize, rulesOf, signedUsd, sizeText, usd, VALIDITIES } from './model';
 import type { Perps } from './usePerps';
 
 type OrderKind = 'market' | 'limit' | 'line';
@@ -74,7 +74,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   const [reduceOnly, setReduceOnly] = useState(false);
   const [sending, setSending] = useState(false);
 
-  const rules = PERP_RULES[k];
+  const rules = rulesOf(k);
   const cap = leverageCap(k);
   const lev = Math.max(1, Math.min(cap, leverage));
   const mid = market?.mid ?? market?.mark ?? null;
@@ -98,7 +98,11 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   const reduce = kind !== 'line' && reduceOnly;
   // LIVE is read-only in this release: orders stay on paper.
   const live = account?.mode === 'live';
-  const ready = !live && size != null && size > 0 && price != null && !sending;
+  // A close-only perp (removed from the list, still held) takes only an
+  // order that reduces the position: the other way, no more than is held.
+  const closeOnly = rules.known && !rules.tradable;
+  const reduces = held != null && held.side !== side && size != null && size <= held.size + 1e-12 && kind !== 'line';
+  const ready = !live && rules.known && (!closeOnly || reduces) && size != null && size > 0 && price != null && !sending;
   const size_ = large ? 'lg' : 'md';
   const segSize = large ? 'lg' : 'sm';
 
@@ -172,7 +176,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
       />
 
       {kind !== 'market' && <Field label={kind === 'line' ? 'Line' : 'Limit price'} value={priceText} onChange={setPriceText} unit="$" placeholder={mid == null ? '' : perpPrice(mid)} large={large} action={pickButton(kind === 'line' ? 'Line' : 'Limit price', setPriceText)} />}
-      <Field label="Size" value={sizeText_} onChange={setSizeText} unit={k} placeholder={`0.${'0'.repeat(rules.szDecimals - 1)}1`} large={large} />
+      <Field label="Size" value={sizeText_} onChange={setSizeText} unit={rules.unit} placeholder={rules.szDecimals > 0 ? `0.${'0'.repeat(rules.szDecimals - 1)}1` : '1'} large={large} />
       <div className="flex items-center justify-between gap-3">
         <span className="type-label text-fg-muted">Leverage{adding ? ' (the position’s)' : held ? ' (for what opens)' : ''}</span>
         <div role="group" aria-label="Leverage" className="flex items-center rounded-6 border border-line bg-inset">
@@ -216,9 +220,11 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
 
       <p className="type-caption text-fg-subtle tnum">
         {notional == null
-          ? `Type a size${kind === 'market' ? '' : ' and a price'}. At most ${cap}x; a ${k} size carries ${rules.szDecimals} decimals.`
+          ? `Type a size${kind === 'market' ? '' : ' and a price'}. At most ${cap}x; a ${rules.unit} size carries ${rules.szDecimals} decimals.`
           : `${usd(notional)} · ${held && !adding ? `closes ${sizeText(k, Math.min(size!, held.size))}${margin! > 0 ? `, then ` : ''}` : ''}${margin! > 0 || !held || adding ? `margin ${usd(margin!)}` : ''} · fee ≈ ${usd(fee!)}${liq != null ? ` · liquidation ≈ ${perpPrice(roundPrice(k, liq))}` : ''}${kind === 'line' ? ` · when the mark ${mid != null && price! > mid ? 'rises' : 'falls'} to ${perpPrice(price!)}` : ''}`}
       </p>
+      {closeOnly && <p className="type-caption text-fg">{perpLabel(k)} is close-only: it was removed from the app's markets. Only orders that reduce your position are taken.</p>}
+      {!rules.known && <p className="type-caption text-fg-subtle">{perpLabel(k)} isn't on the app's list of perps.</p>}
       {live && (
         <p className="type-caption text-fg">
           LIVE on {account?.network}: your Hyperliquid account is shown read-only. LIVE orders come in the next release; switch Hyperliquid to Paper in Settings to trade on paper.

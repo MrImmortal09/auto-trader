@@ -69,6 +69,8 @@ export default function App() {
   // Any stock's chart, ladder and option chain (plan Phase 3): off, every
   // stock control stays hidden and a stock opens its instrument page alone.
   const stocksOn = flags.data?.stock_charts === true;
+  // The `hyperliquid` switch: the searches find the perps on the app's list.
+  const perpsOn = flags.data?.hyperliquid === true;
   // Stock options on users' paper books (Phase 4): the watchlist's Buy on a stock row.
   const stockPaperOn = flags.data?.stock_paper === true;
   const screens = visibleScreens(role, watchlistsOn !== false);
@@ -135,6 +137,12 @@ export default function App() {
     pointTradeAt(intent);
     setTradeSeq((n) => n + 1);
     go('trade');
+  }
+
+  /** A Hyperliquid perp from a search: its chart on the Trade screen, and its ticket. */
+  function openPerp(key: string) {
+    setSearchOpen(false);
+    openTrade({ chart: { kind: 'perp', key }, perp: key });
   }
 
   /** A search result: Enter opens it (its chart, while stocks are on and the
@@ -232,7 +240,7 @@ export default function App() {
           unreachable={unreachable}
           role={role}
           onKillSwitch={() => setKillSwitchOpen(true)}
-          search={searchOn ? <Search serverBase={serverBase} onOpen={openResult} onAdd={onAdd} stocksOn={stocksOn} /> : undefined}
+          search={searchOn ? <Search serverBase={serverBase} onOpen={openResult} onAdd={onAdd} stocksOn={stocksOn} onOpenPerp={perpsOn ? openPerp : undefined} /> : undefined}
         />
       ) : (
         <PhoneStatusBar
@@ -258,7 +266,7 @@ export default function App() {
         <main className={`min-w-0 flex-1 ${screen === 'trade' ? 'overflow-hidden' : 'overflow-y-auto'}`}>{content}</main>
       </div>
       {!desktop && <TabBar screens={nav} tabs={tabs} screen={screen} onSelect={go} search={searchOn ? { open: searchOpen, onOpen: () => setSearchOpen(true) } : undefined} />}
-      {!desktop && searchOn && <SearchSheet serverBase={serverBase} open={searchOpen} onClose={() => setSearchOpen(false)} onOpen={openResult} onAdd={onAdd} />}
+      {!desktop && searchOn && <SearchSheet serverBase={serverBase} open={searchOpen} onClose={() => setSearchOpen(false)} onOpen={openResult} onAdd={onAdd} onOpenPerp={perpsOn ? openPerp : undefined} />}
       {addTo.picker}
 
       {killSwitchOpen && canReadOwner && (

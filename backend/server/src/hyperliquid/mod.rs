@@ -1,17 +1,22 @@
-//! Hyperliquid perps: the three the app trades, and their market data.
+//! Hyperliquid perps: the ones the app trades, and their market data.
 //!
-//! Only BTC, ETH and trade.xyz's gold (`xyz:GOLD`, a builder-deployed perp)
-//! are charted or priced — no other Hyperliquid market. Their charts are
-//! `HL:BTC`, `HL:ETH` and `HL:GOLD` on the same candle routes as everything
-//! else. The live bars, and each perp's mark, mid, oracle price and funding,
-//! come from one WebSocket open only while the `hyperliquid` switch is on.
+//! The perps on the list ([`markets`]) are charted and priced: BTC, ETH and
+//! trade.xyz's gold to start with, and whatever else the admin adds. Their
+//! charts are `HL:BTC`, `HL:GOLD`, `HL:xyz:NVDA` on the same candle routes
+//! as everything else. The live bars, and each perp's mark, mid, oracle
+//! price and funding, come from one WebSocket open only while the
+//! `hyperliquid` switch is on, which follows only what is in use: a perp's
+//! context while the header shows it, a screen has asked for it in the last
+//! minute, a chart watches it or a paper book holds, rests or arms
+//! something in it; its candles at a timeframe while a chart watches them.
 //!
 //! Each perp's bars at each timeframe are kept once a chart asks for them
 //! (a [`Series`]): Hyperliquid's `candleSnapshot` is read for what isn't kept
 //! yet — the older days a chart asks for, and the tail while the feed was
 //! down — and one fetch at a time per perp and timeframe, so charts opening
 //! together share it. Hyperliquid limits each IP to 1,200 request weight a
-//! minute, and the order calls to come draw on the same budget.
+//! minute, and the order calls to come draw on the same budget. A series no
+//! chart has watched for half an hour is dropped.
 //!
 //! The feed's `candle` channel can miss a bar's last trades, and sends
 //! nothing for a minute without a trade (Hyperliquid's own candles have a
@@ -23,7 +28,7 @@
 //! Market data comes from mainnet whatever the trading network: paper fills
 //! are priced on the real market. Nothing here holds a key or can trade.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
 use hyperliquid_client::feed::{self, FeedMsg, Sub};
@@ -35,11 +40,10 @@ use tokio::task::JoinHandle;
 use crate::candles::bars::{Bar, Tf};
 
 pub mod live;
+pub mod markets;
 pub mod paper;
 pub mod perp;
 
-/// The candle intervals followed live: the charts' timeframes.
-const TFS: [Tf; 3] = [Tf::M1, Tf::M5, Tf::M15];
 /// Room for a burst of bar changes while a stream catches up.
 const CHANGES_CAPACITY: usize = 1024;
 /// Most bars kept per perp and timeframe (Hyperliquid serves only its latest
@@ -49,17 +53,32 @@ const MAX_SERIES_BARS: usize = 12_000;
 /// most this many.
 const CORRECT_MAX_BARS: i64 = 60;
 /// A series no chart has asked for (or streamed) in this long is not
-/// corrected any more; the next chart to ask reads its tail again.
+/// corrected any more, and its candles are not followed; the next chart to
+/// ask reads its tail again.
 const SERIES_IDLE_MS: i64 = 10 * 60_000;
+/// A series no chart has watched in this long is dropped.
+const SERIES_DROP_MS: i64 = 30 * 60_000;
+/// A perp a screen asked about is followed for this long after.
+const ASKED_FOR_MS: i64 = 60_000;
+/// Hyperliquid allows 1,000 subscriptions an IP; the feed keeps below.
+const MAX_SUBS: usize = 900;
+/// How often what the feed follows is worked out again (and idle series
+/// dropped).
+const KEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A perp the app trades, with Hyperliquid's rules for it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Market {
-    /// The app's name for it: `BTC`, `ETH`, `GOLD`.
+    /// The app's name for it: Hyperliquid's coin (`BTC`, `xyz:NVDA`), but
+    /// `GOLD` for trade.xyz's gold, as it has been called from the start.
     pub key: &'static str,
-    /// Hyperliquid's name: `BTC`, `ETH`, `xyz:GOLD`.
+    /// Hyperliquid's name: `BTC`, `xyz:GOLD`.
     pub coin: &'static str,
-    /// What the screens call it: `BTC-PERP`.
+    /// Its name without the dex: `BTC`, `GOLD`, `NVDA`.
+    pub base: &'static str,
+    /// The builder dex it trades on (`xyz`); `None` on a core perp.
+    pub dex: Option<&'static str>,
+    /// What the screens call it: `BTC-PERP`, `NVDA-PERP (io)`.
     pub label: &'static str,
     pub name: &'static str,
     /// Decimals a size may carry: 5 for BTC is 0.00001 BTC.
@@ -68,8 +87,9 @@ pub struct Market {
     /// ([`MAX_LEVERAGE`]).
     pub max_leverage: u32,
     /// Fees as a fraction of notional at Hyperliquid's base tier: 0.045 %
-    /// taker and 0.015 % maker on core perps, double on a builder-deployed
-    /// one (trade.xyz's gold).
+    /// taker and 0.015 % maker on core perps; a builder-deployed one's scale
+    /// with its deployer's share (double on trade.xyz's gold), a tenth of
+    /// that in growth mode.
     pub taker_fee: f64,
     pub maker_fee: f64,
 }
@@ -77,13 +97,6 @@ pub struct Market {
 /// The most leverage the app takes on any perp (the owner's cap,
 /// 2026-11-19), whatever Hyperliquid allows above it.
 pub const MAX_LEVERAGE: u32 = 20;
-
-/// Every perp the app charts or trades, in the header's order.
-pub const MARKETS: [Market; 3] = [
-    Market { key: "BTC", coin: "BTC", label: "BTC-PERP", name: "Bitcoin", sz_decimals: 5, max_leverage: 40, taker_fee: 0.00045, maker_fee: 0.00015 },
-    Market { key: "ETH", coin: "ETH", label: "ETH-PERP", name: "Ether", sz_decimals: 4, max_leverage: 25, taker_fee: 0.00045, maker_fee: 0.00015 },
-    Market { key: "GOLD", coin: "xyz:GOLD", label: "GOLD-PERP", name: "Gold (trade.xyz)", sz_decimals: 4, max_leverage: 25, taker_fee: 0.0009, maker_fee: 0.0003 },
-];
 
 /// What a perp's chart symbol starts with.
 pub const SYMBOL_PREFIX: &str = "HL:";
@@ -94,21 +107,27 @@ impl Market {
         format!("{SYMBOL_PREFIX}{}", self.key)
     }
 
-    /// The market `HL:BTC` (any case) names.
+    /// The market `HL:BTC` (any case) names, on the list (added or
+    /// close-only).
     pub fn of_symbol(raw: &str) -> Option<&'static Market> {
         let raw = raw.trim();
         let rest = raw.get(..SYMBOL_PREFIX.len()).filter(|p| p.eq_ignore_ascii_case(SYMBOL_PREFIX)).map(|_| &raw[SYMBOL_PREFIX.len()..])?;
-        MARKETS.iter().find(|m| m.key.eq_ignore_ascii_case(rest))
+        Market::of_key(rest)
     }
 
-    /// The market Hyperliquid calls `coin`.
+    /// The market Hyperliquid calls `coin`, on the list.
     pub fn of_coin(coin: &str) -> Option<&'static Market> {
-        MARKETS.iter().find(|m| m.coin == coin)
+        markets::by_coin(coin).map(|e| e.market)
     }
 
-    /// The market the app calls `key`.
+    /// The market the app calls `key` (any case), on the list.
     pub fn of_key(key: &str) -> Option<&'static Market> {
-        MARKETS.iter().find(|m| m.key == key)
+        markets::by_key(key).map(|e| e.market)
+    }
+
+    /// Added (not close-only): it takes orders that open or add.
+    pub fn tradable(&self) -> bool {
+        markets::tradable(self.key)
     }
 
     /// The most leverage the app takes on it.
@@ -224,10 +243,14 @@ fn merge(s: &mut Series, fetched: Vec<Bar>, forming: Option<i64>) -> Vec<Bar> {
     changed
 }
 
+/// One lock per perp and timeframe, made on first use.
+type FetchLocks = HashMap<(&'static str, Tf), Arc<Mutex<()>>>;
+
 struct Running {
     stop: watch::Sender<bool>,
     feed: JoinHandle<()>,
     reader: JoinHandle<()>,
+    keeper: JoinHandle<()>,
 }
 
 /// Hyperliquid's market data while the `hyperliquid` switch is on.
@@ -237,8 +260,15 @@ pub struct HlMarketData {
     series: StdMutex<HashMap<(&'static str, Tf), Series>>,
     /// One Hyperliquid read at a time per perp and timeframe: charts opening
     /// together wait for the one fetch and share it.
-    fetching: HashMap<(&'static str, Tf), Mutex<()>>,
+    fetching: StdMutex<FetchLocks>,
     changes: broadcast::Sender<BarChange>,
+    /// What the feed follows ([`HlMarketData::resubscribe`]).
+    subs: watch::Sender<BTreeSet<Sub>>,
+    /// When a screen last asked about each perp (Unix ms).
+    asked: StdMutex<HashMap<&'static str, i64>>,
+    /// The perps a paper book holds, rests or arms something in, as the
+    /// desk's last tick found them.
+    in_use: StdMutex<HashSet<&'static str>>,
     running: Mutex<Option<Running>>,
 }
 
@@ -250,20 +280,30 @@ fn bar_of(c: &hyperliquid_client::Candle) -> Bar {
     Bar { t: c.t, o: c.o, h: c.h, l: c.l, c: c.c, v: Some(c.v) }
 }
 
+/// The app's key for a coin the feed followed: the list's, or (for one no
+/// longer on it) as the list would name it.
+fn key_of_coin(coin: &str) -> Option<&'static str> {
+    Market::of_coin(coin).map(|m| m.key)
+}
+
 impl HlMarketData {
     pub fn new() -> Arc<Self> {
         Arc::new(HlMarketData {
             info: InfoClient::new(Network::Mainnet),
             live: StdMutex::new(Live::default()),
             series: StdMutex::new(HashMap::new()),
-            fetching: MARKETS.iter().flat_map(|m| TFS.iter().map(move |tf| ((m.key, *tf), Mutex::new(())))).collect(),
+            fetching: StdMutex::new(HashMap::new()),
             changes: broadcast::channel(CHANGES_CAPACITY).0,
+            subs: watch::channel(BTreeSet::new()).0,
+            asked: StdMutex::new(HashMap::new()),
+            in_use: StdMutex::new(HashSet::new()),
             running: Mutex::new(None),
         })
     }
 
     // Lock order, where both are held: `live`, then `series`. Neither is
-    // held across an await.
+    // held across an await; `asked` and `in_use` are never held with
+    // another.
     fn live(&self) -> MutexGuard<'_, Live> {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -272,8 +312,116 @@ impl HlMarketData {
         self.series.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn fetch_lock(&self, key: &'static str, tf: Tf) -> &Mutex<()> {
-        self.fetching.get(&(key, tf)).expect("a lock for every perp and timeframe")
+    fn fetch_lock(&self, key: &'static str, tf: Tf) -> Arc<Mutex<()>> {
+        let mut all = self.fetching.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(all.entry((key, tf)).or_default())
+    }
+
+    /// What the feed should follow now: each perp's context while the
+    /// header shows it, a screen asked for it lately, a paper book uses it
+    /// or a chart watches it; a series' candles while a chart watches it.
+    /// Contexts come first, held perps first of all, should the cap bite.
+    fn wanted(&self, now: i64) -> BTreeSet<Sub> {
+        let in_use: Vec<&'static str> = self.in_use.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+        let asked: Vec<&'static str> = self.asked.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, at)| now - **at < ASKED_FOR_MS).map(|(k, _)| *k).collect();
+        let watched: Vec<(&'static str, Tf)> = self.series().iter().filter(|(_, s)| s.watched(now)).map(|(k, _)| *k).collect();
+        let header = markets::entries().into_iter().filter(|e| e.added && e.header).map(|e| e.market.key);
+        let mut ctx: Vec<&'static str> = Vec::new();
+        for key in in_use.into_iter().chain(header).chain(asked).chain(watched.iter().map(|(k, _)| *k)) {
+            if !ctx.contains(&key) {
+                ctx.push(key);
+            }
+        }
+        let mut out = BTreeSet::new();
+        let ctx_subs = ctx.iter().filter_map(|k| Market::of_key(k)).map(|m| Sub::Ctx { coin: m.coin.to_string() });
+        let candle_subs = watched.iter().filter_map(|(k, tf)| Market::of_key(k).map(|m| Sub::Candle { coin: m.coin.to_string(), interval: tf.as_str().to_string() }));
+        for sub in ctx_subs.chain(candle_subs) {
+            if out.len() >= MAX_SUBS {
+                tracing::warn!("Hyperliquid feed: more than {MAX_SUBS} subscriptions wanted — the rest wait");
+                break;
+            }
+            out.insert(sub);
+        }
+        out
+    }
+
+    /// Work out what the feed follows again, and forget what it stops
+    /// following: a context's quote, a series' forming bar (its tail is read
+    /// again on the next ask).
+    fn resubscribe(&self) {
+        let wanted = self.wanted(now_ms());
+        let mut dropped = Vec::new();
+        self.subs.send_if_modified(|current| {
+            if *current == wanted {
+                return false;
+            }
+            dropped = current.difference(&wanted).cloned().collect();
+            *current = wanted;
+            true
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        let mut live = self.live();
+        let mut all = self.series();
+        for sub in dropped {
+            match sub {
+                Sub::Ctx { coin } => {
+                    if let Some(key) = key_of_coin(&coin) {
+                        live.quotes.remove(key);
+                    }
+                }
+                Sub::Candle { coin, interval } => {
+                    let (Some(key), Some(tf)) = (key_of_coin(&coin), Tf::parse(&interval)) else { continue };
+                    live.last.remove(&(key, tf));
+                    if let Some(s) = all.get_mut(&(key, tf)) {
+                        s.live = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A screen is about to show `keys`: follow their contexts for the next
+    /// minute.
+    pub fn ask(&self, keys: &[&'static str]) {
+        if keys.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        let fresh = {
+            let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+            let mut fresh = false;
+            for key in keys {
+                fresh |= asked.insert(key, now).is_none_or(|at| now - at >= ASKED_FOR_MS);
+            }
+            fresh
+        };
+        if fresh {
+            self.resubscribe();
+        }
+    }
+
+    /// The perps the paper books use now (the desk's tick).
+    pub fn set_in_use(&self, keys: HashSet<&'static str>) {
+        let changed = {
+            let mut in_use = self.in_use.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = *in_use != keys;
+            *in_use = keys;
+            changed
+        };
+        if changed {
+            self.resubscribe();
+        }
+    }
+
+    /// Drop the series no chart has watched in [`SERIES_DROP_MS`], forget
+    /// old asks, and follow what is wanted now.
+    fn keep(&self) {
+        let now = now_ms();
+        self.series().retain(|_, s| now - s.touched_ms < SERIES_DROP_MS);
+        self.asked.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, at| now - *at < ASKED_FOR_MS);
+        self.resubscribe();
     }
 
     /// Open the feed (`on`) or close it, as the switch now says.
@@ -286,25 +434,29 @@ impl HlMarketData {
             let _ = r.stop.send(true);
             r.feed.abort();
             r.reader.abort();
+            r.keeper.abort();
             *self.live() = Live::default();
             self.series().clear();
+            self.asked.lock().unwrap_or_else(|e| e.into_inner()).clear();
             tracing::info!("Hyperliquid feed closed");
             return;
         }
-        let subs: Vec<Sub> = MARKETS
-            .iter()
-            .flat_map(|m| {
-                TFS.iter()
-                    .map(|tf| Sub::Candle { coin: m.coin.to_string(), interval: tf.as_str().to_string() })
-                    .chain([Sub::Ctx { coin: m.coin.to_string() }])
-            })
-            .collect();
+        self.resubscribe();
         let (tx, rx) = mpsc::channel(4096);
         let (stop, stop_rx) = watch::channel(false);
-        let feed = tokio::spawn(feed::run(Network::Mainnet, subs, tx, stop_rx));
+        let feed = tokio::spawn(feed::run(Network::Mainnet, self.subs.subscribe(), tx, stop_rx));
         let reader = tokio::spawn(Arc::clone(self).read(rx));
-        *running = Some(Running { stop, feed, reader });
-        tracing::info!("Hyperliquid feed opening (BTC, ETH, xyz:GOLD)");
+        let me = Arc::clone(self);
+        let keeper = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(KEEP_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                me.keep();
+            }
+        });
+        *running = Some(Running { stop, feed, reader, keeper });
+        tracing::info!("Hyperliquid feed opening ({} subscriptions)", self.subs.borrow().len());
     }
 
     /// Keep the feed's updates, until it ends.
@@ -342,13 +494,24 @@ impl HlMarketData {
                     let (Some(m), Some(tf)) = (Market::of_coin(&c.coin), Tf::parse(&c.interval)) else { continue };
                     let bar = bar_of(&c);
                     let before = self.live().last.insert((m.key, tf), bar).map(|b| b.t);
-                    if let Some(s) = self.series().get_mut(&(m.key, tf)) {
-                        s.bars.insert(bar.t, bar);
-                    }
+                    let tail = {
+                        let mut all = self.series();
+                        all.get_mut(&(m.key, tf)).map(|s| {
+                            let tail = s.tail_ms();
+                            s.bars.insert(bar.t, bar);
+                            tail
+                        })
+                    };
                     let _ = self.changes.send(BarChange { key: m.key, tf, bar });
                     // A new bar: the one before closed, maybe without its
-                    // last trades, maybe with flat minutes since.
-                    if let Some(closed) = before.filter(|t| *t < bar.t) {
+                    // last trades, maybe with flat minutes since. The first
+                    // bar since the series was subscribed: what closed
+                    // between its read and now.
+                    let closed = match before {
+                        Some(t) => Some(t).filter(|t| *t < bar.t),
+                        None => tail.filter(|t| *t < bar.t),
+                    };
+                    if let Some(closed) = closed {
                         tokio::spawn(Arc::clone(&self).correct(m, tf, closed));
                     }
                 }
@@ -363,7 +526,8 @@ impl HlMarketData {
         if !self.series().get(&(m.key, tf)).is_some_and(|s| s.watched(now)) {
             return;
         }
-        let _one = self.fetch_lock(m.key, tf).lock().await;
+        let lock = self.fetch_lock(m.key, tf);
+        let _one = lock.lock().await;
         let from = from_t.max(now - CORRECT_MAX_BARS * tf.ms());
         let fetched = match self.fetch(m, tf, from, now).await {
             Ok(bars) => bars,
@@ -383,7 +547,8 @@ impl HlMarketData {
             self.series().iter().filter(|(_, s)| s.watched(now)).map(|(k, s)| (*k, s.tail_ms())).collect();
         for ((key, tf), tail) in wanted {
             let Some(m) = Market::of_key(key) else { continue };
-            let _one = self.fetch_lock(key, tf).lock().await;
+            let lock = self.fetch_lock(key, tf);
+            let _one = lock.lock().await;
             match self.fetch(m, tf, tail, now_ms()).await {
                 Ok(fetched) => self.apply(m, tf, fetched, true),
                 Err(e) => tracing::warn!("Hyperliquid {} {} not caught up after a reconnect: {e}", m.label, tf.as_str()),
@@ -439,12 +604,15 @@ impl HlMarketData {
     /// An open chart still follows `keys` at `tf`: keep correcting them.
     pub fn touch(&self, keys: &[&'static str], tf: Tf) {
         let now = now_ms();
-        let mut all = self.series();
-        for key in keys {
-            if let Some(s) = all.get_mut(&(*key, tf)) {
-                s.touched_ms = now;
+        {
+            let mut all = self.series();
+            for key in keys {
+                if let Some(s) = all.get_mut(&(*key, tf)) {
+                    s.touched_ms = now;
+                }
             }
         }
+        self.resubscribe();
     }
 
     /// `m`'s bars at `tf` opening in `[from_ms, to_ms]`, oldest first. Only
@@ -452,7 +620,8 @@ impl HlMarketData {
     /// holds, and its tail unless the feed has kept it current. A tail that
     /// can't be read gives the kept bars; older ones that can't, an error.
     pub async fn history(&self, m: &'static Market, tf: Tf, from_ms: i64, to_ms: i64) -> Result<Vec<Bar>, HlError> {
-        let _one = self.fetch_lock(m.key, tf).lock().await;
+        let lock = self.fetch_lock(m.key, tf);
+        let _one = lock.lock().await;
         let now = now_ms();
         let up = self.is_up();
         let (head, tail) = {
@@ -498,7 +667,11 @@ impl HlMarketData {
         if tail_read {
             s.live = up;
         }
-        Ok(s.bars.range(from_ms..=to_ms).map(|(_, b)| *b).collect())
+        let bars: Vec<Bar> = s.bars.range(from_ms..=to_ms).map(|(_, b)| *b).collect();
+        drop(all);
+        // A new series: its candles are followed from now.
+        self.resubscribe();
+        Ok(bars)
     }
 }
 
@@ -526,11 +699,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_perps_are_named() {
+    fn a_symbol_names_a_perp_on_the_list() {
         assert_eq!(Market::of_symbol("HL:BTC").map(|m| m.coin), Some("BTC"));
         assert_eq!(Market::of_symbol("hl:gold").map(|m| m.coin), Some("xyz:GOLD"));
         assert_eq!(Market::of_symbol(" HL:ETH ").map(|m| m.label), Some("ETH-PERP"));
-        assert_eq!(Market::of_symbol("HL:SOL"), None);
+        assert_eq!(Market::of_symbol("HL:DOGE-NOT-LISTED"), None, "not on the list");
         assert_eq!(Market::of_symbol("BTC"), None);
         assert_eq!(Market::of_symbol("NIFTY"), None);
         assert!(is_hl_symbol("HL:SOL"), "an unknown perp is still the perps' to refuse");
@@ -538,7 +711,7 @@ mod tests {
         assert_eq!(Market::of_coin("xyz:GOLD").map(|m| m.key), Some("GOLD"));
         assert_eq!(Market::of_coin("GOLD"), None, "only trade.xyz's gold");
         assert_eq!(Market::of_key("ETH").map(|m| m.coin), Some("ETH"));
-        assert_eq!(MARKETS.iter().map(Market::symbol).collect::<Vec<_>>(), ["HL:BTC", "HL:ETH", "HL:GOLD"]);
+        assert_eq!(markets::BUILTIN.iter().map(Market::symbol).collect::<Vec<_>>(), ["HL:BTC", "HL:ETH", "HL:GOLD"]);
     }
 
     fn bar(t: i64, c: f64) -> Bar {

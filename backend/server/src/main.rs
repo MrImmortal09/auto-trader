@@ -219,6 +219,9 @@ pub(crate) struct AppState {
     /// Hyperliquid LIVE, the owner's: its switches, its API wallets (sealed
     /// under AUTH_SECRET) and its account read from Hyperliquid.
     pub hl_live: Arc<hyperliquid::live::LiveDesk>,
+    /// The admin's list of Hyperliquid perps: adding and removing them
+    /// (`hyperliquid::markets`).
+    pub hl_markets: Arc<hyperliquid::markets::MarketAdmin>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,8 +1208,12 @@ async fn main() {
     )
     .await;
 
-    // Hyperliquid perps: market data (its feed opens below if the switch is
-    // on), and the paper desk with every account that has something open.
+    // Hyperliquid perps: the list of perps the app trades, market data (its
+    // feed opens below if the switch is on), and the paper desk with every
+    // account that has something open.
+    hyperliquid::markets::load(&pool).await.expect("load the Hyperliquid markets");
+    let hl_markets = Arc::new(hyperliquid::markets::MarketAdmin::new(pool.clone()));
+    tokio::spawn(hyperliquid::markets::run_refresh(Arc::clone(&hl_markets), Arc::clone(&flags)));
     let hl = hyperliquid::HlMarketData::new();
     let perps = Arc::new(
         hyperliquid::paper::PerpDesk::load(pool.clone(), Arc::clone(&hl))
@@ -1258,6 +1265,7 @@ async fn main() {
         hl: Arc::clone(&hl),
         perps,
         hl_live,
+        hl_markets,
     };
     // Hyperliquid's feed, if its switch was left on.
     {
@@ -1349,6 +1357,8 @@ async fn main() {
                                                    .delete(routes::admin_sessions::delete_session_handler))
         .route("/api/admin/data",                   get(routes::admin_data::data_handler))
         .route("/api/v2/hl/markets",                get(routes::v2::hl::markets_handler))
+        .route("/api/v2/hl/catalog",                get(routes::v2::hl::catalog_handler))
+        .route("/api/v2/hl/admin/markets",          get(routes::v2::hl_markets::view_handler).put(routes::v2::hl_markets::change_handler))
         .route("/api/v2/hl/account",                get(routes::v2::hl_desk::account_handler))
         .route("/api/v2/hl/orders",                 post(routes::v2::hl_desk::order_handler))
         .route("/api/v2/hl/orders/:id",             axum::routing::patch(routes::v2::hl_desk::move_order_handler).delete(routes::v2::hl_desk::cancel_order_handler))

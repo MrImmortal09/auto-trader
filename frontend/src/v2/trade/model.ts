@@ -4,6 +4,8 @@
 import type { ChartLevel, ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
 import { INDEX_ORDER } from '../../lib/execute';
 import { level, shortDate, signedMoney } from '../lib/format';
+import { isPerpKey } from './perp/catalog';
+import { perpLabel } from './perp/model';
 
 export type Tf = '1m' | '5m' | '15m';
 /** Which library draws the charts: KLineChart (the default) or Vela. */
@@ -44,10 +46,10 @@ export type ChartSym =
   | { kind: 'option'; index: string; expiry: string; strike: number; side: 'CE' | 'PE' }
   | { kind: 'perp'; key: PerpKey };
 
-/** A Hyperliquid perp the app trades (behind the `hyperliquid` switch):
- * BTC, ETH, and trade.xyz's gold. */
-export type PerpKey = 'BTC' | 'ETH' | 'GOLD';
-export const PERP_KEYS: PerpKey[] = ['BTC', 'ETH', 'GOLD'];
+/** A Hyperliquid perp on the app's list (behind the `hyperliquid` switch),
+ * by its key: Hyperliquid's coin (`BTC`, `xyz:NVDA`), `GOLD` for trade.xyz's
+ * gold. The list is the server's (`perp/catalog.ts`). */
+export type PerpKey = string;
 
 /** A perp's chart name, `HL:BTC`, or an underlying named so. */
 export function isPerpName(name: string): boolean {
@@ -142,7 +144,7 @@ export function symbolLabel(s: ChartSym): string {
     case 'index':
       return s.index === 'NIFTY' ? 'NIFTY 50' : s.index;
     case 'perp':
-      return `${s.key}-PERP`;
+      return perpLabel(s.key);
   }
 }
 
@@ -168,7 +170,7 @@ export function parseChartSym(raw: unknown): ChartSym | null {
     if (!isTicker(s.symbol) || isIndex(s.symbol)) return null;
     return { kind: 'equity', symbol: s.symbol, exchange: s.exchange === 'BSE' ? 'BSE' : 'NSE' };
   }
-  if (s.kind === 'perp') return PERP_KEYS.includes(s.key as PerpKey) ? { kind: 'perp', key: s.key as PerpKey } : null;
+  if (s.kind === 'perp') return isPerpKey(s.key) ? { kind: 'perp', key: s.key } : null;
   if (s.kind === 'option') {
     const ok = index && typeof s.expiry === 'string' && DAY.test(s.expiry) && typeof s.strike === 'number' && Number.isFinite(s.strike) && s.strike > 0 && (s.side === 'CE' || s.side === 'PE');
     return ok ? { kind: 'option', index, expiry: s.expiry as string, strike: s.strike as number, side: s.side as 'CE' | 'PE' } : null;

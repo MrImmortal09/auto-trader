@@ -28,7 +28,7 @@ import { C, type LinePart, type OrderLineData } from '../chartSetup';
 import type { PlacingPrompt } from '../ChartPanel';
 import type { ChartLine } from '../KChart';
 import type { PerpKey } from '../model';
-import { perpPrice, pnlAt, roundPrice, sideWord, signedUsd, sizeText } from './model';
+import { perpLabel, perpPrice, pnlAt, roundPrice, sideWord, signedUsd, sizeText } from './model';
 
 /** A level being put on a perp's chart: the next click sets it. `pick`
  * hands the price to `onPick` (the ticket's limit or line price). */
@@ -150,21 +150,21 @@ export function usePerps({ serverBase, enabled, onShow }: {
       toast({ tone: 'neutral', ...fallback });
       return;
     }
-    for (const l of legs) toast({ tone: l.action === 'BUY' ? 'profit' : 'loss', title: `${l.action === 'BUY' ? 'Bought' : 'Sold'} ${l.size} ${l.market}-PERP`, body: `At ${perpPrice(l.price)} (paper)` });
+    for (const l of legs) toast({ tone: l.action === 'BUY' ? 'profit' : 'loss', title: `${l.action === 'BUY' ? 'Bought' : 'Sold'} ${l.size} ${perpLabel(l.market)}`, body: `At ${perpPrice(l.price)} (paper)` });
   }
 
   const actions: PerpActions = {
     order: (body) =>
       run(
         () => perpOrder(serverBase, body),
-        `${body.market}-PERP order not placed`,
-        (b) => filledToast(b, { title: `Limit ${body.side} ${body.size} ${body.market}-PERP resting`, body: `At ${perpPrice(body.price ?? 0)} — it fills when the price reaches it` }),
+        `${perpLabel(body.market)} order not placed`,
+        (b) => filledToast(b, { title: `Limit ${body.side} ${body.size} ${perpLabel(body.market)} resting`, body: `At ${perpPrice(body.price ?? 0)} — it fills when the price reaches it` }),
       ),
-    close: (market, size) => run(() => perpClose(serverBase, market, size), `${market}-PERP not closed`, (b) => filledToast(b, { title: `${market}-PERP closed`, body: '' })),
-    setLevels: (market, update) => run(() => perpLevels(serverBase, market, update), `${market}-PERP stop or target not set`),
+    close: (market, size) => run(() => perpClose(serverBase, market, size), `${perpLabel(market)} not closed`, (b) => filledToast(b, { title: `${perpLabel(market)} closed`, body: '' })),
+    setLevels: (market, update) => run(() => perpLevels(serverBase, market, update), `${perpLabel(market)} stop or target not set`),
     line: (body) =>
-      run(() => perpLine(serverBase, body), `${body.market}-PERP line order not placed`, () =>
-        toast({ tone: 'neutral', title: `Line order: ${body.side} ${body.size} ${body.market}-PERP`, body: `At ${perpPrice(body.price)} — a market order once the price crosses it` }),
+      run(() => perpLine(serverBase, body), `${perpLabel(body.market)} line order not placed`, () =>
+        toast({ tone: 'neutral', title: `Line order: ${body.side} ${body.size} ${perpLabel(body.market)}`, body: `At ${perpPrice(body.price)} — a market order once the price crosses it` }),
       ),
     updateLine: (id, update) => run(() => perpUpdateLine(serverBase, id, update), 'Line order not changed'),
     moveOrder: (id, price) => run(() => perpMoveOrder(serverBase, id, price), 'Limit not moved', (b) => filledToast(b, { title: 'Limit moved', body: `To ${perpPrice(price)}` })),

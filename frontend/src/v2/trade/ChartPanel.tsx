@@ -19,7 +19,9 @@ import { useDrawing, useDrawPrefs, type DrawApi, type DrawTool } from './drawing
 import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type ChartState, type Placing } from './KChart';
 import type { Layers } from './lines';
-import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, PERP_KEYS, sameSym, symbolLabel, symbolName, symExpiry, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, sameSym, symbolLabel, symbolName, symExpiry, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { usePerpCatalog } from './perp/catalog';
+import { PerpResults } from './perp/PerpResults';
 import { QuoteStrip } from './QuoteStrip';
 import { drawableStudies, STUDIES } from './studies';
 
@@ -67,17 +69,26 @@ function LotsStepper({ lots }: { lots: LotsPick }) {
 }
 
 /**
- * The symbol picker's search row (behind the `stock_charts` switch): any
- * stock, future or option the catalog lists, typed and picked for this
+ * The symbol picker's search row: any stock, future or option the catalog
+ * lists (behind the `stock_charts` switch), and any Hyperliquid perp on the
+ * app's list (behind the `hyperliquid` one), typed and picked for this
  * chart. A future is named with its month ("RELIANCE DEC FUT"), since a
  * stock lists several; the row this chart shows (`current`) is marked.
  * Mounted only while the picker is open, so a query never outlives it.
  */
-function PickerSearch({ serverBase, compact, current, onPick }: { serverBase: string; compact: boolean; current: ChartSym; onPick: (row: InstrumentRow) => void }) {
+function PickerSearch({ serverBase, compact, current, onPick, onPickPerp, stocksOn, perpsOn }: {
+  serverBase: string;
+  compact: boolean;
+  current: ChartSym;
+  onPick: (row: InstrumentRow) => void;
+  onPickPerp: (key: string) => void;
+  stocksOn: boolean;
+  perpsOn: boolean;
+}) {
   const [query, setQuery] = useState('');
   const typed = query.trim();
-  const search = useSearch(serverBase, query, true);
-  const rows = rowsOf(search.answer).filter((r) => chartSymOf(r, true) != null);
+  const search = useSearch(serverBase, stocksOn ? query : '', stocksOn);
+  const rows = stocksOn ? rowsOf(search.answer).filter((r) => chartSymOf(r, true) != null) : [];
   const row = compact ? 'h-11' : 'h-8';
   return (
     <div className="pb-2">
@@ -88,7 +99,7 @@ function PickerSearch({ serverBase, compact, current, onPick }: { serverBase: st
           aria-label="Search an instrument for this chart"
           autoComplete="off"
           spellCheck={false}
-          placeholder="Search a stock, future or option…"
+          placeholder={stocksOn ? (perpsOn ? 'Search a stock, option or perp…' : 'Search a stock, future or option…') : 'Search a perp: NVDA, SOL, SP500…'}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           className="min-w-0 flex-1 bg-transparent type-label text-fg outline-none placeholder:text-fg-subtle"
@@ -96,6 +107,7 @@ function PickerSearch({ serverBase, compact, current, onPick }: { serverBase: st
       </div>
       {typed && (
         <div role="listbox" aria-label="Instruments" className="mt-1 max-h-56 overflow-y-auto">
+          {perpsOn && <PerpResults query={typed} compact={compact} current={current.kind === 'perp' ? current.key : null} onPick={(r) => onPickPerp(r.key)} heading={stocksOn} />}
           {rows.slice(0, 12).map((r) => {
             const sym = chartSymOf(r, true);
             const on = sym != null && sameSym(sym, current);
@@ -116,7 +128,7 @@ function PickerSearch({ serverBase, compact, current, onPick }: { serverBase: st
             );
           })}
           {search.pending && <p className="px-2 py-1 type-caption text-fg-subtle">Searching…</p>}
-          {!search.pending && search.answer && rows.length === 0 && <p className="px-2 py-1 type-caption text-fg-subtle">No match for '{typed}'</p>}
+          {stocksOn ? !search.pending && search.answer && rows.length === 0 && <p className="px-2 py-1 type-caption text-fg-subtle">No match for '{typed}'</p> : null}
           {search.error && <p className="px-2 py-1 type-caption text-loss">{search.error}</p>}
         </div>
       )}
@@ -237,6 +249,10 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
 
   // An index's value, and a perp's mid, come from the screen's feeds.
   const quoted = sym.kind === 'index' || sym.kind === 'perp';
+  // The picker's perps: the header's, and the one shown if it isn't.
+  const perpList = usePerpCatalog().list;
+  const pinnedPerps = perpList.filter((r) => r.tradable && r.header).map((r) => r.key);
+  if (sym.kind === 'perp' && !pinnedPerps.some((k) => k.toLowerCase() === sym.key.toLowerCase())) pinnedPerps.push(sym.key);
   const shown = quoted ? spot[underlying] ?? chartState.last?.c ?? null : chartState.last?.c ?? null;
   // A different instrument is a new figure, not a tick.
   const flash = useTickFlash(shown, true, symbolName(sym));
@@ -327,14 +343,20 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             <ChevronDown size={14} className="shrink-0 text-fg-muted" />
           </button>
           <Popover open={menu === 'pick'} onClose={close} backdrop={compact}>
-            {stocksOn && (
+            {(stocksOn || perpsOn) && (
               <PickerSearch
                 serverBase={serverBase}
                 compact={compact}
                 current={sym}
+                stocksOn={stocksOn}
+                perpsOn={perpsOn}
                 onPick={(row) => {
                   const picked = chartSymOf(row, true);
                   if (picked) onSym(picked, row);
+                  close();
+                }}
+                onPickPerp={(key) => {
+                  onSym({ kind: 'perp', key });
                   close();
                 }}
               />
@@ -352,9 +374,9 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             </div>
             {perpsOn && (
               <>
-                <div className="px-2 pt-3 pb-1.5 type-caption text-fg-muted">Hyperliquid perps</div>
+                <div className="px-2 pt-3 pb-1.5 type-caption text-fg-muted">Hyperliquid perps{stocksOn ? '' : ' — search for more'}</div>
                 <div className="grid grid-cols-3 gap-1">
-                  {PERP_KEYS.map((key) => {
+                  {pinnedPerps.map((key) => {
                     const s: ChartSym = { kind: 'perp', key };
                     return (
                       <button key={key} type="button" onClick={() => (onSym(s), close())} className={`h-8 rounded-6 px-2 type-label ${sameSym(s, sym) ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}>
