@@ -422,6 +422,28 @@ pub struct AccountView {
     pub activity: Vec<Activity>,
     /// The latest 50 fills since the last reset, newest first.
     pub fills: Vec<FillRow>,
+    /// LIVE: `testnet` or `mainnet`; left out on paper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<&'static str>,
+    /// LIVE: each Hyperliquid balance behind it — the core perps', and gold's
+    /// dex (`xyz`), which keeps its own margin. Left out on paper.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub venues: Vec<Venue>,
+    /// LIVE: when it was read from Hyperliquid (IST); left out on paper,
+    /// which is always current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+}
+
+/// One Hyperliquid balance: the core perps' or a builder dex's.
+#[derive(Debug, Clone, Serialize)]
+pub struct Venue {
+    /// `core` or `xyz`.
+    pub dex: &'static str,
+    pub label: &'static str,
+    pub account_value: f64,
+    pub withdrawable: f64,
+    pub margin_used: f64,
 }
 
 /// An order checked against the market ([`PerpDesk::prepare`]), ready to
@@ -824,6 +846,12 @@ impl PerpDesk {
         .await
     }
 
+    /// Whether `user_id` holds, rests and arms nothing on paper.
+    pub async fn flat(&self, user_id: i64) -> Result<bool, Refusal> {
+        let mut map = self.accounts.lock().await;
+        Ok(self.account(&mut map, user_id).await?.book.is_flat())
+    }
+
     /// Start over at [`START_USDC`]: only with nothing open, resting or armed.
     pub async fn reset(&self, user_id: i64) -> Result<(), Refusal> {
         let now = now_ts();
@@ -891,6 +919,9 @@ impl PerpDesk {
             lines: book.lines,
             activity,
             fills,
+            network: None,
+            venues: Vec::new(),
+            as_of: None,
         })
     }
 

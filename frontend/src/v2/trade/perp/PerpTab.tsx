@@ -36,6 +36,9 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
   };
   const waiting = account.orders.length + account.lines.length;
   const flat = account.positions.length === 0 && waiting === 0;
+  // LIVE is read-only in this release.
+  const live = account.mode === 'live';
+  const readOnly = live ? 'LIVE orders come in the next release' : undefined;
 
   const GRID = 'grid grid-cols-[minmax(140px,1.2fr)_120px_100px_100px_100px_110px_minmax(150px,1fr)_150px] items-center gap-2';
   const cards = (
@@ -66,16 +69,16 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
               {targets && <span className="text-profit"> · targets {targets}</span>}
             </p>
             <div className="grid grid-cols-4 gap-2">
-              <Button size="lg" kind="ghost" onClick={() => (onOpen(k), perps.place(k, 'stop'))}>
+              <Button size="lg" kind="ghost" disabled={live} onClick={() => (onOpen(k), perps.place(k, 'stop'))}>
                 + Stop
               </Button>
-              <Button size="lg" kind="ghost" onClick={() => (onOpen(k), perps.place(k, 'target'))}>
+              <Button size="lg" kind="ghost" disabled={live} onClick={() => (onOpen(k), perps.place(k, 'target'))}>
                 + Target
               </Button>
-              <Button pointerOnly size="lg" kind="loss-outline" disabled={busy != null || half <= 0} onClick={() => void run(p.id, () => perps.actions.close(k, half))}>
+              <Button pointerOnly size="lg" kind="loss-outline" disabled={live || busy != null || half <= 0} onClick={() => void run(p.id, () => perps.actions.close(k, half))}>
                 ½
               </Button>
-              <Button pointerOnly size="lg" kind="loss" disabled={busy != null} onClick={() => void run(p.id, () => perps.actions.close(k))}>
+              <Button pointerOnly size="lg" kind="loss" disabled={live || busy != null} onClick={() => void run(p.id, () => perps.actions.close(k))}>
                 Close
               </Button>
             </div>
@@ -124,7 +127,7 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
               <span className="flex min-w-0 flex-col type-caption tnum">
                 <span className={p.levels?.stop != null ? 'text-loss' : 'text-fg-subtle'}>
                   {p.levels?.stop != null ? `Stop ${perpPrice(p.levels.stop)}` : (
-                    <button type="button" className="text-loss hover:underline" onClick={() => (onOpen(k), perps.place(k, 'stop'))}>
+                    <button type="button" disabled={live} title={readOnly} className="text-loss hover:underline disabled:opacity-50 disabled:no-underline" onClick={() => (onOpen(k), perps.place(k, 'stop'))}>
                       + Stop
                     </button>
                   )}
@@ -134,16 +137,16 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
                     Target {perpPrice(t.price)} · {t.size == null ? 'all left' : sizeText(k, t.size)}
                   </span>
                 ))}
-                <button type="button" className="self-start text-profit hover:underline" onClick={() => (onOpen(k), perps.place(k, 'target'))}>
+                <button type="button" disabled={live} title={readOnly} className="self-start text-profit hover:underline disabled:opacity-50 disabled:no-underline" onClick={() => (onOpen(k), perps.place(k, 'target'))}>
                   + Target
                 </button>
                 {p.funding !== 0 && <span className="text-fg-subtle">Funding {p.funding > 0 ? 'paid' : 'received'} {usd(Math.abs(p.funding))}</span>}
               </span>
               <span className="flex justify-end gap-2">
-                <Button pointerOnly kind="loss-outline" disabled={busy != null || half <= 0} onClick={() => void run(p.id, () => perps.actions.close(k, half))} title={`Close ${sizeText(k, half)} at the mid`}>
+                <Button pointerOnly kind="loss-outline" disabled={live || busy != null || half <= 0} onClick={() => void run(p.id, () => perps.actions.close(k, half))} title={`Close ${sizeText(k, half)} at the mid`}>
                   ½
                 </Button>
-                <Button pointerOnly kind="loss" disabled={busy != null} onClick={() => void run(p.id, () => perps.actions.close(k))} title="Close it all at the mid">
+                <Button pointerOnly kind="loss" disabled={live || busy != null} onClick={() => void run(p.id, () => perps.actions.close(k))} title={readOnly ?? 'Close it all at the mid'}>
                   Close
                 </Button>
               </span>
@@ -162,9 +165,9 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
           <li key={o.id} className="flex items-center gap-3 border-b border-line px-1 py-2">
             <span className="min-w-0 flex-1 type-body text-fg">
               <span className="type-body-strong">{o.market}-PERP</span> · limit {o.side === 'long' ? 'buy' : 'sell'} {sizeText(o.market, o.size)} at {perpPrice(o.price)}
-              {o.reduce_only ? ' · reduce only' : ` · ${o.leverage}x`}
+              {o.reduce_only ? ' · reduce only' : o.leverage > 0 ? ` · ${o.leverage}x` : ''}
             </span>
-            <Button pointerOnly kind="neutral" disabled={busy != null} onClick={() => void run(o.id, () => perps.actions.cancelOrder(o.id))}>
+            <Button pointerOnly kind="neutral" disabled={live || busy != null} title={readOnly} onClick={() => void run(o.id, () => perps.actions.cancelOrder(o.id))}>
               Cancel
             </Button>
           </li>
@@ -172,10 +175,10 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
         {account.lines.map((l) => (
           <li key={l.id} className="flex items-center gap-3 border-b border-line px-1 py-2">
             <span className="min-w-0 flex-1 type-body text-fg">
-              <span className="type-body-strong">{l.market}-PERP</span> · line: {sideWord(l.side).toLowerCase()} {sizeText(l.market, l.size)} at {l.leverage}x when the mark {l.rising ? 'rises' : 'falls'} to {perpPrice(l.price)}
+              <span className="type-body-strong">{l.market}-PERP</span> · line: {sideWord(l.side).toLowerCase()} {sizeText(l.market, l.size)}{l.leverage > 0 ? ` at ${l.leverage}x` : ''} when the mark {l.rising ? 'rises' : 'falls'} to {perpPrice(l.price)}
               {l.valid_until ? ` · till ${l.valid_until.slice(11, 16)}` : ' · until cancelled'}
             </span>
-            <Button pointerOnly kind="neutral" disabled={busy != null} onClick={() => void run(l.id, () => perps.actions.cancelLine(l.id))}>
+            <Button pointerOnly kind="neutral" disabled={live || busy != null} title={readOnly} onClick={() => void run(l.id, () => perps.actions.cancelLine(l.id))}>
               Cancel
             </Button>
           </li>
@@ -223,7 +226,7 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
   return (
     <div className="flex flex-col gap-2 py-2">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-1 type-caption tnum">
-        <span className="type-label text-fg">Perps · paper</span>
+        <span className="type-label text-fg">{live ? `Perps · LIVE (${account.network})` : 'Perps · paper'}</span>
         <span className="text-fg-muted">
           Equity <span className="text-fg">{usd(account.equity)}</span>
         </span>
@@ -233,9 +236,16 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
         <span className="text-fg-muted">
           Open P&L <span className={TONE_TEXT[toneOf(account.upnl)]}>{signedUsd(account.upnl)}</span>
         </span>
-        <span className="text-fg-muted">
-          Since {usd(account.start)} <span className={TONE_TEXT[toneOf(account.equity - account.start)]}>{signedUsd(account.equity - account.start)}</span>
-        </span>
+        {!live && (
+          <span className="text-fg-muted">
+            Since {usd(account.start)} <span className={TONE_TEXT[toneOf(account.equity - account.start)]}>{signedUsd(account.equity - account.start)}</span>
+          </span>
+        )}
+        {(account.venues ?? []).map((v) => (
+          <span key={v.dex} className="text-fg-muted">
+            {v.label} <span className="text-fg">{usd(v.account_value)}</span>
+          </span>
+        ))}
         <span className="flex-1" />
         <Segment
           label="Perps view"
@@ -249,10 +259,17 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
             { value: 'activity', label: 'Activity' },
           ]}
         />
-        <Button kind="quiet" disabled={!flat || busy != null} title={flat ? 'Back to 10,000 USDC' : 'Close and cancel everything first'} onClick={() => void run('reset', perps.actions.reset)}>
-          Reset
-        </Button>
+        {!live && (
+          <Button kind="quiet" disabled={!flat || busy != null} title={flat ? 'Back to 10,000 USDC' : 'Close and cancel everything first'} onClick={() => void run('reset', perps.actions.reset)}>
+            Reset
+          </Button>
+        )}
       </div>
+      {live && perps.error && (
+        <p className="px-1 type-caption text-loss">
+          Couldn't refresh the LIVE account: {perps.error}. Shown as read{account.as_of ? ` at ${account.as_of.slice(11)} IST` : ' earlier'} — a stop, target or liquidation since then isn't on it.
+        </p>
+      )}
       {view === 'open' && (compact && account.positions.length > 0 ? cards : open)}
       {view === 'waiting' && waitingList}
       {view === 'fills' && fills}

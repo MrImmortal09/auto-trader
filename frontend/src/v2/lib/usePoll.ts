@@ -18,13 +18,18 @@ interface Answer<T> {
 /**
  * `load` now and every `everyMs`, while `enabled` and the tab is visible —
  * a hidden tab stops polling and catches up the moment it's shown again.
- * A slow answer never overwrites a newer one. A new `key` (what's being
- * loaded changed) starts over, and the old key's data is never shown for it.
+ * A tick while the last load is still out is skipped, so a server that
+ * stalls never has requests piling up against it (and taking the browser's
+ * connections from everything else). A slow answer never overwrites a newer
+ * one. A new `key` (what's being loaded changed) starts over, and the old
+ * key's data is never shown for it.
  */
 export function usePoll<T>(load: () => Promise<T>, everyMs: number, key: string, enabled = true): Polled<T> {
   const [answer, setAnswer] = useState<Answer<T>>({ key, data: null, error: null });
   const loadRef = useRef(load);
   const seq = useRef(0);
+  // Loads out now: a scheduled tick waits for none.
+  const inFlight = useRef(0);
 
   useEffect(() => {
     loadRef.current = load;
@@ -32,6 +37,7 @@ export function usePoll<T>(load: () => Promise<T>, everyMs: number, key: string,
 
   const run = useCallback(async (forKey: string) => {
     const mine = ++seq.current;
+    inFlight.current++;
     try {
       const data = await loadRef.current();
       if (mine === seq.current) setAnswer({ key: forKey, data, error: null });
@@ -39,6 +45,8 @@ export function usePoll<T>(load: () => Promise<T>, everyMs: number, key: string,
       if (mine !== seq.current) return;
       const error = e instanceof Error ? e.message : 'Could not reach the server';
       setAnswer((prev) => ({ key: forKey, data: prev.key === forKey ? prev.data : null, error }));
+    } finally {
+      inFlight.current--;
     }
   }, []);
 
@@ -46,7 +54,7 @@ export function usePoll<T>(load: () => Promise<T>, everyMs: number, key: string,
     if (!enabled) return;
     const counter = seq;
     const tick = () => {
-      if (document.visibilityState === 'visible') void run(key);
+      if (document.visibilityState === 'visible' && inFlight.current === 0) void run(key);
     };
     void run(key);
     const timer = window.setInterval(tick, everyMs);

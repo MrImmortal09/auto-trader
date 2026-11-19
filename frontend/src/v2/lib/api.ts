@@ -18,6 +18,7 @@ import type {
   DeskAnswer,
   FeedAnswer,
   Flags,
+  HlLiveView,
   HlMarketsAnswer,
   PerpAccount,
   GroupId,
@@ -514,6 +515,16 @@ export const perpUpdateLine = (base: string, id: string, update: PerpLevelsUpdat
 export const perpCancelLine = (base: string, id: string) => send(base, `/api/v2/hl/lines/${encodeURIComponent(id)}`, 'DELETE');
 /** Back to 10,000 USDC; refused while anything is open, resting or armed. */
 export const perpReset = (base: string) => send(base, '/api/v2/hl/reset', 'POST');
+
+// ── Hyperliquid LIVE: the owner's switches and API wallets ─────────────── //
+
+export const getHlLive = (base: string) => getJson<HlLiveView>(base, '/api/v2/hl/live');
+/** Paper ↔ LIVE and testnet ↔ mainnet; refused unless flat. */
+export const putHlLiveSettings = (base: string, change: { mode?: 'paper' | 'live'; network?: 'testnet' | 'mainnet' }) => send(base, '/api/v2/hl/live/settings', 'PUT', change);
+/** Store a network's API wallet (its key sealed on the server), then check it. */
+export const putHlCredentials = (base: string, body: { network: 'testnet' | 'mainnet'; account: string; key: string }) => send(base, '/api/v2/hl/live/credentials', 'PUT', body);
+export const checkHlCredentials = (base: string, network: 'testnet' | 'mainnet') => send(base, '/api/v2/hl/live/check', 'POST', { network });
+export const removeHlCredentials = (base: string, network: 'testnet' | 'mainnet') => send(base, `/api/v2/hl/live/credentials/${network}`, 'DELETE');
 /** Log in to Kotak with the server's saved credentials — v1's Auto Connect. */
 export const kotakAutoLogin = (base: string) => send(base, '/api/auth/kotak/auto-login', 'POST');
 export const kotakDisconnect = (base: string) => send(base, '/api/auth/kotak/disconnect', 'DELETE');

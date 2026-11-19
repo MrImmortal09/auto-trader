@@ -497,6 +497,31 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    // Hyperliquid LIVE (`hyperliquid::live`), the owner's alone: the
+    // Paper/LIVE and testnet/mainnet switches (one row), and an API wallet
+    // per network — its key sealed under a key from AUTH_SECRET, never
+    // readable here. New tables, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hl_live_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            mode TEXT NOT NULL,
+            network TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hl_credentials (
+            network TEXT PRIMARY KEY,
+            account TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            key_box TEXT NOT NULL,
+            checked_at TEXT,
+            check_ok INTEGER NOT NULL DEFAULT 0,
+            check_note TEXT,
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+
     // Each signed-in person's watchlists (`watchlists`, `/api/v2/watchlists`):
     // up to five named lists of up to fifty price-map keys, kept by user id
     // (the admin is a `users` row too). Nothing here is read by the engine;

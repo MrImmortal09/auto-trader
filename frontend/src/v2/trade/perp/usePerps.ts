@@ -75,6 +75,7 @@ function levelLines(
   levels: PerpLevels | undefined,
   onLevels: (update: PerpLevelsUpdate) => void,
   canRemoveTarget: (count: number) => boolean,
+  editable = true,
 ): ChartLine[] {
   const out: ChartLine[] = [];
   const stop = levels?.stop;
@@ -86,11 +87,12 @@ function levelLines(
       data: {
         color: C.loss,
         dashed: true,
-        draggable: true,
-        parts: (at) => [
-          { key: 'label', text: `Stop ${signedUsd(pnlAt(side, size, entry, at))}`, color: C.loss, icon: 'grip' },
-          { key: 'remove', text: '×', color: C.loss },
-        ],
+        draggable: editable,
+        parts: (at) => {
+          const parts: LinePart[] = [{ key: 'label', text: `Stop ${signedUsd(pnlAt(side, size, entry, at))}`, color: C.loss, icon: lock(editable) }];
+          if (editable) parts.push({ key: 'remove', text: '×', color: C.loss });
+          return parts;
+        },
         axisText: (at) => perpPrice(at),
       },
       onMove: (at) => onLevels({ stop: roundPrice(key, at) }),
@@ -102,15 +104,15 @@ function levelLines(
   for (const t of targets) {
     const sells = t.size ?? Math.max(0, size - sized);
     const parts = (at: number): LinePart[] => {
-      const out: LinePart[] = [{ key: 'label', text: `Target · ${t.size == null ? 'all left' : sizeText(key, t.size)} ${signedUsd(pnlAt(side, sells, entry, at))}`, color: C.profit, icon: 'grip' }];
-      if (canRemoveTarget(targets.length)) out.push({ key: 'remove', text: '×', color: C.profit });
+      const out: LinePart[] = [{ key: 'label', text: `Target · ${t.size == null ? 'all left' : sizeText(key, t.size)} ${signedUsd(pnlAt(side, sells, entry, at))}`, color: C.profit, icon: lock(editable) }];
+      if (editable && canRemoveTarget(targets.length)) out.push({ key: 'remove', text: '×', color: C.profit });
       return out;
     };
     out.push({
       id: `${owner}:target:${t.id}`,
       price: t.price,
       zLevel: 2,
-      data: { color: C.profit, dashed: true, draggable: true, parts, axisText: (at) => perpPrice(at) },
+      data: { color: C.profit, dashed: true, draggable: editable, parts, axisText: (at) => perpPrice(at) },
       onMove: (at) => onLevels({ set_target: { id: t.id, price: roundPrice(key, at) } }),
       onPart: (part) => part === 'remove' && onLevels({ remove_target: t.id }),
     });
@@ -128,6 +130,8 @@ export function usePerps({ serverBase, enabled, onShow }: {
   const toast = useToast();
   const poll = usePoll(() => getPerpAccount(serverBase), 1_000, serverBase, enabled);
   const account = enabled ? poll.data : null;
+  // LIVE is read-only in this release: nothing on its lines moves or cancels.
+  const editable = account?.mode !== 'live';
   const [placing, setPlacing] = useState<PerpPlacing | null>(null);
   const cancelPlacing = useCallback(() => setPlacing(null), []);
 
@@ -186,9 +190,9 @@ export function usePerps({ serverBase, enabled, onShow }: {
               { key: 'label', text: `${sideWord(p.side)} ${sizeText(key, p.size)} · ${p.leverage}x · entry ${perpPrice(p.entry)}`, color: C.fg },
               { key: 'pnl', text: p.upnl == null ? '—' : signedUsd(p.upnl), color: pnlColor },
             ];
-            if (p.levels?.stop == null) parts.push({ key: 'add-stop', text: '+ Stop', color: C.loss });
-            parts.push({ key: 'add-target', text: '+ Target', color: C.profit });
-            parts.push({ key: 'close', text: 'Close', color: C.loss, filled: true });
+            if (editable && p.levels?.stop == null) parts.push({ key: 'add-stop', text: '+ Stop', color: C.loss });
+            if (editable) parts.push({ key: 'add-target', text: '+ Target', color: C.profit });
+            if (editable) parts.push({ key: 'close', text: 'Close', color: C.loss, filled: true });
             return parts;
           },
           axisText: (at) => perpPrice(at),
@@ -214,7 +218,7 @@ export function usePerps({ serverBase, enabled, onShow }: {
         },
       });
     }
-    out.push(...levelLines(key, p.id, p.side, p.size, p.entry, p.levels, (u) => void actions.setLevels(key, u), () => true));
+    out.push(...levelLines(key, p.id, p.side, p.size, p.entry, p.levels, (u) => void actions.setLevels(key, u), () => true, editable));
     return out;
   }
 
@@ -223,11 +227,13 @@ export function usePerps({ serverBase, enabled, onShow }: {
     const data: OrderLineData = {
       color: C.accent,
       dashed: true,
-      draggable: true,
-      parts: () => [
-        { key: 'label', text: `Limit ${o.side === 'long' ? 'buy' : 'sell'} ${sizeText(key, o.size)}${o.reduce_only ? ' · reduce only' : ` · ${o.leverage}x`}`, color: C.accent, icon: lock(true) },
-        { key: 'remove', text: '×', color: C.accent },
-      ],
+      draggable: editable,
+      parts: () => {
+        const lev = o.reduce_only ? ' · reduce only' : o.leverage > 0 ? ` · ${o.leverage}x` : '';
+        const parts: LinePart[] = [{ key: 'label', text: `Limit ${o.side === 'long' ? 'buy' : 'sell'} ${sizeText(key, o.size)}${lev}`, color: C.accent, icon: lock(editable) }];
+        if (editable) parts.push({ key: 'remove', text: '×', color: C.accent });
+        return parts;
+      },
       axisText: (at) => perpPrice(at),
     };
     return {
@@ -251,18 +257,20 @@ export function usePerps({ serverBase, enabled, onShow }: {
         data: {
           color: C.fg,
           dashed: true,
-          draggable: true,
-          parts: () => [
-            { key: 'label', text: `${sideWord(l.side)} ${sizeText(key, l.size)} · ${l.leverage}x when ${l.rising ? '≥' : '≤'} line${until}`, color: C.fg, icon: 'grip' },
-            { key: 'remove', text: '×', color: C.fg },
-          ],
+          draggable: editable,
+          parts: () => {
+            const lev = l.leverage > 0 ? ` · ${l.leverage}x` : '';
+            const parts: LinePart[] = [{ key: 'label', text: `${sideWord(l.side)} ${sizeText(key, l.size)}${lev} when ${l.rising ? '≥' : '≤'} line${until}`, color: C.fg, icon: lock(editable) }];
+            if (editable) parts.push({ key: 'remove', text: '×', color: C.fg });
+            return parts;
+          },
           axisText: (at) => perpPrice(at),
         },
         onMove: (at) => void actions.updateLine(l.id, { price: roundPrice(key, at) }),
         onPart: (part) => part === 'remove' && void actions.cancelLine(l.id),
       },
     ];
-    out.push(...levelLines(key, l.id, l.side, l.size, l.price, l.levels, (u) => void actions.updateLine(l.id, u), () => true));
+    out.push(...levelLines(key, l.id, l.side, l.size, l.price, l.levels, (u) => void actions.updateLine(l.id, u), () => true, editable));
     return out;
   }
 
@@ -277,6 +285,7 @@ export function usePerps({ serverBase, enabled, onShow }: {
 
   function prompt(key: PerpKey): PlacingPrompt | null {
     if (!placing || placing.key !== key) return null;
+    if (!editable && placing.kind !== 'pick') return null;
     if (placing.kind === 'pick') {
       const onPick = placing.onPick;
       return {

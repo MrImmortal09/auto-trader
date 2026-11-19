@@ -1,0 +1,427 @@
+{
+ "key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+ "address": "0x14791697260E4c9A71f18484C9f997B308e59325",
+ "nonce": 1700000000123,
+ "cases": [
+  {
+   "name": "order_gtc_btc",
+   "mainnet": true,
+   "action": {
+    "type": "order",
+    "orders": [
+     {
+      "a": 0,
+      "b": true,
+      "p": "63768.5",
+      "s": "0.01",
+      "r": false,
+      "t": {
+       "limit": {
+        "tif": "Gtc"
+       }
+      }
+     }
+    ],
+    "grouping": "na"
+   },
+   "msgpack": "83a474797065a56f72646572a66f72646572739186a16100a162c3a170a736333736382e35a173a4302e3031a172c2a17481a56c696d697481a3746966a3477463a867726f7570696e67a26e61",
+   "hash": "c3cceec6b8ea173b15e3595ae21c281ccc6f9045c4254a30f9174c2a50f9c1f0",
+   "r": "0xb75e70a9692f2f4e03e38ace01f530fb00b5d2019cb2b0ab9e99f6264af74216",
+   "s": "0x2ca477e5d46d39f085464e211af6a3ec7364cb8a3c5e5616ddb06c43dc89982c",
+   "v": 27
+  },
+  {
+   "name": "order_gtc_btc",
+   "mainnet": false,
+   "action": {
+    "type": "order",
+    "orders": [
+     {
+      "a": 0,
+      "b": true,
+      "p": "63768.5",
+      "s": "0.01",
+      "r": false,
+      "t": {
+       "limit": {
+        "tif": "Gtc"
+       }
+      }
+     }
+    ],
+    "grouping": "na"
+   },
+   "msgpack": "83a474797065a56f72646572a66f72646572739186a16100a162c3a170a736333736382e35a173a4302e3031a172c2a17481a56c696d697481a3746966a3477463a867726f7570696e67a26e61",
+   "hash": "c3cceec6b8ea173b15e3595ae21c281ccc6f9045c4254a30f9174c2a50f9c1f0",
+   "r": "0xa94028baeba0e4782c99910409b70db4735604af0a342d6d6558dde8e69c9fa5",
+   "s": "0x339395d950bc6be6a8ed113d964e85e961e9c4920002eae92dd32a84f063eb17",
+   "v": 27
+  },
+  {
+   "name": "order_ioc_reduce_gold",
+   "mainnet": true,
+   "action": {
+    "type": "order",
+    "orders": [
+     {
+      "a": 110003,
+      "b": false,
+      "p": "3715.1",
+      "s": "0.5",
+      "r": true,
+      "t": {
+       "limit": {
+        "tif": "Ioc"
+       }
+      }
+     }
+    ],
+    "grouping": "na"
+   },
+   "msgpack": "83a474797065a56f72646572a66f72646572739186a161ce0001adb3a162c2a170a6333731352e31a173a3302e35a172c3a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61",
+   "hash": "42104229fa6cc725af0cab3b2691251a4e672cb4b255288a6cba3759d0379627",
+   "r": "0xb4122824ab49cd3172be745f66d352812b187d40bd76a7c0a02ed2fd82c59193",
+   "s": "0x5f2207a4d814e9fd6017ce59d37f8b26449af49d9aee82cca1b04d9aec94f974",
+   "v": 27
+  },
+  {
+   "name": "order_ioc_reduce_gold",
+   "mainnet": false,
+   "action": {
+    "type": "order",
+    "orders": [
+     {
+      "a": 110003,
+      "b": false,
+      "p": "3715.1",
+      "s": "0.5",
+      "r": true,
+      "t": {
+       "limit": {
+        "tif": "Ioc"
+       }
+      }
+     }
+    ],
+    "grouping": "na"
+   },
+   "msgpack": "83a474797065a56f72646572a66f72646572739186a161ce0001adb3a162c2a170a6333731352e31a173a3302e35a172c3a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61",
+   "hash": "42104229fa6cc725af0cab3b2691251a4e672cb4b255288a6cba3759d0379627",
+   "r": "0x377ef81270f5c3ff5a41474a4ddd109ca75201253dfb737033f8342054c8b3f4",
+   "s": "0x437a3577435f7b11e0634358eb260bc6fab569760b8d9a797846258c5df29985",
+   "v": 27
+  },
+  {
+   "name": "order_trigger_entry_with_tpsl",
+   "mainnet": true,
+   "action": {
+    "type": "order",
+    "orders": [
+     {
+      "a": 1,
+      "b": true,
+      "p": "1900",
+      "s": "0.2",
+      "r": false,
+      "t": {
+       "trigger": {
+        "isMarket": true,
+        "triggerPx": "1810",
+        "tpsl": "sl"
+       }
+      }
+     },
+     {
+      "a": 1,
+      "b": false,
+      "p": "1700",
+      "s": "0.2",
+      "r": true,
+      "t": {
+       "trigger": {
+        "isMarket": true,
+        "triggerPx": "1750",
+        "tpsl": "sl"
+       }
+      }
+     },
+     {
+      "a": 1,
+      "b": false,
+      "p": "1900",
+      "s": "0.2",
+      "r": true,
+      "t": {
+       "trigger": {
+        "isMarket": true,
+        "triggerPx": "1900",
+        "tpsl": "tp"
+       }
+      }
+     }
+    ],
+    "grouping": "normalTpsl"
+   },
+   "msgpack": "83a474797065a56f72646572a66f72646572739386a16101a162c3a170a431393030a173a3302e32a172c2a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a431383130a47470736ca2736c86a16101a162c2a170a431373030a173a3302e32a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a431373530a47470736ca2736c86a16101a162c2a170a431393030a173a3302e32a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a431393030a47470736ca27470a867726f7570696e67aa6e6f726d616c5470736c",
+   "hash": "a7f39241f007ba47b4682e0cc5cffd56cd1ba3b397cf0c1f24745c5def591640",
+   "r": "0xbfc9df919a915be66086370eb8b7628117f74864b8464a5f32ef7e6a5f47adaf",
+   "s": "0x741a510d9bacce58dfb45d5da8a22955cd5f5016f770d91cfa80c13a7786626b",
+   "v": 27
+  },
+  {
+   "name": "order_trigger_entry_with_tpsl",
+   "mainnet": false,
+   "action": {
+    "type": "order",
+    "orders": [
+     {
+      "a": 1,
+      "b": true,
+      "p": "1900",
+      "s": "0.2",
+      "r": false,
+      "t": {
+       "trigger": {
+        "isMarket": true,
+        "triggerPx": "1810",
+        "tpsl": "sl"
+       }
+      }
+     },
+     {
+      "a": 1,
+      "b": false,
+      "p": "1700",
+      "s": "0.2",
+      "r": true,
+      "t": {
+       "trigger": {
+        "isMarket": true,
+        "triggerPx": "1750",
+        "tpsl": "sl"
+       }
+      }
+     },
+     {
+      "a": 1,
+      "b": false,
+      "p": "1900",
+      "s": "0.2",
+      "r": true,
+      "t": {
+       "trigger": {
+        "isMarket": true,
+        "triggerPx": "1900",
+        "tpsl": "tp"
+       }
+      }
+     }
+    ],
+    "grouping": "normalTpsl"
+   },
+   "msgpack": "83a474797065a56f72646572a66f72646572739386a16101a162c3a170a431393030a173a3302e32a172c2a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a431383130a47470736ca2736c86a16101a162c2a170a431373030a173a3302e32a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a431373530a47470736ca2736c86a16101a162c2a170a431393030a173a3302e32a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a431393030a47470736ca27470a867726f7570696e67aa6e6f726d616c5470736c",
+   "hash": "a7f39241f007ba47b4682e0cc5cffd56cd1ba3b397cf0c1f24745c5def591640",
+   "r": "0xd849b2f6fa2bdb06b2af7d548b85326af477a41c2bf72225a2f1720002f3c672",
+   "s": "0x547e4b0a62a57598c5e5291874ca585e84ffc725e4c24947e11e52d019f1f6b3",
+   "v": 27
+  },
+  {
+   "name": "position_tpsl",
+   "mainnet": true,
+   "action": {
+    "type": "order",
+    "orders": [
+     {
+      "a": 0,
+      "b": false,
+      "p": "56000",
+      "s": "0.01",
+      "r": true,
+      "t": {
+       "trigger": {
+        "isMarket": true,
+        "triggerPx": "62000.5",
+        "tpsl": "sl"
+       }
+      }
+     }
+    ],
+    "grouping": "positionTpsl"
+   },
+   "msgpack": "83a474797065a56f72646572a66f72646572739186a16100a162c2a170a53536303030a173a4302e3031a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a736323030302e35a47470736ca2736ca867726f7570696e67ac706f736974696f6e5470736c",
+   "hash": "692f739cd2b3dd709bd70fb1328bcbd8e9b87d3844e7a435c495fafa5a3d74e0",
+   "r": "0xa20c8581ca02c8f406379aea2208f7086da144199ebe0a2b814dc9322f1dc0a7",
+   "s": "0x9ee19a6ff1e8de87d252a3c039d8da44e8098704f292a36c38c3a22ce51bd53",
+   "v": 28
+  },
+  {
+   "name": "position_tpsl",
+   "mainnet": false,
+   "action": {
+    "type": "order",
+    "orders": [
+     {
+      "a": 0,
+      "b": false,
+      "p": "56000",
+      "s": "0.01",
+      "r": true,
+      "t": {
+       "trigger": {
+        "isMarket": true,
+        "triggerPx": "62000.5",
+        "tpsl": "sl"
+       }
+      }
+     }
+    ],
+    "grouping": "positionTpsl"
+   },
+   "msgpack": "83a474797065a56f72646572a66f72646572739186a16100a162c2a170a53536303030a173a4302e3031a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a736323030302e35a47470736ca2736ca867726f7570696e67ac706f736974696f6e5470736c",
+   "hash": "692f739cd2b3dd709bd70fb1328bcbd8e9b87d3844e7a435c495fafa5a3d74e0",
+   "r": "0x793b9daad356457c2eff8906c6b8ba25e0dabbd3f2b16b94d4040c94a2761f55",
+   "s": "0x3059db03b88e9d7204bb5d9c273187989d9a0500464d578d5da481f002879ec6",
+   "v": 27
+  },
+  {
+   "name": "cancel",
+   "mainnet": true,
+   "action": {
+    "type": "cancel",
+    "cancels": [
+     {
+      "a": 0,
+      "o": 123456789
+     },
+     {
+      "a": 110003,
+      "o": 42
+     }
+    ]
+   },
+   "msgpack": "82a474797065a663616e63656ca763616e63656c739282a16100a16fce075bcd1582a161ce0001adb3a16f2a",
+   "hash": "ef5d71114f4f595be3aa21a8a0e03db7d6ed9968d98baf18ac6f084805473520",
+   "r": "0x325050dd53b06326136802fb023e22f86b9c6a93a3cd806befae1cdb571e378d",
+   "s": "0x532b6c2a02ef2149d211b4f1a3844060a160bab8ba0ddb60ae97a8f61274a261",
+   "v": 28
+  },
+  {
+   "name": "cancel",
+   "mainnet": false,
+   "action": {
+    "type": "cancel",
+    "cancels": [
+     {
+      "a": 0,
+      "o": 123456789
+     },
+     {
+      "a": 110003,
+      "o": 42
+     }
+    ]
+   },
+   "msgpack": "82a474797065a663616e63656ca763616e63656c739282a16100a16fce075bcd1582a161ce0001adb3a16f2a",
+   "hash": "ef5d71114f4f595be3aa21a8a0e03db7d6ed9968d98baf18ac6f084805473520",
+   "r": "0x61762bb578db83952faad2b4f1f92415f9a0826a6892f833beb8517eb3b18b88",
+   "s": "0x726403722e7ede69c411d87f5796e7c71a6ef90bf08a59d1262ac9548b82bb58",
+   "v": 28
+  },
+  {
+   "name": "batch_modify",
+   "mainnet": true,
+   "action": {
+    "type": "batchModify",
+    "modifies": [
+     {
+      "oid": 987654321,
+      "order": {
+       "a": 0,
+       "b": true,
+       "p": "63000",
+       "s": "0.012",
+       "r": false,
+       "t": {
+        "limit": {
+         "tif": "Gtc"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "msgpack": "82a474797065ab62617463684d6f64696679a86d6f6469666965739182a36f6964ce3ade68b1a56f7264657286a16100a162c3a170a53633303030a173a5302e303132a172c2a17481a56c696d697481a3746966a3477463",
+   "hash": "902b6032371a024812854b28232057c82c98cd9e77c2d919d75b66d3f3eb411a",
+   "r": "0xbd83743e9975392c7c5aaf31c65fd7523a068fbc03b1faf99e19303d24cb3c0f",
+   "s": "0x48f1cc5f0ec2b78aa522097f4c53e0306f956ef8301a78f7c8806f74cdeee88a",
+   "v": 27
+  },
+  {
+   "name": "batch_modify",
+   "mainnet": false,
+   "action": {
+    "type": "batchModify",
+    "modifies": [
+     {
+      "oid": 987654321,
+      "order": {
+       "a": 0,
+       "b": true,
+       "p": "63000",
+       "s": "0.012",
+       "r": false,
+       "t": {
+        "limit": {
+         "tif": "Gtc"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "msgpack": "82a474797065ab62617463684d6f64696679a86d6f6469666965739182a36f6964ce3ade68b1a56f7264657286a16100a162c3a170a53633303030a173a5302e303132a172c2a17481a56c696d697481a3746966a3477463",
+   "hash": "902b6032371a024812854b28232057c82c98cd9e77c2d919d75b66d3f3eb411a",
+   "r": "0x72eaa0802127a2e2250a040af54520342dddd37095b9a8cbcf90cf4bfb1ecb17",
+   "s": "0x7556c00539ed5d8c396f4ef5aa3f4009283151d8ace3aa65ad26d0dbd734358c",
+   "v": 28
+  },
+  {
+   "name": "update_leverage_isolated",
+   "mainnet": true,
+   "action": {
+    "type": "updateLeverage",
+    "asset": 110003,
+    "isCross": false,
+    "leverage": 20
+   },
+   "msgpack": "84a474797065ae7570646174654c65766572616765a56173736574ce0001adb3a7697343726f7373c2a86c6576657261676514",
+   "hash": "7f16d4ff66bfdf1989c6b93f1f253a0222dfab2866250414a5e12fd73a3e43f0",
+   "r": "0xe4e7f8ebd0c960adc908b23ccaa3717e7f663b7a0af6346ffc19d43974a1fbf1",
+   "s": "0x5dbaffe3f496e06cef3841df5c017d6f81f8c7355b60ddff6fdda5bddb636018",
+   "v": 28
+  },
+  {
+   "name": "update_leverage_isolated",
+   "mainnet": false,
+   "action": {
+    "type": "updateLeverage",
+    "asset": 110003,
+    "isCross": false,
+    "leverage": 20
+   },
+   "msgpack": "84a474797065ae7570646174654c65766572616765a56173736574ce0001adb3a7697343726f7373c2a86c6576657261676514",
+   "hash": "7f16d4ff66bfdf1989c6b93f1f253a0222dfab2866250414a5e12fd73a3e43f0",
+   "r": "0x66a4120c2e8f339c0e5cd508482469e995549f905a01aa0bc0c02076257abf17",
+   "s": "0x17d428d8506865fd3672c895b571f45b5a4a518bd36945541b17454044bd3d87",
+   "v": 28
+  }
+ ],
+ "wire": {
+  "63768.5": "63768.5",
+  "0.01": "0.01",
+  "1900": "1900",
+  "0.00001": "0.00001",
+  "3715.10": "3715.1",
+  "100": "100"
+ }
+}

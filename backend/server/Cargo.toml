@@ -24,6 +24,8 @@ serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 hmac               = "0.12"
 sha2               = "0.10"
+# The Hyperliquid API wallet's key, encrypted at rest under a key from AUTH_SECRET.
+aes-gcm            = "0.10"
 base64             = "0.22"
 subtle             = "2.6"
 futures            = "0.3"
@@ -41,3 +43,4 @@ rand               = "0.8"
 
 [dev-dependencies]
 tower              = { version = "0.4", features = ["util"] }
+tokio              = { version = "1", features = ["test-util"] }

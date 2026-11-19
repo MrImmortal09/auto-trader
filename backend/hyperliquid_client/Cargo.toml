@@ -3,8 +3,8 @@ name = "hyperliquid_client"
 version = "0.1.0"
 edition = "2021"
 
-# Hyperliquid client. This first slice is read-only market data (the info
-# endpoint and the WebSocket feed); nothing in it can sign or send an order.
+# Hyperliquid client: market data (the info endpoint and the WebSocket feed),
+# and signing for the exchange endpoint (an API wallet's L1 actions).
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -15,6 +15,11 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tracing = "0.1"
+# Signing: secp256k1 (RFC 6979, low-s), keccak, and msgpack for the action hash.
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+rmp-serde = "1"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

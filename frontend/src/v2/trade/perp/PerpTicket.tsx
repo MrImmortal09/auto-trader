@@ -96,7 +96,9 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   const stop = typed(stopText);
   const target = typed(targetText);
   const reduce = kind !== 'line' && reduceOnly;
-  const ready = size != null && size > 0 && price != null && !sending;
+  // LIVE is read-only in this release: orders stay on paper.
+  const live = account?.mode === 'live';
+  const ready = !live && size != null && size > 0 && price != null && !sending;
   const size_ = large ? 'lg' : 'md';
   const segSize = large ? 'lg' : 'sm';
 
@@ -217,6 +219,13 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           ? `Type a size${kind === 'market' ? '' : ' and a price'}. At most ${cap}x; a ${k} size carries ${rules.szDecimals} decimals.`
           : `${usd(notional)} · ${held && !adding ? `closes ${sizeText(k, Math.min(size!, held.size))}${margin! > 0 ? `, then ` : ''}` : ''}${margin! > 0 || !held || adding ? `margin ${usd(margin!)}` : ''} · fee ≈ ${usd(fee!)}${liq != null ? ` · liquidation ≈ ${perpPrice(roundPrice(k, liq))}` : ''}${kind === 'line' ? ` · when the mark ${mid != null && price! > mid ? 'rises' : 'falls'} to ${perpPrice(price!)}` : ''}`}
       </p>
+      {live && (
+        <p className="type-caption text-fg">
+          LIVE on {account?.network}: your Hyperliquid account is shown read-only. LIVE orders come in the next release; switch Hyperliquid to Paper in Settings to trade on paper.
+          {account?.network === 'testnet' && ' Charts, prices and these estimates are mainnet’s; testnet’s own prices differ.'}
+        </p>
+      )}
+      {live && perps.error && <p className="type-caption text-loss">Couldn't refresh the LIVE account ({perps.error}): what is shown is from {account?.as_of ? `${account.as_of.slice(11)} IST` : 'earlier'}.</p>}
       <Button size={size_} kind={side === 'long' ? 'profit' : 'loss'} pointerOnly disabled={!ready} onClick={() => void send()}>
         {sending ? 'Sending…' : `${kind === 'line' ? 'Arm: ' : ''}${side === 'long' ? 'Buy / long' : 'Sell / short'}${size ? ` ${sizeText(k, size)}` : ''}${kind === 'limit' && price ? ` @ ${perpPrice(price)}` : ''}`}
       </Button>
@@ -224,8 +233,8 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
       {account && (
         <section className="flex flex-col gap-1 border-t border-line pt-3">
           <div className="flex items-baseline justify-between">
-            <span className="type-label text-fg-muted">Perps wallet (paper)</span>
-            <span className={`num-medium ${TONE_TEXT[toneOf(account.equity - account.start)]}`}>{signedUsd(account.equity - account.start)}</span>
+            <span className="type-label text-fg-muted">{live ? `Hyperliquid account (LIVE · ${account.network})` : 'Perps wallet (paper)'}</span>
+            {!live && <span className={`num-medium ${TONE_TEXT[toneOf(account.equity - account.start)]}`}>{signedUsd(account.equity - account.start)}</span>}
           </div>
           <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 type-caption tnum">
             <span className="text-fg-muted">Equity</span>
@@ -236,6 +245,12 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
             <span className="text-right text-fg">{usd(account.margin)}</span>
             <span className="text-fg-muted">Open P&L</span>
             <span className={`text-right ${TONE_TEXT[toneOf(account.upnl)]}`}>{signedUsd(account.upnl)}</span>
+            {(account.venues ?? []).map((v) => (
+              <span key={v.dex} className="contents">
+                <span className="text-fg-muted">{v.label}</span>
+                <span className="text-right text-fg">{usd(v.account_value)}</span>
+              </span>
+            ))}
           </div>
         </section>
       )}
