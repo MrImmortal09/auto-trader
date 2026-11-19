@@ -19,12 +19,15 @@ import { activityEvents, type EngineError } from './activity';
 import { MIN_CHART_HEIGHT, MIN_PANEL_HEIGHT } from './height';
 import { DEFAULT_DESK_WIDTH, MAX_DESK_WIDTH, MIN_DESK_WIDTH, MIN_PANEL_BODY, useWidth } from '../paneSizes';
 import { ActivityList, HistoryList, PaperActivityList } from './lists';
+import { PerpTab } from '../perp/PerpTab';
+import type { Perps } from '../perp/usePerps';
+import type { PerpKey } from '../model';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 /** What a user's paper portfolio starts with, and starts over with. */
 const PAPER_START = 1_000_000;
 
-type TabId = 'positions' | 'waiting' | 'orders' | 'history' | 'activity';
+type TabId = 'positions' | 'waiting' | 'orders' | 'history' | 'activity' | 'perps';
 
 /** The tallest the panel can be now: its own height, plus all of the charts'
  * but `MIN_CHART_HEIGHT`, less whatever already reaches past the screen's
@@ -188,7 +191,7 @@ export function AccountColumn({ mode, desk, positions, paper, vertical, onHide }
  * Exit all is held. Its top edge drags to resize it — up into the charts,
  * never past the bottom of the window — and the chevron folds it.
  */
-export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, deskWidth, onDeskWidth, deskHidden, onDeskHidden, deskRemoved, chartsRef, layout, paper }: {
+export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, history, h, canSet, onAdd, onRemove, open, onToggle, height, onHeight, deskWidth, onDeskWidth, deskHidden, onDeskHidden, deskRemoved, chartsRef, layout, paper, perps }: {
   serverBase: string;
   mode: string;
   desk: DeskAnswer | null;
@@ -223,6 +226,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   layout: string;
   /** A user's paper portfolio: no Waiting or Orders, their own activity. */
   paper?: PaperAccount;
+  /** Hyperliquid perps on paper (the `hyperliquid` switch): a Perps tab. */
+  perps?: { desk: Perps; onOpen: (key: PerpKey) => void };
 }) {
   const [tab, setTab] = useState<TabId>('positions');
   // The height under a drag, kept here until the pointer lifts.
@@ -242,7 +247,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   const flash = useTickFlash(openPnl, true, active.map((p) => p.id).join());
   const closed = history.filter((c) => c.channel === 'Scalps');
   // A paper book has no orders at Kotak, and waits only on buy lines.
-  const shown: TabId = paper && (tab === 'orders' || (tab === 'waiting' && waiting.length === 0)) ? 'positions' : tab;
+  const shown: TabId = (paper && (tab === 'orders' || (tab === 'waiting' && waiting.length === 0))) || (tab === 'perps' && !perps) ? 'positions' : tab;
   // Orders only matter while that tab is open: Kotak's book, and the engine's
   // own sends it may not list yet.
   const ordersOpen = !paper && open && shown === 'orders';
@@ -536,6 +541,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
           {!paper && <PanelTab id="orders" label="Orders" count={null} active={shown === 'orders'} onSelect={setTab} />}
           <PanelTab id="history" label="History" count={closed.length} active={shown === 'history'} onSelect={setTab} />
           <PanelTab id="activity" label="Activity" count={null} active={shown === 'activity'} onSelect={setTab} />
+          {perps && <PanelTab id="perps" label="Perps" count={perps.desk.account ? perps.desk.account.positions.length : null} active={shown === 'perps'} onSelect={setTab} />}
         </div>
       ) : (
         <span className="flex h-11 items-center gap-2 px-3 type-body-strong text-fg">
@@ -617,6 +623,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
           {shown === 'orders' && orders}
           {shown === 'history' && <HistoryList calls={closed} />}
           {shown === 'activity' && (paper ? <PaperActivityList items={paper.activity} /> : <ActivityList events={activityEvents(fills, errors)} />)}
+          {shown === 'perps' && perps && <PerpTab account={perps.desk.account} perps={perps.desk} onOpen={perps.onOpen} />}
         </div>
       </div>
     </section>

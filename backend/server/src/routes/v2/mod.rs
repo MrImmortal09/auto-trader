@@ -7,6 +7,7 @@ pub mod desk;
 pub mod flags;
 pub mod history;
 pub mod hl;
+pub mod hl_desk;
 pub mod instruments;
 pub mod limit_close;
 pub mod me;

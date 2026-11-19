@@ -5,9 +5,10 @@ import { useToast } from '../ui/toast';
 /**
  * Who an action is for. `admin`: the admin's sign-in (real money, the
  * engine, the broker, settings, the allow-list). `user`: a user's sign-in
- * (their own paper portfolio).
+ * (their own paper portfolio). `signed`: anyone signed in, each on their own
+ * account (Hyperliquid perps on paper).
  */
-export type GuardScope = 'admin' | 'user';
+export type GuardScope = 'admin' | 'user' | 'signed';
 
 /**
  * Run an action that changes something. Without the sign-in it needs, the

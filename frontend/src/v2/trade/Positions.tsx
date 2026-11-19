@@ -17,6 +17,9 @@ import { approxMoney, levelPnl } from './model';
 import { AccountColumn } from './panel/TradingPanel';
 import { activityEvents, type EngineError } from './panel/activity';
 import { ActivityList, HistoryList, PaperActivityList } from './panel/lists';
+import { PerpTab } from './perp/PerpTab';
+import type { Perps } from './perp/usePerps';
+import type { PerpKey } from './model';
 import { busyNote, levelWords, limitCancellable, limitStatus, limitWords, lineSummary } from './words';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -111,14 +114,14 @@ function railOf(p: ExecutePosition, indexNow: number | null, levelsOn: boolean) 
   } satisfies DeskPosition, levelsOn);
 }
 
-type SheetTab = 'positions' | 'history' | 'activity';
+type SheetTab = 'positions' | 'history' | 'activity' | 'perps';
 
 /**
  * Phone: the trading panel as a bottom sheet — the account's figures, then
  * Positions (each trade, its stop and target, −1 lot and Exit), History
  * (today's closed trades) and Activity (fills and engine errors).
  */
-export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, indexNow, deltaOf, since, canSet, onRemove, onAdd, onClose, paper }: {
+export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, indexNow, deltaOf, since, canSet, onRemove, onAdd, onClose, paper, perps }: {
   scalps: ExecutePosition[];
   h: PositionHandlers;
   mode: string;
@@ -138,6 +141,8 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
   onClose: () => void;
   /** A user's paper portfolio: their figures and their own activity. */
   paper?: PaperAccount;
+  /** Hyperliquid perps on paper (the `hyperliquid` switch): a Perps tab. */
+  perps?: { desk: Perps; onOpen: (key: PerpKey) => void };
 }) {
   const [tab, setTab] = useState<SheetTab>('positions');
   const active = scalps.filter((p) => !p.placing);
@@ -146,20 +151,25 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
     <Modal open onClose={onClose} label="Trading">
       <div className="flex flex-col gap-4 overflow-y-auto px-4 pt-3 pb-4">
         <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical={false} />
-        <Segment
-          label="Trading panel"
-          size="lg"
-          stretch
-          value={tab}
-          onChange={setTab}
-          options={[
-            { value: 'positions', label: `Positions · ${active.length}` },
-            { value: 'history', label: `History · ${closed.length}` },
-            { value: 'activity', label: 'Activity' },
-          ]}
-        />
+        {/* Four tabs with the perps: the row scrolls rather than squeeze. */}
+        <div className="-mx-1 shrink-0 overflow-x-auto px-1">
+          <Segment
+            label="Trading panel"
+            size="lg"
+            stretch
+            value={tab}
+            onChange={setTab}
+            options={[
+              { value: 'positions', label: `Positions · ${active.length}` },
+              { value: 'history', label: `History · ${closed.length}` },
+              { value: 'activity', label: 'Activity' },
+              ...(perps ? [{ value: 'perps' as const, label: `Perps · ${perps.desk.account?.positions.length ?? 0}` }] : []),
+            ]}
+          />
+        </div>
         {tab === 'history' && <HistoryList calls={closed} large />}
         {tab === 'activity' && (paper ? <PaperActivityList items={paper.activity} large /> : <ActivityList events={activityEvents(fills, errors)} large />)}
+        {tab === 'perps' && perps && <PerpTab account={perps.desk.account} perps={perps.desk} onOpen={(k) => (onClose(), perps.onOpen(k))} compact />}
         {tab === 'positions' && scalps.length === 0 && <p className="type-body text-fg-subtle">No open trade.</p>}
         {tab === 'positions' &&
           scalps.map((p) => {

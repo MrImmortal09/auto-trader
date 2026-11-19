@@ -213,6 +213,9 @@ pub(crate) struct AppState {
     /// Hyperliquid perps' market data, live while the `hyperliquid` switch
     /// is on (`PUT /api/v2/flags` opens and closes its feed).
     pub hl: Arc<hyperliquid::HlMarketData>,
+    /// Hyperliquid perps on paper: the owner's and every user's, each on its
+    /// own USDC wallet. Never read by the Kotak engine.
+    pub perps: Arc<hyperliquid::paper::PerpDesk>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,6 +1202,16 @@ async fn main() {
     )
     .await;
 
+    // Hyperliquid perps: market data (its feed opens below if the switch is
+    // on), and the paper desk with every account that has something open.
+    let hl = hyperliquid::HlMarketData::new();
+    let perps = Arc::new(
+        hyperliquid::paper::PerpDesk::load(pool.clone(), Arc::clone(&hl))
+            .await
+            .expect("load the paper perps desk"),
+    );
+    tokio::spawn(hyperliquid::paper::run(Arc::clone(&perps)));
+
     // 10. Router
     let state = AppState {
         signal_tx,
@@ -1234,7 +1247,8 @@ async fn main() {
         quotes,
         feed_latency,
         order_timing,
-        hl: hyperliquid::HlMarketData::new(),
+        hl: Arc::clone(&hl),
+        perps,
     };
     // Hyperliquid's feed, if its switch was left on.
     {
@@ -1326,6 +1340,14 @@ async fn main() {
                                                    .delete(routes::admin_sessions::delete_session_handler))
         .route("/api/admin/data",                   get(routes::admin_data::data_handler))
         .route("/api/v2/hl/markets",                get(routes::v2::hl::markets_handler))
+        .route("/api/v2/hl/account",                get(routes::v2::hl_desk::account_handler))
+        .route("/api/v2/hl/orders",                 post(routes::v2::hl_desk::order_handler))
+        .route("/api/v2/hl/orders/:id",             axum::routing::patch(routes::v2::hl_desk::move_order_handler).delete(routes::v2::hl_desk::cancel_order_handler))
+        .route("/api/v2/hl/positions/:market",      axum::routing::patch(routes::v2::hl_desk::levels_handler))
+        .route("/api/v2/hl/positions/:market/close", post(routes::v2::hl_desk::close_handler))
+        .route("/api/v2/hl/lines",                  post(routes::v2::hl_desk::line_handler))
+        .route("/api/v2/hl/lines/:id",              axum::routing::patch(routes::v2::hl_desk::update_line_handler).delete(routes::v2::hl_desk::cancel_line_handler))
+        .route("/api/v2/hl/reset",                  post(routes::v2::hl_desk::reset_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))
