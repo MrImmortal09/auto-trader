@@ -385,21 +385,33 @@ const dayOf = (t: number) => Math.floor((t + IST_MS) / 86_400_000);
 /** The IST calendar day of a Unix-ms instant, as a day number. */
 export const istDay = dayOf;
 
+/** The day a VWAP restarts on: the IST day, or for a perp (`utc`, trading
+ * around the clock) the UTC day, as Hyperliquid's own chart restarts it. */
+export function vwapDay(utc: boolean): (t: number) => number {
+  return utc ? (t) => Math.floor(t / 86_400_000) : dayOf;
+}
+
 /**
- * VWAP by bar start, restarting each IST day: the volume-weighted typical
- * price of the day's bars with Upstox's official volume. A bar without any
- * yet — the forming bar, until its official minute lands — carries the day's
- * VWAP so far, so the line and its readout reach the latest bar. Before the
- * day's first volume there is none.
+ * VWAP by bar start, restarting each IST day (a perp's, `utc`: each UTC
+ * day): the volume-weighted typical price of the day's bars with Upstox's
+ * official volume (a perp's own). A bar without any yet — the forming bar,
+ * until its official minute lands — carries the day's VWAP so far, so the
+ * line and its readout reach the latest bar. Before the day's first volume
+ * there is none. A perp's bars, read from an IST midnight, start part-way
+ * into their first UTC day: that day has no VWAP rather than a wrong one.
  */
-export function vwapOf(bars: Bar[]): Map<number, number> {
+export function vwapOf(bars: Bar[], utc = false): Map<number, number> {
   const out = new Map<number, number>();
+  const dayOfBar = vwapDay(utc);
+  const sorted = [...bars].sort((a, z) => a.t - z.t);
+  const partial = utc && sorted.length > 0 && sorted[0].t > dayOfBar(sorted[0].t) * 86_400_000 ? dayOfBar(sorted[0].t) : null;
   let day = -1;
   let pv = 0;
   let vol = 0;
-  for (const b of [...bars].sort((a, z) => a.t - z.t)) {
-    if (dayOf(b.t) !== day) {
-      day = dayOf(b.t);
+  for (const b of sorted) {
+    if (dayOfBar(b.t) === partial) continue;
+    if (dayOfBar(b.t) !== day) {
+      day = dayOfBar(b.t);
       pv = 0;
       vol = 0;
     }
@@ -412,12 +424,13 @@ export function vwapOf(bars: Bar[]): Map<number, number> {
   return out;
 }
 
-/** A VWAP series cut into its IST days, oldest first: each day's line is
- * its own, never joined to the day before. */
-export function vwapDays(series: Map<number, number>): { day: number; points: { time: number; price: number }[] }[] {
+/** A VWAP series cut into its IST days (a perp's UTC days, `utc`), oldest
+ * first: each day's line is its own, never joined to the day before. */
+export function vwapDays(series: Map<number, number>, utc = false): { day: number; points: { time: number; price: number }[] }[] {
   const days = new Map<number, { time: number; price: number }[]>();
+  const dayOfBar = vwapDay(utc);
   for (const [time, price] of [...series].sort((a, z) => a[0] - z[0])) {
-    const day = dayOf(time);
+    const day = dayOfBar(time);
     if (!days.has(day)) days.set(day, []);
     days.get(day)!.push({ time, price });
   }

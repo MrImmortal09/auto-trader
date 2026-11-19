@@ -3,6 +3,7 @@
 // once, globally.
 
 import { registerIndicator, registerOverlay, utils, type Chart, type DeepPartial, type OverlayFigure, type Styles } from 'klinecharts';
+import { vwapDay } from './model';
 import { C, FONT, PALETTE, alpha } from '../lib/palette';
 import { pivotLines, type PivotLevels } from './pivots';
 
@@ -268,9 +269,10 @@ const dayNumber = (t: number) => Math.floor((t + IST_OFFSET) / 86_400_000);
 
 // ── VWAP ────────────────────────────────────────────────────────────────── //
 
-/** Each chart's VWAP by bar start (Unix ms), keyed by the chart's id. The
- * indicator reads it here: KLineChart can't carry a Map in `extendData`. */
-export const VWAP_SERIES = new Map<string, Map<number, number>>();
+/** Each chart's VWAP by bar start (Unix ms), keyed by the chart's id, and
+ * whether its days are UTC days (a perp's). The indicator reads it here:
+ * KLineChart can't carry a Map in `extendData`. */
+export const VWAP_SERIES = new Map<string, { byBar: Map<number, number>; utc: boolean }>();
 
 registerIndicator<{ vwap?: number; day?: number }, number, { key: string }>({
   name: 'v2Vwap',
@@ -291,7 +293,9 @@ registerIndicator<{ vwap?: number; day?: number }, number, { key: string }>({
   ],
   calc: (dataList, indicator) => {
     const series = VWAP_SERIES.get(indicator.extendData?.key ?? '');
-    return dataList.map((d) => ({ vwap: series?.get(d.timestamp), day: dayNumber(d.timestamp) }));
+    // Each day's line breaks where its own day does: a perp's at 00:00 UTC.
+    const dayOfBar = series?.utc ? vwapDay(true) : dayNumber;
+    return dataList.map((d) => ({ vwap: series?.byBar.get(d.timestamp), day: dayOfBar(d.timestamp) }));
   },
 });
 

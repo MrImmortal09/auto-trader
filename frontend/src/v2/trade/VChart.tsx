@@ -828,7 +828,8 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     const c = chart.current;
     if (!c || !loaded || !bars) return;
     const ex = extras.current;
-    const days = vwap ? vwapDays(sym.kind === 'index' ? vwapOnIndex(futureBars, bars) : vwapOf(bars)).filter((d) => d.points.length >= 2) : [];
+    // An index's from its future, in IST days; a perp's own, in UTC days.
+    const days = vwap ? vwapDays(sym.kind === 'index' ? vwapOnIndex(futureBars, bars) : vwapOf(bars, wholeDay), sym.kind !== 'index' && wholeDay).filter((d) => d.points.length >= 2) : [];
     const wanted = new Set(days.map((d) => d.day));
     quietly(applying, () => {
       for (const [day, vid] of ex.vwap) {
@@ -854,7 +855,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
         c.drawings.lock(d.id, true);
       }
     });
-  }, [vwap, bars, futureBars, loaded, sym.kind]);
+  }, [vwap, bars, futureBars, loaded, sym.kind, wholeDay]);
 
   // Standard pivots for today, from a week of 15-minute bars; read again every
   // half hour in case the page stays open past midnight.
