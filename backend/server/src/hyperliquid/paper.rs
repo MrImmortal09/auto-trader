@@ -424,6 +424,55 @@ pub struct AccountView {
     pub fills: Vec<FillRow>,
 }
 
+/// An order checked against the market ([`PerpDesk::prepare`]), ready to
+/// place on an account.
+#[derive(Debug, Clone)]
+struct Prepared {
+    market: &'static Market,
+    side: Side,
+    size: f64,
+    leverage: u32,
+    limit: Option<f64>,
+    reduce_only: bool,
+    levels: PerpLevels,
+    /// Through the mid already: fills now, as a taker, at `mid`.
+    now_fill: bool,
+    mid: f64,
+}
+
+/// Place `p` on `acc`: fill it now, or rest it. The ledger legs it made
+/// come back with the answer. A refusal leaves `acc` half-changed at worst,
+/// which is why it only ever runs on a copy (`PerpDesk::with_account`).
+fn place(acc: &mut Account, p: &Prepared, now: &str, now_ms: i64) -> Result<(OrderAnswer, Vec<Leg>), Refusal> {
+    let m = p.market;
+    if p.now_fill {
+        // A book with nothing held was not stepped, so its funding clock
+        // stands at its last position: a position opened now pays at the
+        // next hour, not at once.
+        let had_none = acc.book.positions.is_empty();
+        let fill = FillReq { market: m, side: p.side, size: p.size, price: p.mid, fee_rate: m.taker_fee, leverage: p.leverage, reduce_only: p.reduce_only, reason: if p.limit.is_some() { "LIMIT" } else { "MARKET" }, now, levels: Some(&p.levels) };
+        let f = apply_fill(&mut acc.book, acc.cash, &fill, new_id).map_err(Refusal::conflict)?;
+        acc.cash += f.cash_delta;
+        if had_none && !acc.book.positions.is_empty() {
+            acc.book.funded_hour = Some(now_ms.div_euclid(HOUR_MS));
+        }
+        for leg in &f.legs {
+            acc.note(now, "fill", Some(m.key), fill_words(m, leg));
+        }
+        return Ok((OrderAnswer { filled: f.legs.clone(), resting: None }, f.legs));
+    }
+    if acc.book.orders.len() + acc.book.lines.len() >= MAX_WAITING {
+        return Err(Refusal::conflict(format!("At most {MAX_WAITING} orders and line orders wait at once")));
+    }
+    if p.reduce_only && acc.book.position(m.key).is_none_or(|held| held.side == p.side) {
+        return Err(Refusal::conflict(format!("No {} position for a reduce-only order to reduce", m.label)));
+    }
+    let order = PerpOrder { id: new_id(), market: m.key.to_string(), side: p.side, size: p.size, price: p.limit.unwrap_or(p.mid), leverage: p.leverage, reduce_only: p.reduce_only, placed_at: now.to_string(), levels: p.levels.clone() };
+    acc.note(now, "order", Some(m.key), format!("Limit {} {} {} at {} resting", order.side.action().to_lowercase(), p.size, m.label, order.price));
+    acc.book.orders.push(order.clone());
+    Ok((OrderAnswer { filled: Vec::new(), resting: Some(order) }, Vec::new()))
+}
+
 pub struct PerpDesk {
     pool: SqlitePool,
     hl: Arc<HlMarketData>,
@@ -548,9 +597,9 @@ impl PerpDesk {
         Ok(out)
     }
 
-    /// Send an order: a market order fills now at the mid; a limit fills now
-    /// at the mid if the mid is already through it, else rests.
-    pub async fn order(&self, user_id: i64, req: OrderReq) -> Result<OrderAnswer, Refusal> {
+    /// Check `req` against the market now: its size, leverage, price,
+    /// worth and levels, and whether it fills at once. Changes nothing.
+    fn prepare(&self, req: &OrderReq) -> Result<Prepared, Refusal> {
         let m = req.market;
         let px = self.need_px(m)?;
         let size = m.round_size(req.size);
@@ -575,44 +624,48 @@ impl PerpDesk {
             Side::Long => p >= px.mid,
             Side::Short => p <= px.mid,
         });
+        Ok(Prepared { market: m, side: req.side, size, leverage: req.leverage, limit, reduce_only: req.reduce_only, levels, now_fill, mid: px.mid })
+    }
+
+    /// Send an order: a market order fills now at the mid; a limit fills now
+    /// at the mid if the mid is already through it, else rests.
+    pub async fn order(&self, user_id: i64, req: OrderReq) -> Result<OrderAnswer, Refusal> {
+        let prepared = self.prepare(&req)?;
         let now = now_ts();
-        self.with_account(user_id, |acc| {
-            if now_fill {
-                let fill = FillReq { market: m, side: req.side, size, price: px.mid, fee_rate: m.taker_fee, leverage: req.leverage, reduce_only: req.reduce_only, reason: if limit.is_some() { "LIMIT" } else { "MARKET" }, now: &now, levels: Some(&levels) };
-                let f = apply_fill(&mut acc.book, acc.cash, &fill, new_id).map_err(Refusal::conflict)?;
-                acc.cash += f.cash_delta;
-                for leg in &f.legs {
-                    acc.note(&now, "fill", Some(m.key), fill_words(m, leg));
-                }
-                return Ok((OrderAnswer { filled: f.legs.clone(), resting: None }, f.legs));
-            }
-            if acc.book.orders.len() + acc.book.lines.len() >= MAX_WAITING {
-                return Err(Refusal::conflict(format!("At most {MAX_WAITING} orders and line orders wait at once")));
-            }
-            if req.reduce_only && acc.book.position(m.key).is_none_or(|p| p.side == req.side) {
-                return Err(Refusal::conflict(format!("No {} position for a reduce-only order to reduce", m.label)));
-            }
-            let order = PerpOrder { id: new_id(), market: m.key.to_string(), side: req.side, size, price: limit.unwrap_or(px.mid), leverage: req.leverage, reduce_only: req.reduce_only, placed_at: now.clone(), levels };
-            acc.note(&now, "order", Some(m.key), format!("Limit {} {} {} at {} resting", order.side.action().to_lowercase(), size, m.label, order.price));
-            acc.book.orders.push(order.clone());
-            Ok((OrderAnswer { filled: Vec::new(), resting: Some(order) }, Vec::new()))
-        })
-        .await
+        let now_ms = shared_domain::now_ist().timestamp_millis();
+        self.with_account(user_id, |acc| place(acc, &prepared, &now, now_ms)).await
     }
 
     /// Move a resting limit to `price`; one moved through the mid fills now.
+    /// All or nothing: a move refused (no live price, a stop now on the wrong
+    /// side, too small at the new price, not enough USDC to fill) leaves the
+    /// order resting where it was.
     pub async fn move_order(&self, user_id: i64, order_id: &str, price: f64) -> Result<OrderAnswer, Refusal> {
-        let (key, side, size, leverage, reduce_only, levels) = {
+        let req = {
             let mut map = self.accounts.lock().await;
             let acc = self.account(&mut map, user_id).await?;
             let o = acc.book.orders.iter().find(|o| o.id == order_id).ok_or_else(|| Refusal::not_found("No such order"))?;
-            (o.market.clone(), o.side, o.size, o.leverage, o.reduce_only, o.levels.clone())
+            OrderReq {
+                market: market(&o.market)?,
+                side: o.side,
+                size: o.size,
+                leverage: o.leverage,
+                kind: Kind::Limit(price),
+                reduce_only: o.reduce_only,
+                stop: o.levels.stop,
+                targets: o.levels.targets.iter().map(|t| (t.price, t.size)).collect(),
+            }
         };
-        self.cancel_order(user_id, order_id).await?;
-        let m = market(&key)?;
-        let stop = levels.stop;
-        let targets: Vec<(f64, Option<f64>)> = levels.targets.iter().map(|t| (t.price, t.size)).collect();
-        self.order(user_id, OrderReq { market: m, side, size, leverage, kind: Kind::Limit(price), reduce_only, stop, targets }).await
+        let prepared = self.prepare(&req)?;
+        let now = now_ts();
+        let now_ms = shared_domain::now_ist().timestamp_millis();
+        self.with_account(user_id, |acc| {
+            let i = acc.book.orders.iter().position(|o| o.id == order_id).ok_or_else(|| Refusal::not_found("No such order"))?;
+            acc.book.orders.remove(i);
+            // Refused here, the account copy is dropped: the order stays.
+            place(acc, &prepared, &now, now_ms)
+        })
+        .await
     }
 
     pub async fn cancel_order(&self, user_id: i64, order_id: &str) -> Result<(), Refusal> {
@@ -984,6 +1037,58 @@ mod tests {
         assert!(book.lines.is_empty());
         // The short line closed the 0.1 long it met first: flat, its stop unused.
         assert!(book.positions.is_empty(), "{:?}", book.positions);
+    }
+
+    #[test]
+    fn a_limit_that_would_flip_into_a_short_it_cant_afford_drops_and_keeps_the_long() {
+        let (mut book, mut cash) = (Book::default(), START_USDC);
+        open_long(&mut book, &mut cash, 0.1, 60_000.0, None);
+        book.funded_hour = Some(0);
+        // Rested with no margin held for it: 2 BTC at 5x needs $22,800.
+        book.orders.push(PerpOrder { id: "o".into(), market: "BTC".into(), side: Side::Short, size: 2.0, price: 61_000.0, leverage: 5, reduce_only: false, placed_at: "t".into(), levels: PerpLevels::default() });
+        let (before, cash_before) = (book.position("BTC").cloned(), cash);
+        let s = step_book(&mut book, &mut cash, &|_: &str| Some(px(61_100.0)), 0, "t");
+        assert!(s.legs.is_empty(), "nothing filled, nothing booked");
+        assert_eq!((book.position("BTC").cloned(), cash), (before, cash_before), "the long and its margin are untouched");
+        assert!(book.orders.is_empty(), "the order is dropped, and said so");
+        assert!(s.notes.iter().any(|(_, _, m)| m.contains("dropped")));
+    }
+
+    fn prepared(side: Side, size: f64, limit: Option<f64>, mid: f64) -> Prepared {
+        Prepared { market: btc(), side, size, leverage: 10, limit, reduce_only: false, levels: PerpLevels::default(), now_fill: limit.is_none(), mid }
+    }
+
+    fn account() -> Account {
+        Account { book: Book::default(), cash: START_USDC, epoch: 0, activity: VecDeque::new() }
+    }
+
+    #[test]
+    fn a_first_position_starts_its_funding_clock_at_the_hour_it_opens() {
+        let mut acc = account();
+        // Last held something long ago: the clock stands at hour 3.
+        acc.book.funded_hour = Some(3);
+        place(&mut acc, &prepared(Side::Long, 0.1, None, 60_000.0), "t", 10 * H + 30 * 60_000).unwrap();
+        assert_eq!(acc.book.funded_hour, Some(10));
+        // So the next tick in the same hour charges nothing...
+        let s = step_book(&mut acc.book, &mut acc.cash, &|_: &str| Some(px(60_000.0)), 10 * H + 31 * 60_000, "t");
+        assert!(!s.changed && acc.book.position("BTC").unwrap().funding == 0.0);
+        // ...and 11:00 charges the hour.
+        step_book(&mut acc.book, &mut acc.cash, &|_: &str| Some(px(60_000.0)), 11 * H, "t");
+        assert!(acc.book.position("BTC").unwrap().funding > 0.0);
+    }
+
+    #[test]
+    fn a_refused_placement_is_reported_and_the_order_rests_if_it_can() {
+        let mut acc = account();
+        // Through the mid and too big to afford: refused.
+        let err = place(&mut acc, &prepared(Side::Long, 2.0, None, 60_000.0), "t", 0).unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(acc.book.positions.is_empty());
+        // Below the mid: it rests, whatever the cash (checked when it fills).
+        let mut resting = prepared(Side::Long, 0.1, Some(59_000.0), 60_000.0);
+        resting.now_fill = false;
+        let (answer, legs) = place(&mut acc, &resting, "t", 0).unwrap();
+        assert!(legs.is_empty() && answer.resting.is_some());
     }
 
     #[test]

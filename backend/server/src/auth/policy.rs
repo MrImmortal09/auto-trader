@@ -70,8 +70,15 @@ const RULES: &[Rule] = &[
     // charts are `HL:` symbols on the candle routes above.
     rule(On::Read, "/api/v2/hl/markets", Access::SignedIn),
     // Hyperliquid perps on paper: each signed-in person's own account (the
-    // owner's and every user's), keyed by user id in the routes.
-    rule(On::Any, "/api/v2/hl/*", Access::SignedIn),
+    // owner's and every user's), keyed by user id in the routes. Named one
+    // by one: any other `/api/v2/hl/` route (LIVE's, say) stays the admin's.
+    rule(On::Read, "/api/v2/hl/account", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/orders", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/orders/*", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/positions/*", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/lines", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/lines/*", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/reset", Access::SignedIn),
     // The instrument search and its quotes (behind the `search` flag). The
     // status page is the owner's: it carries the hub's error text, call
     // times and the catalog's paths — diagnostics, not market data.
@@ -231,6 +238,13 @@ mod tests {
         (POST, "/api/v2/hl/positions/BTC/close", Access::SignedIn),
         (POST, "/api/v2/hl/lines", Access::SignedIn),
         (POST, "/api/v2/hl/reset", Access::SignedIn),
+        (PATCH, "/api/v2/hl/orders/abc", Access::SignedIn),
+        (PATCH, "/api/v2/hl/lines/abc", Access::SignedIn),
+        (DELETE, "/api/v2/hl/lines/abc", Access::SignedIn),
+        // Anything else under it is the admin's until named.
+        (GET, "/api/v2/hl/network", Access::Admin),
+        (PUT, "/api/v2/hl/network", Access::Admin),
+        (POST, "/api/v2/hl/live/orders", Access::Admin),
         (PATCH, "/api/v2/positions/abc-123", Access::Admin),
         (POST, "/api/v2/positions/abc-123/limit-close", Access::Admin),
         (DELETE, "/api/v2/positions/abc-123/limit-close", Access::Admin),

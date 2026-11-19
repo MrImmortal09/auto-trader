@@ -79,14 +79,20 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   const lev = Math.max(1, Math.min(cap, leverage));
   const mid = market?.mid ?? market?.mark ?? null;
   const held = account?.positions.find((p) => p.market === k) ?? null;
-  // A position's leverage is its own: an add puts margin up at it.
-  const usedLev = held ? held.leverage : lev;
+  // An add puts margin up at the position's own leverage; an order the other
+  // way first closes what is held, and opens what is left over at the
+  // stepper's — the leverage shown is the one sent.
+  const adding = held != null && held.side === side;
+  const usedLev = adding ? held.leverage : lev;
   const size = typed(sizeText_) == null ? null : roundSize(k, typed(sizeText_)!);
   const price = kind === 'market' ? mid : typed(priceText) == null ? null : roundPrice(k, typed(priceText)!);
   const notional = size != null && price != null ? size * price : null;
-  const margin = notional != null ? notional / usedLev : null;
+  // The part of it that opens or adds to a position (an order the other way closes the rest).
+  const opening = size == null ? null : held && !adding ? Math.max(0, size - held.size) : size;
+  const margin = opening != null && price != null ? (opening * price) / usedLev : null;
   const fee = notional != null ? notional * (kind === 'limit' ? rules.maker : rules.taker) : null;
-  const liq = price != null && !held ? estLiq(k, side, price, usedLev) : null;
+  // A liquidation price for a position the order opens fresh.
+  const liq = price != null && (!held || (!adding && (opening ?? 0) > 0)) ? estLiq(k, side, price, usedLev) : null;
   const stop = typed(stopText);
   const target = typed(targetText);
   const reduce = kind !== 'line' && reduceOnly;
@@ -102,8 +108,8 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
     const way = side === 'long' ? 'buy' : 'sell';
     const ok =
       kind === 'line'
-        ? await perps.actions.line({ market: k, side: way, size, leverage: lev, price: price!, valid_minutes: validity, ...levels })
-        : await perps.actions.order({ market: k, side: way, size, leverage: lev, type: kind, price: kind === 'limit' ? price! : undefined, reduce_only: reduce || undefined, ...levels });
+        ? await perps.actions.line({ market: k, side: way, size, leverage: usedLev, price: price!, valid_minutes: validity, ...levels })
+        : await perps.actions.order({ market: k, side: way, size, leverage: usedLev, type: kind, price: kind === 'limit' ? price! : undefined, reduce_only: reduce || undefined, ...levels });
     setSending(false);
     if (ok) {
       setStopText('');
@@ -166,13 +172,13 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
       {kind !== 'market' && <Field label={kind === 'line' ? 'Line' : 'Limit price'} value={priceText} onChange={setPriceText} unit="$" placeholder={mid == null ? '' : perpPrice(mid)} large={large} action={pickButton(kind === 'line' ? 'Line' : 'Limit price', setPriceText)} />}
       <Field label="Size" value={sizeText_} onChange={setSizeText} unit={k} placeholder={`0.${'0'.repeat(rules.szDecimals - 1)}1`} large={large} />
       <div className="flex items-center justify-between gap-3">
-        <span className="type-label text-fg-muted">Leverage{held ? ' (the position’s)' : ''}</span>
+        <span className="type-label text-fg-muted">Leverage{adding ? ' (the position’s)' : held ? ' (for what opens)' : ''}</span>
         <div role="group" aria-label="Leverage" className="flex items-center rounded-6 border border-line bg-inset">
-          <button type="button" aria-label="Less leverage" disabled={!!held || lev <= 1} onClick={() => setLeverage(lev - 1)} className="grid size-8 place-items-center text-fg disabled:opacity-40">
+          <button type="button" aria-label="Less leverage" disabled={adding || lev <= 1} onClick={() => setLeverage(lev - 1)} className="grid size-8 place-items-center text-fg disabled:opacity-40">
             <Minus size={14} />
           </button>
           <span className="w-12 text-center num-medium text-fg">{usedLev}x</span>
-          <button type="button" aria-label="More leverage" disabled={!!held || lev >= cap} onClick={() => setLeverage(lev + 1)} className="grid size-8 place-items-center text-fg disabled:opacity-40">
+          <button type="button" aria-label="More leverage" disabled={adding || lev >= cap} onClick={() => setLeverage(lev + 1)} className="grid size-8 place-items-center text-fg disabled:opacity-40">
             <Plus size={14} />
           </button>
         </div>
@@ -209,7 +215,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
       <p className="type-caption text-fg-subtle tnum">
         {notional == null
           ? `Type a size${kind === 'market' ? '' : ' and a price'}. At most ${cap}x; a ${k} size carries ${rules.szDecimals} decimals.`
-          : `${usd(notional)} · margin ${usd(margin!)} · fee ≈ ${usd(fee!)}${liq != null ? ` · liquidation ≈ ${perpPrice(roundPrice(k, liq))}` : ''}${kind === 'line' ? ` · when the mark ${mid != null && price! > mid ? 'rises' : 'falls'} to ${perpPrice(price!)}` : ''}`}
+          : `${usd(notional)} · ${held && !adding ? `closes ${sizeText(k, Math.min(size!, held.size))}${margin! > 0 ? `, then ` : ''}` : ''}${margin! > 0 || !held || adding ? `margin ${usd(margin!)}` : ''} · fee ≈ ${usd(fee!)}${liq != null ? ` · liquidation ≈ ${perpPrice(roundPrice(k, liq))}` : ''}${kind === 'line' ? ` · when the mark ${mid != null && price! > mid ? 'rises' : 'falls'} to ${perpPrice(price!)}` : ''}`}
       </p>
       <Button size={size_} kind={side === 'long' ? 'profit' : 'loss'} pointerOnly disabled={!ready} onClick={() => void send()}>
         {sending ? 'Sending…' : `${kind === 'line' ? 'Arm: ' : ''}${side === 'long' ? 'Buy / long' : 'Sell / short'}${size ? ` ${sizeText(k, size)}` : ''}${kind === 'limit' && price ? ` @ ${perpPrice(price)}` : ''}`}

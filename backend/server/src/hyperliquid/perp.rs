@@ -312,8 +312,17 @@ pub struct FillReq<'a> {
 /// Apply a fill to `book` with `cash` free USDC: open, add to, reduce,
 /// close or flip the market's position. Refused — nothing changed — when
 /// the cash can't put up the margin and fee, a reduce-only fill has nothing
-/// to reduce, or the size is nothing.
+/// to reduce, or the size is nothing. All or nothing: a flip whose new side
+/// can't be afforded leaves the old position as it was too.
 pub fn apply_fill(book: &mut Book, cash: f64, req: &FillReq, new_id: impl Fn() -> String) -> Result<Filled, String> {
+    let mut work = book.clone();
+    let filled = fill_into(&mut work, cash, req, new_id)?;
+    *book = work;
+    Ok(filled)
+}
+
+/// [`apply_fill`]'s work, on a book it may leave half-changed when it refuses.
+fn fill_into(book: &mut Book, cash: f64, req: &FillReq, new_id: impl Fn() -> String) -> Result<Filled, String> {
     let m = req.market;
     if !(req.size > DUST && req.price.is_finite() && req.price > 0.0) {
         return Err("Nothing to fill".to_string());
@@ -540,6 +549,22 @@ mod tests {
         let err = apply_fill(&mut book, 100.0, &req(Side::Long, 0.1, 60_000.0, false), ids()).unwrap_err();
         assert!(err.contains("Not enough USDC"), "{err}");
         assert!(book.positions.is_empty(), "a refusal changes nothing");
+    }
+
+    #[test]
+    fn a_flip_that_cant_be_afforded_changes_nothing() {
+        let mut book = Book::default();
+        apply_fill(&mut book, 10_000.0, &req(Side::Long, 0.1, 60_000.0, false), ids()).unwrap();
+        let before = book.clone();
+        // Sell 2 BTC: closes the 0.1 long, but the 1.9 short at 10x needs
+        // $11,400 of margin and only $9,397 (+ the long's $600) is free.
+        let err = apply_fill(&mut book, 9_397.3, &req(Side::Short, 2.0, 60_000.0, false), ids()).unwrap_err();
+        assert!(err.contains("Not enough USDC"), "{err}");
+        assert_eq!(book, before, "the long is still held, its margin still behind it");
+        // The same sell, reduce-only, is only the close.
+        let f = apply_fill(&mut book, 9_397.3, &req(Side::Short, 2.0, 60_000.0, true), ids()).unwrap();
+        assert_eq!(f.legs.len(), 1);
+        assert!(book.positions.is_empty());
     }
 
     #[test]
