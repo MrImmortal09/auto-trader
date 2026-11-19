@@ -28,11 +28,29 @@ import { C, type LinePart, type OrderLineData } from '../chartSetup';
 import type { PlacingPrompt } from '../ChartPanel';
 import type { ChartLine } from '../KChart';
 import type { PerpKey } from '../model';
-import { perpLabel, perpPrice, pnlAt, roundPrice, sideWord, signedUsd, sizeText } from './model';
+import { usePerpDraft, type PerpDraft } from './draft';
+import { estLiq, perpLabel, perpPrice, pnlAt, roundPrice, sideWord, signedUsd, sizeText } from './model';
+
+/** A step of the ticket's "Buy on a line": the line, then its stop, then
+ * its target, each one tap on the chart. */
+export type LineStep = 'line' | 'stop' | 'target';
+
+/** How a picked price is asked for: its words on the chart, and the step
+ * of a "Buy on a line" it is. */
+export interface PickOptions {
+  /** The prompt's words at a price (`what · price` when left out). */
+  label?: (price: number) => string;
+  color?: string;
+  step?: LineStep;
+}
 
 /** A level being put on a perp's chart: the next click sets it. `pick`
- * hands the price to `onPick` (the ticket's limit or line price). */
-export type PerpPlacing = { key: PerpKey; kind: 'stop' | 'target' } | { key: PerpKey; kind: 'pick'; what: string; onPick: (price: number) => void };
+ * hands the price to `onPick` (the ticket's limit or line price, or a step
+ * of a "Buy on a line"); `onPick` answering `true` keeps the chart taking
+ * clicks (it has asked for the next step, or refused this one). */
+export type PerpPlacing =
+  | { key: PerpKey; kind: 'stop' | 'target' }
+  | { key: PerpKey; kind: 'pick'; what: string; onPick: (price: number) => boolean | void; options?: PickOptions };
 
 export interface PerpActions {
   order: (body: PerpOrderBody) => Promise<boolean>;
@@ -55,7 +73,7 @@ export interface Perps {
   /** Put a stop or target on `key`'s chart with the next click. */
   place: (key: PerpKey, kind: 'stop' | 'target') => void;
   /** Take the next click on `key`'s chart as a price for `onPick`. */
-  pick: (key: PerpKey, what: string, onPick: (price: number) => void) => void;
+  pick: (key: PerpKey, what: string, onPick: (price: number) => boolean | void, options?: PickOptions) => void;
   cancelPlacing: () => void;
   /** What `key`'s chart draws. */
   lines: (key: PerpKey) => ChartLine[];
@@ -133,6 +151,8 @@ export function usePerps({ serverBase, enabled, onShow }: {
   // LIVE is read-only in this release: nothing on its lines moves or cancels.
   const editable = account?.mode !== 'live';
   const [placing, setPlacing] = useState<PerpPlacing | null>(null);
+  // The ticket's order being set up: its liquidation goes on the chart.
+  const draft = usePerpDraft();
   const cancelPlacing = useCallback(() => setPlacing(null), []);
 
   async function run(act: () => Promise<Sent>, fail: string, done?: (body: unknown) => void): Promise<boolean> {
@@ -204,21 +224,58 @@ export function usePerps({ serverBase, enabled, onShow }: {
         },
       },
     ];
-    if (p.liq != null) {
-      out.push({
-        id: `${p.id}:liq`,
-        price: roundPrice(key, p.liq),
-        zLevel: 1,
-        data: {
-          color: C.loss,
-          dashed: true,
-          draggable: false,
-          parts: () => [{ key: 'label', text: `Liquidation · ${signedUsd(-p.margin)}`, color: C.loss, icon: 'lock' }],
-          axisText: (at) => perpPrice(at),
-        },
-      });
-    }
+    if (p.liq != null) out.push(liqLine(key, `${p.id}:liq`, p.liq, `Liquidation · ${signedUsd(-p.margin)}`));
     out.push(...levelLines(key, p.id, p.side, p.size, p.entry, p.levels, (u) => void actions.setLevels(key, u), () => true, editable));
+    return out;
+  }
+
+  /** A dotted line where a position would be liquidated: never dragged. */
+  function liqLine(key: PerpKey, id: string, at: number, text: string): ChartLine {
+    return {
+      id,
+      price: roundPrice(key, at),
+      zLevel: 1,
+      data: {
+        color: C.loss,
+        dashed: false,
+        dotted: true,
+        draggable: false,
+        parts: () => [{ key: 'label', text, color: C.loss, icon: 'lock' }],
+        axisText: (v) => perpPrice(v),
+      },
+    };
+  }
+
+  /** Where an order that opens a position (a resting limit, an armed line)
+   * would have it liquidated once filled at `entry` — while nothing is held
+   * in it (an add or a flip lands elsewhere) and its leverage is known. */
+  function fillLiqLine(key: PerpKey, id: string, side: PerpSide, entry: number, leverage: number, what: string): ChartLine[] {
+    if (leverage <= 0 || account?.positions.some((p) => p.market === key)) return [];
+    const liq = estLiq(key, side, entry, leverage);
+    return liq == null ? [] : [liqLine(key, id, liq, `Liquidation if ${what} fills · ${leverage}x`)];
+  }
+
+  /** The ticket's order being set up: a line order's line, stop and target
+   * (not yet armed: dashed, fixed), and where it would be liquidated. */
+  function draftLines(key: PerpKey, d: PerpDraft): ChartLine[] {
+    const out: ChartLine[] = [];
+    const fixed = (id: string, at: number, color: string, text: string): ChartLine => ({
+      id: `perp:${key}:draft-${id}`,
+      price: roundPrice(key, at),
+      zLevel: 2,
+      data: { color, dashed: true, draggable: false, parts: () => [{ key: 'label', text, color }], axisText: (v) => perpPrice(v) },
+    });
+    if (d.line) {
+      const what = d.size != null ? ` ${sizeText(key, d.size)}` : '';
+      out.push(fixed('line', d.entry, C.fg, `${sideWord(d.side)}${what} on this line · ${d.leverage}x · not armed yet`));
+      const pnl = (at: number) => (d.size != null ? ` ${signedUsd(pnlAt(d.side, d.size, d.entry, at))}` : '');
+      if (d.stop != null) out.push(fixed('stop', d.stop, C.loss, `Stop${pnl(d.stop)}`));
+      if (d.target != null) out.push(fixed('target', d.target, C.profit, `Target${pnl(d.target)}`));
+    }
+    if (d.liq != null) {
+      const loss = d.margin != null ? ` · ${signedUsd(-d.margin)}` : '';
+      out.push(liqLine(key, `perp:${key}:draft-liq`, d.liq, `Liquidation if ${d.line ? 'the line fills' : 'filled'} at ${perpPrice(d.entry)} · ${d.leverage}x${loss}`));
+    }
     return out;
   }
 
@@ -276,32 +333,39 @@ export function usePerps({ serverBase, enabled, onShow }: {
 
   function lines(key: PerpKey): ChartLine[] {
     if (!account) return [];
-    return [
+    const out = [
       ...account.positions.filter((p) => p.market === key).flatMap(positionLines),
-      ...account.orders.filter((o) => o.market === key).map(orderLine),
-      ...account.lines.filter((l) => l.market === key).flatMap(lineLines),
+      ...account.orders.filter((o) => o.market === key).flatMap((o) => [orderLine(o), ...(o.reduce_only ? [] : fillLiqLine(key, `${o.id}:liq`, o.side, o.price, o.leverage, 'the limit'))]),
+      ...account.lines.filter((l) => l.market === key).flatMap((l) => [...lineLines(l), ...fillLiqLine(key, `${l.id}:liq`, l.side, l.price, l.leverage, 'the line')]),
     ];
+    // The order being set up in the ticket: where it would be liquidated —
+    // unless it is placed already (an armed line or a resting limit there
+    // has its own).
+    const placed = (x: { side: PerpSide; price: number; leverage: number }) => draft != null && x.side === draft.side && x.price === draft.entry && x.leverage === draft.leverage;
+    if (draft && draft.key === key && !account.lines.some((l) => l.market === key && placed(l)) && !account.orders.some((o) => o.market === key && placed(o))) {
+      out.push(...draftLines(key, draft));
+    }
+    return out;
   }
 
   function prompt(key: PerpKey): PlacingPrompt | null {
     if (!placing || placing.key !== key) return null;
     if (!editable && placing.kind !== 'pick') return null;
     if (placing.kind === 'pick') {
-      const onPick = placing.onPick;
+      const { onPick, what, options } = placing;
+      const color = options?.color ?? C.accent;
       return {
-        key: `perp:${key}:pick:${placing.what}`,
-        what: placing.what,
+        key: `perp:${key}:pick:${options?.step ?? ''}:${what}`,
+        what,
         data: {
-          color: C.accent,
+          color,
           dashed: true,
           draggable: false,
-          parts: (at) => [{ key: 'label', text: `${placing.what} · ${perpPrice(roundPrice(key, at))}`, color: C.accent }],
+          parts: (at) => [{ key: 'label', text: options?.label ? options.label(roundPrice(key, at)) : `${what} · ${perpPrice(roundPrice(key, at))}`, color }],
           axisText: (at) => perpPrice(at),
         },
-        onPlace: (at) => {
-          onPick(roundPrice(key, at));
-          return true;
-        },
+        // `true` from `onPick`: more taps to come, so the chart keeps taking them.
+        onPlace: (at) => onPick(roundPrice(key, at)) !== true,
       };
     }
     const p = account?.positions.find((x) => x.market === key);
@@ -335,9 +399,9 @@ export function usePerps({ serverBase, enabled, onShow }: {
       onShow?.(key);
       setPlacing({ key, kind });
     },
-    pick: (key, what, onPick) => {
+    pick: (key, what, onPick, options) => {
       onShow?.(key);
-      setPlacing({ key, kind: 'pick', what, onPick });
+      setPlacing({ key, kind: 'pick', what, onPick, options });
     },
     cancelPlacing,
     lines,

@@ -385,6 +385,10 @@ const dayOf = (t: number) => Math.floor((t + IST_MS) / 86_400_000);
 /** The IST calendar day of a Unix-ms instant, as a day number. */
 export const istDay = dayOf;
 
+/** The UTC calendar day of a Unix-ms instant, as a day number: a perp's
+ * trading day, as Hyperliquid's and TradingView's charts count it. */
+export const utcDay = (t: number) => Math.floor(t / 86_400_000);
+
 /**
  * VWAP by bar start, restarting each IST day: the volume-weighted typical
  * price of the day's bars with Upstox's official volume. A bar without any

@@ -4,7 +4,7 @@
 
 import { registerIndicator, registerOverlay, utils, type Chart, type DeepPartial, type OverlayFigure, type Styles } from 'klinecharts';
 import { C, FONT, PALETTE, alpha } from '../lib/palette';
-import { pivotLines, type PivotLevels } from './pivots';
+import { pivotDay, pivotLines, type PivotLevels } from './pivots';
 
 // The design tokens as plain values (the chart draws on a canvas), from the
 // one source every chart shares; lines.ts, VChart.tsx and pcrIndicator.ts
@@ -126,6 +126,8 @@ function iconFigures(icon: 'grip' | 'lock', x: number, y: number, color: string)
 export interface OrderLineData {
   color: string;
   dashed: boolean;
+  /** Dotted, finer than dashed: an estimate (a perp's liquidation), not an order. */
+  dotted?: boolean;
   /** The pills, left to right, right-aligned against the axis. Called on every
    * draw with the line's price, so a dragged line's label follows it. */
   parts: (price: number) => LinePart[];
@@ -154,7 +156,7 @@ registerOverlay<OrderLineData>({
         key: 'line',
         type: 'line',
         attrs: { coordinates: [{ x: 0, y }, { x: bounding.width, y }] },
-        styles: { style: d.dashed ? 'dashed' : 'solid', dashedValue: [4, 4], color: d.color, size: 1 },
+        styles: { style: d.dashed || d.dotted ? 'dashed' : 'solid', dashedValue: d.dotted ? [1, 3] : [4, 4], color: d.color, size: 1 },
         // The hairline never drags: pressing near it pans the chart, so a
         // stop can only move from its label.
         ignoreEvent: NO_DRAG,
@@ -297,8 +299,8 @@ registerIndicator<{ vwap?: number; day?: number }, number, { key: string }>({
 
 // ── Pivot points ────────────────────────────────────────────────────────── //
 
-/** Each chart's pivots by IST day number, keyed by the chart's id. */
-export const PIVOT_SERIES = new Map<string, Map<number, PivotLevels>>();
+/** Each chart's pivots by day number (an IST day, a perp's UTC day: `pivotDay`), keyed by the chart's id. */
+export const PIVOT_SERIES = new Map<string, { byDay: Map<number, PivotLevels>; allDay: boolean }>();
 
 /** The pivot orange, for every level (3.2:1 on white); the names are `C.muted`. Vela draws the same. */
 export const PIVOT_ORANGE = PALETTE.pivot;
@@ -318,8 +320,11 @@ registerIndicator<Record<string, never>, number, { key: string }>({
   // No legend row: the levels carry their own names.
   createTooltipDataSource: () => ({ name: '', calcParamsText: '', legends: [], features: [] }),
   draw: ({ ctx, chart, bounding, xAxis, yAxis, indicator }) => {
-    const byDay = PIVOT_SERIES.get(indicator.extendData?.key ?? '');
-    if (!byDay || byDay.size === 0) return true;
+    const series = PIVOT_SERIES.get(indicator.extendData?.key ?? '');
+    if (!series || series.byDay.size === 0) return true;
+    const { byDay } = series;
+    // Each level runs across its own day: an IST day, or a perp's UTC day.
+    const dayNumber = pivotDay(series.allDay);
     const data = chart.getDataList();
     const { from, to } = chart.getVisibleRange();
     const start = Math.max(0, from);

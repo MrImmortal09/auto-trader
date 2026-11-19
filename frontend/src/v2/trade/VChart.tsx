@@ -755,7 +755,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
           .filter((part) => WORD_PARTS.has(part.key))
           .map((part) => part.text)
           .join(' · ');
-        const style = { lineColor: line.data.color, lineWidth: 1, lineStyle: line.data.dashed ? ('dashed' as const) : ('solid' as const) };
+        const style = { lineColor: line.data.color, lineWidth: 1, lineStyle: line.data.dotted ? ('dotted' as const) : line.data.dashed ? ('dashed' as const) : ('solid' as const) };
         const styleKey = `${style.lineColor}|${style.lineStyle}`;
         const locked = !line.data.draggable;
         let vid = owned.current.get(line.id);

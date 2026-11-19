@@ -415,7 +415,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       fetchDays(serverBase, symbol, '15m', 8)
         .then((bars) => {
           if (!live) return;
-          PIVOT_SERIES.set(chartId, pivotsByDay(bars, wholeDay));
+          PIVOT_SERIES.set(chartId, { byDay: pivotsByDay(bars, wholeDay), allDay: wholeDay });
           show();
         })
         .catch(() => {});
