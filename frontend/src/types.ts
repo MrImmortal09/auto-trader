@@ -602,7 +602,7 @@ export interface ExecuteFrame {
   ts: number;
   mode: string;
   kill_switch: boolean;
-  /** Manual buys are accepted (09:15–15:30 IST, weekday, or today's special session). */
+  /** Manual buys are accepted (09:15–15:39 IST, weekday, or today's special session). */
   market_open: boolean;
   /** While `market_open` is false, the buy route's own refusal: today's
    * special session window if one is set, else regular hours. Absent from a

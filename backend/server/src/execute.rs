@@ -639,7 +639,7 @@ pub struct ExecuteFrame {
     ts: i64,
     mode: String,
     kill_switch: bool,
-    /// Manual buys are accepted: 09:15–15:30 IST on a weekday, or during
+    /// Manual buys are accepted: 09:15–15:39 IST on a weekday, or during
     /// today's special session.
     market_open: bool,
     /// While `market_open` is false, the buy route's own refusal (today's
@@ -797,7 +797,7 @@ pub fn kotak_ready(state: &AppState) -> bool {
     present && state.kotak_session_healthy.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Manual buys are accepted 09:15–15:30 IST on a weekday, or throughout an
+/// Manual buys are accepted 09:15–15:39 IST on a weekday, or throughout an
 /// active special session — see [`shared_domain::manual_buy_window_open_at`].
 pub fn manual_buy_window_open_at(now: chrono::DateTime<chrono::FixedOffset>) -> bool {
     shared_domain::manual_buy_window_open_at(now)
@@ -818,7 +818,7 @@ fn buy_closed_message_on(date: NaiveDate, what: &str) -> String {
             shared_domain::format_hhmm(session.end)
         )
     } else {
-        format!("Market is closed — {what} run 09:15–15:30 IST")
+        format!("Market is closed — {what} run 09:15–15:39 IST")
     }
 }
 
@@ -1199,13 +1199,13 @@ mod tests {
         let _guard = shared_domain::special_sessions_test_guard();
         let day = NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
         shared_domain::set_special_sessions(Vec::new());
-        assert_eq!(buy_closed_message_on(day, "manual buys"), "Market is closed — manual buys run 09:15–15:30 IST");
-        assert_eq!(buy_closed_message_on(day, "paper trades"), "Market is closed — paper trades run 09:15–15:30 IST");
+        assert_eq!(buy_closed_message_on(day, "manual buys"), "Market is closed — manual buys run 09:15–15:39 IST");
+        assert_eq!(buy_closed_message_on(day, "paper trades"), "Market is closed — paper trades run 09:15–15:39 IST");
 
         shared_domain::set_special_sessions(vec![shared_domain::SpecialSession { date: day, start: 18 * 60, end: 19 * 60 + 15 }]);
         assert_eq!(buy_closed_message_on(day, "paper trades"), "Market is closed — today's special session runs 18:00–19:15 IST");
         // Another day keeps the regular hours.
-        assert_eq!(buy_closed_message_on(day.succ_opt().unwrap(), "manual buys"), "Market is closed — manual buys run 09:15–15:30 IST");
+        assert_eq!(buy_closed_message_on(day.succ_opt().unwrap(), "manual buys"), "Market is closed — manual buys run 09:15–15:39 IST");
         shared_domain::set_special_sessions(Vec::new());
     }
 

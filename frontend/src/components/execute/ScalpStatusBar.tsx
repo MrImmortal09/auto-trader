@@ -105,7 +105,7 @@ export function ScalpAlerts({ frame, streamStale }: { frame: ExecuteFrame | null
   const alerts: { tone: 'bad' | 'warn'; text: string }[] = [];
   if (frame?.kill_switch) alerts.push({ tone: 'bad', text: 'Kill switch engaged — buys are disabled.' });
   if (frame && frame.mode === 'LIVE' && !frame.kotak_ready) alerts.push({ tone: 'bad', text: 'Kotak is disconnected — reconnect it in Settings before trading.' });
-  if (frame && !streamStale && !frame.market_open) alerts.push({ tone: 'warn', text: 'Market closed — manual buys run 09:15–15:30 IST.' });
+  if (frame && !streamStale && !frame.market_open) alerts.push({ tone: 'warn', text: 'Market closed — manual buys run 09:15–15:39 IST.' });
   if (frame && !streamStale && frame.market_open) {
     const age = frame.feed.last_tick_age_ms;
     if (!frame.feed.connected || age == null || age > FEED_STALE_MS) {
