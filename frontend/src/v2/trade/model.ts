@@ -385,20 +385,16 @@ const dayOf = (t: number) => Math.floor((t + IST_MS) / 86_400_000);
 /** The IST calendar day of a Unix-ms instant, as a day number. */
 export const istDay = dayOf;
 
-/** The day a VWAP restarts on: the IST day, or for a perp (`utc`, trading
- * around the clock) the UTC day, as Hyperliquid's own chart restarts it. */
-export function vwapDay(utc: boolean): (t: number) => number {
-  return utc ? (t) => Math.floor(t / 86_400_000) : dayOf;
-}
-
 /**
- * VWAP by bar start, restarting each IST day (a perp's, `utc`: each UTC
- * day): the volume-weighted typical price of the day's bars with Upstox's
- * official volume (a perp's own). A bar without any yet — the forming bar,
- * until its official minute lands — carries the day's VWAP so far, so the
- * line and its readout reach the latest bar. Before the day's first volume
- * there is none. A perp's bars, read from an IST midnight, start part-way
- * into their first UTC day: that day has no VWAP rather than a wrong one.
+ * VWAP by bar start, restarting each IST day: the volume-weighted typical
+ * price of the day's bars with Upstox's official volume. A bar without any
+ * yet — the forming bar, until its official minute lands — carries the day's
+ * VWAP so far, so the line and its readout reach the latest bar. Before the
+ * day's first volume there is none.
+ *
+ * A perp's (`utc`) restarts each UTC day instead, with its own volume. Its
+ * bars, read from an IST midnight, start part-way into their first UTC day:
+ * that day has no VWAP rather than a wrong one.
  */
 export function vwapOf(bars: Bar[], utc = false): Map<number, number> {
   const out = new Map<number, number>();
@@ -435,6 +431,12 @@ export function vwapDays(series: Map<number, number>, utc = false): { day: numbe
     days.get(day)!.push({ time, price });
   }
   return [...days].map(([day, points]) => ({ day, points }));
+}
+
+/** The day a VWAP restarts on: the IST day, or for a perp (`utc`, trading
+ * around the clock) the UTC day, as Hyperliquid's own chart restarts it. */
+export function vwapDay(utc: boolean): (t: number) => number {
+  return utc ? (t) => Math.floor(t / 86_400_000) : dayOf;
 }
 
 /**
