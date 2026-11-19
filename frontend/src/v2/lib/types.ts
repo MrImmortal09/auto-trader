@@ -663,6 +663,119 @@ export interface HlMarket {
   at: number | null;
 }
 
+/** A Hyperliquid perp position or order's way: bought (long) or sold (short). */
+export type PerpSide = 'long' | 'short';
+
+/** A target: close `size` (all that is left when null) once the mark reaches `price`. */
+export interface PerpTarget {
+  id: string;
+  price: number;
+  size: number | null;
+}
+
+/** A perp position's (or order's) stop and targets, on the perp's price. */
+export interface PerpLevels {
+  stop?: number | null;
+  targets?: PerpTarget[];
+}
+
+/** An open perp position on isolated margin, with its mark and P&L. */
+export interface PerpPosition {
+  id: string;
+  /** `BTC`, `ETH`, `GOLD`. */
+  market: 'BTC' | 'ETH' | 'GOLD';
+  side: PerpSide;
+  /** In the coin. */
+  size: number;
+  entry: number;
+  leverage: number;
+  /** Isolated margin, USDC, after funding. */
+  margin: number;
+  /** Funding paid so far (negative: received). */
+  funding: number;
+  fees: number;
+  opened_at: string;
+  levels?: PerpLevels;
+  symbol: string;
+  label: string;
+  mark: number | null;
+  upnl: number | null;
+  /** P&L on the margin, percent. */
+  roe_pct: number | null;
+  liq: number | null;
+  notional: number | null;
+}
+
+/** A resting limit order. */
+export interface PerpOrder {
+  id: string;
+  market: 'BTC' | 'ETH' | 'GOLD';
+  side: PerpSide;
+  size: number;
+  price: number;
+  leverage: number;
+  reduce_only: boolean;
+  placed_at: string;
+  levels?: PerpLevels;
+}
+
+/** A line order: a market order once the mark crosses `price` (rising to
+ * it when `rising`), with the stop and targets its position takes. */
+export interface PerpLine {
+  id: string;
+  market: 'BTC' | 'ETH' | 'GOLD';
+  side: PerpSide;
+  size: number;
+  leverage: number;
+  price: number;
+  rising: boolean;
+  /** IST `YYYY-MM-DD HH:MM:SS`; null: until cancelled. */
+  valid_until: string | null;
+  placed_at: string;
+  levels?: PerpLevels;
+}
+
+export interface PerpActivity {
+  t: string;
+  kind: 'fill' | 'order' | 'line' | 'levels' | 'funding' | 'reset';
+  market: string | null;
+  message: string;
+}
+
+export interface PerpFill {
+  id: number;
+  position_id: string;
+  market: string;
+  action: 'BUY' | 'SELL';
+  size: number;
+  price: number;
+  fee: number;
+  /** P&L it closed, before the fee. */
+  realized: number;
+  /** Funding on what it closed. */
+  funding: number;
+  reason: string;
+  timestamp: string;
+}
+
+/** `GET /api/v2/hl/account`: the caller's perps. */
+export interface PerpAccount {
+  mode: 'paper' | 'live';
+  /** What the wallet starts with. */
+  start: number;
+  /** Free USDC. */
+  cash: number;
+  margin: number;
+  upnl: number;
+  equity: number;
+  epoch: number;
+  positions: PerpPosition[];
+  orders: PerpOrder[];
+  lines: PerpLine[];
+  activity: PerpActivity[];
+  fills: PerpFill[];
+}
+
 export interface HlMarketsAnswer {
   /** The feed to Hyperliquid is connected. */
   up: boolean;

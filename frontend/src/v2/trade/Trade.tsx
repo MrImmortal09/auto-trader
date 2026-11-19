@@ -63,9 +63,11 @@ import { HeaderSwitch, HeaderTabs, HeaderTicker, ListPicker } from './header';
 import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from './headerModel';
 import { Ladder } from './Ladder';
 import { LimitCloseDialog } from './LimitCloseDialog';
+import { PerpTicket } from './perp/PerpTicket';
+import { usePerps } from './perp/usePerps';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, draftLines, draftWhat, firstBuy, MAX_TARGETS, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
 import { armedLine, crossWords, draftStep, entryMisfit, linePnl, lotsLeft, orderOf, sideOf, validityOf, validityWords, VALIDITY_CHOICES, wrongSide, type LineDraft } from './lineOrder';
-import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isPerpName, isTicker, istClock, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isPerpName, isTicker, istClock, PERP_KEYS, type PerpKey, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
@@ -126,13 +128,16 @@ interface Saved {
   lineBuy: boolean;
   /** How long a buy line stays armed, in minutes; `null` till close. */
   lineValidity: number | null;
+  /** The Hyperliquid perp whose ticket is in the ladder's place, behind the
+   * `hyperliquid` switch; null: the options ladder. */
+  perp: PerpKey | null;
 }
 
 const STORE_KEY = TRADE_KEY;
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', stock: null, header: 'indices', headerList: null, lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false, lineBuy: false, lineValidity: 30 };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', stock: null, header: 'indices', headerList: null, lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false, lineBuy: false, lineValidity: 30, perp: null };
 
 /** An option or a dated future that has expired goes back to its
  * underlying's own chart (the server refuses an expired future's name; a
@@ -196,6 +201,7 @@ function loadSaved(): Saved {
     deskHidden: saved.deskHidden === true,
     lineBuy: saved.lineBuy === true,
     lineValidity: validityOf(saved.lineValidity),
+    perp: PERP_KEYS.includes(saved.perp as PerpKey) ? (saved.perp as PerpKey) : null,
   };
 }
 
@@ -322,6 +328,22 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const hlOn: boolean | null = flags.data ? flags.data.hyperliquid === true : null;
   const hl = usePoll(() => getHlMarkets(serverBase), 2_000, serverBase, hlOn === true);
   const perps = hlOn ? (hl.data?.markets ?? []) : [];
+  // The caller's own perps on paper (the owner's and each user's alike).
+  // A stop, target or price placed from the panel or the ticket goes on the
+  // perp's chart: the first chart shows it if none on screen does.
+  const showPerp = useCallback(
+    (key: PerpKey) =>
+      save((s) => {
+        const sym: ChartSym = { kind: 'perp', key };
+        const shown = s.slots.slice(0, desktop ? s.layout : 1);
+        return shown.some((slot) => sameSym(slot.sym, sym)) ? s : { ...s, slots: s.slots.map((slot, n) => (n === 0 ? { ...slot, sym } : slot)) };
+      }),
+    [save, desktop],
+  );
+  const perpDesk = usePerps({ serverBase, enabled: hlOn === true && signedIn, onShow: showPerp });
+  const cancelPerpPlacing = perpDesk.cancelPlacing;
+  // The perp whose ticket stands in the ladder's place.
+  const perpSel: PerpKey | null = hlOn === true && signedIn ? saved.perp : null;
   // A stock saved as the ladder's underlying streams as NIFTY while stocks
   // are off: the server would answer NIFTY's board for it anyway.
   const ladderIndex = stocksOn === false && !isIndex(saved.index) ? 'NIFTY' : saved.index;
@@ -503,17 +525,18 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[ladderIndex] ?? 1));
 
   // Escape drops a "+ Stop", or a line order, that hasn't been placed yet.
-  const placingSomething = placingAt != null || (draft != null && !draft.sending);
+  const placingSomething = placingAt != null || (draft != null && !draft.sending) || perpDesk.placing != null;
   useEffect(() => {
     if (!placingSomething) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       setPlacingAt(null);
       setDraft((d) => (d?.sending ? d : null));
+      cancelPerpPlacing();
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [placingSomething]);
+  }, [placingSomething, cancelPerpPlacing]);
 
   async function busy(id: string, run: () => Promise<Sent | null>): Promise<Sent | null> {
     setSending((s) => ({ ...s, [id]: true }));
@@ -1055,7 +1078,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
    * given (null: the nearest). */
   function selectUnderlying(index: string, expiry: string | null = null) {
     save((s) => {
-      const next = { ...s, index };
+      const next = { ...s, index, perp: null };
       if (expiry) next.expiry = { ...s.expiry, [index]: expiry };
       // The first chart follows the pick, unless a chart on screen already
       // shows this underlying or one of its contracts (the phone shows one chart).
@@ -1063,6 +1086,18 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       if (!shown.some((slot) => underlyingOf(slot.sym) === index)) next.slots = s.slots.map((slot, n) => (n === 0 ? { ...slot, sym: ownChart(index) } : slot));
       return next;
     });
+  }
+
+  /** A perp's ticket in the ladder's place, its chart in the first chart
+   * unless one on screen shows it already. */
+  function selectPerp(key: PerpKey) {
+    save((s) => {
+      const sym: ChartSym = { kind: 'perp', key };
+      const shown = s.slots.slice(0, desktop ? s.layout : 1);
+      const slots = shown.some((slot) => sameSym(slot.sym, sym)) ? s.slots : s.slots.map((slot, n) => (n === 0 ? { ...slot, sym } : slot));
+      return { ...s, perp: key, slots };
+    });
+    if (!desktop) showChart(true);
   }
 
   /** Chart `sym` in slot 1 (the phone's one chart), and make its stock the
@@ -1115,7 +1150,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         };
       })
     : [
-        ...indexTiles(frame?.indices ?? [], ladderIndex, (index) => selectUnderlying(index)),
+        ...indexTiles(frame?.indices ?? [], perpSel ? '' : ladderIndex, (index) => selectUnderlying(index)),
         ...(stock
           ? [
               {
@@ -1124,7 +1159,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
                 spot: spot[stock.symbol] ?? null,
                 prevClose: stockQuote?.close ?? null,
                 changePct: change[stock.symbol] ?? null,
-                on: ladderIndex === stock.symbol,
+                on: perpSel == null && ladderIndex === stock.symbol,
                 onSelect: () => (stock.fo ? selectUnderlying(stock.symbol) : chartInFirst(ownChart(stock.symbol))),
                 // Off the bar; a ladder that was on the stock goes back to NIFTY (the charts stay).
                 onRemove: () => save((s) => ({ ...s, stock: null, index: s.index === stock.symbol ? DEFAULTS.index : s.index })),
@@ -1142,8 +1177,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             spot: m.mid ?? m.mark,
             prevClose: m.prev_day,
             changePct: m.change_pct,
-            on: shownSlots[0] != null && sameSym(shownSlots[0].sym, sym),
-            onSelect: () => chartInFirst(sym),
+            on: perpSel === m.key || (perpSel == null && shownSlots[0] != null && sameSym(shownSlots[0].sym, sym)),
+            // Signed in, the perp's ticket too; a visitor gets its chart.
+            onSelect: () => (signedIn ? selectPerp(m.key) : chartInFirst(sym)),
             title: `${m.label} on Hyperliquid${hl.data?.up === false ? ' — feed reconnecting' : ''}`,
             points: 'wide' as const,
           };
@@ -1157,6 +1193,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // How the shown charts share their row (desktop), as dragged or saved.
   const sharesKey = String(shownSlots.length) as '2' | '3';
   const shares = shownSlots.length < 2 ? [1] : (sharesDrag ?? saved.chartShares[sharesKey] ?? equalShares(shownSlots.length));
+  // A perp's stop, target or picked price goes on the first chart showing it.
+  const perpSlot = perpDesk.placing ? shownSlots.findIndex((sl) => sl.sym.kind === 'perp' && sl.sym.key === perpDesk.placing!.key) : -1;
   const charts = shownSlots.map((slot, i) => {
     const isFullscreen = activeFullscreenSlot === i;
     const cx = {
@@ -1200,14 +1238,37 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           expiries={expiries[index]?.expiries}
           chainAt={(expiry) => chainAt(index, expiry)}
           onNeedChain={(expiry) => needChain(index, expiry)}
-          lines={draft && draftFits && draft.slot === i ? [...chartLines(cx), ...draftLines(draft, draftDelta, lineUntilWords)] : chartLines(cx)}
-          markers={chartMarkers(cx)}
-          placing={draft ? (draft.slot === i ? draftPlacing : null) : placingAt?.slot === i ? placing : null}
+          lines={
+            slot.sym.kind === 'perp'
+              ? perpDesk.lines(slot.sym.key)
+              : draft && draftFits && draft.slot === i
+                ? [...chartLines(cx), ...draftLines(draft, draftDelta, lineUntilWords)]
+                : chartLines(cx)
+          }
+          markers={slot.sym.kind === 'perp' ? [] : chartMarkers(cx)}
+          placing={
+            slot.sym.kind === 'perp'
+              ? i === perpSlot
+                ? perpDesk.prompt(slot.sym.key)
+                : null
+              : draft
+                ? draft.slot === i
+                  ? draftPlacing
+                  : null
+                : placingAt?.slot === i
+                  ? placing
+                  : null
+          }
           // A line order moves on to its next line by itself.
           onPlacingDone={() => {
-            if (!draft) setPlacingAt(null);
+            if (slot.sym.kind === 'perp') perpDesk.cancelPlacing();
+            else if (!draft) setPlacingAt(null);
           }}
           onCancelPlacing={() => {
+            if (slot.sym.kind === 'perp') {
+              perpDesk.cancelPlacing();
+              return;
+            }
             setPlacingAt(null);
             setDraft((d) => (d?.sending ? d : null));
           }}
@@ -1290,6 +1351,17 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     />
   );
 
+  const ticket = perpSel && (
+    <PerpTicket
+      k={perpSel}
+      market={perps.find((m) => m.key === perpSel)}
+      account={perpDesk.account}
+      perps={perpDesk}
+      large={!desktop}
+      onClose={() => save((s) => ({ ...s, perp: null }))}
+    />
+  );
+
   const sheetEl = sheet && (
     <PositionSheet
       scalps={scalps}
@@ -1317,6 +1389,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       }}
       onClose={() => setSheet(false)}
       paper={account}
+      perps={hlOn === true && signedIn ? { desk: perpDesk, onOpen: selectPerp } : undefined}
     />
   );
 
@@ -1348,7 +1421,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
               <SplitHandle height={chartHeight} min={splitMin} max={splitMax} dragging={splitDragging} handle={splitHandle} />
             </>
           )}
-          <div className="flex min-h-0 flex-1 flex-col">{ladder}</div>
+          <div className="flex min-h-0 flex-1 flex-col">{ticket || ladder}</div>
         </div>
         <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />
         {sheetEl}
@@ -1468,11 +1541,17 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             />
             <aside style={{ width: ladderWidth }} className="flex shrink-0 flex-col">
               <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line pr-1 pl-3">
-                <h2 className="min-w-0 truncate type-body-strong text-fg" title={`${ladderIndex} options`}>
-                  {ladderIndex} options
+                <h2 className="min-w-0 truncate type-body-strong text-fg" title={perpSel ? `${perpSel}-PERP on Hyperliquid` : `${ladderIndex} options`}>
+                  {perpSel ? `${perpSel}-PERP` : `${ladderIndex} options`}
                 </h2>
-                {/* A stock's ladder (RELIANCE, BAJAJ-AUTO) leaves the expiry its short form; the six indices keep the long one. */}
-                <span className="ml-auto shrink-0">{expiryPicker('sm', !isIndex(ladderIndex))}</span>
+                {perpSel ? (
+                  <span className="ml-auto shrink-0">
+                    <span className="rounded-4 border border-line px-1.5 py-0.5 type-caption text-fg-muted">Paper</span>
+                  </span>
+                ) : (
+                  // A stock's ladder (RELIANCE, BAJAJ-AUTO) leaves the expiry its short form; the six indices keep the long one.
+                  <span className="ml-auto shrink-0">{expiryPicker('sm', !isIndex(ladderIndex))}</span>
+                )}
                 <button
                   type="button"
                   onClick={() => save((s) => ({ ...s, ladderHidden: true }))}
@@ -1484,8 +1563,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
                 </button>
               </div>
               <div className="flex min-h-0 flex-1 flex-col pt-2 pb-2">
-                {ladder}
-                {blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
+                {ticket || ladder}
+                {!ticket && blocked && board && <p className="shrink-0 px-3 pt-2 type-caption text-loss">{blocked}</p>}
               </div>
             </aside>
           </>
@@ -1515,6 +1594,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         chartsRef={chartsRef}
         layout={saved.barHidden ? 'bar hidden' : 'bar shown'}
         paper={account}
+        perps={hlOn === true && signedIn ? { desk: perpDesk, onOpen: selectPerp } : undefined}
       />
       {!chartStopsOn && scalps.length > 0 && (
         <p className="shrink-0 border-t border-line px-3 py-1 type-caption text-fg-subtle">Chart stops are switched off: a stop or target already set can be removed, but none can be set or moved.</p>

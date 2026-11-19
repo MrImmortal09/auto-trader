@@ -34,6 +34,9 @@ use tokio::task::JoinHandle;
 
 use crate::candles::bars::{Bar, Tf};
 
+pub mod paper;
+pub mod perp;
+
 /// The candle intervals followed live: the charts' timeframes.
 const TFS: [Tf; 3] = [Tf::M1, Tf::M5, Tf::M15];
 /// Room for a burst of bar changes while a stream catches up.
@@ -48,8 +51,8 @@ const CORRECT_MAX_BARS: i64 = 60;
 /// corrected any more; the next chart to ask reads its tail again.
 const SERIES_IDLE_MS: i64 = 10 * 60_000;
 
-/// A perp the app trades.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// A perp the app trades, with Hyperliquid's rules for it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Market {
     /// The app's name for it: `BTC`, `ETH`, `GOLD`.
     pub key: &'static str,
@@ -58,13 +61,27 @@ pub struct Market {
     /// What the screens call it: `BTC-PERP`.
     pub label: &'static str,
     pub name: &'static str,
+    /// Decimals a size may carry: 5 for BTC is 0.00001 BTC.
+    pub sz_decimals: u32,
+    /// Hyperliquid's own leverage limit; the app caps it lower
+    /// ([`MAX_LEVERAGE`]).
+    pub max_leverage: u32,
+    /// Fees as a fraction of notional at Hyperliquid's base tier: 0.045 %
+    /// taker and 0.015 % maker on core perps, double on a builder-deployed
+    /// one (trade.xyz's gold).
+    pub taker_fee: f64,
+    pub maker_fee: f64,
 }
+
+/// The most leverage the app takes on any perp (the owner's cap,
+/// 2026-11-19), whatever Hyperliquid allows above it.
+pub const MAX_LEVERAGE: u32 = 20;
 
 /// Every perp the app charts or trades, in the header's order.
 pub const MARKETS: [Market; 3] = [
-    Market { key: "BTC", coin: "BTC", label: "BTC-PERP", name: "Bitcoin" },
-    Market { key: "ETH", coin: "ETH", label: "ETH-PERP", name: "Ether" },
-    Market { key: "GOLD", coin: "xyz:GOLD", label: "GOLD-PERP", name: "Gold (trade.xyz)" },
+    Market { key: "BTC", coin: "BTC", label: "BTC-PERP", name: "Bitcoin", sz_decimals: 5, max_leverage: 40, taker_fee: 0.00045, maker_fee: 0.00015 },
+    Market { key: "ETH", coin: "ETH", label: "ETH-PERP", name: "Ether", sz_decimals: 4, max_leverage: 25, taker_fee: 0.00045, maker_fee: 0.00015 },
+    Market { key: "GOLD", coin: "xyz:GOLD", label: "GOLD-PERP", name: "Gold (trade.xyz)", sz_decimals: 4, max_leverage: 25, taker_fee: 0.0009, maker_fee: 0.0003 },
 ];
 
 /// What a perp's chart symbol starts with.
@@ -91,6 +108,39 @@ impl Market {
     /// The market the app calls `key`.
     pub fn of_key(key: &str) -> Option<&'static Market> {
         MARKETS.iter().find(|m| m.key == key)
+    }
+
+    /// The most leverage the app takes on it.
+    pub fn leverage_cap(&self) -> u32 {
+        self.max_leverage.min(MAX_LEVERAGE)
+    }
+
+    /// Maintenance margin as a fraction of notional: half the initial
+    /// margin at Hyperliquid's max leverage (1.25 % at 40x, 2 % at 25x).
+    pub fn maintenance(&self) -> f64 {
+        1.0 / (2.0 * f64::from(self.max_leverage))
+    }
+
+    /// `size` on the market's size grid, rounded down (never more than asked).
+    pub fn round_size(&self, size: f64) -> f64 {
+        let f = 10f64.powi(self.sz_decimals as i32);
+        ((size * f) + 1e-9).floor() / f
+    }
+
+    /// `price` as Hyperliquid takes a perp price: at most five significant
+    /// figures and `6 - sz_decimals` decimals (an integer always passes),
+    /// rounded to the nearest.
+    pub fn round_price(&self, price: f64) -> f64 {
+        if !(price.is_finite() && price > 0.0) {
+            return price;
+        }
+        let max_decimals = 6 - self.sz_decimals as i32;
+        let magnitude = price.log10().floor() as i32 + 1;
+        let decimals = (5 - magnitude).clamp(0, max_decimals.max(0));
+        let f = 10f64.powi(decimals);
+        let rounded = (price * f).round() / f;
+        // An integer price is always valid, however many figures it has.
+        if decimals == 0 { price.round() } else { rounded }
     }
 }
 
@@ -454,6 +504,25 @@ impl HlMarketData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_and_prices_follow_hyperliquids_grid() {
+        let btc = Market::of_key("BTC").unwrap();
+        let eth = Market::of_key("ETH").unwrap();
+        let gold = Market::of_key("GOLD").unwrap();
+        assert_eq!(btc.round_size(0.123456789), 0.12345);
+        assert_eq!(eth.round_size(1.99999), 1.9999);
+        assert_eq!(btc.round_price(63_856.37), 63_856.0, "five figures");
+        assert_eq!(btc.round_price(63_856.5), 63_857.0);
+        assert_eq!(btc.round_price(123_456.7), 123_457.0, "an integer always passes");
+        assert_eq!(eth.round_price(1_805.437), 1_805.4);
+        assert_eq!(gold.round_price(3_733.456), 3_733.5);
+        assert_eq!(eth.round_price(0.0123456), 0.01, "at most 6 - 4 = 2 decimals on ETH");
+        assert_eq!(btc.round_price(0.0123456), 0.0, "at most 6 - 5 = 1 decimal on BTC");
+        assert_eq!((btc.leverage_cap(), eth.leverage_cap()), (20, 20));
+        assert!((btc.maintenance() - 0.0125).abs() < 1e-12 && (gold.maintenance() - 0.02).abs() < 1e-12);
+        assert_eq!(gold.taker_fee, 2.0 * btc.taker_fee, "a builder-deployed perp's fees are double");
+    }
 
     #[test]
     fn only_the_three_perps_are_named() {

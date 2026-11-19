@@ -457,6 +457,46 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    // Hyperliquid perps on paper (`hyperliquid::paper`), the owner's and
+    // every user's alike, keyed by user id: a USDC wallet, a ledger of fills,
+    // and the open positions, resting orders and line orders as one JSON
+    // book per account. Never read by the Kotak engine. A reset bumps
+    // `epoch`; older fills stay in the ledger but drop out of every view.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS perp_wallets (
+            user_id INTEGER PRIMARY KEY,
+            balance REAL NOT NULL,
+            epoch INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS perp_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            epoch INTEGER NOT NULL DEFAULT 0,
+            position_id TEXT NOT NULL,
+            market TEXT NOT NULL,
+            action TEXT NOT NULL,
+            size REAL NOT NULL,
+            price REAL NOT NULL,
+            fee REAL NOT NULL,
+            realized REAL NOT NULL,
+            funding REAL NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_perp_fills_user ON perp_fills (user_id, epoch, id)")
+        .execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS perp_books (
+            user_id INTEGER PRIMARY KEY,
+            json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+
     // Each signed-in person's watchlists (`watchlists`, `/api/v2/watchlists`):
     // up to five named lists of up to fifty price-map keys, kept by user id
     // (the admin is a `users` row too). Nothing here is read by the engine;

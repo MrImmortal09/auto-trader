@@ -19,6 +19,7 @@ import type {
   FeedAnswer,
   Flags,
   HlMarketsAnswer,
+  PerpAccount,
   GroupId,
   HistoryAnswer,
   IndicatorAnswer,
@@ -461,6 +462,58 @@ export const setWalletBalance = (base: string, balance: number) => send(base, '/
 export const putFlags = (base: string, change: Partial<Flags>) => send(base, '/api/v2/flags', 'PUT', change);
 /** The Hyperliquid perps' prices and funding (behind the `hyperliquid` switch). */
 export const getHlMarkets = (base: string) => getJson<HlMarketsAnswer>(base, '/api/v2/hl/markets');
+
+// ── Hyperliquid perps on paper: the caller's own account ───────────────── //
+
+export const getPerpAccount = (base: string) => getJson<PerpAccount>(base, '/api/v2/hl/account');
+export interface PerpTargetBody {
+  price: number;
+  /** Left out or null: all that is left. */
+  size?: number | null;
+}
+export interface PerpOrderBody {
+  market: string;
+  side: 'buy' | 'sell';
+  size: number;
+  leverage: number;
+  type: 'market' | 'limit';
+  price?: number;
+  reduce_only?: boolean;
+  stop?: number;
+  targets?: PerpTargetBody[];
+}
+/** A market order fills now; a limit fills now if the mid is through it, else rests. */
+export const perpOrder = (base: string, body: PerpOrderBody) => send(base, '/api/v2/hl/orders', 'POST', body);
+export const perpMoveOrder = (base: string, id: string, price: number) => send(base, `/api/v2/hl/orders/${encodeURIComponent(id)}`, 'PATCH', { price });
+export const perpCancelOrder = (base: string, id: string) => send(base, `/api/v2/hl/orders/${encodeURIComponent(id)}`, 'DELETE');
+/** Close `size` of the market's position (all of it when left out) at the mid. */
+export const perpClose = (base: string, market: string, size?: number) => send(base, `/api/v2/hl/positions/${market}/close`, 'POST', size == null ? {} : { size });
+/** A change to a stop and targets; anything left out stays. `stop: null`
+ * clears it; `set_target` adds one (no `id`) or moves and resizes one;
+ * `price` moves a line order (lines only). */
+export interface PerpLevelsUpdate {
+  stop?: number | null;
+  set_target?: { id?: string; price: number; size?: number | null };
+  remove_target?: string;
+  price?: number;
+}
+export const perpLevels = (base: string, market: string, update: PerpLevelsUpdate) => send(base, `/api/v2/hl/positions/${market}`, 'PATCH', update);
+export interface PerpLineBody {
+  market: string;
+  side: 'buy' | 'sell';
+  size: number;
+  leverage: number;
+  price: number;
+  /** Null or left out: until cancelled. */
+  valid_minutes?: number | null;
+  stop?: number;
+  targets?: PerpTargetBody[];
+}
+export const perpLine = (base: string, body: PerpLineBody) => send(base, '/api/v2/hl/lines', 'POST', body);
+export const perpUpdateLine = (base: string, id: string, update: PerpLevelsUpdate) => send(base, `/api/v2/hl/lines/${encodeURIComponent(id)}`, 'PATCH', update);
+export const perpCancelLine = (base: string, id: string) => send(base, `/api/v2/hl/lines/${encodeURIComponent(id)}`, 'DELETE');
+/** Back to 10,000 USDC; refused while anything is open, resting or armed. */
+export const perpReset = (base: string) => send(base, '/api/v2/hl/reset', 'POST');
 /** Log in to Kotak with the server's saved credentials — v1's Auto Connect. */
 export const kotakAutoLogin = (base: string) => send(base, '/api/auth/kotak/auto-login', 'POST');
 export const kotakDisconnect = (base: string) => send(base, '/api/auth/kotak/disconnect', 'DELETE');
