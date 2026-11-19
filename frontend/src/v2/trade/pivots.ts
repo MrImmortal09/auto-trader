@@ -24,12 +24,13 @@ export function standardPivots(h: number, l: number, c: number): PivotLevels {
 /**
  * Each day's pivots, by IST day number, from the session bars of the trading
  * day before it: its high, low and last close. The first day in `bars` has
- * nothing before it, so no levels.
+ * nothing before it, so no levels. `allDay` (a perp, trading around the
+ * clock) counts every bar of the IST day.
  */
-export function pivotsByDay(bars: Bar[]): Map<number, PivotLevels> {
+export function pivotsByDay(bars: Bar[], allDay = false): Map<number, PivotLevels> {
   const days = new Map<number, { h: number; l: number; c: number; t: number }>();
   for (const b of bars) {
-    if (!inSession(b.t)) continue;
+    if (!allDay && !inSession(b.t)) continue;
     const d = istDay(b.t);
     const day = days.get(d);
     if (!day) days.set(d, { h: b.h, l: b.l, c: b.c, t: b.t });

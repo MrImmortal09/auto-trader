@@ -29,24 +29,24 @@ use crate::execute::SubPool;
 use crate::AppState;
 
 /// Days shown when the request names none.
-const DEFAULT_DAYS: u64 = 5;
+pub(super) const DEFAULT_DAYS: u64 = 5;
 /// Most symbols one stream follows.
-const MAX_STREAM_SYMBOLS: usize = 6;
+pub(super) const MAX_STREAM_SYMBOLS: usize = 6;
 /// How often a stream sends what changed.
-const STREAM_EVERY: Duration = Duration::from_millis(250);
+pub(super) const STREAM_EVERY: Duration = Duration::from_millis(250);
 /// How often a stream tells the service its symbols are still wanted.
 const TOUCH_EVERY_MS: i64 = 30_000;
 
 /// Most days one request may span: Upstox serves at most a month of minute
 /// candles per call, and a week of 1-minute bars is already ~2,600 of them.
-fn max_days(tf: Tf) -> i64 {
+pub(super) fn max_days(tf: Tf) -> i64 {
     match tf {
         Tf::M1 => 7,
         Tf::M5 | Tf::M15 => 31,
     }
 }
 
-fn bad_request(msg: impl Into<String>) -> Response {
+pub(super) fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() }))).into_response()
 }
 
@@ -117,11 +117,11 @@ fn track_error(symbol: &Symbol, e: TrackError) -> Response {
     }
 }
 
-fn parse_tf(raw: Option<&str>) -> Option<Tf> {
+pub(super) fn parse_tf(raw: Option<&str>) -> Option<Tf> {
     raw.map_or(Some(Tf::M5), Tf::parse)
 }
 
-fn parse_date(raw: &str) -> Option<NaiveDate> {
+pub(super) fn parse_date(raw: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").ok()
 }
 
@@ -149,6 +149,10 @@ pub struct CandlesQuery {
 /// `symbol` is an index, or any catalog underlying with the `stock_charts`
 /// switch on (see `candles::symbols`).
 pub async fn candles_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Query(q): Query<CandlesQuery>) -> Response {
+    // A Hyperliquid perp (`HL:BTC`): its own source, see `routes::v2::hl`.
+    if crate::hyperliquid::is_hl_symbol(&q.symbol) {
+        return super::hl::candles(&state, &q.symbol, q.tf.as_deref(), q.from.as_deref(), q.to.as_deref()).await;
+    }
     let grammar = Grammar::load(&state).await;
     let symbol = match grammar.parse(&state, &q.symbol, false) {
         Ok(symbol) => symbol,
@@ -316,6 +320,10 @@ pub async fn candles_stream_handler(State(state): State<AppState>, Extension(ide
     let Some(tf) = parse_tf(q.tf.as_deref()) else {
         return bad_request("tf must be 1m, 5m or 15m");
     };
+    // Hyperliquid perps stream on their own; one stream is one source.
+    if q.symbols.split(',').any(crate::hyperliquid::is_hl_symbol) {
+        return super::hl::stream(&state, &q.symbols, tf).await;
+    }
     let grammar = Grammar::load(&state).await;
     let mut symbols: Vec<Symbol> = Vec::new();
     for raw in q.symbols.split(',').filter(|s| !s.trim().is_empty()) {

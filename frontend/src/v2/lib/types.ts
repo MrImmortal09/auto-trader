@@ -631,6 +631,40 @@ export interface Flags {
    * disabled and says so. The owner's live buy stays index-only whatever it
    * says. Missing from a server older than it. */
   stock_paper?: boolean;
+  /** Hyperliquid perps (BTC, ETH, trade.xyz's gold): their charts
+   * (`HL:BTC`) and prices (`/api/v2/hl/markets`); while off those answer
+   * 404 and the perps are hidden. Missing from a server older than it. */
+  hyperliquid?: boolean;
+}
+
+/** One Hyperliquid perp in `GET /api/v2/hl/markets`; figures are null until
+ * the feed's first update. */
+export interface HlMarket {
+  key: 'BTC' | 'ETH' | 'GOLD';
+  /** Its chart: `HL:BTC`. */
+  symbol: string;
+  /** Hyperliquid's name: `BTC`, `xyz:GOLD`. */
+  coin: string;
+  /** `BTC-PERP`. */
+  label: string;
+  name: string;
+  mark: number | null;
+  mid: number | null;
+  oracle: number | null;
+  prev_day: number | null;
+  change_pct: number | null;
+  /** Hourly funding (0.0001 = 0.01 %/h); a long pays it when positive. */
+  funding_hourly: number | null;
+  open_interest: number | null;
+  /** USD traded over the last 24 hours. */
+  day_volume: number | null;
+  at: number | null;
+}
+
+export interface HlMarketsAnswer {
+  /** The feed to Hyperliquid is connected. */
+  up: boolean;
+  markets: HlMarket[];
 }
 
 export interface ChainSide {

@@ -9,7 +9,7 @@ import { editable } from './chartKeymap';
 import { C, FONT, PIVOT_ORANGE, type MarkerData } from './chartSetup';
 import { keepList, pruneExpired, VELA_DRAWINGS, type DrawApi } from './drawings';
 import type { ChartLine, ChartProps } from './KChart';
-import { barAt, daySummary, futureFor, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
+import { allDay, barAt, daySummary, futureFor, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
 import { pivotLines, pivotsByDay } from './pivots';
 import { DrawHistory } from './undoHistory';
 import { CandleProvider, PROVIDER, velaSymbol, type Feed } from './velaProvider';
@@ -145,6 +145,8 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
   const provider = useRef<CandleProvider | null>(null);
   const feed = useRef<Feed>({ onBar: null });
   const symbol = symbolName(sym);
+  // A perp trades around the clock: its pivots count the whole day.
+  const wholeDay = allDay(sym);
   const future = futureFor(sym);
   const key = `${serverBase}|${symbol}|${tf}`;
   // Bars, the future's bars, the load state and an error, each for the market they belong to.
@@ -863,7 +865,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       fetchDays(serverBase, symbol, '15m', 8)
         .then((dayBars) => {
           if (!live) return;
-          const byDay = pivotsByDay(dayBars);
+          const byDay = pivotsByDay(dayBars, wholeDay);
           const today = Math.max(...byDay.keys());
           const levels = byDay.get(today);
           if (levels && Number.isFinite(today)) setPivotLevels({ key, value: pivotLines(levels) });
@@ -875,7 +877,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       live = false;
       window.clearInterval(timer);
     };
-  }, [pivots, symbol, serverBase, key]);
+  }, [pivots, symbol, serverBase, key, wholeDay]);
 
   // The pivot lines: locked, orange, anchored where the labels stay in view.
   useEffect(() => {

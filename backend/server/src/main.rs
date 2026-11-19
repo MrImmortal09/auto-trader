@@ -13,6 +13,7 @@ mod desk;
 mod execute;
 mod feed_latency;
 mod history;
+mod hyperliquid;
 mod instruments;
 mod line_orders;
 mod market_data;
@@ -209,6 +210,9 @@ pub(crate) struct AppState {
     pub feed_latency: Arc<feed_latency::FeedLatency>,
     /// How long each LIVE order took — see `order_timing`. Admin only.
     pub order_timing: Arc<order_timing::OrderTiming>,
+    /// Hyperliquid perps' market data, live while the `hyperliquid` switch
+    /// is on (`PUT /api/v2/flags` opens and closes its feed).
+    pub hl: Arc<hyperliquid::HlMarketData>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,7 +1234,13 @@ async fn main() {
         quotes,
         feed_latency,
         order_timing,
+        hl: hyperliquid::HlMarketData::new(),
     };
+    // Hyperliquid's feed, if its switch was left on.
+    {
+        let on = state.flags.read().await.hyperliquid;
+        state.hl.switch(on).await;
+    }
     pulse::spawn_sampler(state.clone());
     // Users' paper positions: chart levels and the expiry square-off, and
     // their contracts kept on the feed.
@@ -1315,6 +1325,7 @@ async fn main() {
         .route("/api/admin/special-sessions/:date", axum::routing::put(routes::admin_sessions::put_session_handler)
                                                    .delete(routes::admin_sessions::delete_session_handler))
         .route("/api/admin/data",                   get(routes::admin_data::data_handler))
+        .route("/api/v2/hl/markets",                get(routes::v2::hl::markets_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))

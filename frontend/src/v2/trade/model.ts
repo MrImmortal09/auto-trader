@@ -41,7 +41,23 @@ export type ChartSym =
   | { kind: 'index'; index: string }
   | { kind: 'equity'; symbol: string; exchange: Exchange }
   | { kind: 'future'; index: string; expiry?: string }
-  | { kind: 'option'; index: string; expiry: string; strike: number; side: 'CE' | 'PE' };
+  | { kind: 'option'; index: string; expiry: string; strike: number; side: 'CE' | 'PE' }
+  | { kind: 'perp'; key: PerpKey };
+
+/** A Hyperliquid perp the app trades (behind the `hyperliquid` switch):
+ * BTC, ETH, and trade.xyz's gold. */
+export type PerpKey = 'BTC' | 'ETH' | 'GOLD';
+export const PERP_KEYS: PerpKey[] = ['BTC', 'ETH', 'GOLD'];
+
+/** A perp's chart name, `HL:BTC`, or an underlying named so. */
+export function isPerpName(name: string): boolean {
+  return name.startsWith('HL:');
+}
+
+/** Whether `s` trades around the clock (a perp): no session, no expiry. */
+export function allDay(s: ChartSym): boolean {
+  return s.kind === 'perp';
+}
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -58,6 +74,7 @@ export function isTicker(name: unknown): name is string {
 
 /** The index or stock `s` is, or is a contract on. */
 export function underlyingOf(s: ChartSym): string {
+  if (s.kind === 'perp') return `HL:${s.key}`;
   return s.kind === 'equity' ? s.symbol : s.index;
 }
 
@@ -85,6 +102,8 @@ export function symbolName(s: ChartSym): string {
       return s.expiry ? `${futureName(s.index)}:${s.expiry}` : futureName(s.index);
     case 'option':
       return `${s.index}:${s.expiry}:${s.strike}:${s.side}`;
+    case 'perp':
+      return `HL:${s.key}`;
   }
 }
 
@@ -111,7 +130,7 @@ export function expiryMonth(expiry: string): string {
 
 /** "NIFTY 50", "BANKNIFTY", "RELIANCE", "RELIANCE · BSE", "RELIANCE DEC FUT"
  * ("RELIANCE FUT": the nearest, a future saved without its expiry),
- * "NIFTY 25100 CE". */
+ * "NIFTY 25100 CE", "BTC-PERP". */
 export function symbolLabel(s: ChartSym): string {
   switch (s.kind) {
     case 'option':
@@ -122,6 +141,8 @@ export function symbolLabel(s: ChartSym): string {
       return s.exchange === 'NSE' ? s.symbol : `${s.symbol} · ${s.exchange}`;
     case 'index':
       return s.index === 'NIFTY' ? 'NIFTY 50' : s.index;
+    case 'perp':
+      return `${s.key}-PERP`;
   }
 }
 
@@ -147,6 +168,7 @@ export function parseChartSym(raw: unknown): ChartSym | null {
     if (!isTicker(s.symbol) || isIndex(s.symbol)) return null;
     return { kind: 'equity', symbol: s.symbol, exchange: s.exchange === 'BSE' ? 'BSE' : 'NSE' };
   }
+  if (s.kind === 'perp') return PERP_KEYS.includes(s.key as PerpKey) ? { kind: 'perp', key: s.key as PerpKey } : null;
   if (s.kind === 'option') {
     const ok = index && typeof s.expiry === 'string' && DAY.test(s.expiry) && typeof s.strike === 'number' && Number.isFinite(s.strike) && s.strike > 0 && (s.side === 'CE' || s.side === 'PE');
     return ok ? { kind: 'option', index, expiry: s.expiry as string, strike: s.strike as number, side: s.side as 'CE' | 'PE' } : null;

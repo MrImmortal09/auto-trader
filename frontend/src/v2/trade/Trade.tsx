@@ -22,6 +22,7 @@ import {
   getMyDesk,
   getMyHistory,
   getMyMarks,
+  getHlMarkets,
   paperBuy,
   paperClose,
   paperCancelLineBuy,
@@ -59,7 +60,7 @@ import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from '.
 import { Ladder } from './Ladder';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, draftLines, draftWhat, firstBuy, MAX_TARGETS, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
 import { armedLine, crossWords, draftStep, entryMisfit, linePnl, lotsLeft, orderOf, sideOf, validityOf, validityWords, VALIDITY_CHOICES, wrongSide, type LineDraft } from './lineOrder';
-import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isTicker, istClock, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isPerpName, isTicker, istClock, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
@@ -309,12 +310,19 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // Watchlists count as on only while the search is on too, as everywhere
   // else in the app (App.tsx): with search off nothing prices a stock.
   const watchlistsOn = flags.data?.watchlists === true && flags.data.search === true;
+  // The `hyperliquid` switch: null until known, so a saved perp chart keeps
+  // its place meanwhile. On, the perps' prices come every 2 s.
+  const hlOn: boolean | null = flags.data ? flags.data.hyperliquid === true : null;
+  const hl = usePoll(() => getHlMarkets(serverBase), 2_000, serverBase, hlOn === true);
+  const perps = hlOn ? (hl.data?.markets ?? []) : [];
   // A stock saved as the ladder's underlying streams as NIFTY while stocks
   // are off: the server would answer NIFTY's board for it anyway.
   const ladderIndex = stocksOn === false && !isIndex(saved.index) ? 'NIFTY' : saved.index;
   // A stock's chart saved while the switch is off shows NIFTY instead, and
   // an index's future its index (futures are charted behind the switch too).
   const shownAs = (slot: Slot): Slot => {
+    // A perp's chart while Hyperliquid is switched off shows NIFTY instead.
+    if (slot.sym.kind === 'perp') return hlOn === false ? indexSlot('NIFTY') : slot;
     if (stocksOn !== false) return slot;
     const name = underlyingOf(slot.sym);
     if (!isIndex(name)) return indexSlot('NIFTY');
@@ -344,7 +352,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   }, []);
 
   const activeFullscreenSlot = fullscreenSlot !== null && fullscreenSlot < shownSlots.length ? fullscreenSlot : null;
-  const expiryIndices = [...new Set([ladderIndex, ...shownSlots.map((s) => underlyingOf(s.sym))])].sort();
+  // A perp has no expiries or option chain.
+  const expiryIndices = [...new Set([ladderIndex, ...shownSlots.map((s) => underlyingOf(s.sym))])].filter((i) => !isPerpName(i)).sort();
   const expiriesPoll = usePoll(
     async () => {
       const got = await Promise.all(expiryIndices.map((i) => getExpiries(serverBase, i).catch(() => undefined)));
@@ -409,7 +418,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const readOnly = board ? stockBuyBlocked(boardKind(board), paper, flags.data?.stock_paper) : null;
 
   // Each underlying in use: its nearest chain (deltas, tick size).
-  const wantedIndices = [...new Set([ladderIndex, ...shownSlots.map((s) => underlyingOf(s.sym)), ...scalps.map((p) => p.index)])].sort();
+  const wantedIndices = [...new Set([ladderIndex, ...shownSlots.map((s) => underlyingOf(s.sym)), ...scalps.map((p) => p.index)])].filter((i) => !isPerpName(i)).sort();
   const indicesKey = `${serverBase}|${wantedIndices.join(',')}`;
   const chainsPoll = usePoll(
     async () => {
@@ -477,6 +486,11 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // A held stock option whose stock is off the ladder: its desk row carries
   // the stock's price (`index_ltp`), for its index-trigger levels' estimates.
   for (const row of desk.data?.open ?? []) if (spot[row.index] == null && row.index_ltp != null) spot[row.index] = row.index_ltp;
+  // The perps, under their chart names (`HL:BTC`): the book's mid, else the mark.
+  for (const m of perps) {
+    spot[m.symbol] = m.mid ?? m.mark;
+    change[m.symbol] = m.change_pct;
+  }
   const held = new Map(scalps.map((p) => [p.symbol, p]));
   const blocked = buyBlockedReason(frame, stale);
   const lots = Math.max(1, Math.min(MAX_LOTS, saved.lots[ladderIndex] ?? 1));
@@ -1106,6 +1120,21 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
               },
             ]
           : []),
+        // Hyperliquid's perps: a tap charts one in the first chart.
+        ...perps.map((m) => {
+          const sym: ChartSym = { kind: 'perp', key: m.key };
+          return {
+            id: m.symbol,
+            label: m.key,
+            spot: m.mid ?? m.mark,
+            prevClose: m.prev_day,
+            changePct: m.change_pct,
+            on: shownSlots[0] != null && sameSym(shownSlots[0].sym, sym),
+            onSelect: () => chartInFirst(sym),
+            title: `${m.label} on Hyperliquid${hl.data?.up === false ? ' — feed reconnecting' : ''}`,
+            points: 'wide' as const,
+          };
+        }),
       ];
   const headerLabel = headerWatchlist ? 'Watchlist' : 'Index';
   const setHeader = (header: HeaderMode) => save((s) => ({ ...s, header }));
@@ -1177,6 +1206,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           fullscreen={isFullscreen}
           onFullscreen={(on) => toggleFullscreen(i, on)}
           stocksOn={stocksOn === true}
+          perpsOn={hlOn === true}
         />
         {isFullscreen && activeScalps.length > 0 && (
           <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />

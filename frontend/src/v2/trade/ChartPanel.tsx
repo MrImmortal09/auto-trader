@@ -19,7 +19,7 @@ import { useDrawing, useDrawPrefs, type DrawApi, type DrawTool } from './drawing
 import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type ChartState, type Placing } from './KChart';
 import type { Layers } from './lines';
-import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, sameSym, symbolLabel, symbolName, symExpiry, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, PERP_KEYS, sameSym, symbolLabel, symbolName, symExpiry, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { QuoteStrip } from './QuoteStrip';
 import { drawableStudies, STUDIES } from './studies';
 
@@ -126,7 +126,7 @@ function PickerSearch({ serverBase, compact, current, onPick }: { serverBase: st
 
 /** One chart: its header (instrument, timeframe, Layers), the quote strip
  * and the chart. */
-export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, style, onStyle, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide, fullscreen = false, onFullscreen, stocksOn = false }: {
+export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, onLayers, style, onStyle, spot, change, expiries, chainAt, onNeedChain, lines, markers, placing, onPlacingDone, onCancelPlacing, bus, lib, onLib, compact, onHide, fullscreen = false, onFullscreen, stocksOn = false, perpsOn = false }: {
   chartId: string;
   serverBase: string;
   sym: ChartSym;
@@ -166,6 +166,8 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   fullscreen?: boolean;
   onFullscreen?: (on: boolean) => void;
   /** The `stock_charts` switch: the picker's search row and the quote strip. */
+  /** The `hyperliquid` switch: the picker offers the perps. */
+  perpsOn?: boolean;
   stocksOn?: boolean;
 }) {
   const [menu, setMenu] = useState<'pick' | 'layers' | 'tf' | 'draw' | 'studies' | null>(null);
@@ -233,10 +235,12 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
     if (menu === 'pick') onNeedChain(pickExpiry);
   }, [menu, pickExpiry, onNeedChain]);
 
-  const shown = sym.kind === 'index' ? spot[underlying] ?? chartState.last?.c ?? null : chartState.last?.c ?? null;
+  // An index's value, and a perp's mid, come from the screen's feeds.
+  const quoted = sym.kind === 'index' || sym.kind === 'perp';
+  const shown = quoted ? spot[underlying] ?? chartState.last?.c ?? null : chartState.last?.c ?? null;
   // A different instrument is a new figure, not a tick.
   const flash = useTickFlash(shown, true, symbolName(sym));
-  const pct = sym.kind === 'index' ? change[underlying] ?? null : null;
+  const pct = quoted ? change[underlying] ?? null : null;
   const spotNow = spot[underlying];
   const chain = chainAt(pickExpiry);
   const strikes = chain?.strikes ?? [];
@@ -346,8 +350,23 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                 );
               })}
             </div>
-            <div className="px-2 pt-3 pb-1.5 type-caption text-fg-muted">{underlying} options</div>
-            {all.length > 0 && (
+            {perpsOn && (
+              <>
+                <div className="px-2 pt-3 pb-1.5 type-caption text-fg-muted">Hyperliquid perps</div>
+                <div className="grid grid-cols-3 gap-1">
+                  {PERP_KEYS.map((key) => {
+                    const s: ChartSym = { kind: 'perp', key };
+                    return (
+                      <button key={key} type="button" onClick={() => (onSym(s), close())} className={`h-8 rounded-6 px-2 type-label ${sameSym(s, sym) ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}>
+                        {symbolLabel(s)}
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+            {sym.kind !== 'perp' && <div className="px-2 pt-3 pb-1.5 type-caption text-fg-muted">{underlying} options</div>}
+            {sym.kind !== 'perp' && all.length > 0 && (
               <div role="tablist" aria-label="Expiry" className="flex gap-1 overflow-x-auto pb-1.5">
                 {all.map((e, i) => {
                   const on = e.date === pickedDate;
@@ -366,7 +385,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                 })}
               </div>
             )}
-            {strikes.length === 0 ? (
+            {sym.kind === 'perp' ? null : strikes.length === 0 ? (
               <p className="px-2 pb-2 type-caption text-fg-subtle">{all.length === 0 ? 'The option list loads after the Kotak login.' : 'Loading strikes…'}</p>
             ) : (
               <div ref={strikeList} className="relative max-h-64 overflow-y-auto">
@@ -479,7 +498,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             <CheckboxRow
               checked={layers.vwap}
               title="VWAP"
-              note={sym.kind === 'index' ? `From ${underlying} futures` : `From this ${sym.kind === 'option' ? 'option' : sym.kind === 'future' ? 'future' : 'stock'}'s own trades`}
+              note={sym.kind === 'index' ? `From ${underlying} futures` : `From this ${sym.kind === 'option' ? 'option' : sym.kind === 'future' ? 'future' : sym.kind === 'perp' ? 'perp' : 'stock'}'s own trades`}
               onChange={(v) => onLayers({ ...layers, vwap: v })}
             />
             <CheckboxRow

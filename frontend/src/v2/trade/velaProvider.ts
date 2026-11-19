@@ -1,10 +1,11 @@
 // Vela's data provider over the candle service: history from /api/v2/candles,
 // the forming bar from the stream the chart opens, and the NSE/BSE session as
-// the market calendar so the time axis skips closed hours.
+// the market calendar so the time axis skips closed hours (a Hyperliquid
+// perp's is the whole day).
 
 import type { DataProvider, OHLCV, ProviderInfo } from '@luxalgo/vela';
 import { fetchBars, upsert } from './bars';
-import type { Bar, Tf } from './model';
+import { isPerpName, type Bar, type Tf } from './model';
 
 export const PROVIDER = 'at';
 
@@ -101,7 +102,9 @@ export class CandleProvider implements DataProvider {
     };
   }
 
-  async getCalendar(_ticker: string, range: { from: number; to: number }): Promise<ReadonlyArray<readonly [number, number]>> {
+  async getCalendar(ticker: string, range: { from: number; to: number }): Promise<ReadonlyArray<readonly [number, number]>> {
+    // A Hyperliquid perp trades around the clock: one window, no gaps.
+    if (isPerpName(apiSymbol(ticker))) return [[range.from, range.to]];
     return sessionWindows(range.from, range.to);
   }
 

@@ -32,6 +32,7 @@ pub struct FlagsUpdate {
     pub watchlists: Option<bool>,
     pub stock_charts: Option<bool>,
     pub stock_paper: Option<bool>,
+    pub hyperliquid: Option<bool>,
 }
 
 /// `before` with `update` applied, and the `(name, on)` of each switch that
@@ -55,6 +56,9 @@ fn apply_update(before: FeatureFlags, update: &FlagsUpdate) -> (FeatureFlags, Ve
     }
     if let Some(on) = update.stock_paper {
         after.stock_paper = on;
+    }
+    if let Some(on) = update.hyperliquid {
+        after.hyperliquid = on;
     }
     let changes = after
         .entries()
@@ -123,6 +127,10 @@ pub async fn put_flags_handler(
     if !before.search && after.search {
         state.instruments.rebuild_in_background("search switched on");
     }
+    // Hyperliquid's feed is open only while its switch is on.
+    if before.hyperliquid != after.hyperliquid {
+        state.hl.switch(after.hyperliquid).await;
+    }
 
     let summary = changes
         .iter()
@@ -157,7 +165,7 @@ mod tests {
 
     #[test]
     fn an_update_changes_only_the_switches_it_names() {
-        let before = FeatureFlags { index_options_only: false, chart_stops: true, search: false, watchlists: false, stock_charts: false, stock_paper: false };
+        let before = FeatureFlags { index_options_only: false, chart_stops: true, search: false, watchlists: false, stock_charts: false, stock_paper: false, hyperliquid: false };
 
         let (after, changes) = apply_update(before, &FlagsUpdate { index_options_only: Some(true), ..Default::default() });
         assert_eq!(after, FeatureFlags { index_options_only: true, ..before });
@@ -178,6 +186,10 @@ mod tests {
         let (after, changes) = apply_update(before, &FlagsUpdate { stock_paper: Some(true), ..Default::default() });
         assert_eq!(after, FeatureFlags { stock_paper: true, ..before });
         assert_eq!(changes, vec![("stock_paper", true)]);
+
+        let (after, changes) = apply_update(before, &FlagsUpdate { hyperliquid: Some(true), ..Default::default() });
+        assert_eq!(after, FeatureFlags { hyperliquid: true, ..before });
+        assert_eq!(changes, vec![("hyperliquid", true)]);
 
         // Re-sending a value that is already set is not a change.
         let (after, changes) = apply_update(before, &FlagsUpdate { chart_stops: Some(true), ..Default::default() });

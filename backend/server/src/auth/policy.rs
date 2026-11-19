@@ -66,6 +66,9 @@ const RULES: &[Rule] = &[
     rule(On::Read, "/api/v2/status", Access::SignedIn),
     rule(On::Read, "/api/execute/stream", Access::SignedIn),
     rule(On::Read, "/api/market/*", Access::SignedIn),
+    // Hyperliquid perps' prices (behind the `hyperliquid` switch); their
+    // charts are `HL:` symbols on the candle routes above.
+    rule(On::Read, "/api/v2/hl/markets", Access::SignedIn),
     // The instrument search and its quotes (behind the `search` flag). The
     // status page is the owner's: it carries the hub's error text, call
     // times and the catalog's paths — diagnostics, not market data.
@@ -217,6 +220,7 @@ mod tests {
         (PUT, "/api/admin/credentials", Access::Admin),
         (GET, "/api/v2/flags", Access::SignedIn),
         (PUT, "/api/v2/flags", Access::Admin),
+        (GET, "/api/v2/hl/markets", Access::SignedIn),
         (PATCH, "/api/v2/positions/abc-123", Access::Admin),
         (GET, "/api/v2/history", Access::Admin),
         (GET, "/api/v2/desk", Access::Admin),

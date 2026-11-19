@@ -1101,6 +1101,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyperliquid_client"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2394,6 +2408,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "hmac 0.12.1",
+ "hyperliquid_client",
  "kotak_client",
  "rand 0.8.7",
  "reqwest",

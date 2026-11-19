@@ -18,6 +18,7 @@ import type {
   DeskAnswer,
   FeedAnswer,
   Flags,
+  HlMarketsAnswer,
   GroupId,
   HistoryAnswer,
   IndicatorAnswer,
@@ -446,6 +447,8 @@ export const saveSettings = (base: string, cfg: TradingConfig) => send(base, '/a
 /** The paper wallet's balance — v1's virtual balance. */
 export const setWalletBalance = (base: string, balance: number) => send(base, '/api/wallet/balance', 'POST', { balance });
 export const putFlags = (base: string, change: Partial<Flags>) => send(base, '/api/v2/flags', 'PUT', change);
+/** The Hyperliquid perps' prices and funding (behind the `hyperliquid` switch). */
+export const getHlMarkets = (base: string) => getJson<HlMarketsAnswer>(base, '/api/v2/hl/markets');
 /** Log in to Kotak with the server's saved credentials — v1's Auto Connect. */
 export const kotakAutoLogin = (base: string) => send(base, '/api/auth/kotak/auto-login', 'POST');
 export const kotakDisconnect = (base: string) => send(base, '/api/auth/kotak/disconnect', 'DELETE');

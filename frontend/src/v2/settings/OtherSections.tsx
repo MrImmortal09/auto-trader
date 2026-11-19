@@ -101,7 +101,7 @@ export function ServerData({ serverBase, settings, system, id, title, large = fa
   );
 }
 
-/** Beta: the two engine switches, off until turned on (`/api/v2/flags`). */
+/** Beta: switches that are off until turned on (`/api/v2/flags`). */
 export function Beta({ serverBase, flags, onSaved, id, title }: { serverBase: string; flags: Flags | null; onSaved: () => void; id?: string; title?: string }) {
   const guard = useGuard();
   const toast = useToast();
@@ -117,6 +117,9 @@ export function Beta({ serverBase, flags, onSaved, id, title }: { serverBase: st
       </Row>
       <Row title="Chart stops" caption="Set a manual trade's stop and target by dragging on the Trade charts. A level crossed sells the whole holding at market.">
         <Toggle label="Chart stops" checked={flags?.chart_stops ?? false} disabled={!flags} onChange={(on) => void flip({ chart_stops: on }, `Chart stops ${on ? 'on' : 'off'}`)} />
+      </Row>
+      <Row title="Hyperliquid perps" caption="BTC, ETH and gold perps from Hyperliquid on the Trade charts and header, priced live around the clock. Charts only for now: nothing is traded.">
+        <Toggle label="Hyperliquid perps" checked={flags?.hyperliquid ?? false} disabled={!flags} onChange={(on) => void flip({ hyperliquid: on }, `Hyperliquid perps ${on ? 'on' : 'off'}`)} />
       </Row>
     </Section>
   );
