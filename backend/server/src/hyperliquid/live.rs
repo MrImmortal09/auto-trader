@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
-use hyperliquid_client::account::{AccountState, HlFill, HlOpenOrder};
+use hyperliquid_client::account::{AccountState, HlFill, HlOpenOrder, UserRole};
 use hyperliquid_client::exchange::{Answer, ExchangeClient, Nonces};
 use hyperliquid_client::signing::Wallet;
 use hyperliquid_client::{InfoClient, Network};
@@ -446,14 +446,15 @@ impl LiveDesk {
         if s.mode == HlMode::Live && s.network == network {
             return Err(Refusal::conflict("Switch Hyperliquid to Paper before changing the LIVE API wallet"));
         }
-        let account = account.trim().to_ascii_lowercase();
-        if !is_address(&account) {
-            return Err(Refusal::bad("The account must be a 0x address of 40 hex digits"));
+        let typed = account.trim().to_ascii_lowercase();
+        if !typed.is_empty() && !is_address(&typed) {
+            return Err(Refusal::bad("The account must be a 0x address of 40 hex digits (or left empty, to read it from the API wallet)"));
         }
         let wallet = Wallet::from_hex(key).map_err(|e| Refusal::bad(e.to_string()))?;
-        if wallet.address() == account {
-            return Err(Refusal::bad("That is the account's own key, which can withdraw — create an API wallet on Hyperliquid (More → API) and use its key"));
-        }
+        // What Hyperliquid knows the key's address as: an API wallet (and
+        // whose), an account's own key, or nothing yet.
+        let role = timed("what this key is", self.info[&network].user_role(wallet.address())).await.map_err(|e| Refusal::conflict(format!("{e} — nothing saved")))?;
+        let account = account_for(&typed, wallet.address(), &role, net_str(network))?;
         let key_box = seal(&box_key, key.trim())?;
         let now = shared_domain::current_ist_timestamp_string();
         sqlx::query(
@@ -659,6 +660,28 @@ async fn read_into(cache: &mut LiveCache, info: &InfoClient, account: &str, dexe
         }
     }
     Ok(())
+}
+
+/// The account an API wallet whose address is `agent` trades for, from what
+/// was typed (`typed`: maybe empty, or the API wallet's own address pasted
+/// by mistake) and what Hyperliquid knows `agent` as on `net`. An account's
+/// own key, which can withdraw, is refused.
+fn account_for(typed: &str, agent: &str, role: &UserRole, net: &str) -> Result<String, Refusal> {
+    let unset = typed.is_empty() || typed == agent;
+    match role {
+        UserRole::Agent { user } if unset || typed == user => Ok(user.clone()),
+        UserRole::Agent { user } => Err(Refusal::conflict(format!(
+            "This API wallet ({agent}) trades for {user} on {net}, not {typed}: put {user} as the account, or use {typed}'s own API wallet"
+        ))),
+        UserRole::Missing if unset => Err(Refusal::conflict(format!(
+            "Hyperliquid {net} doesn't know this API wallet ({agent}) yet: authorize it on Hyperliquid (More → API) with your main wallet, then save again. The account is your main wallet's address, not the API wallet's"
+        ))),
+        // Not authorized yet: kept, and its check says so.
+        UserRole::Missing => Ok(typed.to_string()),
+        UserRole::User | UserRole::Vault | UserRole::SubAccount { .. } | UserRole::Other(_) => Err(Refusal::bad(
+            "That is a Hyperliquid account's own key, which can withdraw — create an API wallet on Hyperliquid (More → API) and paste its key",
+        )),
+    }
 }
 
 /// "SOL long 3, BTC short 0.1, 2 open orders (ETH, xyz:GOLD)": what an
@@ -874,6 +897,28 @@ mod tests {
         assert!(active(&d(Some("xyz"), 0.0, vec![pos("xyz:GOLD", 1.0)]), None));
         assert!(active(&d(Some("xyz"), 0.0, vec![]), Some(&[order("xyz:GOLD", 1, true, None, false)])), "an order seen on it");
         assert!(!active(&d(Some("xyz"), 0.0, vec![]), Some(&[order("BTC", 1, true, None, false)])));
+    }
+
+    #[test]
+    fn the_account_is_read_from_the_api_wallet_and_a_main_key_refused() {
+        let agent = "0x2face01ae2f77e40bd2bd1879cb755842e00308f";
+        let me = "0x45b39d79a1cef6246181bd4d1c44e402588e17f0";
+        let theirs = "0x1111111111111111111111111111111111111111";
+        let approved = UserRole::Agent { user: me.to_string() };
+        // The API wallet's own address pasted as the account, or none: its account is used.
+        assert_eq!(account_for(agent, agent, &approved, "testnet").unwrap(), me);
+        assert_eq!(account_for("", agent, &approved, "testnet").unwrap(), me);
+        assert_eq!(account_for(me, agent, &approved, "testnet").unwrap(), me);
+        let err = account_for(theirs, agent, &approved, "testnet").unwrap_err();
+        assert!(err.message.contains("trades for") && err.message.contains(me), "{}", err.message);
+        // Not authorized yet: kept with a real account, refused without one.
+        assert_eq!(account_for(me, agent, &UserRole::Missing, "testnet").unwrap(), me);
+        let err = account_for(agent, agent, &UserRole::Missing, "testnet").unwrap_err();
+        assert!(err.message.contains("doesn't know this API wallet"), "{}", err.message);
+        // An account's own key, whatever was typed.
+        for typed in [agent, me, ""] {
+            assert!(account_for(typed, agent, &UserRole::User, "mainnet").unwrap_err().message.contains("own key"));
+        }
     }
 
     #[test]

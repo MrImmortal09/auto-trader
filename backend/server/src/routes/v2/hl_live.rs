@@ -4,7 +4,8 @@
 //!
 //! - `GET    /api/v2/hl/live` — the switches and the API wallets (never a key)
 //! - `PUT    /api/v2/hl/live/settings` `{mode?, network?}`
-//! - `PUT    /api/v2/hl/live/credentials` `{network, account, key}` — stored sealed, then checked
+//! - `PUT    /api/v2/hl/live/credentials` `{network, account, key}` — stored sealed, then checked;
+//!   `account` may be empty: Hyperliquid says whose API wallet the key is
 //! - `POST   /api/v2/hl/live/check` `{network}`
 //! - `DELETE /api/v2/hl/live/credentials/:network`
 

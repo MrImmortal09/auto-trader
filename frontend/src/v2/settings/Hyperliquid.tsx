@@ -36,13 +36,13 @@ function Wallet({ net, cred, canStore, live, busy, onSave, onCheck, onRemove, la
   const size = large ? 'lg' : 'md';
   const form = (
     <div className="flex w-full flex-col gap-2">
-      <input className={field} placeholder="Account address (0x…), the wallet you fund" value={account} onChange={(e) => setAccount(e.target.value)} autoComplete="off" spellCheck={false} />
-      <input className={field} placeholder="API wallet private key (0x…)" type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="new-password" spellCheck={false} />
+      <input className={field} placeholder="API wallet private key (0x…), from Hyperliquid's API page" type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="new-password" spellCheck={false} />
+      <input className={field} placeholder="Your main wallet's address (optional: read from the API wallet)" value={account} onChange={(e) => setAccount(e.target.value)} autoComplete="off" spellCheck={false} />
       <div className="flex gap-2">
         <Button
           size={size}
           kind="accent"
-          disabled={busy || !canStore || account.trim() === '' || key.trim() === ''}
+          disabled={busy || !canStore || key.trim() === ''}
           onClick={async () => {
             if (await onSave(account, key)) {
               setKey('');
@@ -66,7 +66,7 @@ function Wallet({ net, cred, canStore, live, busy, onSave, onCheck, onRemove, la
       title={`API wallet · ${net}`}
       caption={
         <>
-          Create one at <a className="text-accent underline" href={APP_URL[net]} target="_blank" rel="noreferrer">{APP_URL[net].replace('https://', '')}</a>, approve it, and paste its private key here. An API wallet can trade but never withdraw or transfer; the key is sealed on the server with its AUTH_SECRET and never shown again.
+          Create one at <a className="text-accent underline" href={APP_URL[net]} target="_blank" rel="noreferrer">{APP_URL[net].replace('https://', '')}</a>, authorize it with your main wallet, and paste its private key here. Your account (the main wallet's address, not the API wallet's) is read from Hyperliquid. An API wallet can trade but never withdraw or transfer; the key is sealed on the server with its AUTH_SECRET and never shown again.
           {!canStore && <span className="text-loss"> AUTH_SECRET isn't set on the server, so no key can be stored.</span>}
         </>
       }
