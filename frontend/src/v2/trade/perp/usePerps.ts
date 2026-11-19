@@ -148,8 +148,10 @@ export function usePerps({ serverBase, enabled, onShow }: {
   const toast = useToast();
   const poll = usePoll(() => getPerpAccount(serverBase), 1_000, serverBase, enabled);
   const account = enabled ? poll.data : null;
-  // LIVE is read-only in this release: nothing on its lines moves or cancels.
-  const editable = account?.mode !== 'live';
+  // Every line moves and cancels, on paper and LIVE alike (LIVE: on
+  // Hyperliquid, by its order id).
+  const editable = true;
+  const where = account?.mode === 'live' ? `LIVE · ${account.network}` : 'paper';
   const [placing, setPlacing] = useState<PerpPlacing | null>(null);
   // The ticket's order being set up: its liquidation goes on the chart.
   const draft = usePerpDraft();
@@ -159,6 +161,8 @@ export function usePerps({ serverBase, enabled, onShow }: {
     const sent = await guard('Sign in to trade perps on paper.', act, fail, 'signed');
     if (!sent?.ok) return false;
     done?.(sent.body);
+    // LIVE: what Hyperliquid refused beside the order (a stop or target not placed) is said loudly.
+    for (const w of (sent.body as { warnings?: string[] } | null)?.warnings ?? []) toast({ tone: 'loss', title: 'Check the position on Hyperliquid', body: w });
     void poll.refresh();
     return true;
   }
@@ -170,7 +174,7 @@ export function usePerps({ serverBase, enabled, onShow }: {
       toast({ tone: 'neutral', ...fallback });
       return;
     }
-    for (const l of legs) toast({ tone: l.action === 'BUY' ? 'profit' : 'loss', title: `${l.action === 'BUY' ? 'Bought' : 'Sold'} ${l.size} ${perpLabel(l.market)}`, body: `At ${perpPrice(l.price)} (paper)` });
+    for (const l of legs) toast({ tone: l.action === 'BUY' ? 'profit' : 'loss', title: `${l.action === 'BUY' ? 'Bought' : 'Sold'} ${l.size} ${perpLabel(l.market)}`, body: `At ${perpPrice(l.price)} (${where})` });
   }
 
   const actions: PerpActions = {

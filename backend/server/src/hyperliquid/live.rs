@@ -49,6 +49,9 @@ use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use super::paper::{AccountView, FillRow, PositionView, Refusal, Venue};
 use super::perp::{PerpLevels, PerpLine, PerpOrder, PerpPosition, PerpTarget, Side};
 use super::{markets, Market};
+
+mod trade;
+pub use trade::{LiveOrder, LiveOrderAnswer};
 /// How long each part of the LIVE account is reused before it is read again.
 /// An open Trade screen costs about 60 a minute per dex the account has
 /// something on (its state every 2 s), 120 more for its open orders (every
@@ -266,6 +269,9 @@ pub struct LiveDesk {
     cache: Mutex<HashMap<Network, LiveCache>>,
     /// Each network's dexes (`perpDexs` names), with when they were read.
     dexes: Mutex<HashMap<Network, NetDexes>>,
+    /// Each network's perps as its orders name them (asset id, size grid),
+    /// with when they were read.
+    assets: Mutex<HashMap<Network, trade::NetAssets>>,
     /// Held exclusively by the mode switch and the API wallets' changes, and
     /// shared by the owner's paper orders ([`LiveDesk::paper_gate`]).
     gate: Arc<RwLock<()>>,
@@ -303,6 +309,7 @@ impl LiveDesk {
             nonces: Nonces::default(),
             cache: Mutex::new(HashMap::new()),
             dexes: Mutex::new(HashMap::new()),
+            assets: Mutex::new(HashMap::new()),
             gate: Arc::new(RwLock::new(())),
         })
     }

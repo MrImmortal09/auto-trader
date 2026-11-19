@@ -75,6 +75,8 @@ pub enum HlError {
     Key(String),
     #[error("could not encode the action: {0}")]
     Encode(String),
+    #[error("Hyperliquid refused it: {0}")]
+    Refused(String),
 }
 
 /// One OHLCV candle of `coin` at `interval`, opening at `t` (Unix ms).
@@ -349,6 +351,14 @@ impl InfoClient {
     pub async fn perp_listings(&self, dex: Option<&str>) -> Result<Vec<PerpListing>, HlError> {
         let raw = self.post(json!({ "type": "metaAndAssetCtxs", "dex": dex.unwrap_or("") })).await?;
         read_listings(raw, dex.is_some_and(|d| !d.is_empty()))
+    }
+
+    /// Every perp's mid on `dex` (`None`: the core perps), by coin as
+    /// Hyperliquid names it.
+    pub async fn all_mids(&self, dex: Option<&str>) -> Result<std::collections::HashMap<String, f64>, HlError> {
+        let raw = self.post(json!({ "type": "allMids", "dex": dex.unwrap_or("") })).await?;
+        let map = raw.as_object().ok_or_else(|| HlError::Decode("allMids is not an object".into()))?;
+        Ok(map.iter().filter_map(|(coin, v)| v.as_str().and_then(|s| num(s).ok()).map(|px| (coin.clone(), px))).collect())
     }
 
     /// The dexes in `perpDexs` order (index 0, the core perps, has no

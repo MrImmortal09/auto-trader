@@ -107,7 +107,7 @@ function Wallet({ net, cred, canStore, live, busy, onSave, onCheck, onRemove, la
  * Settings → Hyperliquid, the owner's: Paper or LIVE, testnet or mainnet,
  * and an API wallet per network. Either switch changes only while flat;
  * LIVE needs the network's API wallet to have passed its check. LIVE is
- * read-only in this release: the Trade screen shows the Hyperliquid account,
+ * the owner's own account: the Trade screen shows it, and its orders go to it,
  * and orders stay on paper.
  */
 export function Hyperliquid({ serverBase, id, title, large }: { serverBase: string; id?: string; title?: string; large: boolean }) {
@@ -138,7 +138,7 @@ export function Hyperliquid({ serverBase, id, title, large }: { serverBase: stri
   const cred = v.credentials[v.network];
   return (
     <Section id={id} title={title} lead="BTC, ETH and gold perps on Hyperliquid. Paper trades on the live market with 10,000 USDC; LIVE is your own Hyperliquid account.">
-      <Row title="Mode" caption={v.mode === 'live' ? `LIVE on ${v.network}: the Trade screen shows your Hyperliquid account. Orders are sent in the next release; until then it is read-only.` : 'Paper: orders fill on the live market against your paper wallet.'}>
+      <Row title="Mode" caption={v.mode === 'live' ? `LIVE on ${v.network}: the Trade screen shows your Hyperliquid account, and its orders go to it${v.network === 'mainnet' ? ' — real money, each opening order confirmed first' : ''}. Stops and targets rest on Hyperliquid.` : 'Paper: orders fill on the live market against your paper wallet.'}>
         <Segment
           label="Hyperliquid mode"
           size={segSize}
@@ -183,7 +183,7 @@ export function Hyperliquid({ serverBase, id, title, large }: { serverBase: stri
         <div className="flex flex-col gap-3 p-6">
           <h2 className="type-title text-fg">Go LIVE on Hyperliquid {v.network}?</h2>
           <p className="type-body text-fg-muted">
-            The Trade screen shows your Hyperliquid account {cred ? `(${cred.account})` : ''} instead of the paper wallet. {v.network === 'mainnet' ? 'This is real money.' : 'Testnet uses free test USDC; the charts stay on mainnet prices.'} Orders are not sent in this release. The API wallet is checked again now, and the account must hold and rest nothing on Hyperliquid, so LIVE can be left again.
+            The Trade screen shows your Hyperliquid account {cred ? `(${cred.account})` : ''} instead of the paper wallet. {v.network === 'mainnet' ? 'This is real money.' : 'Testnet uses free test USDC; the charts stay on mainnet prices.'} Its orders go to Hyperliquid, and the kill switch closes it too. The API wallet is checked again now, and the account must hold and rest nothing on Hyperliquid, so LIVE can be left again.
           </p>
           <div className="mt-2 flex justify-end gap-2">
             <Button size="md" kind="neutral" onClick={() => setConfirmLive(false)} disabled={busy} data-autofocus>

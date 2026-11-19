@@ -76,6 +76,23 @@ impl ExchangeClient {
         }
     }
 
+    /// Sign and post `action`, and read what each order in it came to.
+    /// Hyperliquid refusing the action as a whole is an `Err` with its words.
+    pub async fn orders<A: Serialize>(&self, wallet: &Wallet, action: &A, nonce: u64) -> Result<Vec<OrderStatus>, HlError> {
+        match self.post(wallet, action, nonce).await? {
+            Answer::Err(why) => Err(HlError::Refused(why)),
+            Answer::Ok(response) => read_statuses(&response),
+        }
+    }
+
+    /// Sign and post an action that answers no per-order statuses (leverage).
+    pub async fn act<A: Serialize>(&self, wallet: &Wallet, action: &A, nonce: u64) -> Result<(), HlError> {
+        match self.post(wallet, action, nonce).await? {
+            Answer::Err(why) => Err(HlError::Refused(why)),
+            Answer::Ok(_) => Ok(()),
+        }
+    }
+
     /// A signed action that does nothing: proves the API wallet is one the
     /// exchange takes, and trades nothing.
     pub async fn noop(&self, wallet: &Wallet, nonce: u64) -> Result<Answer, HlError> {
@@ -88,9 +105,80 @@ impl ExchangeClient {
     }
 }
 
+/// What one order of an action came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderStatus {
+    /// Resting on the book (a limit, or a trigger waiting for its price).
+    Resting { oid: u64 },
+    /// Filled now, all or part of it (an IOC's unfilled rest is cancelled).
+    Filled { oid: u64, size: f64, avg_px: f64 },
+    /// A cancel or modify that went through.
+    Success,
+    /// A stop or target sent with its entry (`normalTpsl`), live once the
+    /// entry fills: `waitingForFill`, `waitingForTrigger`.
+    Waiting(String),
+    /// Refused, in Hyperliquid's words.
+    Error(String),
+}
+
+/// The statuses of an `order`, `cancel` or `batchModify` answer, one per
+/// order sent, in order: `{"type":…,"data":{"statuses":[…]}}`.
+pub fn read_statuses(response: &Value) -> Result<Vec<OrderStatus>, HlError> {
+    let statuses = response
+        .get("data")
+        .and_then(|d| d.get("statuses"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| HlError::Decode(format!("an answer without statuses: {}", response.to_string().chars().take(300).collect::<String>())))?;
+    statuses
+        .iter()
+        .map(|st| {
+            if st.as_str() == Some("success") {
+                return Ok(OrderStatus::Success);
+            }
+            if let Some(e) = st.get("error").and_then(Value::as_str) {
+                return Ok(OrderStatus::Error(e.to_string()));
+            }
+            if let Some(r) = st.get("resting") {
+                let oid = r.get("oid").and_then(Value::as_u64).ok_or_else(|| HlError::Decode(format!("resting without an oid: {st}")))?;
+                return Ok(OrderStatus::Resting { oid });
+            }
+            if let Some(f) = st.get("filled") {
+                let oid = f.get("oid").and_then(Value::as_u64).ok_or_else(|| HlError::Decode(format!("filled without an oid: {st}")))?;
+                let size = f.get("totalSz").and_then(Value::as_str).map(crate::num).transpose()?.unwrap_or(0.0);
+                let avg_px = f.get("avgPx").and_then(Value::as_str).map(crate::num).transpose()?.unwrap_or(0.0);
+                return Ok(OrderStatus::Filled { oid, size, avg_px });
+            }
+            // "waitingForFill" / "waitingForTrigger": a TP/SL child, live once its entry fills.
+            if let Some(w) = st.as_str() {
+                return Ok(OrderStatus::Waiting(w.to_string()));
+            }
+            Err(HlError::Decode(format!("an order status this client doesn't know: {st}")))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_says_what_each_order_came_to() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"order","data":{"statuses":[{"resting":{"oid":77738308}},{"filled":{"totalSz":"0.02","avgPx":"1891.4","oid":77747314}},{"error":"Order could not immediately match against any resting orders. asset=4"},"success","waitingForFill"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_statuses(&v).unwrap(),
+            [
+                OrderStatus::Resting { oid: 77738308 },
+                OrderStatus::Filled { oid: 77747314, size: 0.02, avg_px: 1891.4 },
+                OrderStatus::Error("Order could not immediately match against any resting orders. asset=4".into()),
+                OrderStatus::Success,
+                OrderStatus::Waiting("waitingForFill".into()),
+            ]
+        );
+        assert!(read_statuses(&serde_json::json!({"type":"order"})).is_err());
+    }
 
     #[test]
     fn nonces_only_ever_rise() {
