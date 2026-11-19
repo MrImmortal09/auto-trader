@@ -172,6 +172,14 @@ pub fn venue(dex: Option<&str>) -> &'static str {
     }
 }
 
+/// The coin on `list` that already has `coin`'s key. Keys are matched in
+/// any case, and gold's is `GOLD`: a coin whose key another perp has would
+/// reach that one's charts and orders.
+fn key_taken<'a>(list: impl IntoIterator<Item = &'a Entry>, coin: &str) -> Option<&'static str> {
+    let key = key_for(coin).to_ascii_lowercase();
+    list.into_iter().find(|e| e.market.key.to_ascii_lowercase() == key && e.market.coin != coin).map(|e| e.market.coin)
+}
+
 /// Hyperliquid's rules for a perp, as the app keeps them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rules {
@@ -341,6 +349,9 @@ impl MarketAdmin {
             let Some(listed) = listed else {
                 return Err(Refusal::bad(format!("{coin} isn't a live Hyperliquid perp")));
             };
+            if let Some(other) = key_taken(next.values(), coin) {
+                return Err(Refusal::conflict(format!("{coin} can't be added: its name, {}, is {other}'s already", key_for(coin))));
+            }
             let market = market_of(coin, Rules::of(&listed.rules));
             let header = next.get(coin).is_some_and(|e| e.header);
             next.insert(coin.clone(), Entry { market, added: true, header });
@@ -502,6 +513,16 @@ mod tests {
         assert_eq!(a, b);
         let c = market_of("xyz:TSLA", rules(3, 5, 0.00009));
         assert_eq!(c.max_leverage, 5, "new rules, a new market");
+    }
+
+    #[test]
+    fn a_coin_whose_key_another_perp_has_is_refused() {
+        let list = builtin_entries();
+        assert_eq!(key_taken(&list, "GOLD"), Some("xyz:GOLD"), "a core GOLD would take gold's key");
+        assert_eq!(key_taken(&list, "btc"), Some("BTC"), "keys match in any case");
+        assert_eq!(key_taken(&list, "BTC"), None, "the same coin again is no clash");
+        assert_eq!(key_taken(&list, "xyz:GOLD"), None);
+        assert_eq!(key_taken(&list, "xyz:NVDA"), None);
     }
 
     #[test]

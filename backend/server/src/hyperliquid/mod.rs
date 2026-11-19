@@ -264,6 +264,9 @@ pub struct HlMarketData {
     changes: broadcast::Sender<BarChange>,
     /// What the feed follows ([`HlMarketData::resubscribe`]).
     subs: watch::Sender<BTreeSet<Sub>>,
+    /// One `resubscribe` at a time, from working out what is wanted to
+    /// applying it: an older answer never lands over a newer one.
+    resubscribing: StdMutex<()>,
     /// When a screen last asked about each perp (Unix ms).
     asked: StdMutex<HashMap<&'static str, i64>>,
     /// The perps a paper book holds, rests or arms something in, as the
@@ -295,15 +298,16 @@ impl HlMarketData {
             fetching: StdMutex::new(HashMap::new()),
             changes: broadcast::channel(CHANGES_CAPACITY).0,
             subs: watch::channel(BTreeSet::new()).0,
+            resubscribing: StdMutex::new(()),
             asked: StdMutex::new(HashMap::new()),
             in_use: StdMutex::new(HashSet::new()),
             running: Mutex::new(None),
         })
     }
 
-    // Lock order, where both are held: `live`, then `series`. Neither is
-    // held across an await; `asked` and `in_use` are never held with
-    // another.
+    // Lock order: `resubscribing`, then `live`, then `series`; the feed's
+    // reader holds `live` while it reads `subs`. None is held across an
+    // await; `asked` and `in_use` are never held with another.
     fn live(&self) -> MutexGuard<'_, Live> {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -349,6 +353,7 @@ impl HlMarketData {
     /// following: a context's quote, a series' forming bar (its tail is read
     /// again on the next ask).
     fn resubscribe(&self) {
+        let _one = self.resubscribing.lock().unwrap_or_else(|e| e.into_inner());
         let wanted = self.wanted(now_ms());
         let mut dropped = Vec::new();
         self.subs.send_if_modified(|current| {
@@ -485,15 +490,27 @@ impl HlMarketData {
                         s.live = false;
                     }
                 }
+                // A message still in flight when its sub was dropped is not
+                // kept: checked under `live`, which `resubscribe` takes only
+                // after `subs` changed, so what it forgot stays forgotten.
                 FeedMsg::Ctx(ctx) => {
                     if let Some(m) = Market::of_coin(&ctx.coin) {
-                        self.live().quotes.insert(m.key, Quote { ctx, at_ms: now_ms() });
+                        let mut live = self.live();
+                        if self.subs.borrow().contains(&Sub::Ctx { coin: ctx.coin.clone() }) {
+                            live.quotes.insert(m.key, Quote { ctx, at_ms: now_ms() });
+                        }
                     }
                 }
                 FeedMsg::Candle(c) => {
                     let (Some(m), Some(tf)) = (Market::of_coin(&c.coin), Tf::parse(&c.interval)) else { continue };
                     let bar = bar_of(&c);
-                    let before = self.live().last.insert((m.key, tf), bar).map(|b| b.t);
+                    let before = {
+                        let mut live = self.live();
+                        if !self.subs.borrow().contains(&Sub::Candle { coin: c.coin.clone(), interval: c.interval.clone() }) {
+                            continue;
+                        }
+                        live.last.insert((m.key, tf), bar).map(|b| b.t)
+                    };
                     let tail = {
                         let mut all = self.series();
                         all.get_mut(&(m.key, tf)).map(|s| {

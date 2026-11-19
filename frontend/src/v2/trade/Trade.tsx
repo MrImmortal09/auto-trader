@@ -64,6 +64,7 @@ import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from '.
 import { Ladder } from './Ladder';
 import { LimitCloseDialog } from './LimitCloseDialog';
 import { isPerpKey, perpInfo, useLoadPerpCatalog } from './perp/catalog';
+import { perpLabel } from './perp/model';
 import { PerpTicket } from './perp/PerpTicket';
 import { usePerps } from './perp/usePerps';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, draftLines, draftWhat, firstBuy, MAX_TARGETS, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
@@ -1561,8 +1562,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             />
             <aside style={{ width: ladderWidth }} className="flex shrink-0 flex-col">
               <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line pr-1 pl-3">
-                <h2 className="min-w-0 truncate type-body-strong text-fg" title={perpSel ? `${perpSel}-PERP on Hyperliquid` : `${ladderIndex} options`}>
-                  {perpSel ? `${perpSel}-PERP` : `${ladderIndex} options`}
+                <h2 className="min-w-0 truncate type-body-strong text-fg" title={perpSel ? `${perpLabel(perpSel)} on ${perpInfo(perpSel)?.venue ?? 'Hyperliquid'}` : `${ladderIndex} options`}>
+                  {perpSel ? perpLabel(perpSel) : `${ladderIndex} options`}
                 </h2>
                 {perpSel ? (
                   <span className="ml-auto shrink-0">
