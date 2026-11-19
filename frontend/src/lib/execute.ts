@@ -86,7 +86,7 @@ export function buyBlockedReason(frame: ExecuteFrame | null, streamStale: boolea
   if (!frame || streamStale) return 'Not connected to the server';
   if (frame.kill_switch) return 'Kill switch is active';
   // The server's words name a special session's hours; an older server sends none.
-  if (!frame.market_open) return frame.closed_message ?? 'Market is closed (09:15–15:30 IST)';
+  if (!frame.market_open) return frame.closed_message ?? 'Market is closed (09:15–15:39 IST)';
   const age = frame.feed.last_tick_age_ms;
   if (!frame.feed.connected || age == null || age > FEED_STALE_MS) return 'Price feed is stale';
   if (frame.mode === 'LIVE' && !frame.kotak_ready) return 'Kotak is not connected';

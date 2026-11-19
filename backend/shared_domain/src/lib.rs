@@ -817,13 +817,13 @@ pub struct MonitoredPosition {
     pub entry_line: Option<EntryLine>,
 }
 
-/// Manual buys are accepted 09:15–15:30 IST on a weekday — the exchange's
-/// normal session, inside the engine's own 09:15–15:40 window — or throughout
+/// Manual buys are accepted 09:15–15:39 IST on a weekday — up to the engine's
+/// 15:39 no-entry cutoff, inside its 09:15–15:40 window — or throughout
 /// an active special session on its date. A tap's buy and a crossed buy line
 /// alike.
 pub fn manual_buy_window_open_at(now: DateTime<FixedOffset>) -> bool {
     use chrono::Timelike;
-    in_special_session_at(now) || (is_regular_market_hours_at(now) && (now.hour(), now.minute()) < (15, 30))
+    in_special_session_at(now) || (is_regular_market_hours_at(now) && (now.hour(), now.minute()) < (15, 39))
 }
 
 /// The entry condition of a line order whose buy line is still armed: no

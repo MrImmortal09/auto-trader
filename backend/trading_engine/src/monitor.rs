@@ -651,7 +651,7 @@ enum LineStep {
 /// `index`: nothing yet, dropped (its validity ran out, its contract is
 /// being squared off on its expiry day, or the index jumped past the line
 /// and its stop or a target at once), or crossed. A crossing outside the
-/// manual buy window (09:15–15:30, or a special session) buys nothing — the
+/// manual buy window (09:15–15:39, or a special session) buys nothing — the
 /// line waits, and the 15:39 cutoff drops it — the same hours as a tap.
 fn line_step(pos: &MonitoredPosition, index: Option<f64>, now: chrono::DateTime<chrono::FixedOffset>) -> Option<LineStep> {
     if !pos.manual || !pos.line_armed() || pos.force_exit.is_some() {
@@ -7185,8 +7185,8 @@ mod tests {
         assert_eq!(line_step(&pos, Some(26_010.0), at), None);
         assert_eq!(line_step(&pos, None, at), None);
         assert_eq!(line_step(&pos, Some(25_979.0), at), Some(LineStep::Trigger { index: 25_979.0 }));
-        // Crossed after the 15:30 close of tap buys: nothing bought, it waits for the cutoff.
-        assert_eq!(line_step(&pos, Some(25_979.0), ist_time(2026, 11, 18, 15, 33)), None);
+        // Crossed after the 15:39 close of tap buys: nothing bought, it waits for the cutoff.
+        assert_eq!(line_step(&pos, Some(25_979.0), ist_time(2026, 11, 18, 15, 39)), None);
         assert_eq!(line_step(&pos, Some(25_979.0), ist_time(2026, 11, 21, 11, 5)), None);
 
         // Crossed: a market buy of exactly the lots ordered, under the 15 s rule from the crossing.
