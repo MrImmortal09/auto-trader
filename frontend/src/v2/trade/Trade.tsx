@@ -1547,7 +1547,13 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
                 {perpSel ? (
                   <span className="ml-auto shrink-0">
                     {perpDesk.account?.mode === 'live' ? (
-                      <span className="rounded-4 border border-live-ink bg-live px-1.5 py-0.5 type-caption text-fg">LIVE · {perpDesk.account.network}</span>
+                      <span
+                        className="rounded-4 border border-live-ink bg-live px-1.5 py-0.5 type-caption text-fg"
+                        title={perpDesk.account.network === 'testnet' ? 'The charts and prices are mainnet’s: the feed is always mainnet, and testnet’s own prices differ' : undefined}
+                      >
+                        LIVE · {perpDesk.account.network}
+                        {perpDesk.account.network === 'testnet' && ' · mainnet prices'}
+                      </span>
                     ) : (
                       <span className="rounded-4 border border-line px-1.5 py-0.5 type-caption text-fg-muted">Paper</span>
                     )}

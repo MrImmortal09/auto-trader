@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
+use tokio::sync::OwnedRwLockReadGuard;
 
 use crate::auth::Identity;
 use crate::hyperliquid::paper::{Kind, LevelsChange, OrderReq, Refusal};
@@ -54,11 +55,17 @@ async fn live_for(state: &AppState, identity: &Identity) -> Option<hyperliquid_c
     }
 }
 
-/// Orders are paper's alone in this release: LIVE ones are refused.
-async fn paper_only(state: &AppState, identity: &Identity) -> Result<(), Response> {
+/// Orders are paper's alone in this release: LIVE ones are refused. The
+/// owner's hold the LIVE switch's gate from this check until booked, so the
+/// mode can't change in between (`LiveDesk::paper_gate`).
+async fn paper_only(state: &AppState, identity: &Identity) -> Result<Option<OwnedRwLockReadGuard<()>>, Response> {
+    let gate = match identity {
+        Identity::Admin { .. } => Some(state.hl_live.paper_gate().await),
+        _ => None,
+    };
     match live_for(state, identity).await {
         Some(_) => Err(refuse(StatusCode::CONFLICT, "Hyperliquid is LIVE: LIVE orders aren't sent yet (they come in the next release). Switch Hyperliquid to Paper in Settings to trade on paper")),
-        None => Ok(()),
+        None => Ok(gate),
     }
 }
 
@@ -192,14 +199,15 @@ macro_rules! caller_or_return {
     };
 }
 
-/// The caller's account id, for a route that changes something: paper only.
+/// The caller's account id, for a route that changes something: paper
+/// only. With it the LIVE switch's gate, held until the route answers.
 macro_rules! paper_caller_or_return {
     ($state:expr, $identity:expr) => {{
         let id = caller_or_return!($state, $identity);
-        if let Err(e) = paper_only(&$state, &$identity).await {
-            return e;
+        match paper_only(&$state, &$identity).await {
+            Ok(gate) => (id, gate),
+            Err(e) => return e,
         }
-        id
     }};
 }
 
@@ -213,7 +221,7 @@ pub async fn account_handler(State(state): State<AppState>, Extension(identity):
 }
 
 pub async fn order_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Json(b): Json<OrderBody>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     let (m, side) = match (market(&b.market), side(&b.side)) {
         (Ok(m), Ok(s)) => (m, s),
         (Err(e), _) | (_, Err(e)) => return e,
@@ -229,17 +237,17 @@ pub async fn order_handler(State(state): State<AppState>, Extension(identity): E
 }
 
 pub async fn move_order_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(order_id): Path<String>, Json(b): Json<MoveBody>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     answer(state.perps.move_order(id, &order_id, b.price).await)
 }
 
 pub async fn cancel_order_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(order_id): Path<String>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     answer(state.perps.cancel_order(id, &order_id).await.map(|()| json!({ "status": "cancelled" })))
 }
 
 pub async fn close_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(key): Path<String>, body: Option<Json<CloseBody>>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     let m = match market(&key) {
         Ok(m) => m,
         Err(e) => return e,
@@ -249,7 +257,7 @@ pub async fn close_handler(State(state): State<AppState>, Extension(identity): E
 }
 
 pub async fn levels_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(key): Path<String>, Json(b): Json<LevelsBody>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     let m = match market(&key) {
         Ok(m) => m,
         Err(e) => return e,
@@ -261,7 +269,7 @@ pub async fn levels_handler(State(state): State<AppState>, Extension(identity): 
 }
 
 pub async fn line_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Json(b): Json<LineBody>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     let (m, side) = match (market(&b.market), side(&b.side)) {
         (Ok(m), Ok(s)) => (m, s),
         (Err(e), _) | (_, Err(e)) => return e,
@@ -271,17 +279,17 @@ pub async fn line_handler(State(state): State<AppState>, Extension(identity): Ex
 }
 
 pub async fn update_line_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(line_id): Path<String>, Json(b): Json<LevelsBody>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     answer(state.perps.update_line(id, &line_id, b.price, b.change()).await)
 }
 
 pub async fn cancel_line_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(line_id): Path<String>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     answer(state.perps.cancel_line(id, &line_id).await.map(|()| json!({ "status": "cancelled" })))
 }
 
 pub async fn reset_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
-    let id = paper_caller_or_return!(state, identity);
+    let (id, _gate) = paper_caller_or_return!(state, identity);
     answer(state.perps.reset(id).await.map(|()| json!({ "status": "reset" })))
 }
 

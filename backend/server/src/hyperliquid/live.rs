@@ -16,9 +16,20 @@
 //! - **The LIVE account** is Hyperliquid's: positions, open orders (stops and
 //!   targets are its trigger orders) and fills read from the `info` endpoint
 //!   and cached a few seconds, inside Hyperliquid's request limits. Nothing
-//!   about it is kept here.
+//!   about it is kept here. A read that doesn't answer in a few seconds has
+//!   failed, and a failure is answered again at once for a moment, so a
+//!   stalled Hyperliquid never piles up waiting requests.
+//! - **LIVE starts and ends flat**: entering or leaving it needs the
+//!   Hyperliquid account to hold and rest nothing (on every dex, coins the
+//!   app doesn't trade included), and entering it needs the owner's paper
+//!   perps flat and the API wallet to pass a fresh check. One lock covers the
+//!   switch and the API wallets' changes, and the owner's paper orders wait
+//!   for it ([`LiveDesk::paper_gate`]), so nothing lands between a check and
+//!   the change it allows.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
@@ -31,7 +42,7 @@ use hyperliquid_client::{InfoClient, Network};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 
 use super::paper::{AccountView, FillRow, PositionView, Refusal, Venue};
 use super::perp::{PerpLevels, PerpLine, PerpOrder, PerpPosition, PerpTarget, Side};
@@ -40,9 +51,16 @@ use super::Market;
 /// The dex gold trades on, with its own margin.
 const GOLD_DEX: &str = "xyz";
 /// How long each part of the LIVE account is reused before it is read again.
+/// An open Trade screen costs about 120 (states) + 240 (orders) + 20 to 40
+/// (fills) of the 1,200 request weight Hyperliquid allows an IP a minute.
 const STATE_TTL: Duration = Duration::from_secs(2);
-const ORDERS_TTL: Duration = Duration::from_secs(5);
-const FILLS_TTL: Duration = Duration::from_secs(30);
+const ORDERS_TTL: Duration = Duration::from_secs(10);
+const FILLS_TTL: Duration = Duration::from_secs(60);
+/// One read of the LIVE account that hasn't answered in this long has failed.
+const ACCOUNT_READ_TIMEOUT: Duration = Duration::from_secs(4);
+/// A failed read is answered again, at once, for this long: the requests
+/// queued behind it don't each wait out their own timeout.
+const FAILURE_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -153,10 +171,24 @@ fn ist(ms: i64) -> String {
         .unwrap_or_default()
 }
 
-/// What the LIVE account was last read as, per part.
+/// `read` within [`ACCOUNT_READ_TIMEOUT`], its failure in words.
+async fn timed<T>(what: &str, read: impl Future<Output = Result<T, hyperliquid_client::HlError>>) -> Result<T, String> {
+    match tokio::time::timeout(ACCOUNT_READ_TIMEOUT, read).await {
+        Err(_) => Err(format!("couldn't read {what} from Hyperliquid: no answer in {} s", ACCOUNT_READ_TIMEOUT.as_secs())),
+        Ok(Err(e)) => Err(format!("couldn't read {what} from Hyperliquid: {e}")),
+        Ok(Ok(v)) => Ok(v),
+    }
+}
+
+/// What the LIVE account was last read as, per part — for one account: a
+/// different one starts afresh.
 #[derive(Default)]
 struct LiveCache {
-    states: Option<(Instant, AccountState, AccountState)>,
+    account: String,
+    /// The last read failed, and why: answered again until [`FAILURE_TTL`].
+    failed: Option<(Instant, String)>,
+    /// With when they were read, in IST, for the screens' "as of".
+    states: Option<(Instant, String, AccountState, AccountState)>,
     orders: Option<(Instant, Vec<HlOpenOrder>)>,
     fills: Option<(Instant, Vec<HlFill>)>,
 }
@@ -170,6 +202,9 @@ pub struct LiveDesk {
     exchange: HashMap<Network, ExchangeClient>,
     nonces: Nonces,
     cache: Mutex<HashMap<Network, LiveCache>>,
+    /// Held exclusively by the mode switch and the API wallets' changes, and
+    /// shared by the owner's paper orders ([`LiveDesk::paper_gate`]).
+    gate: Arc<RwLock<()>>,
 }
 
 impl LiveDesk {
@@ -203,11 +238,18 @@ impl LiveDesk {
             exchange: nets.iter().map(|n| (*n, ExchangeClient::new(*n))).collect(),
             nonces: Nonces::default(),
             cache: Mutex::new(HashMap::new()),
+            gate: Arc::new(RwLock::new(())),
         })
     }
 
     pub async fn settings(&self) -> LiveSettings {
         *self.settings.read().await
+    }
+
+    /// Held by an owner's paper order from its "not LIVE" check until it is
+    /// booked: the mode can't change in between.
+    pub async fn paper_gate(&self) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.gate).read_owned().await
     }
 
     /// The owner's network while Hyperliquid is LIVE.
@@ -246,25 +288,32 @@ impl LiveDesk {
         Ok(())
     }
 
-    /// Whether the owner's LIVE account on `network` holds or rests
-    /// nothing, read fresh. A read that fails can't say so.
-    async fn live_flat(&self, network: Network) -> Result<bool, Refusal> {
-        let account = self.creds.read().await.get(&network).map(|c| c.account.clone()).ok_or_else(|| Refusal::conflict("no API wallet for this network"))?;
+    /// What the account behind `network`'s API wallet holds and rests on
+    /// Hyperliquid, every coin (the app's or not), read fresh: empty when it
+    /// is flat. A read that fails can't say so.
+    async fn live_open(&self, network: Network) -> Result<Vec<String>, Refusal> {
+        let account = self.creds.read().await.get(&network).map(|c| c.account.clone()).ok_or_else(|| Refusal::conflict(format!("No {} API wallet", net_str(network))))?;
         let info = &self.info[&network];
         let read = async {
-            let core = info.account_state(&account, None).await?;
-            let gold = info.account_state(&account, Some(GOLD_DEX)).await?;
-            let core_orders = info.open_orders(&account, None).await?;
-            let gold_orders = info.open_orders(&account, Some(GOLD_DEX)).await?;
-            Ok::<_, hyperliquid_client::HlError>(core.positions.is_empty() && gold.positions.is_empty() && core_orders.is_empty() && gold_orders.is_empty())
+            let mut positions = Vec::new();
+            let mut orders: Vec<HlOpenOrder> = Vec::new();
+            for dex in [None, Some(GOLD_DEX)] {
+                positions.extend(timed("the account", info.account_state(&account, dex)).await?.positions);
+                orders.extend(timed("the open orders", info.open_orders(&account, dex)).await?);
+            }
+            Ok::<_, String>(open_words(&positions, &orders))
         };
-        read.await.map_err(|e| Refusal::conflict(format!("could not read the LIVE account to see it is flat ({e}) — nothing changed")))
+        read.await.map_err(|e| Refusal::conflict(format!("{e} — so it can't be seen to be flat; nothing changed")))
     }
 
-    /// Change the mode and/or network. `paper_flat`: the owner's paper
-    /// perps hold, rest and arm nothing. Only ever while flat on both sides
-    /// of the change; LIVE needs the network's API wallet to pass its check.
-    pub async fn set(&self, mode: Option<HlMode>, network: Option<Network>, paper_flat: bool) -> Result<LiveView, Refusal> {
+    /// Change the mode and/or network: only while flat on both sides of the
+    /// change. `paper_flat` says whether the owner's paper perps hold, rest
+    /// and arm nothing; it is read once the switch is held, so no paper
+    /// order lands between it and the change. LIVE also needs the network's
+    /// API wallet to pass a check run now, and the Hyperliquid account to be
+    /// flat (so it can be left again).
+    pub async fn set(&self, mode: Option<HlMode>, network: Option<Network>, paper_flat: impl Future<Output = Result<bool, Refusal>>) -> Result<LiveView, Refusal> {
+        let _switch = self.gate.write().await;
         let now = self.settings().await;
         let next = LiveSettings { mode: mode.unwrap_or(now.mode), network: network.unwrap_or(now.network) };
         if next == now {
@@ -274,19 +323,32 @@ impl LiveDesk {
             if next.network != now.network {
                 return Err(Refusal::conflict("Switch Hyperliquid to Paper before changing the network"));
             }
-            if !self.live_flat(now.network).await? {
-                return Err(Refusal::conflict(format!("The LIVE {} account still holds a position or an order — close and cancel everything on Hyperliquid first", net_str(now.network))));
+            let open = self.live_open(now.network).await?;
+            if !open.is_empty() {
+                return Err(Refusal::conflict(format!("The LIVE {} account still holds {} — close and cancel them on Hyperliquid first", net_str(now.network), open.join(", "))));
             }
         }
         if next.mode == HlMode::Live {
-            if !paper_flat {
+            if !paper_flat.await? {
                 return Err(Refusal::conflict("Your paper perps still hold, rest or arm something — close and cancel them first"));
             }
+            if !self.creds.read().await.contains_key(&next.network) {
+                return Err(Refusal::conflict(format!("Add a {} API wallet first", net_str(next.network))));
+            }
+            // A check of any age won't do: an approval can expire or be pruned.
+            self.check_now(next.network).await?;
             let creds = self.creds.read().await;
-            match creds.get(&next.network) {
-                None => return Err(Refusal::conflict(format!("Add a {} API wallet first", net_str(next.network)))),
-                Some(c) if !c.check_ok => return Err(Refusal::conflict(format!("The {} API wallet hasn't passed its check — check it again", net_str(next.network)))),
-                Some(_) => {}
+            if let Some(c) = creds.get(&next.network).filter(|c| !c.check_ok) {
+                return Err(Refusal::conflict(format!("The {} API wallet failed its check: {}", net_str(next.network), c.check_note.as_deref().unwrap_or("no reason given"))));
+            }
+            drop(creds);
+            let open = self.live_open(next.network).await?;
+            if !open.is_empty() {
+                return Err(Refusal::conflict(format!(
+                    "The {} Hyperliquid account holds {} — LIVE starts flat, so it can be left again: close and cancel them on Hyperliquid first",
+                    net_str(next.network),
+                    open.join(", ")
+                )));
             }
         }
         self.save_settings(next).await?;
@@ -297,6 +359,7 @@ impl LiveDesk {
     /// Store `network`'s API wallet: the account's address and the API
     /// wallet's private key (sealed), then check it.
     pub async fn save_credential(&self, network: Network, account: &str, key: &str) -> Result<LiveView, Refusal> {
+        let _switch = self.gate.write().await;
         let Some(box_key) = self.box_key else {
             return Err(Refusal::conflict("AUTH_SECRET isn't set on the server, so no key can be stored"));
         };
@@ -328,12 +391,16 @@ impl LiveDesk {
         .await
         .map_err(|e| Refusal::conflict(format!("could not store the API wallet: {e}")))?;
         self.creds.write().await.insert(network, Credential { account, agent: wallet.address().to_string(), key_box, checked_at: None, check_ok: false, check_note: None });
+        // Another account's: nothing read for the last one is shown for it.
+        self.cache.lock().await.remove(&network);
         tracing::warn!(network = net_str(network), agent = wallet.address(), "Hyperliquid API wallet stored");
-        self.check(network).await
+        self.check_now(network).await?;
+        Ok(self.view().await)
     }
 
     /// Forget `network`'s API wallet; not while it is the LIVE one.
     pub async fn remove_credential(&self, network: Network) -> Result<LiveView, Refusal> {
+        let _switch = self.gate.write().await;
         let s = self.settings().await;
         if s.mode == HlMode::Live && s.network == network {
             return Err(Refusal::conflict("Switch Hyperliquid to Paper before removing the LIVE API wallet"));
@@ -344,6 +411,7 @@ impl LiveDesk {
             .await
             .map_err(|e| Refusal::conflict(format!("could not remove the API wallet: {e}")))?;
         self.creds.write().await.remove(&network);
+        self.cache.lock().await.remove(&network);
         Ok(self.view().await)
     }
 
@@ -363,6 +431,13 @@ impl LiveDesk {
     /// the result: approved by the account, accepted by the exchange (a
     /// signed `noop`), and the account's balances read.
     pub async fn check(&self, network: Network) -> Result<LiveView, Refusal> {
+        let _switch = self.gate.write().await;
+        self.check_now(network).await?;
+        Ok(self.view().await)
+    }
+
+    /// [`LiveDesk::check`], with the switch already held.
+    async fn check_now(&self, network: Network) -> Result<(), Refusal> {
         let (ok, note) = match self.wallet(network).await {
             Err(r) => (false, r.message),
             Ok((account, wallet)) => self.probe(network, &account, &wallet).await,
@@ -381,7 +456,7 @@ impl LiveDesk {
             c.check_ok = ok;
             c.check_note = Some(note);
         }
-        Ok(self.view().await)
+        Ok(())
     }
 
     async fn probe(&self, network: Network, account: &str, wallet: &Wallet) -> (bool, String) {
@@ -413,35 +488,70 @@ impl LiveDesk {
     }
 
     /// The owner's LIVE account on `network`, from Hyperliquid (cached a
-    /// few seconds per part), in the paper desk's shape.
+    /// few seconds per part), in the paper desk's shape. Each read gives up
+    /// after [`ACCOUNT_READ_TIMEOUT`]; a failure is answered again at once
+    /// until [`FAILURE_TTL`], so the requests queued behind it don't wait.
     pub async fn account(&self, network: Network) -> Result<AccountView, Refusal> {
         let account = self.creds.read().await.get(&network).map(|c| c.account.clone()).ok_or_else(|| Refusal::conflict(format!("No {} API wallet", net_str(network))))?;
         let info = &self.info[&network];
         let mut all = self.cache.lock().await;
         let cache = all.entry(network).or_default();
-        let read_err = |e: hyperliquid_client::HlError| Refusal::conflict(format!("couldn't read the LIVE account from Hyperliquid: {e}"));
-        if cache.states.as_ref().is_none_or(|(at, ..)| at.elapsed() > STATE_TTL) {
-            let core = info.account_state(&account, None).await.map_err(read_err)?;
-            let gold = info.account_state(&account, Some(GOLD_DEX)).await.map_err(read_err)?;
-            cache.states = Some((Instant::now(), core, gold));
+        if cache.account != account {
+            *cache = LiveCache { account: account.clone(), ..LiveCache::default() };
         }
-        if cache.orders.as_ref().is_none_or(|(at, _)| at.elapsed() > ORDERS_TTL) {
-            let mut orders = info.open_orders(&account, None).await.map_err(read_err)?;
-            orders.extend(info.open_orders(&account, Some(GOLD_DEX)).await.map_err(read_err)?);
-            cache.orders = Some((Instant::now(), orders));
-        }
-        if cache.fills.as_ref().is_none_or(|(at, _)| at.elapsed() > FILLS_TTL) {
-            // Fills are a nicety: a failed read keeps the last ones.
-            match info.user_fills(&account).await {
-                Ok(f) => cache.fills = Some((Instant::now(), f)),
-                Err(e) => tracing::warn!("Hyperliquid fills not read: {e}"),
+        if let Some((at, why)) = &cache.failed {
+            if at.elapsed() < FAILURE_TTL {
+                return Err(Refusal::conflict(why.clone()));
             }
         }
-        let (_, core, gold) = cache.states.as_ref().expect("just read");
+        if let Err(why) = read_into(cache, info, &account).await {
+            cache.failed = Some((Instant::now(), why.clone()));
+            return Err(Refusal::conflict(why));
+        }
+        cache.failed = None;
+        let (_, as_of, core, gold) = cache.states.as_ref().expect("just read");
         let orders = &cache.orders.as_ref().expect("just read").1;
         let fills = cache.fills.as_ref().map(|(_, f)| f.as_slice()).unwrap_or_default();
-        Ok(live_account_view(network, core, gold, orders, fills))
+        let mut view = live_account_view(network, core, gold, orders, fills);
+        view.as_of = Some(as_of.clone());
+        Ok(view)
     }
+}
+
+/// Read what `cache` holds too old a copy of (each part on its own TTL).
+async fn read_into(cache: &mut LiveCache, info: &InfoClient, account: &str) -> Result<(), String> {
+    if cache.states.as_ref().is_none_or(|(at, ..)| at.elapsed() > STATE_TTL) {
+        let core = timed("the LIVE account", info.account_state(account, None)).await?;
+        let gold = timed("the LIVE account", info.account_state(account, Some(GOLD_DEX))).await?;
+        cache.states = Some((Instant::now(), shared_domain::current_ist_timestamp_string(), core, gold));
+    }
+    if cache.orders.as_ref().is_none_or(|(at, _)| at.elapsed() > ORDERS_TTL) {
+        let mut orders = timed("the LIVE orders", info.open_orders(account, None)).await?;
+        orders.extend(timed("the LIVE orders", info.open_orders(account, Some(GOLD_DEX))).await?);
+        cache.orders = Some((Instant::now(), orders));
+    }
+    if cache.fills.as_ref().is_none_or(|(at, _)| at.elapsed() > FILLS_TTL) {
+        // Fills are a nicety: a failed read keeps the last ones (this
+        // account's: the cache starts afresh for another).
+        match timed("the LIVE fills", info.user_fills(account)).await {
+            Ok(f) => cache.fills = Some((Instant::now(), f)),
+            Err(e) => tracing::warn!("Hyperliquid {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// "SOL long 3, BTC short 0.1, 2 open orders (ETH, xyz:GOLD)": what an
+/// account holds and rests, every coin.
+fn open_words(positions: &[hyperliquid_client::account::HlPosition], orders: &[HlOpenOrder]) -> Vec<String> {
+    let mut out: Vec<String> = positions.iter().filter(|p| p.szi != 0.0).map(|p| format!("{} {} {}", p.coin, if p.szi > 0.0 { "long" } else { "short" }, p.szi.abs())).collect();
+    if !orders.is_empty() {
+        let mut coins: Vec<&str> = orders.iter().map(|o| o.coin.as_str()).collect();
+        coins.sort_unstable();
+        coins.dedup();
+        out.push(format!("{} open order{} ({})", orders.len(), if orders.len() == 1 { "" } else { "s" }, coins.join(", ")));
+    }
+    out
 }
 
 /// A trigger order's stop or target, as a level.
@@ -569,6 +679,7 @@ pub fn live_account_view(network: Network, core: &AccountState, gold: &AccountSt
             Venue { dex: "core", label: "Core perps (BTC, ETH)", account_value: core.account_value, withdrawable: core.withdrawable, margin_used: core.margin_used },
             Venue { dex: GOLD_DEX, label: "Gold (trade.xyz dex)", account_value: gold.account_value, withdrawable: gold.withdrawable, margin_used: gold.margin_used },
         ],
+        as_of: None,
     }
 }
 
@@ -612,6 +723,26 @@ mod tests {
             timestamp: 0,
             children: Vec::new(),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_hangs_fails_after_the_timeout() {
+        let hang = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<_, hyperliquid_client::HlError>(1)
+        };
+        let started = tokio::time::Instant::now();
+        let err = timed("the LIVE account", hang).await.unwrap_err();
+        assert_eq!(started.elapsed(), ACCOUNT_READ_TIMEOUT, "given up at the timeout, not after the read's own 15 s");
+        assert!(err.contains("no answer in 4 s"), "{err}");
+        assert_eq!(timed("x", async { Ok::<_, hyperliquid_client::HlError>(7) }).await, Ok(7));
+    }
+
+    #[test]
+    fn what_is_open_is_named_coin_by_coin() {
+        assert!(open_words(&[], &[]).is_empty(), "flat");
+        let w = open_words(&[pos("SOL", 3.0), pos("BTC", -0.1), pos("ETH", 0.0)], &[order("ETH", 1, true, None, false), order("xyz:GOLD", 2, false, None, false), order("ETH", 3, true, None, false)]);
+        assert_eq!(w, ["SOL long 3", "BTC short 0.1", "3 open orders (ETH, xyz:GOLD)"]);
     }
 
     #[test]

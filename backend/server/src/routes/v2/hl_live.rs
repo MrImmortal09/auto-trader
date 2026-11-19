@@ -73,11 +73,8 @@ pub async fn settings_handler(State(state): State<AppState>, Extension(identity)
     let Some(owner) = identity.user_id() else {
         return refuse(StatusCode::UNAUTHORIZED, "sign in");
     };
-    let paper_flat = match state.perps.flat(owner).await {
-        Ok(flat) => flat,
-        Err(r) => return refuse(r.status, r.message),
-    };
-    match state.hl_live.set(mode, net, paper_flat).await {
+    // Read once the switch is held: no paper order lands in between.
+    match state.hl_live.set(mode, net, state.perps.flat(owner)).await {
         Ok(view) => {
             send_log(&state.db_tx, &state.log_tx, "WARN", json!({
                 "event": "HL_MODE",

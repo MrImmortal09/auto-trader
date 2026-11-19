@@ -180,7 +180,7 @@ export function Hyperliquid({ serverBase, id, title, large }: { serverBase: stri
         <div className="flex flex-col gap-3 p-6">
           <h2 className="type-title text-fg">Go LIVE on Hyperliquid {v.network}?</h2>
           <p className="type-body text-fg-muted">
-            The Trade screen shows your Hyperliquid account {cred ? `(${cred.account})` : ''} instead of the paper wallet. {v.network === 'mainnet' ? 'This is real money.' : 'Testnet uses free test USDC.'} Orders are not sent in this release.
+            The Trade screen shows your Hyperliquid account {cred ? `(${cred.account})` : ''} instead of the paper wallet. {v.network === 'mainnet' ? 'This is real money.' : 'Testnet uses free test USDC; the charts stay on mainnet prices.'} Orders are not sent in this release. The API wallet is checked again now, and the account must hold and rest nothing on Hyperliquid, so LIVE can be left again.
           </p>
           <div className="mt-2 flex justify-end gap-2">
             <Button size="md" kind="neutral" onClick={() => setConfirmLive(false)} disabled={busy} data-autofocus>

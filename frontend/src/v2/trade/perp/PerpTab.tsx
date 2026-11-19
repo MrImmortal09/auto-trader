@@ -265,6 +265,11 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
           </Button>
         )}
       </div>
+      {live && perps.error && (
+        <p className="px-1 type-caption text-loss">
+          Couldn't refresh the LIVE account: {perps.error}. Shown as read{account.as_of ? ` at ${account.as_of.slice(11)} IST` : ' earlier'} — a stop, target or liquidation since then isn't on it.
+        </p>
+      )}
       {view === 'open' && (compact && account.positions.length > 0 ? cards : open)}
       {view === 'waiting' && waitingList}
       {view === 'fills' && fills}

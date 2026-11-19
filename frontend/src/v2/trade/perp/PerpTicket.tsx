@@ -219,7 +219,13 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           ? `Type a size${kind === 'market' ? '' : ' and a price'}. At most ${cap}x; a ${k} size carries ${rules.szDecimals} decimals.`
           : `${usd(notional)} · ${held && !adding ? `closes ${sizeText(k, Math.min(size!, held.size))}${margin! > 0 ? `, then ` : ''}` : ''}${margin! > 0 || !held || adding ? `margin ${usd(margin!)}` : ''} · fee ≈ ${usd(fee!)}${liq != null ? ` · liquidation ≈ ${perpPrice(roundPrice(k, liq))}` : ''}${kind === 'line' ? ` · when the mark ${mid != null && price! > mid ? 'rises' : 'falls'} to ${perpPrice(price!)}` : ''}`}
       </p>
-      {live && <p className="type-caption text-fg">LIVE on {account?.network}: your Hyperliquid account is shown read-only. LIVE orders come in the next release; switch Hyperliquid to Paper in Settings to trade on paper.</p>}
+      {live && (
+        <p className="type-caption text-fg">
+          LIVE on {account?.network}: your Hyperliquid account is shown read-only. LIVE orders come in the next release; switch Hyperliquid to Paper in Settings to trade on paper.
+          {account?.network === 'testnet' && ' Charts, prices and these estimates are mainnet’s; testnet’s own prices differ.'}
+        </p>
+      )}
+      {live && perps.error && <p className="type-caption text-loss">Couldn't refresh the LIVE account ({perps.error}): what is shown is from {account?.as_of ? `${account.as_of.slice(11)} IST` : 'earlier'}.</p>}
       <Button size={size_} kind={side === 'long' ? 'profit' : 'loss'} pointerOnly disabled={!ready} onClick={() => void send()}>
         {sending ? 'Sending…' : `${kind === 'line' ? 'Arm: ' : ''}${side === 'long' ? 'Buy / long' : 'Sell / short'}${size ? ` ${sizeText(k, size)}` : ''}${kind === 'limit' && price ? ` @ ${perpPrice(price)}` : ''}`}
       </Button>

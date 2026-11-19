@@ -778,6 +778,8 @@ export interface PerpAccount {
   network?: 'testnet' | 'mainnet';
   /** LIVE: each Hyperliquid balance behind it (the core perps', gold's dex). */
   venues?: { dex: string; label: string; account_value: number; withdrawable: number; margin_used: number }[];
+  /** LIVE: when it was read from Hyperliquid (IST `YYYY-MM-DD HH:MM:SS`); paper is always current. */
+  as_of?: string;
 }
 
 /** A stored Hyperliquid API wallet, as Settings shows it (never its key). */

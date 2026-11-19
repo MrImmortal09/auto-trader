@@ -429,6 +429,10 @@ pub struct AccountView {
     /// dex (`xyz`), which keeps its own margin. Left out on paper.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub venues: Vec<Venue>,
+    /// LIVE: when it was read from Hyperliquid (IST); left out on paper,
+    /// which is always current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
 }
 
 /// One Hyperliquid balance: the core perps' or a builder dex's.
@@ -917,6 +921,7 @@ impl PerpDesk {
             fills,
             network: None,
             venues: Vec::new(),
+            as_of: None,
         })
     }
 
