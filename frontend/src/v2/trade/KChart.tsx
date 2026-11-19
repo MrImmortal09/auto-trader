@@ -380,14 +380,15 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       c.removeIndicator({ name: 'v2Vwap' });
       return;
     }
-    VWAP_SERIES.set(chartId, sym.kind === 'index' ? vwapOnIndex(futureBars, bars) : vwapOf(bars));
+    // An index's from its future, in IST days; a perp's own, in UTC days.
+    VWAP_SERIES.set(chartId, sym.kind === 'index' ? { byBar: vwapOnIndex(futureBars, bars), utc: false } : { byBar: vwapOf(bars, wholeDay), utc: wholeDay });
     vwapVersion.current += 1;
     if (c.getIndicators({ name: 'v2Vwap' }).length === 0) {
       c.createIndicator({ name: 'v2Vwap', paneId: 'candle_pane', extendData: { key: chartId }, calcParams: [vwapVersion.current] }, true);
     } else {
       c.overrideIndicator({ name: 'v2Vwap', calcParams: [vwapVersion.current] });
     }
-  }, [vwap, bars, futureBars, chartId, sym.kind]);
+  }, [vwap, bars, futureBars, chartId, sym.kind, wholeDay]);
 
   // Standard pivots, from a week of 15-minute bars so the trading day before
   // is there on a Monday or after a holiday. Fixed for the day; read again

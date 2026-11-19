@@ -181,7 +181,7 @@ export function FuturesChart({ serverBase, index, onIndex, tf, onTf, checks, buy
       c.removeIndicator({ name: 'v2Vwap' });
       return;
     }
-    VWAP_SERIES.set(CHART_ID, vwapOf(bars));
+    VWAP_SERIES.set(CHART_ID, { byBar: vwapOf(bars), utc: false });
     version.current.vwap += 1;
     if (c.getIndicators({ name: 'v2Vwap' }).length === 0) {
       c.createIndicator({ name: 'v2Vwap', paneId: 'candle_pane', extendData: { key: CHART_ID }, calcParams: [version.current.vwap] }, true);
