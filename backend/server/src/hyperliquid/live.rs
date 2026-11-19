@@ -678,9 +678,13 @@ fn account_for(typed: &str, agent: &str, role: &UserRole, net: &str) -> Result<S
         ))),
         // Not authorized yet: kept, and its check says so.
         UserRole::Missing => Ok(typed.to_string()),
-        UserRole::User | UserRole::Vault | UserRole::SubAccount { .. } | UserRole::Other(_) => Err(Refusal::bad(
+        UserRole::User | UserRole::Vault | UserRole::SubAccount { .. } => Err(Refusal::bad(
             "That is a Hyperliquid account's own key, which can withdraw — create an API wallet on Hyperliquid (More → API) and paste its key",
         )),
+        // A role this build doesn't know: say what came back, keep nothing.
+        UserRole::Other(role) => Err(Refusal::conflict(format!(
+            "Hyperliquid {net} calls this key's address ({agent}) '{role}', which isn't an API wallet — nothing saved"
+        ))),
     }
 }
 
@@ -901,8 +905,8 @@ mod tests {
 
     #[test]
     fn the_account_is_read_from_the_api_wallet_and_a_main_key_refused() {
-        let agent = "0x2face01ae2f77e40bd2bd1879cb755842e00308f";
-        let me = "0x45b39d79a1cef6246181bd4d1c44e402588e17f0";
+        let agent = "0xa9e0000000000000000000000000000000000001";
+        let me = "0xacc0000000000000000000000000000000000002";
         let theirs = "0x1111111111111111111111111111111111111111";
         let approved = UserRole::Agent { user: me.to_string() };
         // The API wallet's own address pasted as the account, or none: its account is used.
@@ -919,6 +923,9 @@ mod tests {
         for typed in [agent, me, ""] {
             assert!(account_for(typed, agent, &UserRole::User, "mainnet").unwrap_err().message.contains("own key"));
         }
+        // A role Hyperliquid adds later: named, not taken for a main key.
+        let err = account_for(me, agent, &UserRole::Other("newKind".into()), "mainnet").unwrap_err();
+        assert!(err.message.contains("'newKind'") && !err.message.contains("own key"), "{}", err.message);
     }
 
     #[test]

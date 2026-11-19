@@ -45,7 +45,10 @@ function Wallet({ net, cred, canStore, live, busy, onSave, onCheck, onRemove, la
           disabled={busy || !canStore || key.trim() === ''}
           onClick={async () => {
             if (await onSave(account, key)) {
+              // The saved account shows from what was stored; nothing typed
+              // here carries over to the next Replace.
               setKey('');
+              setAccount('');
               setEditing(false);
             }
           }}
