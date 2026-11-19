@@ -3,6 +3,8 @@ import { ChartLine, Plus, Search as SearchIcon, X } from 'lucide-react';
 import { chartOffWhy, chartSymOf, type OpenHow as InstrumentHow } from '../lib/openInstrument';
 import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
+import { searchPerps, useLoadPerpCatalog } from '../trade/perp/catalog';
+import { PerpResults } from '../trade/perp/PerpResults';
 import { useQuotes } from '../lib/useQuotes';
 import { Chip } from '../ui/Chip';
 import { defaultRow, derivativeNote, groupsOf, optionId, rowSymbol, rowTitle } from './searchModel';
@@ -38,9 +40,12 @@ function inField(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
-export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
+export function Search({ serverBase, onOpen, onAdd, stocksOn = false, onOpenPerp }: {
   serverBase: string;
   onOpen: (row: InstrumentRow, how: OpenHow) => void;
+  /** Chart a Hyperliquid perp on the Trade screen (behind the `hyperliquid`
+   * switch): the perps on the app's list are found too. */
+  onOpenPerp?: (key: string) => void;
   /** Add a result to a watchlist; left out while watchlists are off. */
   onAdd?: (row: InstrumentRow) => void;
   /** The `stock_charts` switch: a stock's chart button lights up. */
@@ -59,6 +64,8 @@ export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
   const listId = useId();
   const typed = query.trim();
   const search = useSearch(serverBase, query, open);
+  const perpList = useLoadPerpCatalog(serverBase, open && !!onOpenPerp).list;
+  const perpHits = onOpenPerp && typed ? searchPerps(perpList, typed).length : 0;
   const groups = typed ? (search.answer ? groupsOf(search.answer) : []) : recents.length ? [{ head: 'Recent', rows: recents }] : [];
   const flat = groups.flatMap((g) => g.rows);
   const quotes = useQuotes(serverBase, open ? flat.map((r) => r.ws_key) : []);
@@ -145,7 +152,7 @@ export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
   }
 
   const closedAsOf = flat.map((r) => quotes.get(r.ws_key)?.as_of).find((s) => !!s) ?? null;
-  const empty = typed && search.answer && !search.pending && flat.length === 0;
+  const empty = typed && search.answer && !search.pending && flat.length === 0 && perpHits === 0;
 
   return (
     <div ref={box} className="relative shrink-0">
@@ -199,6 +206,19 @@ export function Search({ serverBase, onOpen, onAdd, stocksOn = false }: {
       {open && (
         <div className="absolute left-0 top-full z-30 mt-1 w-[480px] rounded-12 border border-line bg-panel p-2 shadow-md animate-fade-in">
           <div id={listId} role="listbox" aria-label="Search results" className="max-h-[60dvh] overflow-y-auto">
+            {onOpenPerp && typed && (
+              <PerpResults
+                query={typed}
+                compact={false}
+                onPick={(r) => {
+                  setOpen(false);
+                  setActive(null);
+                  setQuery('');
+                  input.current?.blur();
+                  onOpenPerp(r.key);
+                }}
+              />
+            )}
             {groups.map((g) => (
               <div key={g.head} role="group" aria-labelledby={`${listId}-${g.head}`}>
                 <div className="flex items-center justify-between px-2 pb-1 pt-2">

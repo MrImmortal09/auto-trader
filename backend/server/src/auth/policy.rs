@@ -69,6 +69,10 @@ const RULES: &[Rule] = &[
     // Hyperliquid perps' prices (behind the `hyperliquid` switch); their
     // charts are `HL:` symbols on the candle routes above.
     rule(On::Read, "/api/v2/hl/markets", Access::SignedIn),
+    // The perps the app trades, with their rules (no prices): what search
+    // and the pickers offer. Adding and removing them (`hl/admin/markets`)
+    // stays the admin's.
+    rule(On::Read, "/api/v2/hl/catalog", Access::SignedIn),
     // Hyperliquid perps on paper: each signed-in person's own account (the
     // owner's and every user's), keyed by user id in the routes. Named one
     // by one: any other `/api/v2/hl/` route (LIVE's, say) stays the admin's.
@@ -231,6 +235,10 @@ mod tests {
         (GET, "/api/v2/flags", Access::SignedIn),
         (PUT, "/api/v2/flags", Access::Admin),
         (GET, "/api/v2/hl/markets", Access::SignedIn),
+        (GET, "/api/v2/hl/catalog", Access::SignedIn),
+        (GET, "/api/v2/hl/admin/markets", Access::Admin),
+        (PUT, "/api/v2/hl/admin/markets", Access::Admin),
+        (PATCH, "/api/v2/hl/positions/xyz:NVDA", Access::SignedIn),
         (GET, "/api/v2/hl/account", Access::SignedIn),
         (POST, "/api/v2/hl/orders", Access::SignedIn),
         (DELETE, "/api/v2/hl/orders/abc", Access::SignedIn),

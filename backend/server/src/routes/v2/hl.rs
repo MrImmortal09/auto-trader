@@ -1,12 +1,13 @@
-//! Hyperliquid perps' market data: `HL:` symbols on the candle routes, and
-//! `GET /api/v2/hl/markets`. All behind the `hyperliquid` switch: while it
-//! is off they answer 404. Read-only — see `crate::hyperliquid`.
+//! Hyperliquid perps' market data: `HL:` symbols on the candle routes,
+//! `GET /api/v2/hl/markets` and `GET /api/v2/hl/catalog`. All behind the
+//! `hyperliquid` switch: while it is off they answer 404. Read-only — see
+//! `crate::hyperliquid`.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -15,16 +16,18 @@ use axum::{
     Json,
 };
 use chrono::{NaiveDate, TimeZone};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::broadcast;
 
 use super::candles::{bad_request, max_days, parse_date, parse_tf, DEFAULT_DAYS, MAX_STREAM_SYMBOLS, STREAM_EVERY};
 use crate::candles::bars::{Bar, Tf};
-use crate::hyperliquid::{Market, MARKETS};
+use crate::hyperliquid::{markets, Market};
 use crate::AppState;
 
-const SYMBOL_HELP: &str = "a Hyperliquid symbol must be HL:BTC, HL:ETH or HL:GOLD";
+const SYMBOL_HELP: &str = "a Hyperliquid symbol is HL: and a perp on the app's list (HL:BTC, HL:GOLD, HL:xyz:NVDA)";
+/// Most perps one `/api/v2/hl/markets` call asks about, beside the header's.
+const MAX_ASKED: usize = 40;
 
 fn switched_off() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "Hyperliquid is switched off" }))).into_response()
@@ -202,14 +205,57 @@ pub async fn stream(state: &AppState, raw: &str, tf: Tf) -> Response {
     Sse::new(updates).keep_alive(KeepAlive::default()).into_response()
 }
 
-/// One perp in `/api/v2/hl/markets`.
+/// A perp's rules, as the screens need them to size and price an order.
 #[derive(Serialize)]
-struct MarketRow {
+struct RulesRow {
     key: &'static str,
     symbol: String,
     coin: &'static str,
+    base: &'static str,
+    /// The builder dex it trades on; `null` on a core perp.
+    dex: Option<&'static str>,
+    /// `Hyperliquid`, `trade.xyz`, `Paragon`, …
+    venue: &'static str,
     label: &'static str,
     name: &'static str,
+    sz_decimals: u32,
+    max_leverage: u32,
+    /// The most the app takes on it: Hyperliquid's limit, at most 20x.
+    leverage_cap: u32,
+    taker_fee: f64,
+    maker_fee: f64,
+    /// Added; `false`: close-only (removed, still held somewhere).
+    tradable: bool,
+    /// In the Trade header.
+    header: bool,
+}
+
+fn rules_row(e: &markets::Entry) -> RulesRow {
+    let m = e.market;
+    RulesRow {
+        key: m.key,
+        symbol: m.symbol(),
+        coin: m.coin,
+        base: m.base,
+        dex: m.dex,
+        venue: markets::venue(m.dex),
+        label: m.label,
+        name: m.name,
+        sz_decimals: m.sz_decimals,
+        max_leverage: m.max_leverage,
+        leverage_cap: m.leverage_cap(),
+        taker_fee: m.taker_fee,
+        maker_fee: m.maker_fee,
+        tradable: e.added,
+        header: e.header,
+    }
+}
+
+/// One perp in `/api/v2/hl/markets`: its rules and its prices now.
+#[derive(Serialize)]
+struct MarketRow {
+    #[serde(flatten)]
+    rules: RulesRow,
     mark: Option<f64>,
     mid: Option<f64>,
     oracle: Option<f64>,
@@ -224,26 +270,47 @@ struct MarketRow {
     at: Option<i64>,
 }
 
-/// `GET /api/v2/hl/markets` — the three perps with their mark, mid, oracle
-/// price, 24 h change, funding and open interest, from the live feed (empty
-/// figures until its first update); `up` says the feed is connected.
-pub async fn markets_handler(State(state): State<AppState>) -> Response {
+#[derive(Deserialize)]
+pub struct MarketsQuery {
+    /// Perps to price beside the header's, by key, comma-separated: the
+    /// ones a screen charts, trades or holds.
+    keys: Option<String>,
+}
+
+/// `GET /api/v2/hl/markets?keys=xyz:NVDA,SOL` — the header's perps and the
+/// ones asked about (on the list, added or close-only), with their mark,
+/// mid, oracle price, 24 h change, funding and open interest from the live
+/// feed (empty figures until its first update). Asking follows a perp for
+/// the next minute, so the screen's next poll finds it priced. `up` says
+/// the feed is connected; `rev` changes whenever the list does
+/// (`/api/v2/hl/catalog`).
+pub async fn markets_handler(State(state): State<AppState>, Query(q): Query<MarketsQuery>) -> Response {
     if !on(&state).await {
         return switched_off();
     }
-    let rows: Vec<MarketRow> = MARKETS
+    let all = markets::entries();
+    let mut asked: Vec<&'static str> = Vec::new();
+    for raw in q.keys.as_deref().unwrap_or_default().split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        if asked.len() >= MAX_ASKED {
+            return bad_request(format!("at most {MAX_ASKED} keys"));
+        }
+        if let Some(m) = Market::of_key(raw) {
+            if !asked.contains(&m.key) {
+                asked.push(m.key);
+            }
+        }
+    }
+    state.hl.ask(&asked);
+    let rows: Vec<MarketRow> = all
         .iter()
-        .map(|m| {
-            let q = state.hl.quote(m.key);
+        .filter(|e| (e.added && e.header) || asked.contains(&e.market.key))
+        .map(|e| {
+            let q = state.hl.quote(e.market.key);
             let ctx = q.as_ref().map(|q| &q.ctx);
             let price = ctx.map(|c| c.mid.unwrap_or(c.mark));
             let prev = ctx.map(|c| c.prev_day).filter(|p| *p > 0.0);
             MarketRow {
-                key: m.key,
-                symbol: m.symbol(),
-                coin: m.coin,
-                label: m.label,
-                name: m.name,
+                rules: rules_row(e),
                 mark: ctx.map(|c| c.mark),
                 mid: ctx.and_then(|c| c.mid),
                 oracle: ctx.map(|c| c.oracle),
@@ -256,7 +323,19 @@ pub async fn markets_handler(State(state): State<AppState>) -> Response {
             }
         })
         .collect();
-    Json(json!({ "up": state.hl.is_up(), "markets": rows })).into_response()
+    Json(json!({ "up": state.hl.is_up(), "rev": markets::rev(), "markets": rows })).into_response()
+}
+
+/// `GET /api/v2/hl/catalog` — every perp on the app's list with its rules,
+/// in the order added: the added ones (what search and the pickers offer)
+/// and the close-only ones (`tradable: false`), so a position still held in
+/// one is shown and closed. No prices: `/api/v2/hl/markets` has them.
+pub async fn catalog_handler(State(state): State<AppState>) -> Response {
+    if !on(&state).await {
+        return switched_off();
+    }
+    let rows: Vec<RulesRow> = markets::entries().iter().map(rules_row).collect();
+    Json(json!({ "rev": markets::rev(), "markets": rows })).into_response()
 }
 
 #[cfg(test)]

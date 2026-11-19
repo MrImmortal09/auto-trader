@@ -639,17 +639,46 @@ export interface Flags {
   hyperliquid?: boolean;
 }
 
-/** One Hyperliquid perp in `GET /api/v2/hl/markets`; figures are null until
- * the feed's first update. */
-export interface HlMarket {
-  key: 'BTC' | 'ETH' | 'GOLD';
-  /** Its chart: `HL:BTC`. */
+/** A Hyperliquid perp on the app's list (`GET /api/v2/hl/catalog`), with
+ * Hyperliquid's rules for it: BTC, ETH and gold to start with, and whatever
+ * the admin adds. `tradable: false` is close-only: removed, but still held
+ * somewhere, so it can be shown and closed. */
+export interface HlPerpRules {
+  /** The app's name: Hyperliquid's coin (`BTC`, `xyz:NVDA`), `GOLD` for trade.xyz's gold. */
+  key: string;
+  /** Its chart: `HL:BTC`, `HL:xyz:NVDA`. */
   symbol: string;
   /** Hyperliquid's name: `BTC`, `xyz:GOLD`. */
   coin: string;
-  /** `BTC-PERP`. */
+  /** Without the dex: `NVDA`. A size's unit. */
+  base: string;
+  /** The builder dex it trades on (`xyz`); null on a core perp. */
+  dex: string | null;
+  /** `Hyperliquid`, `trade.xyz`, `Paragon`, … */
+  venue: string;
+  /** `BTC-PERP`, `NVDA-PERP (io)`. */
   label: string;
   name: string;
+  sz_decimals: number;
+  max_leverage: number;
+  /** The most the app takes on it (Hyperliquid's limit, at most 20x). */
+  leverage_cap: number;
+  taker_fee: number;
+  maker_fee: number;
+  tradable: boolean;
+  /** In the Trade header. */
+  header: boolean;
+}
+
+export interface HlCatalogAnswer {
+  /** Changes whenever the list does. */
+  rev: number;
+  markets: HlPerpRules[];
+}
+
+/** One Hyperliquid perp in `GET /api/v2/hl/markets`: its rules and its
+ * prices; figures are null until the feed's first update. */
+export interface HlMarket extends HlPerpRules {
   mark: number | null;
   mid: number | null;
   oracle: number | null;
@@ -661,6 +690,44 @@ export interface HlMarket {
   /** USD traded over the last 24 hours. */
   day_volume: number | null;
   at: number | null;
+}
+
+/** One perp on Admin → Hyperliquid markets. */
+export interface HlAdminPerp {
+  coin: string;
+  key: string;
+  base: string;
+  sz_decimals: number;
+  max_leverage: number;
+  leverage_cap: number;
+  taker_fee: number;
+  maker_fee: number;
+  growth_mode: boolean;
+  only_isolated: boolean;
+  price: number | null;
+  change_pct: number | null;
+  day_volume: number | null;
+  /** `close_only`: removed, still held by someone. */
+  state: 'added' | 'close_only' | 'off';
+  header: boolean;
+  held: boolean;
+}
+
+export interface HlAdminDex {
+  /** null: the core perps. */
+  dex: string | null;
+  venue: string;
+  perps: HlAdminPerp[];
+}
+
+/** `GET /api/v2/hl/admin/markets`. */
+export interface HlAdminMarkets {
+  rev: number;
+  max_header: number;
+  max_leverage: number;
+  dexes: HlAdminDex[];
+  /** Perps the app keeps that Hyperliquid no longer lists. */
+  unlisted: { coin: string; key: string; label: string; state: 'added' | 'close_only'; held: boolean }[];
 }
 
 /** A Hyperliquid perp position or order's way: bought (long) or sold (short). */
@@ -808,6 +875,9 @@ export interface HlLiveView {
 export interface HlMarketsAnswer {
   /** The feed to Hyperliquid is connected. */
   up: boolean;
+  /** The list's revision (`HlCatalogAnswer.rev`). */
+  rev: number;
+  /** The header's perps and the ones asked about. */
   markets: HlMarket[];
 }
 

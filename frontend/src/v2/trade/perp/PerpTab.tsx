@@ -4,7 +4,7 @@ import { toneOf } from '../../lib/format';
 import { Button } from '../../ui/Button';
 import { Chip } from '../../ui/Chip';
 import { Segment } from '../../ui/Segment';
-import { perpPrice, roundPrice, roundSize, sideWord, signedUsd, sizeText, usd } from './model';
+import { perpLabel, perpPrice, roundPrice, roundSize, sideWord, signedUsd, sizeText, usd } from './model';
 import type { Perps } from './usePerps';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -164,7 +164,7 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
         {account.orders.map((o) => (
           <li key={o.id} className="flex items-center gap-3 border-b border-line px-1 py-2">
             <span className="min-w-0 flex-1 type-body text-fg">
-              <span className="type-body-strong">{o.market}-PERP</span> · limit {o.side === 'long' ? 'buy' : 'sell'} {sizeText(o.market, o.size)} at {perpPrice(o.price)}
+              <span className="type-body-strong">{perpLabel(o.market)}</span> · limit {o.side === 'long' ? 'buy' : 'sell'} {sizeText(o.market, o.size)} at {perpPrice(o.price)}
               {o.reduce_only ? ' · reduce only' : o.leverage > 0 ? ` · ${o.leverage}x` : ''}
             </span>
             <Button pointerOnly kind="neutral" disabled={live || busy != null} title={readOnly} onClick={() => void run(o.id, () => perps.actions.cancelOrder(o.id))}>
@@ -175,7 +175,7 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
         {account.lines.map((l) => (
           <li key={l.id} className="flex items-center gap-3 border-b border-line px-1 py-2">
             <span className="min-w-0 flex-1 type-body text-fg">
-              <span className="type-body-strong">{l.market}-PERP</span> · line: {sideWord(l.side).toLowerCase()} {sizeText(l.market, l.size)}{l.leverage > 0 ? ` at ${l.leverage}x` : ''} when the mark {l.rising ? 'rises' : 'falls'} to {perpPrice(l.price)}
+              <span className="type-body-strong">{perpLabel(l.market)}</span> · line: {sideWord(l.side).toLowerCase()} {sizeText(l.market, l.size)}{l.leverage > 0 ? ` at ${l.leverage}x` : ''} when the mark {l.rising ? 'rises' : 'falls'} to {perpPrice(l.price)}
               {l.valid_until ? ` · till ${l.valid_until.slice(11, 16)}` : ' · until cancelled'}
             </span>
             <Button pointerOnly kind="neutral" disabled={live || busy != null} title={readOnly} onClick={() => void run(l.id, () => perps.actions.cancelLine(l.id))}>
@@ -199,7 +199,7 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
               <span className="w-16 shrink-0 text-fg-muted">{f.timestamp.slice(11, 19)}</span>
               <span className={`w-10 shrink-0 ${f.action === 'BUY' ? 'text-profit' : 'text-loss'}`}>{f.action}</span>
               <span className="min-w-0 flex-1 text-fg">
-                {f.size} {f.market}-PERP at {perpPrice(f.price)} · {f.reason.toLowerCase()}
+                {f.size} {perpLabel(f.market)} at {perpPrice(f.price)} · {f.reason.toLowerCase()}
               </span>
               <span className="text-fg-muted">fee {usd(f.fee)}</span>
               {closing && <span className={`w-24 text-right ${TONE_TEXT[toneOf(net)]}`}>{signedUsd(net)}</span>}

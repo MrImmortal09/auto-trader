@@ -25,6 +25,8 @@ export interface StockChip {
  * the ladder's underlying (and expiry), and the stock tab. */
 export interface TradeIntent {
   chart?: ChartSym;
+  /** A Hyperliquid perp's ticket in the ladder's place (signed in). */
+  perp?: string;
   ladder?: { index: string; expiry?: string | null };
   stock?: StockChip;
 }
@@ -143,5 +145,6 @@ export function pointTradeAt(intent: TradeIntent) {
     }
   }
   if (intent.stock) next.stock = intent.stock;
+  if (intent.perp) next.perp = intent.perp;
   writeStored(TRADE_KEY, next);
 }

@@ -9,6 +9,7 @@ pub mod history;
 pub mod hl;
 pub mod hl_desk;
 pub mod hl_live;
+pub mod hl_markets;
 pub mod instruments;
 pub mod limit_close;
 pub mod me;

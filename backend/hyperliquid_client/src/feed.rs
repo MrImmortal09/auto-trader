@@ -3,9 +3,13 @@
 //! [`run`] connects, subscribes, and hands every candle and context update
 //! to its channel until told to stop; a dropped connection is reopened with
 //! a backoff, and [`FeedMsg::Up`] / [`FeedMsg::Down`] say when it is live.
+//! What it follows can change while it runs: each change is subscribed and
+//! unsubscribed on the open connection, and a reconnect subscribes what is
+//! wanted then.
 //! A ping goes out every [`PING_EVERY`] so Hyperliquid never closes a quiet
 //! connection (it does after a minute without traffic).
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -27,7 +31,7 @@ const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// What to follow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Sub {
     /// `coin`'s candles at `interval` (`1m`, `5m`, `15m`, …).
     Candle { coin: String, interval: String },
@@ -36,12 +40,19 @@ pub enum Sub {
 }
 
 impl Sub {
-    fn message(&self) -> Value {
-        let subscription = match self {
+    fn subscription(&self) -> Value {
+        match self {
             Sub::Candle { coin, interval } => json!({ "type": "candle", "coin": coin, "interval": interval }),
             Sub::Ctx { coin } => json!({ "type": "activeAssetCtx", "coin": coin }),
-        };
-        json!({ "method": "subscribe", "subscription": subscription })
+        }
+    }
+
+    fn message(&self) -> Value {
+        json!({ "method": "subscribe", "subscription": self.subscription() })
+    }
+
+    fn unsubscribe(&self) -> Value {
+        json!({ "method": "unsubscribe", "subscription": self.subscription() })
     }
 }
 
@@ -90,9 +101,9 @@ pub fn parse(text: &str) -> Option<FeedMsg> {
     }
 }
 
-/// Follow `subs` on `network`, handing updates to `tx`, until `stop` turns
-/// true or `tx` is dropped.
-pub async fn run(network: Network, subs: Vec<Sub>, tx: mpsc::Sender<FeedMsg>, mut stop: watch::Receiver<bool>) {
+/// Follow what `subs` holds on `network` (as it changes), handing updates to
+/// `tx`, until `stop` turns true or `tx` is dropped.
+pub async fn run(network: Network, mut subs: watch::Receiver<BTreeSet<Sub>>, tx: mpsc::Sender<FeedMsg>, mut stop: watch::Receiver<bool>) {
     let mut backoff = BACKOFF_START;
     loop {
         if *stop.borrow() || tx.is_closed() {
@@ -103,8 +114,9 @@ pub async fn run(network: Network, subs: Vec<Sub>, tx: mpsc::Sender<FeedMsg>, mu
             Ok(Err(e)) => format!("connect: {e}"),
             Ok(Ok((ws, _))) => {
                 let (mut sink, mut stream) = ws.split();
+                let mut active: BTreeSet<Sub> = subs.borrow_and_update().clone();
                 let subscribed = tokio::time::timeout(CONNECT_TIMEOUT, async {
-                    for sub in &subs {
+                    for sub in &active {
                         sink.send(Message::Text(sub.message().to_string())).await?;
                     }
                     Ok::<_, tokio_tungstenite::tungstenite::Error>(())
@@ -131,6 +143,25 @@ pub async fn run(network: Network, subs: Vec<Sub>, tx: mpsc::Sender<FeedMsg>, mu
                                     let _ = sink.send(Message::Close(None)).await;
                                     return;
                                 }
+                            }
+                            changed = subs.changed() => {
+                                if changed.is_err() {
+                                    let _ = sink.send(Message::Close(None)).await;
+                                    return;
+                                }
+                                let wanted = subs.borrow_and_update().clone();
+                                let mut failed = None;
+                                for (sub, on) in diff(&active, &wanted) {
+                                    let msg = if on { sub.message() } else { sub.unsubscribe() };
+                                    if let Err(e) = sink.send(Message::Text(msg.to_string())).await {
+                                        failed = Some(format!("subscribe: {e}"));
+                                        break;
+                                    }
+                                }
+                                if let Some(why) = failed {
+                                    break why;
+                                }
+                                active = wanted;
                             }
                             _ = ping.tick() => {
                                 if last_heard.elapsed() > SILENT_FOR {
@@ -175,9 +206,26 @@ pub async fn run(network: Network, subs: Vec<Sub>, tx: mpsc::Sender<FeedMsg>, mu
     }
 }
 
+/// What to send to go from following `active` to following `wanted`:
+/// each sub with `true` to subscribe it, `false` to unsubscribe it.
+fn diff<'a>(active: &'a BTreeSet<Sub>, wanted: &'a BTreeSet<Sub>) -> Vec<(&'a Sub, bool)> {
+    active.difference(wanted).map(|s| (s, false)).chain(wanted.difference(active).map(|s| (s, true))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_unsubscribes_what_went_and_subscribes_what_came() {
+        let ctx = |c: &str| Sub::Ctx { coin: c.into() };
+        let active: BTreeSet<Sub> = [ctx("BTC"), ctx("ETH")].into();
+        let wanted: BTreeSet<Sub> = [ctx("ETH"), ctx("xyz:NVDA")].into();
+        assert_eq!(diff(&active, &wanted), [(&ctx("BTC"), false), (&ctx("xyz:NVDA"), true)]);
+        assert!(diff(&wanted, &wanted).is_empty());
+        assert_eq!(ctx("BTC").unsubscribe()["method"], "unsubscribe");
+        assert_eq!(ctx("BTC").unsubscribe()["subscription"]["coin"], "BTC");
+    }
 
     #[test]
     fn the_feed_reads_candles_and_contexts_and_skips_the_rest() {

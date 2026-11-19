@@ -63,11 +63,13 @@ import { HeaderSwitch, HeaderTabs, HeaderTicker, ListPicker } from './header';
 import { indexTiles, type HeaderMode, type HeaderNote, type HeaderTile } from './headerModel';
 import { Ladder } from './Ladder';
 import { LimitCloseDialog } from './LimitCloseDialog';
+import { isPerpKey, perpInfo, useLoadPerpCatalog } from './perp/catalog';
+import { perpLabel } from './perp/model';
 import { PerpTicket } from './perp/PerpTicket';
 import { usePerps } from './perp/usePerps';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, draftLines, draftWhat, firstBuy, MAX_TARGETS, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
 import { armedLine, crossWords, draftStep, entryMisfit, linePnl, lotsLeft, orderOf, sideOf, validityOf, validityWords, VALIDITY_CHOICES, wrongSide, type LineDraft } from './lineOrder';
-import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isPerpName, isTicker, istClock, PERP_KEYS, type PerpKey, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isPerpName, isTicker, istClock, type PerpKey, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
@@ -201,7 +203,7 @@ function loadSaved(): Saved {
     deskHidden: saved.deskHidden === true,
     lineBuy: saved.lineBuy === true,
     lineValidity: validityOf(saved.lineValidity),
-    perp: PERP_KEYS.includes(saved.perp as PerpKey) ? (saved.perp as PerpKey) : null,
+    perp: isPerpKey(saved.perp) ? saved.perp : null,
   };
 }
 
@@ -324,10 +326,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // else in the app (App.tsx): with search off nothing prices a stock.
   const watchlistsOn = flags.data?.watchlists === true && flags.data.search === true;
   // The `hyperliquid` switch: null until known, so a saved perp chart keeps
-  // its place meanwhile. On, the perps' prices come every 2 s.
+  // its place meanwhile.
   const hlOn: boolean | null = flags.data ? flags.data.hyperliquid === true : null;
-  const hl = usePoll(() => getHlMarkets(serverBase), 2_000, serverBase, hlOn === true);
-  const perps = hlOn ? (hl.data?.markets ?? []) : [];
   // The caller's own perps on paper (the owner's and each user's alike).
   // A stop, target or price placed from the panel or the ticket goes on the
   // perp's chart: the first chart shows it if none on screen does.
@@ -341,6 +341,26 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     [save, desktop],
   );
   const perpDesk = usePerps({ serverBase, enabled: hlOn === true && signedIn, onShow: showPerp });
+  // The perps' prices every 2 s: the header's, and the ones charted, on the
+  // ticket or in the caller's book (`keys`), which the server follows while
+  // asked. A change of them is asked at once, not at the next poll.
+  const book = perpDesk.account;
+  const perpKeys = [
+    ...new Set([
+      ...saved.slots.flatMap((sl) => (sl.sym.kind === 'perp' ? [sl.sym.key] : [])),
+      ...(saved.perp ? [saved.perp] : []),
+      ...(book ? [...book.positions, ...book.orders, ...book.lines].map((x) => x.market) : []),
+    ]),
+  ].slice(0, 40);
+  const perpKeysText = perpKeys.join(',');
+  const hl = usePoll(() => getHlMarkets(serverBase, perpKeys), 2_000, serverBase, hlOn === true);
+  const refreshHl = hl.refresh;
+  useEffect(() => {
+    if (hlOn === true) void refreshHl();
+  }, [perpKeysText, hlOn, refreshHl]);
+  // The list of perps (their rules), read again whenever the poll says it changed.
+  const perpCatalog = useLoadPerpCatalog(serverBase, hlOn === true, hl.data?.rev);
+  const perps = hlOn ? (hl.data?.markets ?? []) : [];
   const cancelPerpPlacing = perpDesk.cancelPlacing;
   // The perp whose ticket stands in the ladder's place.
   const perpSel: PerpKey | null = hlOn === true && signedIn ? saved.perp : null;
@@ -350,8 +370,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   // A stock's chart saved while the switch is off shows NIFTY instead, and
   // an index's future its index (futures are charted behind the switch too).
   const shownAs = (slot: Slot): Slot => {
-    // A perp's chart while Hyperliquid is switched off shows NIFTY instead.
-    if (slot.sym.kind === 'perp') return hlOn === false ? indexSlot('NIFTY') : slot;
+    // A perp's chart while Hyperliquid is switched off, or one no longer on
+    // the app's list, shows NIFTY instead.
+    if (slot.sym.kind === 'perp') return hlOn === false || (perpCatalog.rev != null && !perpInfo(slot.sym.key)) ? indexSlot('NIFTY') : slot;
     if (stocksOn !== false) return slot;
     const name = underlyingOf(slot.sym);
     if (!isIndex(name)) return indexSlot('NIFTY');
@@ -1168,19 +1189,19 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
               },
             ]
           : []),
-        // Hyperliquid's perps: a tap charts one in the first chart.
-        ...perps.map((m) => {
+        // Hyperliquid's perps in the header (the admin's pick): a tap charts one in the first chart.
+        ...perps.filter((m) => m.header && m.tradable).map((m) => {
           const sym: ChartSym = { kind: 'perp', key: m.key };
           return {
             id: m.symbol,
-            label: m.key,
+            label: m.base,
             spot: m.mid ?? m.mark,
             prevClose: m.prev_day,
             changePct: m.change_pct,
             on: perpSel === m.key || (perpSel == null && shownSlots[0] != null && sameSym(shownSlots[0].sym, sym)),
             // Signed in, the perp's ticket too; a visitor gets its chart.
             onSelect: () => (signedIn ? selectPerp(m.key) : chartInFirst(sym)),
-            title: `${m.label} on Hyperliquid${hl.data?.up === false ? ' — feed reconnecting' : ''}`,
+            title: `${m.label} on ${m.venue}${hl.data?.up === false ? ' — feed reconnecting' : ''}`,
             points: 'wide' as const,
           };
         }),
@@ -1541,8 +1562,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             />
             <aside style={{ width: ladderWidth }} className="flex shrink-0 flex-col">
               <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line pr-1 pl-3">
-                <h2 className="min-w-0 truncate type-body-strong text-fg" title={perpSel ? `${perpSel}-PERP on Hyperliquid` : `${ladderIndex} options`}>
-                  {perpSel ? `${perpSel}-PERP` : `${ladderIndex} options`}
+                <h2 className="min-w-0 truncate type-body-strong text-fg" title={perpSel ? `${perpLabel(perpSel)} on ${perpInfo(perpSel)?.venue ?? 'Hyperliquid'}` : `${ladderIndex} options`}>
+                  {perpSel ? perpLabel(perpSel) : `${ladderIndex} options`}
                 </h2>
                 {perpSel ? (
                   <span className="ml-auto shrink-0">

@@ -13,6 +13,7 @@ import { Modal } from '../ui/Modal';
 import { Toggle } from '../ui/Toggle';
 import { useToast } from '../ui/toast';
 import { FeedLatency } from './FeedLatency';
+import { HlMarkets } from './HlMarkets';
 import { OrderTiming } from './OrderTiming';
 import { Note, PaperLine, PaperPositions, PaperTrades } from './PaperActivity';
 import { StoredData } from './StoredData';
@@ -384,6 +385,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
           {rows}
           {addForm}
         </Section>
+        <HlMarkets serverBase={serverBase} desktop={desktop} />
         <FeedLatency serverBase={serverBase} desktop={desktop} />
         <OrderTiming serverBase={serverBase} />
         <PaperPositions serverBase={serverBase} users={list} />

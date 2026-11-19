@@ -164,6 +164,10 @@ impl RawCtx {
     }
 }
 
+/// Hyperliquid's base-tier fees on a core perp, as a fraction of notional.
+pub const BASE_TAKER_FEE: f64 = 0.00045;
+pub const BASE_MAKER_FEE: f64 = 0.00015;
+
 /// A perp's trading rules, from the dex's `meta`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerpRules {
@@ -176,6 +180,27 @@ pub struct PerpRules {
     pub max_leverage: u32,
     /// Only isolated margin is allowed on it.
     pub only_isolated: bool,
+    /// A builder-deployed perp's fee share for its deployer (`None` on a
+    /// core perp): its fees scale with it.
+    pub deployer_fee_scale: Option<f64>,
+    /// Growth mode: 90 % off every fee.
+    pub growth_mode: bool,
+}
+
+impl PerpRules {
+    /// Its taker and maker fees at the base tier, as Hyperliquid computes
+    /// them: a builder-deployed perp's are the core rate times
+    /// `scale + 1` (a scale under 1) or `2 * scale`, and a tenth of that in
+    /// growth mode.
+    pub fn fees(&self) -> (f64, f64) {
+        let scale = match self.deployer_fee_scale {
+            None => 1.0,
+            Some(s) if s < 1.0 => s + 1.0,
+            Some(s) => 2.0 * s,
+        };
+        let growth = if self.growth_mode { 0.1 } else { 1.0 };
+        (BASE_TAKER_FEE * scale * growth, BASE_MAKER_FEE * scale * growth)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,11 +213,49 @@ struct RawAsset {
     only_isolated: Option<bool>,
     #[serde(default)]
     is_delisted: Option<bool>,
+    #[serde(default)]
+    deployer_fee_scale: Option<String>,
+    #[serde(default)]
+    growth_mode: Option<String>,
+}
+
+impl RawAsset {
+    fn rules(self, index: usize, builder: bool) -> Result<PerpRules, HlError> {
+        let deployer_fee_scale = match (builder, self.deployer_fee_scale.as_deref()) {
+            (false, _) => None,
+            (true, None) => Some(1.0),
+            (true, Some(s)) => Some(num(s)?),
+        };
+        Ok(PerpRules {
+            coin: self.name,
+            index,
+            sz_decimals: self.sz_decimals,
+            max_leverage: self.max_leverage,
+            only_isolated: self.only_isolated.unwrap_or(false),
+            deployer_fee_scale,
+            growth_mode: self.growth_mode.as_deref() == Some("enabled"),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct RawMeta {
     universe: Vec<RawAsset>,
+}
+
+/// A dex in `perpDexs`: the core perps (`name: None`) or a builder's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dex {
+    pub name: Option<String>,
+    /// What the builder calls it (`XYZ`, `Paragon`); `None` on the core perps.
+    pub full_name: Option<String>,
+}
+
+/// One perp as `metaAndAssetCtxs` lists it: its rules and its context now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerpListing {
+    pub rules: PerpRules,
+    pub ctx: Option<AssetCtx>,
 }
 
 /// The id an order names a perp by: its index on a core perp; for a
@@ -272,22 +335,51 @@ impl InfoClient {
     pub async fn perp_rules(&self, dex: Option<&str>) -> Result<Vec<PerpRules>, HlError> {
         let raw = self.post(json!({ "type": "meta", "dex": dex.unwrap_or("") })).await?;
         let meta: RawMeta = serde_json::from_value(raw).map_err(|e| HlError::Decode(e.to_string()))?;
-        Ok(meta
-            .universe
+        let builder = dex.is_some_and(|d| !d.is_empty());
+        meta.universe
             .into_iter()
             .enumerate()
             .filter(|(_, a)| a.is_delisted != Some(true))
-            .map(|(index, a)| PerpRules { coin: a.name, index, sz_decimals: a.sz_decimals, max_leverage: a.max_leverage, only_isolated: a.only_isolated.unwrap_or(false) })
-            .collect())
+            .map(|(index, a)| a.rules(index, builder))
+            .collect()
     }
 
-    /// The dexes' names in `perpDexs` order (index 0, the core perps, is
-    /// `None`): what [`asset_id`] counts a builder-deployed perp's dex by.
-    pub async fn perp_dexes(&self) -> Result<Vec<Option<String>>, HlError> {
+    /// Every live perp on `dex` (`None`: the core perps) with its context
+    /// now (24 h volume, mark, funding), delisted ones left out.
+    pub async fn perp_listings(&self, dex: Option<&str>) -> Result<Vec<PerpListing>, HlError> {
+        let raw = self.post(json!({ "type": "metaAndAssetCtxs", "dex": dex.unwrap_or("") })).await?;
+        read_listings(raw, dex.is_some_and(|d| !d.is_empty()))
+    }
+
+    /// The dexes in `perpDexs` order (index 0, the core perps, has no
+    /// name): what [`asset_id`] counts a builder-deployed perp's dex by.
+    pub async fn perp_dexes(&self) -> Result<Vec<Dex>, HlError> {
         let raw = self.post(json!({ "type": "perpDexs" })).await?;
         let list = raw.as_array().ok_or_else(|| HlError::Decode("perpDexs is not a list".into()))?;
-        Ok(list.iter().map(|d| d.get("name").and_then(Value::as_str).map(str::to_string)).collect())
+        Ok(list
+            .iter()
+            .map(|d| Dex {
+                name: d.get("name").and_then(Value::as_str).map(str::to_string),
+                full_name: d.get("fullName").and_then(Value::as_str).map(str::to_string),
+            })
+            .collect())
     }
+}
+
+fn read_listings(raw: Value, builder: bool) -> Result<Vec<PerpListing>, HlError> {
+    let pair = raw.as_array().filter(|a| a.len() == 2).ok_or_else(|| HlError::Decode("metaAndAssetCtxs is not [meta, ctxs]".into()))?;
+    let meta: RawMeta = serde_json::from_value(pair[0].clone()).map_err(|e| HlError::Decode(e.to_string()))?;
+    let ctxs: Vec<Option<RawCtx>> = serde_json::from_value(pair[1].clone()).map_err(|e| HlError::Decode(e.to_string()))?;
+    let mut out = Vec::new();
+    for (index, (asset, ctx)) in meta.universe.into_iter().zip(ctxs.into_iter().chain(std::iter::repeat_with(|| None))).enumerate() {
+        if asset.is_delisted == Some(true) {
+            continue;
+        }
+        let rules = asset.rules(index, builder)?;
+        let ctx = ctx.and_then(|c| c.read(rules.coin.clone()).ok());
+        out.push(PerpListing { rules, ctx });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -327,5 +419,36 @@ mod tests {
         assert_eq!(asset_id(1, 3), 110_003);
         assert_eq!(dex_of("xyz:GOLD"), Some("xyz"));
         assert_eq!(dex_of("BTC"), None);
+    }
+
+    #[test]
+    fn fees_follow_the_deployers_scale_and_growth_mode() {
+        let rules = |scale: Option<f64>, growth: bool| PerpRules { coin: "x".into(), index: 0, sz_decimals: 2, max_leverage: 10, only_isolated: false, deployer_fee_scale: scale, growth_mode: growth };
+        let close = |(a, b): (f64, f64), (c, d): (f64, f64)| (a - c).abs() < 1e-12 && (b - d).abs() < 1e-12;
+        assert!(close(rules(None, false).fees(), (0.00045, 0.00015)), "a core perp");
+        assert!(close(rules(Some(1.0), false).fees(), (0.0009, 0.0003)), "trade.xyz's gold: double");
+        assert!(close(rules(Some(0.5), false).fees(), (0.000675, 0.000225)));
+        assert!(close(rules(Some(1.0), true).fees(), (0.00009, 0.00003)), "growth mode: a tenth");
+        assert!(close(rules(Some(2.0), false).fees(), (0.0018, 0.0006)));
+    }
+
+    #[test]
+    fn listings_skip_delisted_perps_and_keep_their_index() {
+        let raw: Value = serde_json::from_str(
+            r#"[{"universe":[
+                {"szDecimals":4,"name":"xyz:XYZ100","maxLeverage":30,"marginTableId":30,"growthMode":"enabled","deployerFeeScale":"1.0"},
+                {"szDecimals":2,"name":"xyz:OLD","maxLeverage":10,"isDelisted":true,"deployerFeeScale":"1.0"},
+                {"szDecimals":4,"name":"xyz:GOLD","maxLeverage":25,"deployerFeeScale":"1.0","onlyIsolated":true,"marginMode":"noCross"}
+              ]},
+              [{"funding":"0.00000625","openInterest":"9609.9","prevDayPx":"27036.0","dayNtlVlm":"609683800.4","oraclePx":"26702.0","markPx":"26704.0","midPx":"26705.5"},
+               null,
+               {"funding":"0.0000125","openInterest":"66816.18","prevDayPx":"3720.0","dayNtlVlm":"54648087.1","oraclePx":"3733.5","markPx":"3733.0","midPx":null}]]"#,
+        )
+        .unwrap();
+        let l = read_listings(raw, true).unwrap();
+        assert_eq!(l.iter().map(|x| (x.rules.coin.as_str(), x.rules.index)).collect::<Vec<_>>(), [("xyz:XYZ100", 0), ("xyz:GOLD", 2)]);
+        assert!(l[0].rules.growth_mode && !l[1].rules.growth_mode && l[1].rules.only_isolated);
+        assert_eq!(l[0].ctx.as_ref().map(|c| c.day_volume), Some(609_683_800.4));
+        assert_eq!(l[1].ctx.as_ref().map(|c| c.mid), Some(None));
     }
 }

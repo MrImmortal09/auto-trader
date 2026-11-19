@@ -2,6 +2,8 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { Plus, Search as SearchIcon, X } from 'lucide-react';
 import type { InstrumentRow } from '../lib/types';
 import { addRecent, clearRecents, readRecents, useSearch } from '../lib/useSearch';
+import { searchPerps, useLoadPerpCatalog } from '../trade/perp/catalog';
+import { PerpResults } from '../trade/perp/PerpResults';
 import { useQuotes } from '../lib/useQuotes';
 import { Button } from '../ui/Button';
 import { defaultRow, derivativeNote, groupsOf, rowSymbol, rowTitle } from './searchModel';
@@ -19,11 +21,13 @@ import type { OpenHow } from './Search';
 
 const PLACEHOLDER = 'Search NIFTY, RELIANCE, BANKNIFTY 52000 CE…';
 
-export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd }: {
+export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd, onOpenPerp }: {
   serverBase: string;
   open: boolean;
   onClose: () => void;
   onOpen: (row: InstrumentRow, how: OpenHow) => void;
+  /** Chart a Hyperliquid perp on the Trade screen (behind the `hyperliquid` switch). */
+  onOpenPerp?: (key: string) => void;
   /** Add a result to a watchlist; left out while watchlists are off. */
   onAdd?: (row: InstrumentRow) => void;
 }) {
@@ -34,6 +38,8 @@ export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd }: {
   const listId = useId();
   const typed = query.trim();
   const search = useSearch(serverBase, query, open);
+  const perpList = useLoadPerpCatalog(serverBase, open && !!onOpenPerp).list;
+  const perpHits = onOpenPerp && typed ? searchPerps(perpList, typed).length : 0;
   // Read when drawn: five rows at most, and the sheet opens afresh each time.
   const recents: InstrumentRow[] = open && recentsSeq >= 0 ? readRecents() : [];
   const groups = typed ? (search.answer ? groupsOf(search.answer) : []) : recents.length ? [{ head: 'Recent', rows: recents }] : [];
@@ -65,7 +71,7 @@ export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd }: {
   }
 
   const closedAsOf = flat.map((r) => quotes.get(r.ws_key)?.as_of).find((s) => !!s) ?? null;
-  const empty = typed && search.answer && !search.pending && flat.length === 0;
+  const empty = typed && search.answer && !search.pending && flat.length === 0 && perpHits === 0;
 
   return (
     <div role="dialog" aria-modal="true" aria-label="Search" className="fixed inset-0 z-40 flex flex-col bg-panel pb-safe pt-safe animate-fade-in">
@@ -120,6 +126,16 @@ export function SearchSheet({ serverBase, open, onClose, onOpen, onAdd }: {
       </div>
 
       <div id={listId} role="listbox" aria-label="Search results" className="min-h-0 flex-1 overflow-y-auto px-2 py-1">
+        {onOpenPerp && typed && (
+          <PerpResults
+            query={typed}
+            compact
+            onPick={(r) => {
+              setQuery('');
+              onOpenPerp(r.key);
+            }}
+          />
+        )}
         {groups.map((g) => (
           <div key={g.head} role="group" aria-labelledby={`${listId}-${g.head}`}>
             <div className="flex items-center justify-between px-2 pb-1 pt-3">
