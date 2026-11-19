@@ -562,6 +562,11 @@ pub async fn sell_position_handler(
             pos.executed_qty = remaining;
             if remaining <= 0 {
                 pos.state = TradeState::Closed;
+            } else if pos.manual {
+                // A lot sold by hand comes off the farthest chart target.
+                let lot = lot_size.unwrap_or(1).max(1);
+                let option_type = pos.signal.option_type.clone();
+                pos.chart.trim_targets(remaining / lot, option_type.as_deref());
             }
         }
         let snapshot = positions.clone();

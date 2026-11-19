@@ -1,13 +1,14 @@
 // What each Trade chart draws: a scalp's position line with its stop and
 // target, Telegram trades' read-only lines, and the day's markers.
 
-import type { ChartLevel, ChartTarget, ExecutePosition } from '../../types';
+import type { ChartLevel, ChartTarget, EntryLine, ExecutePosition } from '../../types';
 import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { level, price, signedMoney } from '../lib/format';
 import type { CallMark, ChainAnswer, FillMark, TelegramLine } from '../lib/types';
 import { C, type LinePart, type MarkerData, type OrderLineData } from './chartSetup';
 import type { ChartLine, ChartMarker } from './KChart';
 import { approxMoney, istMs, levelCrossed, levelPnl, levelTriggerOn, underlyingOf, type ChartSym } from './model';
+import { crossWords, draftStep, lineUntil, linePnl, lotsLeft, wrongSide, type LineDraft } from './lineOrder';
 
 export type LevelKind = 'stop' | 'target';
 
@@ -17,8 +18,9 @@ export type LevelRef = { kind: 'stop' } | { kind: 'target'; target: ChartTarget 
 /** Most targets one trade may have (the server's `MAX_CHART_TARGETS`). */
 export const MAX_TARGETS = 5;
 
-/** Whole lots `p` holds. */
-export function heldLots(p: Pick<ExecutePosition, 'qty' | 'lot_size'>): number {
+/** Whole lots `p` holds — or, for a line order still waiting, is to buy. */
+export function heldLots(p: Pick<ExecutePosition, 'qty' | 'lot_size'> & Partial<Pick<ExecutePosition, 'placing' | 'line' | 'lots'>>): number {
+  if (p.placing && p.line) return p.lots ?? 0;
   return p.lot_size > 0 ? Math.floor(p.qty / p.lot_size) : 0;
 }
 
@@ -77,6 +79,10 @@ export interface LevelActions {
   clear: (p: ExecutePosition, ref: LevelRef) => void;
   /** "+ Stop": put one where the next click lands, on this chart. */
   place: (p: ExecutePosition, kind: LevelKind, trigger: ChartLevel['trigger']) => void;
+  /** A line order's buy line dragged to `at`. */
+  moveLine: (p: ExecutePosition, at: number) => void;
+  /** A line order's buy line given up. */
+  cancelLine: (p: ExecutePosition) => void;
 }
 
 export interface LineContext {
@@ -184,11 +190,138 @@ function positionLine(p: ExecutePosition, at: number | { at: number }, trigger: 
   };
 }
 
+/** "1 lot" or "4 lots". */
+const lotsWord = (n: number) => `${n} ${n === 1 ? 'lot' : 'lots'}`;
+
+/**
+ * A line order still waiting, on its index's own chart: the buy line (drag
+ * to move it, × to cancel the order, "+ Target" while lots have none), its
+ * stop and its targets (drag to move; a target's × removes it). The ≈
+ * amounts are against the buy line. Once crossed it is being bought: the
+ * lines are locked until it is.
+ */
+function waitingLines(p: ExecutePosition, line: EntryLine, cx: LineContext): ChartLine[] {
+  const armed = !line.triggered_at;
+  const canEdit = armed && cx.actions.canSet && !p.halted;
+  const delta = deltaFor(p, cx.chainFor(p)).value;
+  const lots = heldLots(p);
+  const icon = canEdit ? ('grip' as const) : ('lock' as const);
+  const out: ChartLine[] = [
+    {
+      id: `${p.id}:line`,
+      price: line.price,
+      zLevel: 2,
+      data: {
+        color: C.fg,
+        dashed: true,
+        draggable: canEdit,
+        parts: (at) => {
+          const indexNow = cx.spot[p.index] ?? null;
+          // Dragged, the index decides which way it is crossed from.
+          const rising = at === line.price || indexNow == null ? line.rising : at > indexNow;
+          const text = armed ? `Buy ${lotsWord(lots)} ${p.option_type ?? ''} · ${crossWords({ price: at, rising })} · ${lineUntil(line)}` : 'Buy line crossed · buying at market…';
+          const parts: LinePart[] = [{ key: 'label', text, color: C.fg, icon }];
+          if (canEdit && targetRoom(p) != null) parts.push({ key: 'add-target', text: '+ Target', color: C.profit });
+          if (armed) parts.push({ key: 'remove', text: '×', color: C.fg });
+          return parts;
+        },
+        axisText: (at) => price(at),
+      },
+      onMove: (at) => cx.actions.moveLine(p, at),
+      onPart: (key) => {
+        if (key === 'remove') cx.actions.cancelLine(p);
+        if (key === 'add-target') cx.actions.place(p, 'target', 'index');
+      },
+    },
+  ];
+  const stop = p.chart?.stop;
+  if (stop?.trigger === 'index') {
+    out.push({
+      id: `${p.id}:stop`,
+      price: stop.price,
+      zLevel: 2,
+      data: {
+        color: C.loss,
+        dashed: true,
+        draggable: canEdit,
+        parts: (at) => {
+          const off = wrongSide('stop', p.option_type, line.price, at) != null;
+          const text = off ? 'Stop · wrong side of the buy line' : `Stop ${approxMoney(linePnl(at, line.price, delta, lots * p.lot_size))}`;
+          return [{ key: 'label', text, color: C.loss, filled: off, icon }];
+        },
+        axisText: (at) => price(at),
+      },
+      onMove: (at) => cx.actions.move(p, { kind: 'stop' }, { price: at, trigger: 'index' }),
+    });
+  }
+  const targets = chartTargets(p.chart);
+  const counted = targets.reduce((n, t) => n + (t.lots ?? 0), 0);
+  for (const target of targets) {
+    if (target.trigger !== 'index') continue;
+    const sells = target.lots ?? Math.max(0, lots - counted);
+    out.push({
+      id: `${p.id}:target:${target.id}`,
+      price: target.price,
+      zLevel: 2,
+      data: {
+        color: C.profit,
+        dashed: true,
+        draggable: canEdit,
+        parts: (at) => {
+          const off = wrongSide('target', p.option_type, line.price, at) != null;
+          const text = off ? 'Target · wrong side of the buy line' : `Target · ${targetLotsLabel(target.lots)} ${approxMoney(linePnl(at, line.price, delta, sells * p.lot_size))}`;
+          const parts: LinePart[] = [{ key: 'label', text, color: C.profit, filled: off, icon }];
+          // A line order keeps at least one target: cancel the order instead.
+          if (canEdit && targets.length > 1) parts.push({ key: 'remove', text: '×', color: C.profit });
+          return parts;
+        },
+        axisText: (at) => price(at),
+      },
+      onMove: (at) => cx.actions.move(p, { kind: 'target', target }, { price: at, trigger: 'index' }),
+      onPart: (key) => key === 'remove' && cx.actions.clear(p, { kind: 'target', target }),
+    });
+  }
+  return out;
+}
+
+/** What a line order being placed has so far, on its chart: the buy line,
+ * the stop and the targets placed, each locked until it is sent. */
+export function draftLines(d: LineDraft, delta: number, until: string): ChartLine[] {
+  if (!d.entry) return [];
+  const qty = (lots: number) => lots * d.lotSize;
+  const entry = d.entry;
+  const locked = (id: string, at: number, color: string, text: string): ChartLine => ({
+    id: `draft:${id}`,
+    price: at,
+    zLevel: 3,
+    data: { color, dashed: true, draggable: false, parts: () => [{ key: 'label', text, color, icon: 'lock' }], axisText: (v) => price(v) },
+  });
+  const out = [locked('line', entry.price, C.fg, `Buy ${lotsWord(d.lots)} ${d.side} · ${crossWords(entry)} · ${until}`)];
+  if (d.stop != null) out.push(locked('stop', d.stop, C.loss, `Stop ${approxMoney(linePnl(d.stop, entry.price, delta, qty(d.lots)))}`));
+  d.targets.forEach((t, i) => out.push(locked(`t${i}`, t.price, C.profit, `Target ${i + 1} · ${lotsWord(t.lots)} ${approxMoney(linePnl(t.price, entry.price, delta, qty(t.lots)))}`)));
+  return out;
+}
+
+/** The prompt's words while a line order is placed: what the next tap places. */
+export function draftWhat(d: LineDraft): { what: string; hint: string | null } {
+  const step = draftStep(d);
+  if (step === 'entry') return { what: 'buy line', hint: `${d.label} · bought at market when the index crosses it` };
+  if (step === 'stop') return { what: 'stop', hint: `${d.side === 'CE' ? 'below' : 'above'} the buy line` };
+  const n = d.targets.length + 1;
+  const nth = ['first', 'second', 'third', 'fourth', 'fifth'][n - 1] ?? `${n}th`;
+  return { what: `${nth} target`, hint: `${d.side === 'CE' ? 'above' : 'below'} the buy line · ${lotsWord(lotsLeft(d))} without a target` };
+}
+
 /** The lines on one chart. */
 export function chartLines(cx: LineContext): ChartLine[] {
   const out: ChartLine[] = [];
   if (cx.layers.myTrades) {
     for (const p of cx.scalps) {
+      // A line order waiting on its buy line: on its index's own chart only.
+      if (p.placing && p.line) {
+        if (levelTriggerOn(cx.sym, p, p.expiry ?? cx.chains[p.index]?.expiry) === 'index') out.push(...waitingLines(p, p.line, cx));
+        continue;
+      }
       if (p.qty <= 0) continue;
       // The position's own expiry; the nearest only for rows from before it was recorded.
       const trigger = levelTriggerOn(cx.sym, p, p.expiry ?? cx.chains[p.index]?.expiry);

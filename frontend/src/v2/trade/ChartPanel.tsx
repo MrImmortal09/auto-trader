@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { ChartSpline, ChevronDown, ChevronUp, Layers as LayersIcon, Maximize2, Minimize2, Search as SearchIcon } from 'lucide-react';
 import { INDEX_ORDER } from '../../lib/execute';
 import { price, signedPct, toneOf } from '../lib/format';
@@ -38,6 +38,11 @@ export interface LotsPick {
   others: boolean;
   set: (lots: number) => void;
 }
+
+/** A level being placed, as the prompt over the chart reads it: what the
+ * tap places, a line under it, its lots picker and any other controls (a
+ * line order's validity and Undo). */
+export type PlacingPrompt = Placing & { what: string; lots?: LotsPick; hint?: string | null; extra?: ReactNode };
 
 /** "2 lots", or at the top "all 4 lots" / "all left (2)". */
 function lotsWords(l: LotsPick): string {
@@ -146,7 +151,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
   onNeedChain: (expiry: string | null) => void;
   lines: ChartLine[];
   markers: ChartMarker[];
-  placing: (Placing & { what: string; lots?: LotsPick }) | null;
+  placing: PlacingPrompt | null;
   onPlacingDone: () => void;
   onCancelPlacing: () => void;
   bus: CrosshairBus;
@@ -587,9 +592,13 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             )}
             {placing && (
               <div className="pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center">
-                <div className="pointer-events-auto flex items-center gap-3 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-md">
-                  <span className="type-label text-fg">Tap where the {placing.what} goes</span>
+                <div className="pointer-events-auto flex max-w-[calc(100%-16px)] flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-md">
+                  <span className="flex flex-col">
+                    <span className="type-label text-fg">Tap where the {placing.what} goes</span>
+                    {placing.hint && <span className="type-caption text-fg-subtle">{placing.hint}</span>}
+                  </span>
                   {placing.lots && <LotsStepper lots={placing.lots} />}
+                  {placing.extra}
                   <button type="button" onClick={onCancelPlacing} className="type-label text-fg-muted hover:text-fg">
                     Cancel
                   </button>

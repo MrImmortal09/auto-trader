@@ -55,9 +55,17 @@ export class ApiError extends Error {
   }
 }
 
+/** A refusal's message, and its `code` when the server gives one. */
+async function failureOf(res: Response): Promise<{ error: string; code?: string }> {
+  const body = (await res.json().catch(() => null)) as { error?: unknown; code?: unknown } | null;
+  return {
+    error: typeof body?.error === 'string' ? body.error : `Request failed (${res.status})`,
+    code: typeof body?.code === 'string' ? body.code : undefined,
+  };
+}
+
 async function errorOf(res: Response): Promise<string> {
-  const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
-  return typeof body?.error === 'string' ? body.error : `Request failed (${res.status})`;
+  return (await failureOf(res)).error;
 }
 
 /** The token the live streams put in their URL: the sign-in's, while it hasn't expired. */
@@ -189,6 +197,8 @@ export interface Sent {
   ok: boolean;
   status: number;
   error?: string;
+  /** A refusal's own code, when the server gives one (`line_crossed`). */
+  code?: string;
   body?: unknown;
 }
 
@@ -200,7 +210,7 @@ async function send(base: string, path: string, method: string, body?: unknown):
   };
   try {
     const res = await apiFetch(base, path, init);
-    if (!res.ok) return { ok: false, status: res.status, error: await errorOf(res) };
+    if (!res.ok) return { ok: false, status: res.status, ...(await failureOf(res)) };
     return { ok: true, status: res.status, body: await res.json().catch(() => null) };
   } catch {
     return { ok: false, status: 0, error: 'Could not reach the server' };
@@ -380,7 +390,41 @@ export interface LevelsUpdate {
   stop?: ChartLevel | null;
   set_target?: ChartLevel & { id?: string; lots?: number | null };
   remove_target?: string;
+  /** A line order's buy line, moved while armed: where, and which way the
+   * index now crosses it. */
+  entry?: LinePick;
 }
+
+/** Where a buy line goes, and whether the index rises (from below) or
+ * falls (from above) to it. */
+export interface LinePick {
+  price: number;
+  rising: boolean;
+}
+
+/** A line order: `lots` of the contract bought at market once its index
+ * crosses `line`, valid for `valid_minutes` (`null`: till close), with its
+ * stop and targets on the index. */
+export interface LineBuy {
+  trading_symbol: string;
+  lots: number;
+  line: LinePick;
+  valid_minutes: number | null;
+  stop: number;
+  targets: { price: number; lots: number }[];
+}
+
+/** The refusal `code` of a buy line the index has already crossed: placed again. */
+export const LINE_CROSSED = 'line_crossed';
+
+/** Arm a line order on the owner's engine. */
+export const executeLineBuy = (base: string, order: LineBuy) => send(base, '/api/execute/line-buy', 'POST', order);
+/** Cancel an armed line order on the owner's engine. */
+export const cancelLineBuy = (base: string, id: string) => send(base, `/api/execute/line-buy/${encodeURIComponent(id)}`, 'DELETE');
+/** Arm a line order on the user's paper book. */
+export const paperLineBuy = (base: string, order: LineBuy) => send(base, '/api/v2/me/line-buy', 'POST', order);
+/** Cancel one of the user's armed line orders. */
+export const paperCancelLineBuy = (base: string, id: string) => send(base, `/api/v2/me/line-buy/${encodeURIComponent(id)}`, 'DELETE');
 
 /** What a levels change answers: `sells_now` when a level set is already
  * past the price — `sells_lots` of them, or everything when `null` —

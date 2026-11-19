@@ -520,6 +520,10 @@ fn sl_refused_msg(instrument: &str, source: &str, kept_sl: f64, requested_sl: f6
 /// `TradingConfig::call_validity_minutes` (counted from `created_at`, when the
 /// engine received it).
 fn call_expired_reason(pos: &MonitoredPosition, cfg: &TradingConfig, now_ts: &str) -> Option<String> {
+    // A line order keeps to its own validity (`watch_buy_lines`).
+    if pos.entry_line.is_some() {
+        return None;
+    }
     entry_gate::call_expired(&pos.created_at, cfg.call_validity_minutes, now_ts).then(|| {
         format!(
             "CALL_EXPIRED — not bought within {} min of the call (received {})",
@@ -614,17 +618,181 @@ fn manual_order_stale(requested_at: &str, now_ts: &str) -> bool {
 /// at the broker, or whose send outcome is unknown, is never dropped here:
 /// the order book settles it.
 fn manual_entry_expired_reason(pos: &MonitoredPosition, now_ts: &str) -> Option<String> {
+    // An armed buy line waits for its index under its own validity; once
+    // crossed, the 15 s count from the moment it was.
+    if pos.line_armed() {
+        return None;
+    }
+    let crossed = pos.entry_line.as_ref().and_then(|l| l.triggered_at.as_deref());
     (pos.manual
         && matches!(pos.state, TradeState::WaitingForEntry)
         && pos.entry_order_id.is_none()
         && !pos.entry_send_uncertain
-        && manual_order_stale(&pos.created_at, now_ts))
+        && manual_order_stale(crossed.unwrap_or(&pos.created_at), now_ts))
     .then(|| {
+        let since = if crossed.is_some() { "the buy line was crossed" } else { "the tap" };
         format!(
-            "MANUAL_ENTRY_TIMEOUT — not sent within {} s of the tap (feed, funds check or Kotak too slow); nothing bought, tap again",
+            "MANUAL_ENTRY_TIMEOUT — not sent within {} s of {since} (feed, funds check or Kotak too slow); nothing bought",
             shared_domain::MANUAL_ORDER_TTL_SECS
         )
     })
+}
+
+/// What an armed buy line does now — see [`watch_buy_lines`].
+#[derive(Debug, PartialEq)]
+enum LineStep {
+    /// Drop it, unbought; `loud` when the user should hear about it.
+    Drop { reason: String, loud: bool },
+    /// The index reached it at `index`: buy at market from now.
+    Trigger { index: f64 },
+}
+
+/// What a line order's armed buy line does at `now`, with its index at
+/// `index`: nothing yet, dropped (its validity ran out, its contract is
+/// being squared off on its expiry day, or the index jumped past the line
+/// and its stop or a target at once), or crossed. A crossing outside the
+/// manual buy window (09:15–15:30, or a special session) buys nothing — the
+/// line waits, and the 15:39 cutoff drops it — the same hours as a tap.
+fn line_step(pos: &MonitoredPosition, index: Option<f64>, now: chrono::DateTime<chrono::FixedOffset>) -> Option<LineStep> {
+    if !pos.manual || !pos.line_armed() || pos.force_exit.is_some() {
+        return None;
+    }
+    let line = pos.entry_line.as_ref()?;
+    let now_ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    if line.expired(&now_ts) {
+        let until = line.valid_until.as_deref().and_then(|t| t.get(11..16)).unwrap_or("?");
+        return Some(LineStep::Drop {
+            reason: format!("LINE_ORDER_EXPIRED — the buy line at {:.2} wasn't reached by {until}; nothing bought", line.price),
+            loud: false,
+        });
+    }
+    if is_expiry_squareoff_due(pos, now) {
+        return Some(LineStep::Drop {
+            reason: "LINE_ORDER_EXPIRED — its contract expires today and is being squared off; nothing bought".to_string(),
+            loud: false,
+        });
+    }
+    if !shared_domain::manual_buy_window_open_at(now) {
+        return None;
+    }
+    let index = index?;
+    if !line.reached(index) {
+        return None;
+    }
+    if let Some(what) = shared_domain::line_levels_reached(pos.signal.option_type.as_deref(), &pos.chart, index) {
+        return Some(LineStep::Drop {
+            reason: format!(
+                "LINE_ORDER_SKIPPED — {} jumped to {index:.2}, past the buy line ({:.2}) and the {what} at once; nothing bought",
+                pos.signal.instrument_name, line.price
+            ),
+            loud: true,
+        });
+    }
+    Some(LineStep::Trigger { index })
+}
+
+/// Whether a crossed buy line is still waiting for its contract's price to be
+/// live — ticked within the owner's tap limit
+/// ([`shared_domain::MAX_BUY_PRICE_AGE_SECS`]) — before it buys. The arm
+/// route checks that age when the line is placed, but the crossing can come
+/// hours later, on a far strike that hasn't traded since, and the entry paths
+/// buy at whatever `ltp_map` holds (a PAPER fill is booked at it). Meanwhile
+/// nothing is sent, and the 15 s rule from the crossing
+/// ([`manual_entry_expired_reason`]) drops it if no live price comes — as the
+/// users' paper desk does. `last_tick` gives a feed key's last tick and `now`
+/// the clock, both in Unix seconds.
+fn line_buy_waits_for_price(pos: &MonitoredPosition, last_tick: impl Fn(&str) -> Option<f64>, now: f64) -> bool {
+    let crossed = pos.manual && pos.entry_line.as_ref().is_some_and(|l| l.triggered_at.is_some());
+    if !crossed {
+        return false;
+    }
+    let Some(key) = pos.ws_scrip_key.as_deref() else { return true };
+    last_tick(key).is_none_or(|t| now - t > shared_domain::MAX_BUY_PRICE_AGE_SECS)
+}
+
+/// Watch every armed buy line (line orders, both modes): drop one whose
+/// validity ran out, whose contract is being squared off, or whose index
+/// jumped past its stop or a target, and turn one the index reached into a
+/// market buy — from there the manual buy path sends it with every
+/// safeguard it has (and drops it if it can't within 15 s). A dropped line
+/// gets `force_exit`, which the entry paths turn into an abandoned entry.
+/// Nothing is triggered under the kill switch or past the entry cutoff:
+/// those paths drop every waiting entry. The lines are read under the read
+/// lock; the write lock is taken only when one changes, and each is decided
+/// again under it.
+async fn watch_buy_lines(
+    positions: &Arc<RwLock<Vec<MonitoredPosition>>>,
+    ltp_map: &DashMap<String, f64>,
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    kill_switch: bool,
+    entry_cutoff: bool,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) {
+    if kill_switch || entry_cutoff {
+        return;
+    }
+    let due: Vec<String> = positions
+        .read()
+        .await
+        .iter()
+        .filter(|p| p.line_armed())
+        .filter(|p| line_step(p, index_ltp(ltp_map, &p.signal.instrument_name), now).is_some())
+        .map(|p| p.id.clone())
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+    let now_ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut logs: Vec<(&'static str, String)> = Vec::new();
+    let mut guard = positions.write().await;
+    let mut changed = false;
+    for pos in guard.iter_mut().filter(|p| due.contains(&p.id)) {
+        let label = format!(
+            "{} {} {}",
+            pos.signal.instrument_name,
+            pos.signal.strike.map(|s| s.to_string()).unwrap_or_default(),
+            pos.signal.option_type.as_deref().unwrap_or("")
+        );
+        match line_step(pos, index_ltp(ltp_map, &pos.signal.instrument_name), now) {
+            None => {}
+            Some(LineStep::Drop { reason, loud }) => {
+                if loud {
+                    logs.push(("WARN", json!({
+                        "event": "LINE_ORDER_SKIPPED",
+                        "level": "WARN",
+                        "instrument": pos.signal.instrument_name,
+                        "position_id": pos.id,
+                        "message": format!("{label}: {reason}"),
+                    }).to_string()));
+                }
+                pos.force_exit = Some(reason);
+                changed = true;
+            }
+            Some(LineStep::Trigger { index }) => {
+                let Some(line) = pos.entry_line.as_mut() else { continue };
+                line.triggered_at = Some(now_ts.clone());
+                pos.signal.entry_condition = "MARKET".to_string();
+                logs.push(("INFO", json!({
+                    "event": "LINE_ORDER_TRIGGERED",
+                    "instrument": pos.signal.instrument_name,
+                    "position_id": pos.id,
+                    "message": format!("{label}: {} reached the buy line at {:.2} ({index:.2}) — buying at market", pos.signal.instrument_name, line.price),
+                    "index": index,
+                    "line": line.price,
+                }).to_string()));
+                changed = true;
+            }
+        }
+    }
+    let snapshot = changed.then(|| guard.clone());
+    drop(guard);
+    for (level, msg) in logs {
+        send_log(db_tx, log_tx, level, &msg).await;
+    }
+    if let Some(snapshot) = snapshot {
+        send_positions_snapshot(db_tx, &snapshot).await;
+    }
 }
 
 /// What to do with a manual position's pending add (`manual_add`).
@@ -1929,6 +2097,13 @@ async fn reconcile_live_orders(
                             let lot = lot_size_of(p);
                             p.chart.restore_unsold(selling, filled / lot);
                         }
+                        // A lot sold by hand comes off the farthest target,
+                        // so the targets never add up past what is held.
+                        if p.manual && p.executed_qty > 0 && filled > 0 {
+                            let lot = lot_size_of(p);
+                            let option_type = p.signal.option_type.clone();
+                            p.chart.trim_targets(p.executed_qty / lot, option_type.as_deref());
+                        }
                         if p.executed_qty <= 0
                             && p.sizing.topup_order_id.is_none()
                             && !p.sizing.topup_send_uncertain
@@ -2754,6 +2929,7 @@ async fn adopt_manual(
         manual_add: None,
         chart: Default::default(),
         chart_targets_selling: Vec::new(),
+        entry_line: None,
     };
 
     { positions.write().await.push(new_pos); }
@@ -2906,6 +3082,11 @@ fn decide_live(
                     ),
                     loud: true,
                 });
+            }
+            // A crossed buy line buys only on a live price; the 15 s rule
+            // above drops it if none comes.
+            if line_buy_waits_for_price(pos, telemetry::scrip_last_tick, telemetry::unix_now()) {
+                return None;
             }
             let ltp = ltp?;
             if !entry_triggered(&pos.signal, ltp, cfg) {
@@ -4721,6 +4902,7 @@ pub async fn start_position_monitor(
                                     manual_add: None,
                                     chart: Default::default(),
                                     chart_targets_selling: Vec::new(),
+                                    entry_line: None,
                                 });
                                 telemetry::signal(SignalOutcome::Accepted);
                                 let snapshot = pos_guard.clone();
@@ -4776,10 +4958,14 @@ pub async fn start_position_monitor(
                     // instead of silently trading blind.
                     if !startup_reconciled { continue; }
                     if positions.read().await.is_empty() { continue; }
+                    watch_buy_lines(&positions, &ltp_map, &db_tx, &log_tx, cfg.kill_switch_active, is_entry_cutoff_passed(), shared_domain::now_ist()).await;
                     let gate = EntryGate::new(&indicator_feed);
                     live_tick(&positions, &kotak, &db_tx, &log_tx, &ltp_map, &cfg, &mut last_live_poll, &gate, &mut book_memory).await;
                     continue;
                 }
+
+                let kill_switch = config.read().await.kill_switch_active;
+                watch_buy_lines(&positions, &ltp_map, &db_tx, &log_tx, kill_switch, is_entry_cutoff_passed(), shared_domain::now_ist()).await;
 
                 let mut pos_guard = positions.write().await;
                 if pos_guard.is_empty() { continue; }
@@ -4844,6 +5030,11 @@ pub async fn start_position_monitor(
                         }
                         if let Some(reason) = manual_entry_expired_reason(pos, &gate.now_ts) {
                             pending.push(Pending { idx: i, ltp: 0.0, action: PosAction::Cancel { reason } });
+                            continue;
+                        }
+                        // A crossed buy line is filled only at a live price;
+                        // the 15 s rule above drops it if none comes.
+                        if line_buy_waits_for_price(pos, telemetry::scrip_last_tick, telemetry::unix_now()) {
                             continue;
                         }
                     }
@@ -5362,6 +5553,7 @@ mod tests {
             manual_add: None,
             chart: Default::default(),
             chart_targets_selling: Vec::new(),
+            entry_line: None,
         }
     }
 
@@ -6961,6 +7153,154 @@ mod tests {
             }
             other => panic!("expected a 2-lot market entry, got {other:?}"),
         }
+    }
+
+    /// A 2-lot line order on NIFTY 25000 CE: buy when NIFTY falls to
+    /// 25,980, stop 25,950, targets 26,050 (1 lot) and 26,100 (1 lot).
+    fn line_order(ltp_map: &Arc<DashMap<String, f64>>, created_at: &str) -> MonitoredPosition {
+        use shared_domain::{ChartLevel, ChartLevels, ChartTarget, EntryLine, LevelTrigger};
+        let mut pos = manual_position(ltp_map);
+        pos.created_at = created_at.to_string();
+        pos.signal.entry_condition = shared_domain::LINE_ENTRY.to_string();
+        pos.entry_line = Some(EntryLine { price: 25_980.0, rising: false, valid_until: None, triggered_at: None });
+        let on = |price| ChartLevel { price, trigger: LevelTrigger::Index };
+        let target = |id: &str, price| ChartTarget { id: id.into(), price, trigger: LevelTrigger::Index, lots: Some(1) };
+        pos.chart = ChartLevels { stop: Some(on(25_950.0)), targets: vec![target("a", 26_050.0), target("b", 26_100.0)] };
+        pos
+    }
+
+    #[test]
+    fn a_line_order_buys_nothing_until_its_index_reaches_the_line_then_buys_at_market() {
+        let ltp = Arc::new(DashMap::new());
+        let gate = gate_at("11:05:00");
+        let cfg = cfg_with_lots(1, 3);
+        // Armed ten minutes ago: the 15 s tap rule doesn't apply while it waits.
+        let mut pos = line_order(&ltp, &format!("{} 10:55:00", ist_today()));
+        assert!(pos.line_armed());
+        assert_eq!(manual_entry_expired_reason(&pos, &gate.now_ts), None);
+        assert_eq!(decide_live(&pos, &ltp, &cfg, false, true, &gate), None);
+
+        // A Wednesday, inside the buy window.
+        let at = ist_time(2026, 11, 18, 11, 5);
+        assert_eq!(line_step(&pos, Some(26_010.0), at), None);
+        assert_eq!(line_step(&pos, None, at), None);
+        assert_eq!(line_step(&pos, Some(25_979.0), at), Some(LineStep::Trigger { index: 25_979.0 }));
+        // Crossed after the 15:30 close of tap buys: nothing bought, it waits for the cutoff.
+        assert_eq!(line_step(&pos, Some(25_979.0), ist_time(2026, 11, 18, 15, 33)), None);
+        assert_eq!(line_step(&pos, Some(25_979.0), ist_time(2026, 11, 21, 11, 5)), None);
+
+        // Crossed: a market buy of exactly the lots ordered, under the 15 s rule from the crossing.
+        pos.entry_line.as_mut().unwrap().triggered_at = Some(format!("{} 11:04:55", ist_today()));
+        pos.signal.entry_condition = "MARKET".into();
+        assert!(!pos.line_armed());
+        assert_eq!(line_step(&pos, Some(25_979.0), at), None);
+        // Its own feed key, so no other test's tick makes its price live.
+        let key = "nse_fo|line-buy-test";
+        pos.ws_scrip_key = Some(key.to_string());
+        ltp.insert(key.to_string(), 121.0);
+        // A price that hasn't ticked: nothing is sent yet.
+        assert_eq!(decide_live(&pos, &ltp, &cfg, false, true, &gate), None);
+        telemetry::feed_tick(key);
+        match decide_live(&pos, &ltp, &cfg, false, true, &gate) {
+            Some(LiveAction::PlaceEntry { qty: 150, limit_price: None, .. }) => {}
+            other => panic!("expected a 2-lot market entry, got {other:?}"),
+        }
+        pos.entry_line.as_mut().unwrap().triggered_at = Some(format!("{} 11:04:40", ist_today()));
+        match decide_live(&pos, &ltp, &cfg, false, true, &gate) {
+            Some(LiveAction::AbandonEntry { reason, loud: true }) => assert!(reason.contains("buy line was crossed"), "{reason}"),
+            other => panic!("expected the late send to be dropped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_crossed_line_buys_only_on_a_contract_price_within_the_tap_limit() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = line_order(&ltp, &format!("{} 10:55:00", ist_today()));
+        let now = 1_000_000.0;
+        let ticked = |age: f64| move |_: &str| Some(now - age);
+        // Armed, not crossed: the line watch decides, not this.
+        assert!(!line_buy_waits_for_price(&pos, |_| None, now));
+        pos.entry_line.as_mut().unwrap().triggered_at = Some(format!("{} 11:04:55", ist_today()));
+        pos.signal.entry_condition = "MARKET".into();
+        assert!(!line_buy_waits_for_price(&pos, ticked(1.0), now));
+        assert!(!line_buy_waits_for_price(&pos, ticked(shared_domain::MAX_BUY_PRICE_AGE_SECS), now));
+        assert!(line_buy_waits_for_price(&pos, ticked(shared_domain::MAX_BUY_PRICE_AGE_SECS + 1.0), now));
+        assert!(line_buy_waits_for_price(&pos, |_| None, now), "never ticked");
+        pos.ws_scrip_key = None;
+        assert!(line_buy_waits_for_price(&pos, ticked(1.0), now), "no feed key to read");
+        // A tap's buy, with no line, is left to the route's own check.
+        let tap = manual_position(&ltp);
+        assert!(!line_buy_waits_for_price(&tap, |_| None, now));
+    }
+
+    #[test]
+    fn a_line_order_is_dropped_when_it_runs_out_or_the_index_jumps_past_a_level() {
+        let ltp = Arc::new(DashMap::new());
+        let gate = gate_at("11:05:00");
+        let mut cfg = cfg_with_lots(1, 3);
+        let mut pos = line_order(&ltp, &format!("{} 10:55:00", ist_today()));
+        // A call validity rule for Telegram calls never drops a line order.
+        cfg.call_validity_minutes = 5;
+        assert_eq!(call_expired_reason(&pos, &cfg, &gate.now_ts), None);
+
+        let at = ist_time(2026, 11, 18, 11, 5);
+        pos.entry_line.as_mut().unwrap().valid_until = Some("2026-11-18 11:05:00".into());
+        match line_step(&pos, Some(26_010.0), at) {
+            Some(LineStep::Drop { reason, loud: false }) => assert!(reason.starts_with("LINE_ORDER_EXPIRED"), "{reason}"),
+            other => panic!("expected the expired line to drop, got {other:?}"),
+        }
+        pos.entry_line.as_mut().unwrap().valid_until = Some("2026-11-18 11:30:00".into());
+        assert_eq!(line_step(&pos, Some(26_010.0), at), None);
+        // Its contract expires today and is being squared off: dropped, whatever the index does.
+        let mut expiring = pos.clone();
+        expiring.entry_line.as_mut().unwrap().valid_until = None;
+        expiring.resolved_expiry = chrono::NaiveDate::from_ymd_opt(2026, 11, 18);
+        assert_eq!(line_step(&expiring, Some(26_010.0), at), None);
+        match line_step(&expiring, Some(26_010.0), ist_time(2026, 11, 18, 15, 38)) {
+            Some(LineStep::Drop { reason, loud: false }) => assert!(reason.contains("squared off"), "{reason}"),
+            other => panic!("expected the expiring line to drop, got {other:?}"),
+        }
+        // Past the line and the stop in one jump: not bought.
+        match line_step(&pos, Some(25_940.0), at) {
+            Some(LineStep::Drop { reason, loud: true }) => assert!(reason.contains("the stop"), "{reason}"),
+            other => panic!("expected the gap to be skipped, got {other:?}"),
+        }
+        // Already being dropped, or not a scalp: left alone.
+        pos.force_exit = Some("LINE_ORDER_CANCELLED".into());
+        assert_eq!(line_step(&pos, Some(25_979.0), at), None);
+        pos.force_exit = None;
+        pos.manual = false;
+        assert_eq!(line_step(&pos, Some(25_979.0), at), None);
+    }
+
+    #[tokio::test]
+    async fn the_line_watch_triggers_or_drops_armed_lines_only() {
+        let ltp = Arc::new(DashMap::new());
+        let created = shared_domain::current_ist_timestamp_string();
+        let crossing = line_order(&ltp, &created);
+        let mut waiting = line_order(&ltp, &created);
+        waiting.id = "waiting".into();
+        waiting.entry_line.as_mut().unwrap().price = 25_900.0;
+        waiting.chart.stop.as_mut().unwrap().price = 25_850.0;
+        let mut ran_out = line_order(&ltp, &created);
+        ran_out.id = "ran-out".into();
+        ran_out.entry_line.as_mut().unwrap().valid_until = Some("2000-01-01 00:00:00".into());
+        ltp.insert(shared_domain::index_price_key("Nifty 50"), 25_975.0);
+        let positions = Arc::new(RwLock::new(vec![crossing, waiting, ran_out]));
+        let (db_tx, _db_rx) = mpsc::channel(64);
+        let (log_tx, _log_rx) = broadcast::channel(64);
+
+        let at = ist_time(2026, 11, 18, 11, 5);
+        // Under the kill switch nothing is triggered (its own path drops them).
+        watch_buy_lines(&positions, &ltp, &db_tx, &log_tx, true, false, at).await;
+        assert!(positions.read().await.iter().all(|p| p.line_armed() && p.force_exit.is_none()));
+
+        watch_buy_lines(&positions, &ltp, &db_tx, &log_tx, false, false, at).await;
+        let g = positions.read().await;
+        assert_eq!(g[0].signal.entry_condition, "MARKET");
+        assert!(g[0].entry_line.as_ref().unwrap().triggered_at.is_some());
+        assert!(g[1].line_armed() && g[1].force_exit.is_none());
+        assert!(g[2].force_exit.as_deref().is_some_and(|r| r.starts_with("LINE_ORDER_EXPIRED")));
     }
 
     #[test]

@@ -10,7 +10,7 @@
 use std::convert::Infallible;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -26,6 +26,8 @@ use shared_domain::{ManualAdd, MonitoredPosition, TradeSignal, TradeState};
 
 use crate::auth::Identity;
 use crate::execute::{self, STREAM_EVERY};
+use crate::line_orders;
+use crate::routes::auth_kotak::send_log;
 use crate::routes::positions::persist_positions_snapshot;
 use crate::AppState;
 
@@ -168,7 +170,9 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
     });
     let (position_id, action) = match held {
         Some(p) => {
-            let busy = if matches!(p.state, TradeState::WaitingForEntry) {
+            let busy = if p.line_armed() {
+                Some("a buy line is armed on it — cancel that first")
+            } else if matches!(p.state, TradeState::WaitingForEntry) {
                 Some("its first buy is still being placed")
             } else if p.buy_in_flight() {
                 Some("an add is already in flight")
@@ -247,6 +251,173 @@ pub async fn execute_buy_handler(State(state): State<AppState>, Json(req): Json<
         Json(json!({ "position_id": position_id, "action": action, "symbol": record.trading_symbol, "qty": qty })),
     )
         .into_response()
+}
+
+/// `POST /api/execute/line-buy` — a line order on the owner's engine
+/// (`line_orders`): `lots` of an index option bought at market once its
+/// index crosses `line`, with its stop and targets on the index set now.
+/// Nothing is sent to Kotak here. It becomes a manual position waiting on
+/// its line ([`shared_domain::LINE_ENTRY`]); the engine turns it into a
+/// market buy when the index reaches the line, and from there it is a tap's
+/// buy with every LIVE safeguard. Refused when the index has already crossed
+/// the line (`code: "line_crossed"`), and for any contract already held or
+/// waiting — one trade per contract, as for a tap.
+pub async fn execute_line_buy_handler(State(state): State<AppState>, Json(req): Json<line_orders::LineBuyReq>) -> Response {
+    if !(1..=MAX_LOTS_PER_TAP).contains(&req.lots) {
+        return refuse(StatusCode::BAD_REQUEST, format!("Lots must be between 1 and {MAX_LOTS_PER_TAP}"));
+    }
+    if !state.flags.read().await.chart_stops {
+        return refuse(StatusCode::CONFLICT, "Line orders set a chart stop and targets — switch chart stops on first (/api/v2/flags)");
+    }
+    let (mode, kill_switch) = {
+        let cfg = state.trading_cfg.read().await;
+        (cfg.mode.clone(), cfg.kill_switch_active)
+    };
+    if kill_switch {
+        return refuse(StatusCode::CONFLICT, "Kill switch is active — trading is halted");
+    }
+    if !execute::manual_buy_window_open() || trading_engine::is_entry_cutoff_passed() {
+        return refuse(StatusCode::CONFLICT, execute::manual_buy_closed_message());
+    }
+    if !execute::feed_fresh() {
+        return refuse(StatusCode::CONFLICT, "Price feed is stale — not arming blind");
+    }
+    if mode == "LIVE" && !execute::kotak_ready(&state) {
+        return refuse(StatusCode::CONFLICT, "Kotak is not connected");
+    }
+    let Some((index, chain, record)) = state.execute.find_contract(&state, &req.trading_symbol).await else {
+        return refuse(StatusCode::BAD_REQUEST, format!("{} is not a listed index option", req.trading_symbol.trim()));
+    };
+    let ws_key = record.ws_key();
+    let Some(ltp) = execute::price(&state, &ws_key) else {
+        return refuse(StatusCode::CONFLICT, format!("No live price for {} yet", record.trading_symbol));
+    };
+    if execute::contract_age_secs(&ws_key).is_none_or(|age| age > execute::buy_max_age_secs(execute::SubPool::Owner)) {
+        return refuse(StatusCode::CONFLICT, format!("{}'s price isn't live — not arming blind", record.trading_symbol));
+    }
+    let Some(strike) = record.normalized_strike() else {
+        return refuse(StatusCode::BAD_REQUEST, format!("Can't read the strike of {}", record.trading_symbol));
+    };
+    if crate::paper::engine::squaring_off(record.expiry_date, shared_domain::now_ist()) {
+        return refuse(
+            StatusCode::CONFLICT,
+            format!("{} expires today and is being squared off — pick a later expiry", record.trading_symbol),
+        );
+    }
+    let levels = match line_orders::check_request(&req, &record.option_type) {
+        Ok(levels) => levels,
+        Err(r) => return line_orders::refused_response(r),
+    };
+    let index_now = match line_orders::index_now(&state.prices, &index) {
+        Ok(v) => v,
+        Err(r) => return line_orders::refused_response(r),
+    };
+    if let Err(r) = line_orders::check_not_crossed(&index, req.line, index_now) {
+        return line_orders::refused_response(r);
+    }
+    let line = match line_orders::arm(req.line, req.valid_minutes) {
+        Ok(line) => line,
+        Err(r) => return line_orders::refused_response(r),
+    };
+    let label = format!("{index} {strike} {}", record.option_type);
+    let when = line_orders::describe(&index, &line);
+    let now = shared_domain::current_ist_timestamp_string();
+
+    let mut positions = state.positions.write().await;
+    // One trade per contract, whoever opened it: the broker can't tell two apart.
+    if positions.iter().any(|p| !matches!(p.state, TradeState::Closed) && p.resolved_order.as_ref().is_some_and(|o| o.trading_symbol == record.trading_symbol)) {
+        return refuse(StatusCode::CONFLICT, format!("{label} is already held or waiting — one trade per contract"));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    positions.push(MonitoredPosition {
+        id: id.clone(),
+        signal: TradeSignal {
+            instrument_name: index.clone(),
+            strike: Some(strike),
+            option_type: Some(record.option_type.clone()),
+            expiry: Some(chain.expiry.format("%d-%b-%Y").to_string().to_uppercase()),
+            action: "BUY".to_string(),
+            entry_condition: shared_domain::LINE_ENTRY.to_string(),
+            entry_price: ltp,
+            entry_price_max: None,
+            targets: vec![],
+            stop_loss: 0.0,
+            source: "manual".to_string(),
+            signal_id: Some(format!("manual-{id}")),
+            raw_message: Some(format!("Line BUY {} lot(s) {label} when {when} (LTP {ltp:.2})", req.lots)),
+            chat: None,
+        },
+        state: TradeState::WaitingForEntry,
+        created_at: now,
+        override_qty: Some(req.lots),
+        resolved_order: Some(record.order_template()),
+        resolved_expiry: Some(record.expiry_date),
+        ws_scrip_key: Some(ws_key.clone()),
+        tick_size: record.tick_size,
+        manual: true,
+        chart: levels.clone(),
+        entry_line: Some(line.clone()),
+        ..Default::default()
+    });
+    let snapshot = positions.clone();
+    drop(positions);
+    // The contract's ticks to buy at, the index's to watch the line on.
+    if let Some(tx) = state.ws_tx.lock().await.clone() {
+        let _ = tx.send(json!({ "action": "subscribe", "scrips": ws_key }).to_string());
+        if let Some(msg) = crate::routes::v2::positions::index_subscription(&index) {
+            let _ = tx.send(msg);
+        }
+    }
+    persist_positions_snapshot(&state, &snapshot).await;
+
+    let qty = req.lots * record.lot_size as i32;
+    send_log(&state.db_tx, &state.log_tx, "INFO", json!({
+        "event": "LINE_ORDER_ARMED",
+        "level": "INFO",
+        "message": format!("Buy line armed: {} lot(s) {label} when {when}", req.lots),
+        "instrument": index,
+        "position_id": id,
+        "qty": qty,
+        "line": line,
+        "chart": levels,
+        "mode": mode,
+    }))
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "position_id": id, "symbol": record.trading_symbol, "qty": qty, "line": line, "chart": levels })),
+    )
+        .into_response()
+}
+
+/// `DELETE /api/execute/line-buy/:id` — cancel a line order whose buy line
+/// is still armed. Nothing has been sent for it, so it is dropped through
+/// the engine's own path for an entry not taken. Once the index has crossed
+/// the line it is a market buy in flight, and can't be cancelled here.
+pub async fn execute_line_cancel_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let mut positions = state.positions.write().await;
+    let Some(p) = positions.iter_mut().find(|p| p.id == id && p.manual && p.entry_line.is_some()) else {
+        return refuse(StatusCode::NOT_FOUND, "not found");
+    };
+    if !p.line_armed() {
+        return refuse(StatusCode::CONFLICT, "The buy line was already crossed — it is being bought, or is gone");
+    }
+    if p.force_exit.is_none() {
+        p.force_exit = Some("LINE_ORDER_CANCELLED — cancelled by hand; nothing bought".to_string());
+    }
+    let instrument = p.signal.instrument_name.clone();
+    let snapshot = positions.clone();
+    drop(positions);
+    persist_positions_snapshot(&state, &snapshot).await;
+    send_log(&state.db_tx, &state.log_tx, "INFO", json!({
+        "event": "LINE_ORDER_CANCEL_REQUESTED",
+        "level": "INFO",
+        "message": "Buy line cancelled by hand",
+        "instrument": instrument,
+        "position_id": id,
+    }))
+    .await;
+    (StatusCode::ACCEPTED, Json(json!({ "id": id, "cancelled": true }))).into_response()
 }
 
 /// `POST /api/execute/exit-all` — exit every manual scalp: open ones are sold

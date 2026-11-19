@@ -11,8 +11,9 @@ use axum::{
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
-use shared_domain::{ChartHit, ChartLevel, ChartLevels, LevelRefusal, LevelTrigger, MonitoredPosition, TargetEdit, TradeState};
+use shared_domain::{ChartHit, ChartLevel, ChartLevels, EntryLine, LevelRefusal, LevelTrigger, MonitoredPosition, TargetEdit, TradeState};
 
+use crate::line_orders::{self, LinePick};
 use crate::routes::auth_kotak::send_log;
 use crate::routes::positions::persist_positions_snapshot;
 use crate::AppState;
@@ -30,6 +31,10 @@ pub struct LevelsUpdate {
     pub(crate) set_target: Option<TargetEdit>,
     #[serde(default)]
     pub(crate) remove_target: Option<String>,
+    /// A line order's buy line, moved while it is armed: where to, and
+    /// which way the index now crosses it (see `line_orders::LinePick`).
+    #[serde(default)]
+    pub(crate) entry: Option<LinePick>,
 }
 
 /// Tells a field that is there, even as `null`, from one left out.
@@ -38,8 +43,49 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<ChartLevel>>
 }
 
 impl LevelsUpdate {
-    fn sets_a_level(&self) -> bool {
-        matches!(self.stop, Some(Some(_))) || self.set_target.is_some()
+    pub(crate) fn sets_a_level(&self) -> bool {
+        matches!(self.stop, Some(Some(_))) || self.set_target.is_some() || self.entry.is_some()
+    }
+
+    /// Apply it to an armed line order on a `option_type` of `underlying` —
+    /// its buy line `line` and levels `chart`, `lots` ordered — all or
+    /// nothing: the stop stays (cancel the order instead), every level stays
+    /// on the index, and the side rules hold against the line as moved
+    /// (`check_line_levels`). `index` is the index's value now, which a
+    /// moved line must not have crossed already. The id of a target it set.
+    pub(crate) fn apply_to_line(
+        &self,
+        option_type: &str,
+        underlying: &str,
+        line: &mut EntryLine,
+        chart: &mut ChartLevels,
+        lots: i32,
+        index: Option<f64>,
+    ) -> Result<Option<String>, line_orders::Refused> {
+        if matches!(self.stop, Some(None)) {
+            return Err((StatusCode::CONFLICT, "a line order keeps its stop — cancel the order instead".to_string(), None));
+        }
+        if self.new_levels().any(|l| l.trigger != LevelTrigger::Index) {
+            return Err((StatusCode::BAD_REQUEST, "a line order's stop and targets are set on the index".to_string(), None));
+        }
+        let mut next_line = line.clone();
+        if let Some(pick) = self.entry {
+            if !(pick.price.is_finite() && pick.price > 0.0) {
+                return Err((StatusCode::BAD_REQUEST, "the buy line's price must be a positive number".to_string(), None));
+            }
+            let Some(index) = index else {
+                return Err((StatusCode::CONFLICT, format!("No live {underlying} value — the buy line can't be moved blind"), None));
+            };
+            line_orders::check_not_crossed(underlying, pick, index)?;
+            next_line.price = pick.price;
+            next_line.rising = pick.rising;
+        }
+        let mut next_chart = chart.clone();
+        let set = self.apply(&mut next_chart, lots).map_err(line_orders::refused)?;
+        shared_domain::check_line_levels(Some(option_type), next_line.price, &next_chart, lots).map_err(line_orders::refused)?;
+        *line = next_line;
+        *chart = next_chart;
+        Ok(set)
     }
 
     pub(crate) fn new_levels(&self) -> impl Iterator<Item = ChartLevel> + '_ {
@@ -127,13 +173,75 @@ fn refusal(pos: &MonitoredPosition, update: &LevelsUpdate, chart_stops_on: bool)
 }
 
 /// The bridge message that streams `instrument`'s index, if it is one of the six.
-fn index_subscription(instrument: &str) -> Option<String> {
+pub(crate) fn index_subscription(instrument: &str) -> Option<String> {
     let (segment, feed_name) = shared_domain::kotak_index_feed(instrument)?;
     Some(json!({ "action": "subscribe_indices", "indices": format!("{segment}|{feed_name}") }).to_string())
 }
 
 fn watches_index(pos: &MonitoredPosition) -> bool {
-    pos.chart.levels().chain(pos.chart_targets_selling.iter().map(|t| ChartLevel { price: t.price, trigger: t.trigger })).any(|l| l.trigger == LevelTrigger::Index)
+    pos.entry_line.is_some()
+        || pos.chart.levels().chain(pos.chart_targets_selling.iter().map(|t| ChartLevel { price: t.price, trigger: t.trigger })).any(|l| l.trigger == LevelTrigger::Index)
+}
+
+/// `PATCH /api/v2/positions/:id` on a line order still waiting on its buy
+/// line: move the line, the stop or a target, add or remove a target —
+/// `LevelsUpdate::apply_to_line`. Nothing is sold or bought by it: the
+/// order has nothing held, and a line moved past the index is refused.
+async fn patch_armed_line(state: &AppState, id: &str, update: &LevelsUpdate, chart_stops_on: bool) -> Response {
+    let refuse = |status: StatusCode, msg: &str| (status, Json(json!({ "error": msg }))).into_response();
+    let mut positions = state.positions.write().await;
+    let Some(pos) = positions.iter_mut().find(|p| p.id == id) else {
+        return refuse(StatusCode::NOT_FOUND, "not found");
+    };
+    if !pos.line_armed() {
+        return refuse(StatusCode::CONFLICT, "The buy line was crossed — it is being bought; set levels once it is");
+    }
+    if pos.force_exit.is_some() {
+        return refuse(StatusCode::CONFLICT, "This line order is being cancelled");
+    }
+    if update.sets_a_level() && !chart_stops_on {
+        return refuse(StatusCode::CONFLICT, "chart stops are switched off (/api/v2/flags) — a line order can only be cancelled while they are");
+    }
+    let instrument = pos.signal.instrument_name.clone();
+    let index = match update.entry {
+        Some(_) => match line_orders::index_now(&state.prices, &instrument) {
+            Ok(v) => Some(v),
+            Err((status, msg, _)) => return refuse(status, &msg),
+        },
+        None => None,
+    };
+    let option_type = pos.signal.option_type.clone().unwrap_or_default();
+    let lots = pos.order_lots(lot_of(pos));
+    let Some(line) = pos.entry_line.as_mut() else {
+        return refuse(StatusCode::CONFLICT, "not a line order");
+    };
+    let mut chart = pos.chart.clone();
+    let target_id = match update.apply_to_line(&option_type, &instrument, line, &mut chart, lots, index) {
+        Ok(set) => set,
+        Err(r) => return line_orders::refused_response(r),
+    };
+    pos.chart = chart.clone();
+    let line = line.clone();
+    let subscription = index_subscription(&instrument);
+    let snapshot = positions.clone();
+    drop(positions);
+    if let Some(msg) = subscription.filter(|_| update.entry.is_some()) {
+        if let Some(tx) = state.ws_tx.lock().await.as_ref() {
+            let _ = tx.send(msg);
+        }
+    }
+    persist_positions_snapshot(state, &snapshot).await;
+    send_log(&state.db_tx, &state.log_tx, "INFO", json!({
+        "event": "LINE_ORDER_EDITED",
+        "level": "INFO",
+        "message": format!("Line order moved: buys when {}", line_orders::describe(&instrument, &line)),
+        "instrument": instrument,
+        "position_id": id,
+        "line": line,
+        "chart": chart,
+    }))
+    .await;
+    Json(json!({ "id": id, "chart": chart, "line": line, "sells_now": false, "sells_lots": null, "target_id": target_id })).into_response()
 }
 
 /// Bridge messages that stream the index of every position whose chart levels
@@ -171,6 +279,13 @@ pub async fn patch_position_levels_handler(
     let Some(pos) = positions.iter_mut().find(|p| p.id == id) else {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response();
     };
+    if pos.manual && pos.entry_line.is_some() && matches!(pos.state, TradeState::WaitingForEntry) {
+        drop(positions);
+        return patch_armed_line(&state, &id, &update, chart_stops_on).await;
+    }
+    if update.entry.is_some() {
+        return (StatusCode::CONFLICT, Json(json!({ "error": "only a line order still waiting on its buy line has one to move" }))).into_response();
+    }
     if let Some((status, msg)) = refusal(pos, &update, chart_stops_on) {
         return (status, Json(json!({ "error": msg }))).into_response();
     }

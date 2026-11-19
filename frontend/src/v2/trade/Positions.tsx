@@ -17,7 +17,7 @@ import { approxMoney, levelPnl } from './model';
 import { AccountColumn } from './panel/TradingPanel';
 import { activityEvents, type EngineError } from './panel/activity';
 import { ActivityList, HistoryList, PaperActivityList } from './panel/lists';
-import { busyNote, levelWords } from './words';
+import { busyNote, levelWords, lineSummary } from './words';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 
@@ -38,6 +38,8 @@ export interface PositionHandlers {
   onExit: (p: ExecutePosition) => void;
   /** A first buy still being placed: abandon it. */
   onCancel: (p: ExecutePosition) => void;
+  /** A line order still waiting on its buy line: cancel it. */
+  onCancelLine: (p: ExecutePosition) => void;
   onExitAll: () => void;
   exitAllBusy: boolean;
 }
@@ -157,6 +159,29 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
         {tab === 'positions' && scalps.length === 0 && <p className="type-body text-fg-subtle">No open trade.</p>}
         {tab === 'positions' &&
           scalps.map((p) => {
+            // A line order waiting on its buy line: what it buys when, and Cancel.
+            if (p.placing && p.line) {
+              const armed = !p.line.triggered_at;
+              return (
+                <article key={p.id} className="flex flex-col gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="type-body-strong text-fg">{contractLabel(p.index, p.strike, p.option_type)}</span>
+                      <SourceChip source={{ kind: 'scalp', title: 'Scalp' }} />
+                    </div>
+                    <div className="mt-1 type-caption text-fg-subtle tnum">{armed ? lineSummary(p, p.line) : 'Its buy line was crossed — buying at market…'}</div>
+                  </div>
+                  {armed && (
+                    <>
+                      <p className="type-caption text-fg-subtle">Drag the lines on the {p.index} chart to move them.</p>
+                      <Button pointerOnly size="lg" kind="ghost" disabled={!!h.sending[p.id]} onClick={() => h.onCancelLine(p)}>
+                        Cancel the buy line
+                      </Button>
+                    </>
+                  )}
+                </article>
+              );
+            }
             const note = busyNote(p, !!h.sending[p.id]);
             const locked = note != null || p.qty <= 0;
             const delta = deltaOf(p);

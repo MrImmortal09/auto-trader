@@ -14,6 +14,7 @@ mod execute;
 mod feed_latency;
 mod history;
 mod instruments;
+mod line_orders;
 mod market_data;
 mod order_timing;
 mod orders;
@@ -1271,6 +1272,8 @@ async fn main() {
         .route("/api/execute/stream",               get(routes::execute_stream_handler))
         .route("/api/execute/buy",                  post(routes::execute_buy_handler))
         .route("/api/execute/exit-all",             post(routes::execute_exit_all_handler))
+        .route("/api/execute/line-buy",             post(routes::execute_line_buy_handler))
+        .route("/api/execute/line-buy/:id",         axum::routing::delete(routes::execute_line_cancel_handler))
         .route("/api/settings",                     get(routes::get_settings_handler)
                                                    .post(routes::post_settings_handler))
         .route("/api/kill-switch",                  post(routes::post_kill_switch_handler)
@@ -1349,6 +1352,8 @@ async fn main() {
         .route("/api/v2/me/positions",              get(routes::v2::me::positions_handler))
         .route("/api/v2/me/activity",               get(routes::v2::me::activity_handler))
         .route("/api/v2/me/buy",                    post(routes::v2::me::buy_handler))
+        .route("/api/v2/me/line-buy",               post(routes::v2::me::line_buy_handler))
+        .route("/api/v2/me/line-buy/:id",           axum::routing::delete(routes::v2::me::line_cancel_handler))
         .route("/api/v2/me/positions/:id",          axum::routing::patch(routes::v2::me::patch_levels_handler))
         .route("/api/v2/me/positions/:id/sell",     post(routes::v2::me::sell_handler))
         .route("/api/v2/me/positions/:id/close",    post(routes::v2::me::close_handler))

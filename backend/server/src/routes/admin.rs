@@ -203,7 +203,7 @@ pub async fn delete_user_handler(State(state): State<AppState>, Path(id): Path<i
     let Some(flat) = state.paper.hold_flat(id).await else {
         return refuse(
             StatusCode::CONFLICT,
-            "This user holds open paper positions — disable them instead, or remove them once they are flat",
+            "This user holds open paper positions or armed buy lines — disable them instead, or remove them once they are flat",
         );
     };
     let mut tx = match state.db_pool.begin().await {
@@ -216,6 +216,7 @@ pub async fn delete_user_handler(State(state): State<AppState>, Path(id): Path<i
         sqlx::query("DELETE FROM otp_codes WHERE phone = ?").bind(&current.phone).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM user_trades WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM user_positions WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM user_line_orders WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM user_wallets WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
         crate::watchlists::delete_all(&mut *tx, id).await?;
         sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&mut *tx).await?;

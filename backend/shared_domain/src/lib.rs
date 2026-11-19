@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod entry_gate;
@@ -808,6 +808,148 @@ pub struct MonitoredPosition {
     /// settles. An IOC that misses puts back what it didn't sell.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chart_targets_selling: Vec<ChartTarget>,
+    /// A scalp bought on a line (a line order): its buy line on the index
+    /// chart — see [`EntryLine`]. While it is armed the entry condition is
+    /// [`LINE_ENTRY`] and nothing is bought; once the index reaches it the
+    /// condition turns `"MARKET"` and the manual buy takes it from there.
+    /// Left out of the JSON while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_line: Option<EntryLine>,
+}
+
+/// Manual buys are accepted 09:15–15:30 IST on a weekday — the exchange's
+/// normal session, inside the engine's own 09:15–15:40 window — or throughout
+/// an active special session on its date. A tap's buy and a crossed buy line
+/// alike.
+pub fn manual_buy_window_open_at(now: DateTime<FixedOffset>) -> bool {
+    use chrono::Timelike;
+    in_special_session_at(now) || (is_regular_market_hours_at(now) && (now.hour(), now.minute()) < (15, 30))
+}
+
+/// The entry condition of a line order whose buy line is still armed: no
+/// entry rule reads it as a trigger, so nothing is bought until the engine
+/// sees the index reach the line and turns it into `"MARKET"`.
+pub const LINE_ENTRY: &str = "LINE";
+
+/// The longest a buy line may stay armed, in minutes: a whole session.
+pub const MAX_LINE_VALID_MINUTES: i32 = 375;
+
+/// A line order's buy line on its underlying's chart: the scalp is bought at
+/// market once the index reaches `price` from the side the line was armed
+/// on — "bought if the price crosses this line after it was placed".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntryLine {
+    pub price: f64,
+    /// `true`: armed with the index below the line, it buys as the index
+    /// rises to it. `false`: armed above, it buys as the index falls to it.
+    pub rising: bool,
+    /// IST `%Y-%m-%d %H:%M:%S` it is dropped at, unbought. `None` is "till
+    /// close": the 15:39 no-entry cutoff drops it.
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    /// IST timestamp the index reached it. From then on it is a market buy,
+    /// and the manual 15 s rule counts from here. `None` while armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggered_at: Option<String>,
+}
+
+impl EntryLine {
+    /// Still waiting for the index.
+    pub fn armed(&self) -> bool {
+        self.triggered_at.is_none()
+    }
+
+    /// Whether the index at `index` has reached the line from its side.
+    pub fn reached(&self, index: f64) -> bool {
+        index > 0.0 && if self.rising { index >= self.price } else { index <= self.price }
+    }
+
+    /// Whether its validity ran out by `now_ts` (IST, the same format).
+    pub fn expired(&self, now_ts: &str) -> bool {
+        self.valid_until.as_deref().is_some_and(|until| now_ts >= until)
+    }
+}
+
+/// `valid_until` for a buy line armed at `now` for `minutes` (`None`: till
+/// close). Refused outside 1..=[`MAX_LINE_VALID_MINUTES`].
+pub fn line_valid_until(now: NaiveDateTime, minutes: Option<i32>) -> Result<Option<String>, LevelRefusal> {
+    let Some(m) = minutes else { return Ok(None) };
+    if !(1..=MAX_LINE_VALID_MINUTES).contains(&m) {
+        return Err(LevelRefusal::BadRequest(format!("a buy line is valid for 1 to {MAX_LINE_VALID_MINUTES} minutes")));
+    }
+    Ok(Some((now + chrono::Duration::minutes(i64::from(m))).format("%Y-%m-%d %H:%M:%S").to_string()))
+}
+
+/// Whether `option_type` is a call (`Some(true)`), a put (`Some(false)`) or
+/// neither.
+fn is_call(option_type: Option<&str>) -> Option<bool> {
+    match option_type {
+        Some(t) if t.eq_ignore_ascii_case("CE") => Some(true),
+        Some(t) if t.eq_ignore_ascii_case("PE") => Some(false),
+        _ => None,
+    }
+}
+
+/// Check a line order's stop and targets against its buy line at
+/// `line_price`, for an order of `lots`: a stop and at least one target are
+/// required, every level is on the index, a call's stop sits below the line
+/// and its targets above it (a put the other way round — the side each loses
+/// or gains on), and the targets' lots stay within the order's.
+pub fn check_line_levels(option_type: Option<&str>, line_price: f64, chart: &ChartLevels, lots: i32) -> Result<(), LevelRefusal> {
+    let bad = |msg: &str| Err(LevelRefusal::BadRequest(msg.to_string()));
+    let Some(call) = is_call(option_type) else { return bad("only a CE or a PE can be bought on a line") };
+    if !(line_price.is_finite() && line_price > 0.0) {
+        return bad("the buy line's price must be a positive number");
+    }
+    let Some(stop) = chart.stop else {
+        return Err(LevelRefusal::Conflict("a line order needs its stop — cancel the order instead".to_string()));
+    };
+    if chart.targets.len() > MAX_CHART_TARGETS {
+        return Err(LevelRefusal::Conflict(format!("a trade can have at most {MAX_CHART_TARGETS} targets")));
+    }
+    for level in chart.levels() {
+        if !(level.price.is_finite() && level.price > 0.0) {
+            return bad("a level's price must be a positive number");
+        }
+        if level.trigger != LevelTrigger::Index {
+            return bad("a line order's stop and targets are set on the index");
+        }
+    }
+    if chart.targets.is_empty() {
+        return Err(LevelRefusal::Conflict("a line order needs at least one target — cancel the order instead".to_string()));
+    }
+    let (stop_side, target_side) = if call { ("below", "above") } else { ("above", "below") };
+    let kind = if call { "call" } else { "put" };
+    if (call && stop.price >= line_price) || (!call && stop.price <= line_price) {
+        return Err(LevelRefusal::Conflict(format!("a {kind}'s stop goes {stop_side} its buy line ({line_price})")));
+    }
+    if chart.targets.iter().any(|t| (call && t.price <= line_price) || (!call && t.price >= line_price)) {
+        return Err(LevelRefusal::Conflict(format!("a {kind}'s targets go {target_side} its buy line ({line_price})")));
+    }
+    let mut sum = 0i32;
+    for t in &chart.targets {
+        if let Some(n) = t.lots {
+            if n < 1 {
+                return bad("a target sells at least 1 lot");
+            }
+            sum = sum.saturating_add(n);
+        }
+    }
+    if sum > lots {
+        return Err(LevelRefusal::Conflict(format!("the targets would sell {sum} lots — the order buys {lots}")));
+    }
+    Ok(())
+}
+
+/// Which of a line order's levels the index at `index` has already reached
+/// as its buy line is crossed — `"stop"` or `"target"` — if any. The index
+/// jumped past the line and that level at once: buying now would sell at
+/// once, so it isn't bought.
+pub fn line_levels_reached(option_type: Option<&str>, chart: &ChartLevels, index: f64) -> Option<&'static str> {
+    match chart_hit(option_type, chart, None, Some(index), i32::MAX)? {
+        ChartHit::All { reason: "CHART_STOP" } => Some("stop"),
+        _ => Some("target"),
+    }
 }
 
 /// What a chart stop or target watches.
@@ -1007,6 +1149,47 @@ impl ChartLevels {
         let (_, unsold) = split_target_lots(taken, sold_lots);
         self.targets.extend(unsold);
     }
+
+    /// After a sell by hand left `held_lots`: cut the targets' lots down to
+    /// it, one lot at a time off the farthest target (removed at 0) — "if I
+    /// decrease one lot, decrease the farthest target". "All left" targets
+    /// are left alone. Whether anything changed.
+    pub fn trim_targets(&mut self, held_lots: i32, option_type: Option<&str>) -> bool {
+        let mut changed = false;
+        loop {
+            let total = self.targets.iter().filter_map(|t| t.lots).fold(0, i32::saturating_add);
+            if total <= held_lots.max(0) {
+                return changed;
+            }
+            let Some(i) = self.farthest_counted(option_type) else { return changed };
+            match self.targets[i].lots {
+                Some(n) if n > 1 => self.targets[i].lots = Some(n - 1),
+                _ => {
+                    self.targets.remove(i);
+                }
+            }
+            changed = true;
+        }
+    }
+
+    /// The target with a lot count that is reached last: the highest on the
+    /// premium, and on the index a call's highest and a put's lowest. With
+    /// targets on both prices, which can't be compared, the last one set.
+    fn farthest_counted(&self, option_type: Option<&str>) -> Option<usize> {
+        let counted: Vec<(usize, &ChartTarget)> = self.targets.iter().enumerate().filter(|(_, t)| t.lots.is_some()).collect();
+        let (_, first) = counted.first()?;
+        if counted.iter().any(|(_, t)| t.trigger != first.trigger) {
+            return counted.last().map(|(i, _)| *i);
+        }
+        let higher_is_farther = first.trigger == LevelTrigger::Premium || is_call(option_type) != Some(false);
+        counted
+            .iter()
+            .max_by(|(_, a), (_, b)| {
+                let order = a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal);
+                if higher_is_farther { order } else { order.reverse() }
+            })
+            .map(|(i, _)| *i)
+    }
 }
 
 /// `taken` split at `lots`: the first `lots` lots, off the first targets
@@ -1092,6 +1275,22 @@ impl MonitoredPosition {
         let held_lots = if lot > 0 { self.executed_qty / lot } else { self.executed_qty };
         chart_hit(self.signal.option_type.as_deref(), &self.chart, premium, index, held_lots)
     }
+    /// A line order whose buy line is still waiting for the index — nothing
+    /// sent, nothing that can be.
+    pub fn line_armed(&self) -> bool {
+        matches!(self.state, TradeState::WaitingForEntry) && self.entry_line.as_ref().is_some_and(EntryLine::armed)
+    }
+
+    /// Lots a waiting scalp is to buy (its `override_qty`), or holds once
+    /// open.
+    pub fn order_lots(&self, lot: i32) -> i32 {
+        match self.state {
+            TradeState::WaitingForEntry => self.override_qty.unwrap_or(0),
+            _ if lot > 0 => self.executed_qty / lot,
+            _ => self.executed_qty,
+        }
+    }
+
     /// A buy on top of the holding is pending: a manual add not sent yet, a
     /// top-up order at the broker, or one whose send outcome is unknown.
     pub fn buy_in_flight(&self) -> bool {
@@ -1118,6 +1317,15 @@ pub struct ManualAdd {
 /// this many seconds of the tap is dropped rather than sent at a price the
 /// user never saw.
 pub const MANUAL_ORDER_TTL_SECS: i64 = 15;
+
+/// A contract whose own price hasn't ticked for this long isn't bought by
+/// hand on the owner's desk, nor by the owner's buy line when it is crossed.
+/// Illiquid options trade minutes apart, so this is far longer than the
+/// server's `MAX_CONTRACT_AGE_SECS` — the owner's call. The buy goes in at
+/// market, so the fill may be well away from the price on screen. A paper
+/// desk fills at the price it reads, where a stale one would be free P&L, so
+/// it keeps `MAX_CONTRACT_AGE_SECS`.
+pub const MAX_BUY_PRICE_AGE_SECS: f64 = 300.0;
 
 /// Per-position state of the indicator entry gate
 /// (`TradingConfig::indicator_sizing`): the wait-on-disagree log marker and
@@ -1864,6 +2072,96 @@ mod tests {
         assert_eq!(reason(&put, Some(100.0), Some(25_020.0)), Some("CHART_TARGET"));
         // No index value yet: nothing fires.
         assert_eq!(reason(&call, Some(100.0), None), None);
+    }
+
+    #[test]
+    fn a_buy_line_is_reached_from_the_side_it_was_armed_on() {
+        let falling = EntryLine { price: 25_980.0, rising: false, valid_until: None, triggered_at: None };
+        assert!(!falling.reached(26_000.0));
+        assert!(falling.reached(25_980.0));
+        assert!(falling.reached(25_900.0));
+        let rising = EntryLine { rising: true, ..falling.clone() };
+        assert!(!rising.reached(25_900.0));
+        assert!(rising.reached(25_980.0));
+        assert!(!rising.reached(0.0));
+        // Validity: compared as IST timestamps; none is till close.
+        assert!(!falling.expired("2026-11-18 11:00:00"));
+        let until = EntryLine { valid_until: Some("2026-11-18 11:30:00".into()), ..falling };
+        assert!(!until.expired("2026-11-18 11:29:59"));
+        assert!(until.expired("2026-11-18 11:30:00"));
+        let now = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap().and_hms_opt(11, 0, 0).unwrap();
+        assert_eq!(line_valid_until(now, Some(30)).unwrap().as_deref(), Some("2026-11-18 11:30:00"));
+        assert_eq!(line_valid_until(now, None).unwrap(), None);
+        assert!(line_valid_until(now, Some(0)).is_err());
+        assert!(line_valid_until(now, Some(MAX_LINE_VALID_MINUTES + 1)).is_err());
+    }
+
+    #[test]
+    fn a_line_orders_stop_and_targets_sit_on_the_losing_and_winning_side() {
+        let ok = |side: &str, stop: f64, targets: &[(f64, i32)]| {
+            let chart = levels(Some(on_index(stop)), targets.iter().enumerate().map(|(i, (p, n))| lots_at(&format!("t{i}"), on_index(*p), *n)).collect());
+            check_line_levels(Some(side), 26_000.0, &chart, 4)
+        };
+        // A call: stop below the line, targets above.
+        assert_eq!(ok("CE", 25_950.0, &[(26_050.0, 1), (26_100.0, 3)]), Ok(()));
+        assert!(matches!(ok("CE", 26_050.0, &[(26_100.0, 4)]), Err(LevelRefusal::Conflict(_))));
+        assert!(matches!(ok("CE", 25_950.0, &[(25_990.0, 4)]), Err(LevelRefusal::Conflict(_))));
+        // A put: the other way round.
+        assert_eq!(ok("PE", 26_050.0, &[(25_950.0, 4)]), Ok(()));
+        assert!(matches!(ok("PE", 25_950.0, &[(25_900.0, 4)]), Err(LevelRefusal::Conflict(_))));
+        // On the line itself is neither side.
+        assert!(ok("CE", 26_000.0, &[(26_100.0, 4)]).is_err());
+        // Targets past the order's lots.
+        assert!(matches!(ok("CE", 25_950.0, &[(26_050.0, 2), (26_100.0, 3)]), Err(LevelRefusal::Conflict(_))));
+        // A stop is required, and every level is on the index.
+        let no_stop = levels(None, vec![lots_at("t", on_index(26_100.0), 4)]);
+        assert!(matches!(check_line_levels(Some("CE"), 26_000.0, &no_stop, 4), Err(LevelRefusal::Conflict(_))));
+        // At least one target: the last can't be taken off an armed order.
+        let no_target = levels(Some(on_index(25_950.0)), vec![]);
+        assert!(matches!(check_line_levels(Some("CE"), 26_000.0, &no_target, 4), Err(LevelRefusal::Conflict(_))));
+        let premium = levels(Some(on_premium(90.0)), vec![]);
+        assert!(matches!(check_line_levels(Some("CE"), 26_000.0, &premium, 4), Err(LevelRefusal::BadRequest(_))));
+        assert!(check_line_levels(Some("FUT"), 26_000.0, &levels(Some(on_index(25_950.0)), vec![]), 4).is_err());
+    }
+
+    #[test]
+    fn an_index_that_jumps_past_the_line_and_a_level_at_once_is_not_bought() {
+        let call = levels(Some(on_index(25_950.0)), vec![lots_at("a", on_index(26_050.0), 2), lots_at("b", on_index(26_100.0), 2)]);
+        assert_eq!(line_levels_reached(Some("CE"), &call, 26_000.0), None);
+        assert_eq!(line_levels_reached(Some("CE"), &call, 25_940.0), Some("stop"));
+        assert_eq!(line_levels_reached(Some("CE"), &call, 26_060.0), Some("target"));
+        let put = levels(Some(on_index(26_050.0)), vec![lots_at("a", on_index(25_950.0), 4)]);
+        assert_eq!(line_levels_reached(Some("PE"), &put, 26_060.0), Some("stop"));
+        assert_eq!(line_levels_reached(Some("PE"), &put, 25_900.0), Some("target"));
+    }
+
+    #[test]
+    fn a_lot_sold_by_hand_comes_off_the_farthest_target() {
+        let ids = |c: &ChartLevels| c.targets.iter().map(|t| (t.id.clone(), t.lots)).collect::<Vec<_>>();
+        // A call on the index: the highest target is reached last.
+        let mut call = levels(None, vec![lots_at("near", on_index(26_050.0), 1), lots_at("far", on_index(26_100.0), 2), lots_at("mid", on_index(26_080.0), 1)]);
+        assert!(!call.trim_targets(4, Some("CE")));
+        assert!(call.trim_targets(3, Some("CE")));
+        assert_eq!(ids(&call), [("near".into(), Some(1)), ("far".into(), Some(1)), ("mid".into(), Some(1))]);
+        assert!(call.trim_targets(2, Some("CE")));
+        assert_eq!(ids(&call), [("near".into(), Some(1)), ("mid".into(), Some(1))]);
+        // A put on the index: the lowest is the farthest.
+        let mut put = levels(None, vec![lots_at("near", on_index(25_950.0), 1), lots_at("far", on_index(25_900.0), 1)]);
+        assert!(put.trim_targets(1, Some("PE")));
+        assert_eq!(ids(&put), [("near".into(), Some(1))]);
+        // On the premium the highest, for a put too.
+        let mut premium = levels(None, vec![lots_at("far", on_premium(140.0), 1), lots_at("near", on_premium(120.0), 1)]);
+        assert!(premium.trim_targets(1, Some("PE")));
+        assert_eq!(ids(&premium), [("near".into(), Some(1))]);
+        // "All left" is never cut, and nothing goes below zero.
+        let mut all_left = levels(None, vec![all_at(on_index(26_100.0)), lots_at("a", on_index(26_050.0), 2)]);
+        assert!(all_left.trim_targets(0, Some("CE")));
+        assert_eq!(all_left.targets.len(), 1);
+        assert_eq!(all_left.targets[0].lots, None);
+        // Both prices: the last one set goes first.
+        let mut mixed = levels(None, vec![lots_at("idx", on_index(26_100.0), 1), lots_at("prem", on_premium(130.0), 1)]);
+        assert!(mixed.trim_targets(1, Some("CE")));
+        assert_eq!(ids(&mixed), [("idx".into(), Some(1))]);
     }
 
     #[test]

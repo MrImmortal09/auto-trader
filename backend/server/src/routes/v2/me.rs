@@ -24,6 +24,7 @@ use crate::auth::Identity;
 use crate::desk::{self, DeskPosition};
 use crate::execute;
 use crate::history::{self, Call, GroupBy, Range};
+use crate::line_orders;
 use crate::paper::{self, PaperPosition, Refusal};
 use crate::routes::v2::desk::{ClosedCall, DeskAnswer, Wallet};
 use crate::routes::v2::history::{range_and_group, Answer};
@@ -321,8 +322,90 @@ pub async fn exit_all_handler(State(state): State<AppState>, Extension(identity)
     if let Err(e) = market_open() {
         return e;
     }
+    // Nothing left to buy later either: armed buy lines go too, as on the owner's desk.
+    let cancelled_lines = state.paper.cancel_all_lines(user_id).await;
     let (sold, kept) = state.paper.exit_all(user_id, |p| fresh_price(&state, p)).await;
-    Json(json!({ "sold": sold, "not_sold": kept })).into_response()
+    Json(json!({ "sold": sold, "not_sold": kept, "cancelled_lines": cancelled_lines })).into_response()
+}
+
+/// `POST /api/v2/me/line-buy` — a line order on the caller's paper book
+/// (`crate::line_orders`): `lots` of an index option, bought at the
+/// option's live price once its index crosses `line`, opening with the stop
+/// and targets given. Refused when the index has already crossed the line
+/// (`code: "line_crossed"`), and on a contract held or already waiting.
+pub async fn line_buy_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Json(req): Json<line_orders::LineBuyReq>,
+) -> Response {
+    let user_id = match user_of(&identity) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    if !(1..=paper::MAX_LOTS_PER_TAP).contains(&req.lots) {
+        return refuse(StatusCode::BAD_REQUEST, format!("Lots must be between 1 and {}", paper::MAX_LOTS_PER_TAP));
+    }
+    if !execute::manual_buy_window_open() || trading_engine::is_entry_cutoff_passed() {
+        return refuse(StatusCode::CONFLICT, execute::paper_buy_closed_message());
+    }
+    if !execute::feed_fresh() {
+        return refuse(StatusCode::CONFLICT, "Price feed is stale — not arming blind");
+    }
+    let contract = match paper::resolve::find_paper_contract(&state, &req.trading_symbol).await {
+        Ok(contract) => contract,
+        Err(r) => return r.into_response(),
+    };
+    if contract.underlying_key.is_some() || line_orders::index_key(&contract.index).is_none() {
+        return refuse(StatusCode::BAD_REQUEST, format!("{} can't be bought on a line — line orders are for the six indices", contract.index));
+    }
+    if execute::price(&state, &contract.ws_key).is_none()
+        || execute::contract_age_secs(&contract.ws_key).is_none_or(|age| age > execute::MAX_CONTRACT_AGE_SECS)
+    {
+        return refuse(StatusCode::CONFLICT, format!("{}'s price isn't live — not arming blind", contract.trading_symbol));
+    }
+    if paper::engine::squaring_off(contract.expiry, shared_domain::now_ist()) {
+        return refuse(StatusCode::CONFLICT, format!("{} expires today and is being squared off — pick a later expiry", contract.trading_symbol));
+    }
+    let levels = match line_orders::check_request(&req, &contract.option_type) {
+        Ok(levels) => levels,
+        Err(r) => return line_orders::refused_response(r),
+    };
+    let index_now = match line_orders::index_now(&state.prices, &contract.index) {
+        Ok(v) => v,
+        Err(r) => return line_orders::refused_response(r),
+    };
+    if let Err(r) = line_orders::check_not_crossed(&contract.index, req.line, index_now) {
+        return line_orders::refused_response(r);
+    }
+    let line = match line_orders::arm(req.line, req.valid_minutes) {
+        Ok(line) => line,
+        Err(r) => return line_orders::refused_response(r),
+    };
+    match state.paper.arm_line(user_id, &contract, req.lots, line, levels).await {
+        Ok(order) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "position_id": order.id, "symbol": order.trading_symbol, "qty": order.lots * order.lot_size, "line": order.line, "chart": order.chart })),
+        )
+            .into_response(),
+        Err(r) => r.into_response(),
+    }
+}
+
+/// `DELETE /api/v2/me/line-buy/:id` — cancel one of the caller's line
+/// orders while its buy line is still armed.
+pub async fn line_cancel_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(id): Path<String>,
+) -> Response {
+    let user_id = match user_of(&identity) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    match state.paper.cancel_line(user_id, &id).await {
+        Ok(_) => Json(json!({ "id": id, "cancelled": true })).into_response(),
+        Err(r) => r.into_response(),
+    }
 }
 
 /// `PATCH /api/v2/me/positions/:id {stop?, set_target?, remove_target?}` —
@@ -332,7 +415,9 @@ pub async fn exit_all_handler(State(state): State<AppState>, Extension(identity)
 /// stock price), a target with its `lots` (`null` = all left). One already
 /// crossed sells on the watch loop's next pass (within half a second, at a
 /// fresh price) — everything for the stop, a target's lots for a target:
-/// `sells_now` and `sells_lots` say so.
+/// `sells_now` and `sells_lots` say so. On a line order still waiting on
+/// its buy line it moves the line (`entry`), the stop or a target instead
+/// (`LevelsUpdate::apply_to_line`), and nothing sells.
 pub async fn patch_levels_handler(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
@@ -343,6 +428,24 @@ pub async fn patch_levels_handler(
         Ok(id) => id,
         Err(e) => return e,
     };
+    // A line order still waiting on its buy line: its line, stop and targets.
+    if state.paper.is_line(user_id, &id).await {
+        let order_index = state.paper.lines(user_id).await.into_iter().find(|o| o.id == id).map(|o| o.index);
+        let index = match (update.entry.is_some(), order_index) {
+            (true, Some(name)) => match line_orders::index_now(&state.prices, &name) {
+                Ok(v) => Some(v),
+                Err(r) => return line_orders::refused_response(r),
+            },
+            _ => None,
+        };
+        return match state.paper.set_line_levels(user_id, &id, &update, index).await {
+            Ok((order, target_id)) => Json(json!({ "id": id, "chart": order.chart, "line": order.line, "sells_now": false, "sells_lots": null, "target_id": target_id })).into_response(),
+            Err(r) => line_orders::refused_response(r),
+        };
+    }
+    if update.entry.is_some() {
+        return refuse(StatusCode::CONFLICT, "only a line order still waiting on its buy line has one to move");
+    }
     let (pos, target_id) = match state.paper.set_levels(user_id, &id, &update).await {
         Ok(set) => set,
         Err(r) => return r.into_response(),
