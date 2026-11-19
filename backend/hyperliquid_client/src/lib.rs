@@ -1,16 +1,20 @@
 //! Hyperliquid client: market data for the perps the app trades.
 //!
-//! This slice is read-only. [`InfoClient`] calls the public `info` endpoint
-//! (candles, prices); [`feed`] keeps one WebSocket open for live candles and
-//! each contract's context (mark, mid, oracle price, funding). Nothing here
-//! holds a key, signs, or can place an order.
+//! [`InfoClient`] calls the public `info` endpoint (candles, prices, an
+//! account's positions and orders); [`feed`] keeps one WebSocket open for
+//! live candles and each contract's context (mark, mid, oracle price,
+//! funding); [`signing`] signs exchange actions with an API wallet, which can
+//! trade but never withdraw.
 //!
 //! Hyperliquid names a core perp by its coin (`BTC`) and a builder-deployed
 //! (HIP-3) perp by its dex and coin (`xyz:GOLD`); every call here takes that
 //! name as Hyperliquid spells it. Prices and sizes arrive as decimal strings
 //! and are read as `f64` (market data only — never an amount sent back).
 
+pub mod account;
+pub mod exchange;
 pub mod feed;
+pub mod signing;
 
 use std::time::Duration;
 
@@ -67,6 +71,10 @@ pub enum HlError {
     Status { status: u16, body: String },
     #[error("unreadable Hyperliquid answer: {0}")]
     Decode(String),
+    #[error("API wallet key: {0}")]
+    Key(String),
+    #[error("could not encode the action: {0}")]
+    Encode(String),
 }
 
 /// One OHLCV candle of `coin` at `interval`, opening at `t` (Unix ms).
@@ -97,7 +105,7 @@ struct RawCandle {
     v: String,
 }
 
-fn num(s: &str) -> Result<f64, HlError> {
+pub(crate) fn num(s: &str) -> Result<f64, HlError> {
     s.trim().parse::<f64>().ok().filter(|v| v.is_finite()).ok_or_else(|| HlError::Decode(format!("not a number: {s:?}")))
 }
 
@@ -220,7 +228,7 @@ impl InfoClient {
         self.network
     }
 
-    async fn post(&self, body: Value) -> Result<Value, HlError> {
+    pub(crate) async fn post(&self, body: Value) -> Result<Value, HlError> {
         let resp = self.http.post(format!("{}/info", self.network.api_url())).json(&body).send().await?;
         let status = resp.status();
         if !status.is_success() {

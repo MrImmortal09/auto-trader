@@ -7,6 +7,7 @@ import { Button } from '../ui/Button';
 import { IndicatorSizing, TelegramCalls } from './CallSections';
 import { Connections } from './Connections';
 import { Exits } from './Exits';
+import { Hyperliquid } from './Hyperliquid';
 import { Lots } from './Lots';
 import { Beta, ServerData, TradeNotes } from './OtherSections';
 import { NavItem } from './parts';
@@ -14,7 +15,7 @@ import { betaLine, connectionsLine, exitsLine, indicatorLine, lotsLine, serverLi
 import { Trading } from './Trading';
 import { useSettings } from './useSettings';
 
-type SectionId = 'connections' | 'trading' | 'lots' | 'exits' | 'telegram' | 'indicator' | 'trade' | 'server' | 'beta';
+type SectionId = 'connections' | 'trading' | 'lots' | 'exits' | 'telegram' | 'indicator' | 'trade' | 'hyperliquid' | 'server' | 'beta';
 
 const SECTIONS: { id: SectionId; title: string }[] = [
   { id: 'connections', title: 'Connections' },
@@ -24,6 +25,7 @@ const SECTIONS: { id: SectionId; title: string }[] = [
   { id: 'telegram', title: 'Telegram calls' },
   { id: 'indicator', title: 'Indicator sizing' },
   { id: 'trade', title: 'Trade' },
+  { id: 'hyperliquid', title: 'Hyperliquid' },
   { id: 'server', title: 'Server and data' },
   { id: 'beta', title: 'Beta' },
 ];
@@ -50,6 +52,8 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
   const cfg = settings.cfg;
   const loaded = cfg != null;
   const indexOnly = flags.data ? flags.data.index_options_only : null;
+  // Hyperliquid's section only while its switch is on.
+  const sections = SECTIONS.filter((s) => s.id !== 'hyperliquid' || flags.data?.hyperliquid === true);
 
   // The nav follows the section being read.
   useEffect(() => {
@@ -94,6 +98,8 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
         return <IndicatorSizing id={sid} title={title} settings={settings} large={large} />;
       case 'trade':
         return <TradeNotes id={sid} title={title} flags={flags.data} />;
+      case 'hyperliquid':
+        return <Hyperliquid id={sid} title={title} serverBase={serverBase} large={large} />;
       case 'server':
         return <ServerData id={sid} title={title} serverBase={serverBase} settings={settings} system={system.data} large={large} />;
       case 'beta':
@@ -125,13 +131,14 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
       telegram: telegramLine(cfg, flags.data),
       indicator: indicatorLine(cfg),
       trade: 'One-tap buy · any strike, any expiry · hold to exit all',
+      hyperliquid: 'BTC, ETH and gold perps · Paper or LIVE · API wallets',
       server: serverLine(system.data),
       beta: betaLine(flags.data),
     };
     return (
       <div className="flex flex-col gap-4 p-4">
         <div className="rounded-12 border border-line bg-panel">
-          {SECTIONS.map((s) => (
+          {sections.map((s) => (
             <button
               key={s.id}
               type="button"
@@ -163,7 +170,7 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
     <div className="flex min-h-full">
       <nav aria-label="Settings sections" className="w-[220px] shrink-0 border-r border-line">
         <div className="sticky top-0 flex flex-col gap-1 p-3 pt-5">
-          {SECTIONS.map((s) => (
+          {sections.map((s) => (
             <NavItem
               key={s.id}
               selected={current === s.id}
@@ -178,7 +185,7 @@ export function Settings({ serverBase, desktop, health, onKillSwitch, onModeChan
         </div>
       </nav>
       <div className="min-w-0 flex-1 px-10 pt-6 pb-24">
-        <div className="flex max-w-[760px] flex-col gap-8">{SECTIONS.map((s) => <div key={s.id}>{body(s.id, true)}</div>)}</div>
+        <div className="flex max-w-[760px] flex-col gap-8">{sections.map((s) => <div key={s.id}>{body(s.id, true)}</div>)}</div>
       </div>
     </div>
   );

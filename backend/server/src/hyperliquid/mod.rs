@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 
 use crate::candles::bars::{Bar, Tf};
 
+pub mod live;
 pub mod paper;
 pub mod perp;
 

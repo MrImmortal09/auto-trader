@@ -774,6 +774,33 @@ export interface PerpAccount {
   lines: PerpLine[];
   activity: PerpActivity[];
   fills: PerpFill[];
+  /** LIVE: `testnet` or `mainnet`. */
+  network?: 'testnet' | 'mainnet';
+  /** LIVE: each Hyperliquid balance behind it (the core perps', gold's dex). */
+  venues?: { dex: string; label: string; account_value: number; withdrawable: number; margin_used: number }[];
+}
+
+/** A stored Hyperliquid API wallet, as Settings shows it (never its key). */
+export interface HlCredentialView {
+  /** The account it trades for. */
+  account: string;
+  /** The API wallet's own address. */
+  agent: string;
+  checked_at: string | null;
+  /** Its last check passed: approved, accepted, balances read. */
+  ok: boolean;
+  note: string | null;
+}
+
+/** `GET /api/v2/hl/live`: the owner's Hyperliquid switches and API wallets. */
+export interface HlLiveView {
+  mode: 'paper' | 'live';
+  network: 'testnet' | 'mainnet';
+  credentials: { testnet: HlCredentialView | null; mainnet: HlCredentialView | null };
+  /** AUTH_SECRET is set on the server, so a key can be stored. */
+  can_store_keys: boolean;
+  /** LIVE orders are sent (not yet in this release). */
+  orders_enabled: boolean;
 }
 
 export interface HlMarketsAnswer {
