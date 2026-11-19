@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 're
 import { dispose, init, type AxisCreateRangeCallback, type Chart, type KLineData, type OverlayEvent } from 'klinecharts';
 import { apiUrl } from '../../lib/api';
 import { streamToken } from '../lib/api';
-import { fetchBars, fetchDays, toK, upsert } from './bars';
+import { fetchBars, fetchDays, putOnChart, toK, upsert } from './bars';
 import type { CrosshairBus } from './bus';
 import { CHART_STYLES, PIVOT_SERIES, showOscillator, THOUSANDS, VWAP_SERIES, type MarkerData, type OrderLineData } from './chartSetup';
 import { DRAW_PREFIX, KlineDrawings, NO_DRAW_PREFS, useDrawPrefs, type DrawApi } from './drawings';
@@ -292,10 +292,38 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
         .then((fut) => live && setFutureBars(fut))
         .catch(() => live && setFutureBars([]));
     }
+    // Bars of this symbol (oldest first) into the kept list and onto the chart,
+    // older ones included (see `putOnChart`); none before the chart has loaded.
+    const take = (list: Bar[]) => {
+      if (list.length === 0) return;
+      setBars((prev) => (prev ? list.reduce(upsert, prev) : prev));
+      const push = pushBar.current;
+      if (push) putOnChart(c, push, list);
+    };
+    const takeFuture = (list: Bar[]) => {
+      if (list.length > 0) setFutureBars((prev) => list.reduce(upsert, prev));
+    };
     const token = streamToken();
     const params = new URLSearchParams({ symbols: [symbol, future].filter(Boolean).join(','), tf });
     if (token) params.set('token', token);
     const es = new EventSource(`${apiUrl(serverBase, '/api/v2/candles/stream')}?${params}`);
+    // EventSource reconnects by itself, and the stream sends only what changes
+    // after it is open: what changed while it was down is today's bars again.
+    let opened = false;
+    es.addEventListener('open', () => {
+      if (!opened) {
+        opened = true;
+        return;
+      }
+      fetchDays(serverBase, symbol, tf, 1)
+        .then((today) => live && take(today))
+        .catch(() => {});
+      if (future) {
+        fetchDays(serverBase, future, tf, 1)
+          .then((today) => live && takeFuture(today))
+          .catch(() => {});
+      }
+    });
     es.addEventListener('bars', (e) => {
       let body: { updates: { symbol: string; bar: Bar }[] };
       try {
@@ -303,14 +331,8 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       } catch {
         return;
       }
-      for (const u of body.updates) {
-        if (u.symbol === symbol) {
-          setBars((prev) => (prev ? upsert(prev, u.bar) : prev));
-          pushBar.current?.(toK(u.bar));
-        } else if (u.symbol === future) {
-          setFutureBars((prev) => upsert(prev, u.bar));
-        }
-      }
+      take(body.updates.filter((u) => u.symbol === symbol).map((u) => u.bar));
+      if (future) takeFuture(body.updates.filter((u) => u.symbol === future).map((u) => u.bar));
     });
     return () => {
       live = false;
