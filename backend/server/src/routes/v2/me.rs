@@ -312,6 +312,72 @@ pub async fn close_handler(
     }
 }
 
+#[derive(Deserialize)]
+pub struct LimitCloseReq {
+    lots: i32,
+    price: f64,
+}
+
+/// `POST /api/v2/me/positions/:id/limit-close {lots, price}` — rest a limit
+/// sell of some lots at `price` or better, until it fills (at its price, once
+/// the price reaches it), is cancelled, or the market closes. One at or below
+/// the live price sells at once at the live price, as a marketable limit
+/// does: `filled` is that fill, else `null` and `limit_close` what rests.
+/// Never more than is held; one at a time.
+pub async fn limit_close_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(id): Path<String>,
+    Json(req): Json<LimitCloseReq>,
+) -> Response {
+    let user_id = match user_of(&identity) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    if let Err(e) = market_open() {
+        return e;
+    }
+    let Some(pos) = state.paper.open(user_id).await.into_iter().find(|p| p.id == id) else {
+        return refuse(StatusCode::NOT_FOUND, "not found");
+    };
+    if pos.limit_close.is_some() {
+        return refuse(StatusCode::CONFLICT, format!("A limit sell already rests on {} — cancel it first", pos.label()));
+    }
+    if !(req.price.is_finite() && req.price > 0.0) {
+        return refuse(StatusCode::BAD_REQUEST, "The price must be a positive number");
+    }
+    if !(1..=pos.lots()).contains(&req.lots) {
+        return refuse(StatusCode::BAD_REQUEST, format!("Lots must be between 1 and {} (what you hold)", pos.lots()));
+    }
+    if fresh_price(&state, &pos).is_some_and(|now| now >= req.price) {
+        return match state.paper.sell(user_id, &id, Some(req.lots), "LIMIT_CLOSE", |p| fresh_price(&state, p)).await {
+            Ok(filled) => Json(json!({ "filled": filled, "limit_close": null })).into_response(),
+            Err(r) => r.into_response(),
+        };
+    }
+    match state.paper.place_limit(user_id, &id, req.lots, req.price).await {
+        Ok(pos) => Json(json!({ "filled": null, "limit_close": pos.limit_close })).into_response(),
+        Err(r) => r.into_response(),
+    }
+}
+
+/// `DELETE /api/v2/me/positions/:id/limit-close` — cancel the limit sell
+/// resting on a position, selling nothing.
+pub async fn limit_cancel_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(id): Path<String>,
+) -> Response {
+    let user_id = match user_of(&identity) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    match state.paper.cancel_limit(user_id, &id, "cancelled by hand").await {
+        Ok(_) => Json(json!({ "id": id, "status": "cancelled" })).into_response(),
+        Err(r) => r.into_response(),
+    }
+}
+
 /// `POST /api/v2/me/exit-all` — sell everything the caller holds at the live
 /// prices: what was sold, and why anything wasn't.
 pub async fn exit_all_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {

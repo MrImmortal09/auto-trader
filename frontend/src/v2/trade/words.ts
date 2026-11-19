@@ -1,6 +1,6 @@
 // Words for a manual trade: what it is doing, and how a level fires.
 
-import type { ChartLevel, EntryLine, ExecutePosition } from '../../types';
+import type { ChartLevel, EntryLine, ExecutePosition, LimitClose } from '../../types';
 import { chartTargets, targetLotsLabel } from '../../lib/format';
 import { price } from '../lib/format';
 import type { LevelKind } from './lines';
@@ -36,4 +36,33 @@ export function lineSummary(p: ExecutePosition, line: EntryLine): string {
   ]
     .filter(Boolean)
     .join(' · ');
+}
+
+/** "150 @ ₹152.00", with "· 75 sold" once part of it has filled. */
+export function limitWords(lc: LimitClose): string {
+  return `${lc.qty} @ ₹${price(lc.price)}${lc.filled > 0 ? ` · ${lc.filled} sold` : ''}`;
+}
+
+/** Where a limit close is: on the owner's LIVE desk at Kotak, else watched
+ * here for the price. */
+export function limitStatus(lc: LimitClose, live: boolean): string {
+  switch (lc.status) {
+    case 'sending':
+      return 'Sending to Kotak…';
+    case 'unconfirmed':
+      return 'No answer from Kotak — checking its order book; nothing else sells meanwhile';
+    case 'missing':
+      return "Not in Kotak's order book — it may still rest there, so nothing else sells. Check the Kotak app (cancel it there if it rests), then × releases it";
+    case 'cancelling':
+      return 'Cancelling…';
+    default:
+      return live ? 'Resting at Kotak until it fills, is cancelled, or the close' : 'Fills when the price reaches it; lapses at the close';
+  }
+}
+
+/** Whether its × can cancel it now: not while it is being cancelled, or
+ * while Kotak hasn't answered its send — until it is `missing`, when the ×
+ * releases it (after the owner has checked Kotak). */
+export function limitCancellable(lc: LimitClose): boolean {
+  return lc.status === 'resting' || lc.status === 'sending' || lc.status === 'missing';
 }

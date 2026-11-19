@@ -313,6 +313,7 @@ impl PaperDesk {
             last_ltp: Some(price),
             underlying_key: None,
             segment: contract.segment.clone(),
+            limit_close: None,
         });
         let pos = next.last().cloned().expect("just pushed");
         let leg = LegOut {

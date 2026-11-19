@@ -435,6 +435,18 @@ export interface LevelsAnswer {
   target_id?: string | null;
 }
 
+/** Rest a limit sell of `lots` of the owner's scalp at `price` or better:
+ * LIVE the engine sends it to Kotak as a day order on its next tick, Paper
+ * it fills when the price reaches it. `{qty, price, fills_now}`. */
+export const placeLimitClose = (base: string, id: string, lots: number, price: number) =>
+  send(base, `/api/v2/positions/${encodeURIComponent(id)}/limit-close`, 'POST', { lots, price });
+/** Cancel the owner's scalp's limit sell (LIVE: on the engine's next tick). */
+export const cancelLimitClose = (base: string, id: string) => send(base, `/api/v2/positions/${encodeURIComponent(id)}/limit-close`, 'DELETE');
+/** Rest a limit sell on one of the user's paper positions; one at or below
+ * the live price sells at once. `{filled, limit_close}`. */
+export const paperLimitClose = (base: string, id: string, lots: number, price: number) => send(base, `${mine(id)}/limit-close`, 'POST', { lots, price });
+export const paperCancelLimitClose = (base: string, id: string) => send(base, `${mine(id)}/limit-close`, 'DELETE');
+
 /** Change a scalp's chart stop and targets — PR 4's endpoint, behind the
  * `chart_stops` switch. */
 export const setChartLevels = (base: string, id: string, levels: LevelsUpdate) => send(base, `/api/v2/positions/${encodeURIComponent(id)}`, 'PATCH', levels);

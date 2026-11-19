@@ -17,7 +17,7 @@ import { approxMoney, levelPnl } from './model';
 import { AccountColumn } from './panel/TradingPanel';
 import { activityEvents, type EngineError } from './panel/activity';
 import { ActivityList, HistoryList, PaperActivityList } from './panel/lists';
-import { busyNote, levelWords, lineSummary } from './words';
+import { busyNote, levelWords, limitCancellable, limitStatus, limitWords, lineSummary } from './words';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 
@@ -40,6 +40,10 @@ export interface PositionHandlers {
   onCancel: (p: ExecutePosition) => void;
   /** A line order still waiting on its buy line: cancel it. */
   onCancelLine: (p: ExecutePosition) => void;
+  /** Ask for a limit close of some of it (lots and price). */
+  onLimit: (p: ExecutePosition) => void;
+  /** Cancel its resting limit close. */
+  onCancelLimit: (p: ExecutePosition) => void;
   onExitAll: () => void;
   exitAllBusy: boolean;
 }
@@ -264,6 +268,22 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                       Drag the lines on the {p.index} chart to move them. ≈ amounts use{' '}
                       {delta.assumed ? 'an assumed option delta (0.50) — Upstox has none for this contract' : `the option delta (${Math.abs(delta.value).toFixed(2)})`}.
                     </p>
+                    {p.limit_close ? (
+                      <div className="flex items-center gap-3 border-t border-line pt-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="type-label text-fg-muted">Limit sell</div>
+                          <div className="type-body-strong text-loss tnum">{limitWords(p.limit_close)}</div>
+                          <div className="type-caption text-fg-subtle">{limitStatus(p.limit_close, mode === 'LIVE')}</div>
+                        </div>
+                        <Button size="lg" kind="ghost" disabled={!limitCancellable(p.limit_close) || !!h.sending[p.id]} onClick={() => h.onCancelLimit(p)}>
+                          {p.limit_close.status === 'missing' ? 'Release' : 'Cancel'}
+                        </Button>
+                      </div>
+                    ) : (
+                      <Button pointerOnly size="lg" kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLimit(p)}>
+                        Limit sell…
+                      </Button>
+                    )}
                     <div className="grid grid-cols-2 gap-2">
                       <Button pointerOnly size="lg" kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)}>
                         −1 lot ({p.lot_size})

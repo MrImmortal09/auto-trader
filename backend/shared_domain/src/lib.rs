@@ -815,6 +815,10 @@ pub struct MonitoredPosition {
     /// Left out of the JSON while unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_line: Option<EntryLine>,
+    /// A scalp's limit close, from the Trade panel — see [`LimitClose`].
+    /// Left out of the JSON while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_close: Option<LimitClose>,
 }
 
 /// Manual buys are accepted 09:15–15:39 IST on a weekday — up to the engine's
@@ -1317,6 +1321,119 @@ pub struct ManualAdd {
 /// this many seconds of the tap is dropped rather than sent at a price the
 /// user never saw.
 pub const MANUAL_ORDER_TTL_SECS: i64 = 15;
+
+/// A limit sell resting against a scalp, the Trade panel's "Limit close":
+/// `qty` (whole lots, never more than is held) at `price` or better, until it
+/// fills, is cancelled, or the market closes. LIVE it is a DAY limit sell at
+/// Kotak, which can fill in parts; on paper it fills at `price` once the
+/// last price reaches it. It only ever closes what is held: any other sell
+/// of the position (Close, −1 lot, a chart stop or target, exit all, the
+/// kill switch, the expiry square-off) cancels it first, and LIVE nothing
+/// else is sold until Kotak shows it closed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LimitClose {
+    pub qty: i32,
+    pub price: f64,
+    /// IST `%Y-%m-%d %H:%M:%S` of the request.
+    pub requested_at: String,
+    /// Paper: the price was at or below the last price when it was placed,
+    /// so it fills at once at the last price, as a marketable limit does.
+    #[serde(default)]
+    pub marketable: bool,
+    /// LIVE: Kotak's order number, once placed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+    /// LIVE: IST `%Y-%m-%d %H:%M:%S` the send went out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<String>,
+    /// LIVE: the send got no verdict, so it may be resting at Kotak. The
+    /// order book is searched for it, and nothing else sells meanwhile.
+    #[serde(default)]
+    pub send_uncertain: bool,
+    /// The order-book poll the send went out after; not kept across a
+    /// restart (a fresh book is read before anything else then).
+    #[serde(skip)]
+    pub sent_poll: Option<u64>,
+    /// Units of it sold so far, and what they sold for in all (Kotak's
+    /// average price times `filled`): the next fill is booked as the
+    /// difference.
+    #[serde(default)]
+    pub filled: i32,
+    #[serde(default)]
+    pub filled_value: f64,
+    /// The user asked to cancel it.
+    #[serde(default)]
+    pub cancel_requested: bool,
+    /// LIVE: IST `%Y-%m-%d %H:%M:%S` the last cancel went out; the order
+    /// book says how the order ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_sent_at: Option<String>,
+    /// LIVE: it was missing from Kotak's order book past the grace window
+    /// (a known order, or a send with no answer), and that was said, once.
+    /// It still holds every other sell back; the owner's × releases it.
+    #[serde(default)]
+    pub missing_noted: bool,
+}
+
+impl LimitClose {
+    pub fn new(qty: i32, price: f64, requested_at: String, marketable: bool) -> Self {
+        LimitClose {
+            qty,
+            price,
+            requested_at,
+            marketable,
+            order_id: None,
+            sent_at: None,
+            send_uncertain: false,
+            sent_poll: None,
+            filled: 0,
+            filled_value: 0.0,
+            cancel_requested: false,
+            cancel_sent_at: None,
+            missing_noted: false,
+        }
+    }
+
+    /// Units still to sell.
+    pub fn left(&self) -> i32 {
+        (self.qty - self.filled).max(0)
+    }
+
+    /// LIVE: it is, or may be, at Kotak.
+    pub fn at_broker(&self) -> bool {
+        self.order_id.is_some() || self.send_uncertain
+    }
+
+    /// How the Trade panel words it: `sending` (LIVE, not at Kotak yet),
+    /// `unconfirmed` (sent with no verdict), `missing` (not in Kotak's order
+    /// book past the grace window: its × releases it), `cancelling`, or
+    /// `resting`.
+    pub fn status(&self, live: bool) -> &'static str {
+        if self.missing_noted && self.at_broker() && !self.cancel_requested {
+            "missing"
+        } else if self.send_uncertain {
+            "unconfirmed"
+        } else if self.cancel_requested || self.cancel_sent_at.is_some() {
+            "cancelling"
+        } else if live && self.order_id.is_none() {
+            "sending"
+        } else {
+            "resting"
+        }
+    }
+}
+
+/// `price` on a `tick` grid, rounded up (a sell limit never asks less than
+/// was typed): `152.03` on `0.05` is `152.05`, and `152.05` stays.
+pub fn limit_price_on_tick(price: f64, tick: f64) -> f64 {
+    if !(tick > 0.0) || !price.is_finite() {
+        return price;
+    }
+    let steps = price / tick;
+    let near = steps.round();
+    let steps = if (steps - near).abs() < 1e-6 { near } else { steps.ceil() };
+    ((steps * tick) * 100.0).round() / 100.0
+}
 
 /// A contract whose own price hasn't ticked for this long isn't bought by
 /// hand on the owner's desk, nor by the owner's buy line when it is crossed.

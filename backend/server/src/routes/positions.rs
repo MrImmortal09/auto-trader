@@ -194,10 +194,35 @@ pub async fn patch_position_handler(
     }
 }
 
+/// PAPER books a sell right in the route: a limit close resting on the
+/// position is cancelled first, before its holding is read, so the engine
+/// can't fill it as well. (LIVE the engine does that, and waits for Kotak.)
+async fn drop_paper_limit_before(state: &AppState, id: &str, sell: &str) {
+    if state.trading_cfg.read().await.mode == "LIVE" {
+        return;
+    }
+    let mut positions = state.positions.write().await;
+    let Some(pos) = positions.iter_mut().find(|p| p.id == id) else { return };
+    if pos.limit_close.take().is_none() {
+        return;
+    }
+    let instrument = pos.signal.instrument_name.clone();
+    let snapshot = positions.clone();
+    drop(positions);
+    persist_positions_snapshot(state, &snapshot).await;
+    let _ = state.log_tx.send(serde_json::json!({
+        "event": "LIMIT_CLOSE_CANCELLED",
+        "instrument": instrument,
+        "reason": format!("cancelled before the {sell} sell"),
+        "mode": "PAPER",
+    }).to_string());
+}
+
 pub async fn close_position_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    drop_paper_limit_before(&state, &id, "CLOSED_VIA_FRONTEND").await;
     let snapshot = {
         let positions = state.positions.read().await;
         positions.iter().find(|p| p.id == id).map(|p| {
@@ -394,6 +419,7 @@ pub async fn sell_position_handler(
     Path(id): Path<String>,
     Json(req): Json<SellPositionReq>,
 ) -> impl IntoResponse {
+    drop_paper_limit_before(&state, &id, "MANUAL_SELL").await;
     let snapshot = {
         let positions = state.positions.read().await;
         positions.iter().find(|p| p.id == id).map(|p| {

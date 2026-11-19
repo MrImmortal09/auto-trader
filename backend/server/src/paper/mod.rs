@@ -36,7 +36,7 @@ use axum::http::StatusCode;
 use chrono::NaiveDate;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use shared_domain::{ChartLevel, ChartLevels, LevelTrigger};
+use shared_domain::{ChartLevel, ChartLevels, LevelTrigger, LimitClose};
 
 use crate::routes::v2::positions::{level_refusal, LevelsUpdate};
 use sqlx::SqlitePool;
@@ -56,6 +56,9 @@ pub const MAX_USER_POSITION_SCRIPS: usize = 40;
 pub const MAX_LOTS_PER_TAP: i32 = crate::routes::execute::MAX_LOTS_PER_TAP;
 /// Activity lines kept per user, in memory only.
 const MAX_ACTIVITY: usize = 100;
+/// The tick a paper limit sell's price is put on: every index and stock
+/// option trades in 0.05.
+const PAPER_TICK: f64 = 0.05;
 
 /// A listed option — an index's, or a stock's behind `stock_paper` — as
 /// the route resolved it from the scrip master (see [`resolve`]).
@@ -110,6 +113,11 @@ pub struct PaperPosition {
     /// it was kept — [`Self::segment`] reads it off the feed key then.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub segment: String,
+    /// A limit sell resting on it, from the Trade panel: it fills at its
+    /// price once the price reaches it, and goes at the close or before any
+    /// other sell — see `shared_domain::LimitClose`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_close: Option<LimitClose>,
 }
 
 impl PaperPosition {
@@ -258,6 +266,7 @@ fn reason_text(reason: &str) -> &'static str {
         "CHART_TARGET" => "chart target",
         "EXPIRY_SQUAREOFF" => "expiry square-off",
         "MANUAL_EXIT_ALL" => "exit all",
+        "LIMIT_CLOSE" => "limit sell",
         _ => "by hand",
     }
 }
@@ -498,6 +507,7 @@ impl PaperDesk {
                     last_ltp: Some(price),
                     underlying_key: contract.underlying_key.clone(),
                     segment: contract.segment.clone(),
+                    limit_close: None,
                 });
                 next.len() - 1
             }
@@ -648,6 +658,9 @@ impl PaperDesk {
         if qty <= 0 || !price.is_finite() || price < 0.0 {
             return Err(Refusal::bad_request("Nothing to sell"));
         }
+        // A limit sell resting on it goes first, in the same write: it fills
+        // here (`LIMIT_CLOSE`), or any other sell cancels it.
+        let limit_dropped = next[i].limit_close.take().is_some() && reason != "LIMIT_CLOSE";
         let charges = if price > 0.0 { fill::sell_fill(&pos.index, qty, price) } else { no_charges() };
         let held = next[i].qty - qty;
         if held == 0 {
@@ -677,6 +690,9 @@ impl PaperDesk {
         } else {
             book.insert(user_id, next);
         }
+        if limit_dropped {
+            self.note(user_id, "limit", Some(&pos.id), format!("Limit sell on {} cancelled before the {} sell", pos.label(), reason_text(reason)));
+        }
         self.note(
             user_id,
             "sell",
@@ -696,6 +712,72 @@ impl PaperDesk {
             balance,
             reason: Some(reason),
         })
+    }
+
+    /// Rest a limit sell of `lots` of `user_id`'s position `id` at `price`
+    /// (on the 0.05 tick, rounded up) or better: the watch loop fills it at
+    /// its price once the price reaches it, and lets it go at the close. One
+    /// at a time; never more lots than are held.
+    pub async fn place_limit(&self, user_id: i64, id: &str, lots: i32, price: f64) -> Result<PaperPosition, Refusal> {
+        let mut book = self.book.lock().await;
+        let mut next = book.get(&user_id).cloned().unwrap_or_default();
+        let Some(pos) = next.iter_mut().find(|p| p.id == id) else {
+            return Err(Refusal::not_found());
+        };
+        if pos.limit_close.is_some() {
+            return Err(Refusal::conflict(format!("A limit sell already rests on {} — cancel it first", pos.label())));
+        }
+        let held = pos.lots();
+        if !(1..=held).contains(&lots) {
+            return Err(Refusal::bad_request(format!("Lots must be between 1 and {held} (what you hold)")));
+        }
+        if !(price.is_finite() && price > 0.0) {
+            return Err(Refusal::bad_request("The price must be a positive number"));
+        }
+        let price = shared_domain::limit_price_on_tick(price, PAPER_TICK);
+        let qty = lots * pos.lot_size;
+        pos.limit_close = Some(LimitClose::new(qty, price, shared_domain::current_ist_timestamp_string(), false));
+        let pos = pos.clone();
+        self.write_snapshot(user_id, &next).await?;
+        book.insert(user_id, next);
+        drop(book);
+        self.note(user_id, "limit", Some(&pos.id), format!("Limit sell of {qty} {} at ₹{price:.2} — rests until it fills, is cancelled or the market closes", pos.label()));
+        Ok(pos)
+    }
+
+    /// Let go of the limit sell on `user_id`'s position `id`, selling
+    /// nothing; `why` goes in the activity. Not there is a plain `not_found`.
+    pub async fn cancel_limit(&self, user_id: i64, id: &str, why: &str) -> Result<PaperPosition, Refusal> {
+        let mut book = self.book.lock().await;
+        let mut next = book.get(&user_id).cloned().unwrap_or_default();
+        let Some(pos) = next.iter_mut().find(|p| p.id == id) else {
+            return Err(Refusal::not_found());
+        };
+        if pos.limit_close.take().is_none() {
+            return Err(Refusal::new(StatusCode::NOT_FOUND, "No limit sell rests on it"));
+        }
+        let pos = pos.clone();
+        self.write_snapshot(user_id, &next).await?;
+        book.insert(user_id, next);
+        drop(book);
+        self.note(user_id, "limit", Some(&pos.id), format!("Limit sell on {} {why}", pos.label()));
+        Ok(pos)
+    }
+
+    /// Fill the limit sell on `user_id`'s position `id` at `price` — the
+    /// watch loop's, once the price reached it. Gone meanwhile (sold or
+    /// cancelled by hand) is a plain `not_found`.
+    pub async fn fill_limit(&self, user_id: i64, id: &str, price: f64) -> Result<Filled, Refusal> {
+        let mut book = self.book.lock().await;
+        let pos = book
+            .get(&user_id)
+            .and_then(|l| l.iter().find(|p| p.id == id))
+            .cloned()
+            .ok_or_else(Refusal::not_found)?;
+        let Some(qty) = pos.limit_close.as_ref().map(LimitClose::left) else {
+            return Err(Refusal::not_found());
+        };
+        self.sell_held(&mut book, user_id, &pos, qty, price, "LIMIT_CLOSE", &[]).await
     }
 
     /// Apply `update` to the chart stop and targets of `user_id`'s position
@@ -1327,5 +1409,56 @@ pub(crate) mod tests {
         }
         desk.buy(5, &reliance(1_420.0, "CE"), 1, 1.0).await.unwrap();
         assert_eq!(desk.feed_keys().await.0.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_limit_sell_takes_whole_lots_of_what_is_held_one_at_a_time() {
+        let (_db, desk) = desk("limit-place").await;
+        let c = nifty(25_000.0, "CE");
+        let id = desk.buy(7, &c, 3, 100.0).await.unwrap().position_id;
+        assert_eq!(desk.place_limit(7, &id, 4, 120.0).await.unwrap_err().status, StatusCode::BAD_REQUEST);
+        assert_eq!(desk.place_limit(7, &id, 0, 120.0).await.unwrap_err().status, StatusCode::BAD_REQUEST);
+        assert_eq!(desk.place_limit(7, &id, 1, -1.0).await.unwrap_err().status, StatusCode::BAD_REQUEST);
+        // Another user's position is just as missing.
+        assert_eq!(desk.place_limit(8, &id, 1, 120.0).await.unwrap_err().status, StatusCode::NOT_FOUND);
+        let pos = desk.place_limit(7, &id, 2, 120.03).await.unwrap();
+        let lc = pos.limit_close.unwrap();
+        assert_eq!((lc.qty, lc.price), (150, 120.05), "on the tick, rounded up");
+        assert_eq!(desk.place_limit(7, &id, 1, 125.0).await.unwrap_err().status, StatusCode::CONFLICT);
+        // Kept across a restart.
+        let reloaded = PaperDesk::load(desk.pool.clone(), Arc::new(DashMap::new())).await.unwrap();
+        assert_eq!(reloaded.open(7).await[0].limit_close.as_ref().map(|l| l.qty), Some(150));
+        // Cancelled: nothing sold, and nothing to cancel twice.
+        assert!(desk.cancel_limit(7, &id, "cancelled by hand").await.unwrap().limit_close.is_none());
+        assert_eq!(desk.cancel_limit(7, &id, "cancelled by hand").await.unwrap_err().status, StatusCode::NOT_FOUND);
+        assert_eq!(ledger(&desk, 7).await.len(), 1, "the buy alone");
+    }
+
+    #[tokio::test]
+    async fn a_limit_sell_fills_its_lots_at_its_price_and_any_other_sell_cancels_it_first() {
+        let (_db, desk) = desk("limit-fill").await;
+        let c = nifty(25_000.0, "CE");
+        let id = desk.buy(7, &c, 3, 100.0).await.unwrap().position_id;
+        desk.place_limit(7, &id, 2, 120.0).await.unwrap();
+        let f = desk.fill_limit(7, &id, 120.0).await.unwrap();
+        assert_eq!((f.qty, f.price, f.held, f.reason), (150, 120.0, 75, Some("LIMIT_CLOSE")));
+        assert!(desk.open(7).await[0].limit_close.is_none());
+        assert_eq!(desk.fill_limit(7, &id, 120.0).await.unwrap_err().status, StatusCode::NOT_FOUND);
+
+        // Another limit, then −1 lot by hand: the limit goes first, and only the lot sells.
+        desk.place_limit(7, &id, 1, 130.0).await.unwrap();
+        let sold = desk.sell(7, &id, Some(1), "MANUAL_SELL", |_| Some(110.0)).await.unwrap();
+        assert_eq!((sold.qty, sold.held), (75, 0));
+        assert!(desk.open(7).await.is_empty());
+        assert!(desk.activity(7).iter().any(|a| a.kind == "limit" && a.message.contains("cancelled before")));
+        let legs: Vec<(String, i64, Option<String>)> = ledger(&desk, 7).await.into_iter().map(|(a, q, _, r)| (a, q, r)).collect();
+        assert_eq!(
+            legs,
+            [
+                ("BUY".to_string(), 225, None),
+                ("SELL".to_string(), 150, Some("LIMIT_CLOSE".to_string())),
+                ("SELL".to_string(), 75, Some("MANUAL_SELL".to_string())),
+            ]
+        );
     }
 }

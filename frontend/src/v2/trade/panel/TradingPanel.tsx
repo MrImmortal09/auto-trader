@@ -14,7 +14,7 @@ import { ResizeHandle } from '../../ui/ResizeHandle';
 import { chartTargets, targetLotsLabel } from '../../../lib/format';
 import { targetRoom, type LevelKind, type LevelRef } from '../lines';
 import type { PaperAccount, PositionHandlers } from '../Positions';
-import { busyNote, levelWords, lineSummary } from '../words';
+import { busyNote, levelWords, limitCancellable, limitStatus, limitWords, lineSummary } from '../words';
 import { activityEvents, type EngineError } from './activity';
 import { MIN_CHART_HEIGHT, MIN_PANEL_HEIGHT } from './height';
 import { DEFAULT_DESK_WIDTH, MAX_DESK_WIDTH, MIN_DESK_WIDTH, MIN_PANEL_BODY, useWidth } from '../paneSizes';
@@ -181,9 +181,10 @@ export function AccountColumn({ mode, desk, positions, paper, vertical, onHide }
 
 /**
  * The trading panel under the Trade charts: the account column, and the
- * tabs — Positions (every open trade with its stop and target, −1 lot and
- * Close), Waiting (first buys still being placed) and Orders (what rests at
- * Kotak) for the owner's desk, History (today's closed trades) and Activity.
+ * tabs — Positions (every open trade with its stop and target, its limit
+ * sell, Limit, −1 lot and Close), Waiting (first buys still being placed)
+ * and Orders (what rests at Kotak) for the owner's desk, History (today's
+ * closed trades) and Activity.
  * Exit all is held. Its top edge drags to resize it — up into the charts,
  * never past the bottom of the window — and the chevron folds it.
  */
@@ -256,6 +257,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
       if (p.entry_order_id && p.executed_qty <= 0) rows.push({ key: `${p.id}:entry`, contract, what: 'Buy · filling', id: p.entry_order_id });
       if (p.pending_exit_order_id) rows.push({ key: `${p.id}:exit`, contract, what: 'Sell · filling', id: p.pending_exit_order_id });
       if (p.sl_order_id) rows.push({ key: `${p.id}:sl`, contract, what: `SL-M · trigger ${price(p.sl_order_trigger ?? 0)} · ${p.sl_order_qty ?? 0} qty`, id: p.sl_order_id });
+      const lc = p.limit_close;
+      if (lc?.order_id) rows.push({ key: `${p.id}:limit`, contract, what: `Limit sell · ${lc.qty} @ ${price(lc.price)}${lc.filled ? ` · ${lc.filled} sold` : ''}`, id: lc.order_id });
       return rows;
     });
 
@@ -325,9 +328,10 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   };
 
   // Measured for Inter: a contract name is at most 156 px, a level with its ×
-  // ("BANKNIFTY ≥ 57,890.00 ×") 158, the two buttons 112, and the panel at
+  // ("BANKNIFTY ≥ 57,890.00 ×") 158, the three buttons 176, and the panel at
   // 1440 px holds 1042 of columns and gaps.
-  const GRID = 'grid grid-cols-[minmax(158px,1.3fr)_88px_120px_88px_88px_minmax(160px,1fr)_minmax(160px,1fr)_120px] items-center gap-2';
+  const GRID = 'grid grid-cols-[minmax(158px,1.3fr)_88px_120px_88px_88px_minmax(160px,1fr)_minmax(160px,1fr)_184px] items-center gap-2';
+  const SHORT_STATUS = { sending: 'sending…', unconfirmed: 'checking Kotak…', missing: "not in Kotak's book — check Kotak", cancelling: 'cancelling…', resting: null } as const;
   const positions =
     active.length === 0 ? (
       <p className="px-1 py-3 type-body text-fg-subtle">No open trade. Tap Buy on the ladder to open one.</p>
@@ -355,6 +359,24 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
                   {p.expiry ? expiryLabel(p.expiry) : 'Scalp'}
                   {note && <span className={p.halted ? 'text-loss' : 'text-fg'}> · {note}</span>}
                 </span>
+                {p.limit_close && (
+                  <span className="flex min-w-0 items-center gap-1 type-caption text-loss tnum" title={limitStatus(p.limit_close, mode === 'LIVE' && !paper)}>
+                    <span className="truncate">
+                      Limit sell {limitWords(p.limit_close)}
+                      {SHORT_STATUS[p.limit_close.status] && <span className="text-fg-muted"> · {SHORT_STATUS[p.limit_close.status]}</span>}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={!limitCancellable(p.limit_close) || !!h.sending[p.id]}
+                      title={p.limit_close.status === 'missing' ? "Release it — after checking it doesn't rest at Kotak" : 'Cancel the limit sell'}
+                      aria-label={p.limit_close.status === 'missing' ? 'Release the limit sell' : 'Cancel the limit sell'}
+                      onClick={() => h.onCancelLimit(p)}
+                      className="grid size-5 shrink-0 place-items-center rounded-4 border border-current/40 hover:bg-raised disabled:opacity-40"
+                    >
+                      ×
+                    </button>
+                  </span>
+                )}
               </span>
               <span className="flex items-center justify-end gap-2">
                 <Chip kind="profit">Long</Chip>
@@ -369,6 +391,15 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
               <span>{stopCell(p, locked)}</span>
               <span>{targetCell(p, locked)}</span>
               <span className="flex justify-end gap-2">
+                <Button
+                  pointerOnly
+                  kind="loss-outline"
+                  disabled={locked || p.qty < p.lot_size || !!p.limit_close}
+                  onClick={() => h.onLimit(p)}
+                  title={p.limit_close ? 'A limit sell already rests — cancel it to place another' : 'Sell some lots at a price or better'}
+                >
+                  Limit
+                </Button>
                 <Button pointerOnly kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)} title={`Sell ${p.lot_size} at market`}>
                   −1 lot
                 </Button>
@@ -470,7 +501,7 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
         {book.data || raw.data
           ? (book.data?.error ??
             (mode === 'LIVE'
-              ? 'No orders at Kotak today. A buy or an exit shows here as it is sent; chart stops and targets are watched by the engine and sent at market when hit.'
+              ? 'No orders at Kotak today. A buy, an exit or a limit sell shows here as it is sent; chart stops and targets are watched by the engine and sent at market when hit.'
               : 'Paper trades place no orders at Kotak.'))
           : 'Loading…'}
       </p>
