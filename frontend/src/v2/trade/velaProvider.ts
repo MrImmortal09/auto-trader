@@ -5,7 +5,7 @@
 
 import type { DataProvider, OHLCV, ProviderInfo } from '@luxalgo/vela';
 import { fetchBars, upsert } from './bars';
-import { isPerpName, type Bar, type Tf } from './model';
+import { isPerpName, TFS, type Bar, type Tf } from './model';
 
 export const PROVIDER = 'at';
 
@@ -22,8 +22,8 @@ export const apiSymbol = (ticker: string) => ticker.replace(/_/g, ':').replace(/
 
 export const toOhlcv = (b: Bar): OHLCV => ({ time: b.t, open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v ?? undefined });
 
-const TF_OF: Record<string, Tf> = { '1': '1m', '1m': '1m', '5': '5m', '5m': '5m', '15': '15m', '15m': '15m' };
-/** The candle service's timeframe for a Vela one (`'5'` or `'5m'`). */
+const TF_OF: Record<string, Tf> = { '1': '1m', '1m': '1m', '5': '5m', '5m': '5m', '15': '15m', '15m': '15m', D: '1d', '1D': '1d', '1d': '1d' };
+/** The candle service's timeframe for a Vela one (`'5'`, `'5m'`, `'D'`). */
 export const tfOf = (timeframe: string): Tf => TF_OF[timeframe] ?? '5m';
 
 const IST_MS = 330 * 60_000;
@@ -70,7 +70,7 @@ export class CandleProvider implements DataProvider {
   }
 
   info(): ProviderInfo {
-    return { name: PROVIDER, displayName: 'Auto Trader', supportedTimeframes: ['1m', '5m', '15m'], capabilities: { enumerate: false, stream: true, symbolInfo: false } };
+    return { name: PROVIDER, displayName: 'Auto Trader', supportedTimeframes: TFS, capabilities: { enumerate: false, stream: true, symbolInfo: false } };
   }
 
   async getBars(ticker: string, timeframe: string, range: { from?: number; to?: number; limit?: number }): Promise<OHLCV[]> {
@@ -105,6 +105,16 @@ export class CandleProvider implements DataProvider {
   async getCalendar(ticker: string, range: { from: number; to: number }): Promise<ReadonlyArray<readonly [number, number]>> {
     // A Hyperliquid perp trades around the clock: one window, no gaps.
     if (isPerpName(apiSymbol(ticker))) return [[range.from, range.to]];
+    // Daily bars sit at 00:00 IST, outside the session: each traded day is
+    // its own window, so weekends and holidays leave no gap — today's too,
+    // for the bar the session opens.
+    if (this.cache?.key.endsWith('|1d')) {
+      const today = Math.floor((Date.now() + IST_MS) / DAY_MS) * DAY_MS - IST_MS;
+      const starts = new Set(this.cache.bars.map((b) => b.t));
+      const weekday = new Date(today + IST_MS).getUTCDay();
+      if (weekday !== 0 && weekday !== 6) starts.add(today);
+      return [...starts].sort((a, b) => a - b).map((s): [number, number] => [s, s + DAY_MS]).filter(([s, e]) => e > range.from && s < range.to);
+    }
     return sessionWindows(range.from, range.to);
   }
 

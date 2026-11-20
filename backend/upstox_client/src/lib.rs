@@ -416,6 +416,14 @@ impl UpstoxClient {
         Ok(parse_candles(&data.candles))
     }
 
+    /// Daily candles for `key` on the days `from..=to`, oldest first, each
+    /// stamped 00:00 IST of its day. Past days only, as for minutes.
+    pub async fn daily_candles(&self, key: &str, from: NaiveDate, to: NaiveDate) -> Result<Vec<Candle>, UpstoxError> {
+        let path = format!("/historical-candle/{}/days/1/{}/{}", path_segment(key), to.format("%Y-%m-%d"), from.format("%Y-%m-%d"));
+        let data: CandleData = self.get_v3(&path, "daily_candle").await?;
+        Ok(parse_candles(&data.candles))
+    }
+
     /// Today's `interval_min`-minute candles for `key`, oldest first. During
     /// the session the newest one is still forming — Upstox sends it with
     /// only a last price — so callers must not take it as a finished bar.

@@ -19,14 +19,13 @@ import { useDrawing, useDrawPrefs, type DrawApi, type DrawTool } from './drawing
 import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type ChartState, type Placing } from './KChart';
 import type { Layers } from './lines';
-import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, sameSym, symbolLabel, symbolName, symExpiry, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, sameSym, symbolLabel, symbolName, symExpiry, TF_LABEL, TFS, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { usePerpCatalog } from './perp/catalog';
 import { PerpResults } from './perp/PerpResults';
 import { QuoteStrip } from './QuoteStrip';
 import { drawableStudies, STUDIES } from './studies';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
-const TFS: Tf[] = ['1m', '5m', '15m'];
 
 // Vela is heavy and optional: only downloaded once a chart is switched to it.
 const VChart = lazy(() => import('./VChart'));
@@ -491,7 +490,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             <Popover open={menu === 'tf'} onClose={close} align="right" backdrop>
               {TFS.map((t) => (
                 <button key={t} type="button" onClick={() => (onTf(t), close())} className={`flex h-10 w-full items-center rounded-6 px-3 type-label ${t === tf ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}>
-                  {t}
+                  {TF_LABEL[t]}
                 </button>
               ))}
             </Popover>
@@ -500,7 +499,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           <div role="tablist" aria-label="Timeframe" className="flex gap-0.5 rounded-6 border border-line bg-inset p-0.5">
             {TFS.map((t) => (
               <button key={t} type="button" role="tab" aria-selected={t === tf} onClick={() => onTf(t)} className={`h-6 rounded-4 px-2.5 type-label transition-colors duration-120 ${t === tf ? 'bg-panel text-accent shadow-sm' : 'text-fg-muted hover:text-fg'}`}>
-                {t}
+                {TF_LABEL[t]}
               </button>
             ))}
           </div>

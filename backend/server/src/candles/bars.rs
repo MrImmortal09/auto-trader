@@ -23,6 +23,9 @@ pub enum Tf {
     M1,
     M5,
     M15,
+    /// A day: an Indian one is the IST day's session, stamped 00:00 IST as
+    /// Upstox stamps its daily candles; a perp's is Hyperliquid's UTC day.
+    D1,
 }
 
 impl Tf {
@@ -31,6 +34,7 @@ impl Tf {
             "1m" => Some(Tf::M1),
             "5m" => Some(Tf::M5),
             "15m" => Some(Tf::M15),
+            "1d" | "d" => Some(Tf::D1),
             _ => None,
         }
     }
@@ -40,6 +44,7 @@ impl Tf {
             Tf::M1 => "1m",
             Tf::M5 => "5m",
             Tf::M15 => "15m",
+            Tf::D1 => "1d",
         }
     }
 
@@ -48,6 +53,7 @@ impl Tf {
             Tf::M1 => 1,
             Tf::M5 => 5,
             Tf::M15 => 15,
+            Tf::D1 => 24 * 60,
         }
     }
 
@@ -55,10 +61,14 @@ impl Tf {
         i64::from(self.minutes()) * MINUTE_MS
     }
 
-    /// Start of the bar `t_ms` falls in. IST is UTC+05:30, a whole number of
-    /// 15-minute steps, so flooring Unix time lines every bar up with 09:15.
+    /// Start of the (Indian) bar `t_ms` falls in. IST is UTC+05:30, a whole
+    /// number of 15-minute steps, so flooring Unix time lines every bar up
+    /// with 09:15; a day starts at 00:00 IST.
     pub fn bucket(self, t_ms: i64) -> i64 {
-        t_ms - t_ms.rem_euclid(self.ms())
+        match self {
+            Tf::D1 => ist_day_start(t_ms),
+            _ => t_ms - t_ms.rem_euclid(self.ms()),
+        }
     }
 }
 
@@ -343,6 +353,19 @@ mod tests {
         assert_eq!(session_close(at(9, 15, 0, 0)), at(15, 30, 0, 0));
         assert_eq!(Tf::parse("5M"), Some(Tf::M5));
         assert_eq!(Tf::parse("30m"), None);
+        assert_eq!((Tf::parse("1D"), Tf::D1.as_str()), (Some(Tf::D1), "1d"));
+    }
+
+    #[test]
+    fn a_day_bar_is_the_whole_session_stamped_at_ist_midnight() {
+        let mut day = DaySeries::default();
+        for (h, m, price) in [(9, 15, 100.0), (11, 0, 120.0), (13, 30, 90.0), (15, 29, 105.0)] {
+            day.tick(at(h, m, 10, 0), price);
+        }
+        let bars = day.bars(Tf::D1);
+        assert_eq!(bars, vec![Bar { t: at(0, 0, 0, 0), o: 100.0, h: 120.0, l: 90.0, c: 105.0, v: None }]);
+        assert_eq!(Tf::D1.bucket(at(15, 29, 0, 0)), at(0, 0, 0, 0));
+        assert_eq!(day.bar_at(Tf::D1, at(12, 0, 0, 0)), Some(bars[0]));
     }
 
     #[test]

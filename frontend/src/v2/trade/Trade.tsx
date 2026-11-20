@@ -69,7 +69,7 @@ import { PerpTicket } from './perp/PerpTicket';
 import { usePerps } from './perp/usePerps';
 import { chartLines, chartMarkers, DEFAULT_LAYERS, deltaFor, draftLines, draftWhat, firstBuy, MAX_TARGETS, targetQty, targetRoom, targetText, type LevelActions, type LevelKind, type LevelRef, type Layers } from './lines';
 import { armedLine, crossWords, draftStep, entryMisfit, linePnl, lotsLeft, orderOf, sideOf, validityOf, validityWords, VALIDITY_CHOICES, wrongSide, type LineDraft } from './lineOrder';
-import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isPerpName, isTicker, istClock, type PerpKey, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { approxMoney, boardKind, CHART_LIBS, isIndex, isOwnChart, isPerpName, isTicker, istClock, type PerpKey, levelCrossed, levelPnl, levelTriggerOn, optionOf, ownChartOf, parseChartSym, sameSym, stockBuyBlocked, symbolLabel, symExpiry, tfOrDefault, toTick, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from './panel/height';
 import { DEFAULT_DESK_WIDTH, DEFAULT_LADDER_WIDTH, equalShares, MAX_DESK_WIDTH, MAX_LADDER_WIDTH, MIN_CHART_WIDTH, MIN_DESK_WIDTH, MIN_LADDER_WIDTH, savedShares, savedWidth, useWidth, withLeftShare } from './paneSizes';
 import { usePhoneSplit } from './phoneSplit';
@@ -172,7 +172,7 @@ function loadSaved(): Saved {
     const sym = s?.sym ? parseChartSym(s.sym) : null;
     if (!s || !sym) return d;
     const style: CandleStyle = s.style === 'bars' || s.style === 'area' ? s.style : 'candles';
-    const tf: Tf = s.tf === '1m' || s.tf === '15m' ? s.tf : '5m';
+    const tf: Tf = tfOrDefault(s.tf);
     return { sym: unexpired(sym, today), tf, layers: { ...DEFAULT_LAYERS, ...s.layers, studies: knownStudies(s.layers?.studies) }, style };
   });
   const expiry = Object.fromEntries(Object.entries(saved.expiry ?? {}).filter(([index, date]) => isTicker(index) && typeof date === 'string' && date >= today));
