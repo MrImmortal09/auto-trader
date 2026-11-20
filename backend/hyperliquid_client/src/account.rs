@@ -262,22 +262,16 @@ impl InfoClient {
     pub async fn user_fills(&self, user: &str) -> Result<Vec<HlFill>, HlError> {
         let raw: Vec<RawFill> = serde_json::from_value(self.post(json!({ "type": "userFills", "user": user })).await?)
             .map_err(|e| HlError::Decode(format!("userFills: {e}")))?;
-        raw.into_iter()
-            .map(|f| {
-                Ok(HlFill {
-                    px: num(&f.px)?,
-                    sz: num(&f.sz)?,
-                    is_buy: f.side == "B",
-                    time: f.time,
-                    closed_pnl: num(&f.closed_pnl)?,
-                    fee: num(&f.fee)?,
-                    oid: f.oid,
-                    tid: f.tid,
-                    dir: f.dir,
-                    coin: f.coin,
-                })
-            })
-            .collect()
+        read_fills(raw)
+    }
+
+    /// `user`'s fills since `start_ms` (Unix ms; the oldest 2,000 of them).
+    /// Hyperliquid charges a read by the fills it answers, so a short window
+    /// costs less than [`InfoClient::user_fills`].
+    pub async fn user_fills_since(&self, user: &str, start_ms: i64) -> Result<Vec<HlFill>, HlError> {
+        let raw: Vec<RawFill> = serde_json::from_value(self.post(json!({ "type": "userFillsByTime", "user": user, "startTime": start_ms })).await?)
+            .map_err(|e| HlError::Decode(format!("userFillsByTime: {e}")))?;
+        read_fills(raw)
     }
 
     /// What became of `user`'s order `oid`: Hyperliquid's word for its state
@@ -329,6 +323,25 @@ impl InfoClient {
     pub async fn user_role(&self, address: &str) -> Result<UserRole, HlError> {
         read_role(&self.post(json!({ "type": "userRole", "user": address })).await?)
     }
+}
+
+fn read_fills(raw: Vec<RawFill>) -> Result<Vec<HlFill>, HlError> {
+    raw.into_iter()
+        .map(|f| {
+            Ok(HlFill {
+                px: num(&f.px)?,
+                sz: num(&f.sz)?,
+                is_buy: f.side == "B",
+                time: f.time,
+                closed_pnl: num(&f.closed_pnl)?,
+                fee: num(&f.fee)?,
+                oid: f.oid,
+                tid: f.tid,
+                dir: f.dir,
+                coin: f.coin,
+            })
+        })
+        .collect()
 }
 
 fn read_order_status(v: &Value) -> Result<Option<(String, f64)>, HlError> {

@@ -57,7 +57,11 @@ pub use trade::{LiveOrder, LiveOrderAnswer};
 /// something on (its state every 2 s), 120 more for its open orders (every
 /// 10 s), 4 per dex it has nothing on (every 30 s) and 20 to 40 for fills,
 /// of the 1,200 request weight Hyperliquid allows an IP a minute: about 400
-/// with money on the core perps and one builder dex.
+/// with money on the core perps and one builder dex. The line watch
+/// (`trade.rs`) adds about 120 whatever the screen does: one order's state a
+/// second, the armed lines taking turns, however many there are; and, for a
+/// line that has filled, about 25 a try at its stop and target, a try every
+/// 5 s for at most a minute.
 const STATE_TTL: Duration = Duration::from_secs(2);
 const ORDERS_TTL: Duration = Duration::from_secs(10);
 const FILLS_TTL: Duration = Duration::from_secs(60);
@@ -321,9 +325,11 @@ pub struct LiveDesk {
 }
 
 /// A LIVE line order's stop and target, kept here (and in `hl_line_guards`)
-/// until it fills. Hyperliquid can't attach them to a trigger order — its
-/// children hang only on a market or limit order — so the line rests alone
-/// and `LiveDesk::watch_lines` places them, sized to the fill, once it has.
+/// until they are on Hyperliquid. Hyperliquid can't attach them to a
+/// trigger order — its children hang only on a market or limit order — so
+/// the line rests alone and `LiveDesk::watch_lines` places them, sized to
+/// the fill, once it has filled. Each is cleared once it is on, and the
+/// guard dropped once neither is left.
 #[derive(Debug, Clone)]
 pub(super) struct LineGuard {
     pub network: Network,
@@ -333,8 +339,32 @@ pub(super) struct LineGuard {
     pub buy: bool,
     pub stop: Option<f64>,
     pub target: Option<f64>,
+    /// What the watch has learned of it (not saved: read again after a restart).
+    pub watch: LineWatch,
+}
+
+/// The watch's notes on one [`LineGuard`].
+#[derive(Debug, Clone, Default)]
+pub(super) struct LineWatch {
+    /// What it filled, once read: its stop and target are for this.
+    pub filled: Option<f64>,
     /// When it was first seen fired without a fill under its id.
     pub fired_at: Option<Instant>,
+    /// Since when Hyperliquid's answer has said it is done with (unknown,
+    /// ended with nothing filled, no position): it is dropped only once
+    /// that has held for a few seconds, as a read just after a change may
+    /// not show it yet.
+    pub doubt_since: Option<Instant>,
+    /// Its stop and target have been tried once (a retry trusts what rests).
+    pub tried: bool,
+    /// Since when its stop or target has failed to go on.
+    pub failing_since: Option<Instant>,
+    /// Since when its position has been being closed, its stop not on.
+    pub closing_since: Option<Instant>,
+    /// Not looked at again before this.
+    pub next_at: Option<Instant>,
+    /// A try at its stop and target is under way.
+    pub busy: bool,
 }
 
 impl LiveDesk {
@@ -362,7 +392,7 @@ impl LiveDesk {
             .fetch_all(&pool)
             .await?
             .into_iter()
-            .filter_map(|(network, oid, coin, buy, stop, target)| Some(LineGuard { network: Network::parse(&network)?, oid: u64::try_from(oid).ok()?, coin, buy, stop, target, fired_at: None }))
+            .filter_map(|(network, oid, coin, buy, stop, target)| Some(LineGuard { network: Network::parse(&network)?, oid: u64::try_from(oid).ok()?, coin, buy, stop, target, watch: LineWatch::default() }))
             .collect();
         let nets = [Network::Testnet, Network::Mainnet];
         Ok(LiveDesk {
@@ -422,6 +452,43 @@ impl LiveDesk {
     /// Order `oid`'s kept stop and target, if any.
     pub(super) async fn line_guard(&self, network: Network, oid: u64) -> Option<LineGuard> {
         self.line_guards.lock().await.iter().find(|g| g.network == network && g.oid == oid).cloned()
+    }
+
+    /// `f` on order `oid`'s kept guard, in memory (`None`: it is gone).
+    pub(super) async fn touch_line_guard<R>(&self, network: Network, oid: u64, f: impl FnOnce(&mut LineGuard) -> R) -> Option<R> {
+        self.line_guards.lock().await.iter_mut().find(|g| g.network == network && g.oid == oid).map(f)
+    }
+
+    /// What is left to place of order `oid`'s stop and target, once some of
+    /// it is on: saved too, so a restart doesn't place it twice. A guard
+    /// already dropped (the kill switch) stays dropped.
+    pub(super) async fn line_guard_left(&self, network: Network, oid: u64, stop: Option<f64>, target: Option<f64>) {
+        let saved = sqlx::query("UPDATE hl_line_guards SET stop = ?, target = ? WHERE network = ? AND oid = ?")
+            .bind(stop)
+            .bind(target)
+            .bind(net_str(network))
+            .bind(oid as i64)
+            .execute(&self.pool)
+            .await;
+        if let Err(e) = saved {
+            tracing::error!(network = net_str(network), oid, "Hyperliquid LIVE line guard not saved: {e}");
+        }
+        self.touch_line_guard(network, oid, |g| {
+            g.stop = stop;
+            g.target = target;
+        })
+        .await;
+    }
+
+    /// The next kept guard the watch looks at: in turn after `turn`, not
+    /// one waiting out its retry or under way.
+    pub(super) async fn next_line_guard(&self, turn: &mut usize) -> Option<LineGuard> {
+        let all = self.line_guards.lock().await;
+        let now = Instant::now();
+        let n = all.len();
+        let i = (0..n).map(|k| (*turn + k) % n).find(|&i| !all[i].watch.busy && all[i].watch.next_at.is_none_or(|at| at <= now))?;
+        *turn = i + 1;
+        Some(all[i].clone())
     }
 
     /// Say (or, with `None`, stop saying) on `coin`'s position why a filled
@@ -1140,7 +1207,49 @@ pub fn live_account_view(network: Network, states: &[(Option<&'static str>, Acco
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{init_db, test_support::TempDb};
     use hyperliquid_client::account::HlPosition;
+
+    fn guard(oid: u64) -> LineGuard {
+        LineGuard { network: Network::Testnet, oid, coin: "BTC".into(), buy: true, stop: Some(60_000.0), target: Some(70_000.0), watch: LineWatch::default() }
+    }
+
+    #[tokio::test]
+    async fn the_line_watch_takes_the_kept_lines_in_turn_and_skips_one_waiting_or_under_way() {
+        let db = TempDb::new("hl-line-guards-turns");
+        let desk = LiveDesk::load(init_db(&db.url()).await, None).await.unwrap();
+        for oid in [1, 2, 3] {
+            desk.keep_line_guard(guard(oid)).await;
+        }
+        let mut turn = 0;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(desk.next_line_guard(&mut turn).await.unwrap().oid);
+        }
+        assert_eq!(seen, vec![1, 2, 3, 1], "one a tick, in turn");
+        desk.touch_line_guard(Network::Testnet, 2, |g| g.watch.busy = true).await;
+        desk.touch_line_guard(Network::Testnet, 3, |g| g.watch.next_at = Some(Instant::now() + Duration::from_secs(60))).await;
+        assert_eq!(desk.next_line_guard(&mut turn).await.unwrap().oid, 1, "2 is under way, 3 waits out its retry");
+        desk.touch_line_guard(Network::Testnet, 1, |g| g.watch.busy = true).await;
+        assert!(desk.next_line_guard(&mut turn).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn what_is_left_of_a_line_guard_is_saved_and_a_dropped_one_stays_dropped() {
+        let db = TempDb::new("hl-line-guards-left");
+        let pool = init_db(&db.url()).await;
+        let desk = LiveDesk::load(pool.clone(), None).await.unwrap();
+        desk.keep_line_guard(guard(7)).await;
+        desk.keep_line_guard(guard(8)).await;
+        // 7's stop went on; its target is still to place.
+        desk.line_guard_left(Network::Testnet, 7, None, Some(70_000.0)).await;
+        // The kill switch dropped 8 while a try was under way: the try's save doesn't bring it back.
+        desk.forget_line_guard(Network::Testnet, 8).await;
+        desk.line_guard_left(Network::Testnet, 8, None, None).await;
+        let again = LiveDesk::load(pool, None).await.unwrap();
+        let kept = again.line_guards.lock().await.clone();
+        assert_eq!(kept.iter().map(|g| (g.oid, g.stop, g.target)).collect::<Vec<_>>(), vec![(7, None, Some(70_000.0))]);
+    }
 
     #[test]
     fn a_key_is_sealed_and_opens_only_under_the_same_secret() {
