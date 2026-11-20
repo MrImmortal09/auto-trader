@@ -152,6 +152,9 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   // placed) — and only for an order that opens one (not reduce-only, not an
   // add: a held position shows its own); and a line order's line, stop and
   // target until it is armed.
+  // LIVE: a resting order that adds to the position can't carry its own
+  // stop and target (Hyperliquid would stack a second, fixed-size stop).
+  const restingAdd = live && adding && kind !== 'market';
   const draftLiq = !reduce && liq != null && price != null && (kind === 'market' ? size != null && size > 0 : true) ? liq : null;
   const draftMargin = margin != null && margin > 0 ? margin : null;
   const isLine = kind === 'line';
@@ -350,7 +353,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
     if (size == null) return;
     setSending(true);
     const targets = target != null ? [{ price: target, size: null }] : undefined;
-    const levels = reduce ? {} : { stop: stop ?? undefined, targets };
+    const levels = reduce || restingAdd ? {} : { stop: stop ?? undefined, targets };
     const way = side === 'long' ? 'buy' : 'sell';
     const ok =
       kind === 'line'
@@ -492,12 +495,13 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           </select>
         </label>
       )}
-      {!reduce && (
+      {!reduce && !restingAdd && (
         <>
           <Field label="Stop (optional)" value={stopText} onChange={setStopText} unit="$" large={large} action={pickButton('Stop', setStopText)} />
           <Field label="Target (optional)" value={targetText} onChange={setTargetText} unit="$" large={large} action={pickButton('Target', setTargetText)} />
         </>
       )}
+      {restingAdd && <p className="type-caption text-fg-subtle">A LIVE {isLine ? 'line order' : 'limit'} that adds to the position takes no stop of its own: once it fills, set the position's stop again and it covers all of it.</p>}
       {kind !== 'line' && (
         <div className="flex items-center justify-between gap-3">
           <span className="type-label text-fg-muted">Reduce only</span>

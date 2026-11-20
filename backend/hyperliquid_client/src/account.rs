@@ -286,11 +286,24 @@ impl InfoClient {
         serde_json::from_value(v).map_err(|e| HlError::Decode(format!("extraAgents: {e}")))
     }
 
+    /// `user`'s leverage setting on `coin` now: (isolated, value). Hyperliquid
+    /// keeps one per coin, used by every order on it.
+    pub async fn asset_leverage(&self, user: &str, coin: &str) -> Result<(bool, u32), HlError> {
+        read_leverage(&self.post(json!({ "type": "activeAssetData", "user": user, "coin": coin })).await?)
+    }
+
     /// What Hyperliquid knows `address` as: an account, an API wallet (with
     /// the account it trades for), a vault, a sub-account, or nothing.
     pub async fn user_role(&self, address: &str) -> Result<UserRole, HlError> {
         read_role(&self.post(json!({ "type": "userRole", "user": address })).await?)
     }
+}
+
+fn read_leverage(v: &Value) -> Result<(bool, u32), HlError> {
+    let lev = v.get("leverage").ok_or_else(|| HlError::Decode(format!("activeAssetData without a leverage: {v}")))?;
+    let isolated = lev.get("type").and_then(Value::as_str) == Some("isolated");
+    let value = lev.get("value").and_then(Value::as_u64).ok_or_else(|| HlError::Decode(format!("a leverage without its value: {lev}")))?;
+    Ok((isolated, value as u32))
 }
 
 /// An address as Hyperliquid knows it (`userRole`).
@@ -323,6 +336,15 @@ fn read_role(v: &Value) -> Result<UserRole, HlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_coins_leverage_setting_reads_its_kind_and_value() {
+        let v: Value = serde_json::from_str(r#"{"user":"0x1","coin":"BTC","leverage":{"type":"isolated","value":5,"rawUsd":"-12.0"},"maxTradeSzs":["0.1","0.1"],"markPx":"61696.0"}"#).unwrap();
+        assert_eq!(read_leverage(&v).unwrap(), (true, 5));
+        let v: Value = serde_json::from_str(r#"{"leverage":{"type":"cross","value":20}}"#).unwrap();
+        assert_eq!(read_leverage(&v).unwrap(), (false, 20));
+        assert!(read_leverage(&serde_json::json!({})).is_err());
+    }
 
     #[test]
     fn a_role_says_whose_api_wallet_it_is() {

@@ -286,10 +286,10 @@ pub async fn move_order_handler(State(state): State<AppState>, Extension(identit
 
 pub async fn cancel_order_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(order_id): Path<String>) -> Response {
     let r = match desk_or_return!(state, identity) {
-        (Desk::Paper(id), _gate) => state.perps.cancel_order(id, &order_id).await,
+        (Desk::Paper(id), _gate) => state.perps.cancel_order(id, &order_id).await.map(|()| Vec::new()),
         (Desk::Live(net), _gate) => state.hl_live.cancel(net, &order_id).await,
     };
-    answer(r.map(|()| json!({ "status": "cancelled" })))
+    answer(r.map(|warnings| json!({ "status": "cancelled", "warnings": warnings })))
 }
 
 pub async fn close_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(key): Path<String>, body: Option<Json<CloseBody>>) -> Response {
@@ -316,7 +316,7 @@ pub async fn levels_handler(State(state): State<AppState>, Extension(identity): 
     }
     match desk {
         Desk::Paper(id) => answer(state.perps.set_levels(id, m, b.change()).await),
-        Desk::Live(net) => answer(state.hl_live.set_levels(net, m, &b.change()).await.map(|()| json!({ "status": "set" }))),
+        Desk::Live(net) => answer(state.hl_live.set_levels(net, m, &b.change()).await.map(|warnings| json!({ "status": "set", "warnings": warnings }))),
     }
 }
 
@@ -357,10 +357,10 @@ pub async fn update_line_handler(State(state): State<AppState>, Extension(identi
 
 pub async fn cancel_line_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(line_id): Path<String>) -> Response {
     let r = match desk_or_return!(state, identity) {
-        (Desk::Paper(id), _gate) => state.perps.cancel_line(id, &line_id).await,
+        (Desk::Paper(id), _gate) => state.perps.cancel_line(id, &line_id).await.map(|()| Vec::new()),
         (Desk::Live(net), _gate) => state.hl_live.cancel(net, &line_id).await,
     };
-    answer(r.map(|()| json!({ "status": "cancelled" })))
+    answer(r.map(|warnings| json!({ "status": "cancelled", "warnings": warnings })))
 }
 
 pub async fn reset_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {

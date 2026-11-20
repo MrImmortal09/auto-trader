@@ -1,5 +1,5 @@
 //! Hyperliquid LIVE, the owner's own account: its settings and its API
-//! wallet, and — read-only in this release — what it holds on Hyperliquid.
+//! wallet, what it holds on Hyperliquid, and its orders (`trade`).
 //!
 //! - **Mode** (`paper` / `live`) and **network** (`testnet` / `mainnet`) are
 //!   the owner's switches in Settings, kept in `hl_live_settings`. Either
@@ -341,7 +341,7 @@ impl LiveDesk {
             network: net_str(s.network),
             credentials: Credentials { testnet: show(Network::Testnet), mainnet: show(Network::Mainnet) },
             can_store_keys: self.box_key.is_some(),
-            orders_enabled: false,
+            orders_enabled: true,
         }
     }
 
@@ -722,6 +722,25 @@ fn levels_of(orders: &[&HlOpenOrder]) -> PerpLevels {
     levels
 }
 
+/// What to say about a position's stops (price, size, whole-position) when
+/// they don't cover it as one: several of them, or less than `held`. None
+/// when there is no stop (it is optional) or one covers it all.
+fn stop_note(stops: &[(f64, f64, bool)], held: f64) -> Option<String> {
+    if stops.is_empty() {
+        return None;
+    }
+    let covered = if stops.iter().any(|(_, _, whole)| *whole) { held } else { stops.iter().map(|(_, sz, _)| sz).sum::<f64>() };
+    if stops.len() == 1 && covered + 1e-12 >= held {
+        return None;
+    }
+    let each = stops.iter().map(|(px, sz, whole)| if *whole { format!("{px} for all") } else { format!("{px} for {sz}") }).collect::<Vec<_>>().join(", ");
+    Some(if covered + 1e-12 < held {
+        format!("The stops cover {covered} of {held} ({each}): set the stop again to cover all of it")
+    } else {
+        format!("{} stops ({each}): set the stop again to make it one", stops.len())
+    })
+}
+
 /// Hyperliquid's account (the core perps' and each builder dex's) in the
 /// paper desk's shape: positions with the stops and targets resting against
 /// them, resting limits, stop entries (as line orders) with their children,
@@ -757,6 +776,7 @@ pub fn live_account_view(network: Network, states: &[(Option<&'static str>, Acco
             roe_pct: Some(p.roe * 100.0),
             liq: p.liquidation,
             notional: Some(p.position_value),
+            stop_note: stop_note(&guards.iter().filter(|o| o.is_stop()).filter_map(|o| o.trigger_px.map(|px| (px, o.sz, o.is_position_tpsl))).collect::<Vec<_>>(), size),
         });
     }
     let mut perp_orders = Vec::new();
@@ -933,6 +953,17 @@ mod tests {
         // A role Hyperliquid adds later: named, not taken for a main key.
         let err = account_for(me, agent, &UserRole::Other("newKind".into()), "mainnet").unwrap_err();
         assert!(err.message.contains("'newKind'") && !err.message.contains("own key"), "{}", err.message);
+    }
+
+    #[test]
+    fn stops_that_dont_cover_the_position_as_one_are_said() {
+        assert_eq!(stop_note(&[], 0.02), None, "no stop: it is optional");
+        assert_eq!(stop_note(&[(60_000.0, 0.02, false)], 0.02), None, "one covering it all");
+        assert_eq!(stop_note(&[(60_000.0, 0.0, true)], 0.02), None, "one for the whole position");
+        let short = stop_note(&[(60_000.0, 0.01, false)], 0.02).unwrap();
+        assert!(short.contains("cover 0.01 of 0.02"), "{short}");
+        let two = stop_note(&[(60_000.0, 0.01, false), (59_000.0, 0.01, false)], 0.02).unwrap();
+        assert!(two.starts_with("2 stops") && two.contains("59000 for 0.01"), "{two}");
     }
 
     #[test]

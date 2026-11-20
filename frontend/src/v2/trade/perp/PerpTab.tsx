@@ -67,6 +67,7 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
               <span className={p.levels?.stop != null ? 'text-loss' : 'text-fg-subtle'}>{p.levels?.stop != null ? `Stop ${perpPrice(p.levels.stop)}` : 'No stop'}</span>
               {targets && <span className="text-profit"> · targets {targets}</span>}
             </p>
+            {p.stop_note && <p className="type-caption text-loss">{p.stop_note}</p>}
             <div className="grid grid-cols-4 gap-2">
               <Button size="lg" kind="ghost" disabled={live} onClick={() => (onOpen(k), perps.place(k, 'stop'))}>
                 + Stop
@@ -131,6 +132,7 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
                     </button>
                   )}
                 </span>
+                {p.stop_note && <span className="text-loss">{p.stop_note}</span>}
                 {(p.levels?.targets ?? []).map((t) => (
                   <span key={t.id} className="text-profit">
                     Target {perpPrice(t.price)} · {t.size == null ? 'all left' : sizeText(k, t.size)}

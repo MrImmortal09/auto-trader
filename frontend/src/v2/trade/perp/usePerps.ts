@@ -214,6 +214,8 @@ export function usePerps({ serverBase, enabled, onShow }: {
               { key: 'label', text: `${sideWord(p.side)} ${sizeText(key, p.size)} · ${p.leverage}x · entry ${perpPrice(p.entry)}`, color: C.fg },
               { key: 'pnl', text: p.upnl == null ? '—' : signedUsd(p.upnl), color: pnlColor },
             ];
+            // LIVE: stops that don't cover the position as one.
+            if (p.stop_note) parts.push({ key: 'stop-note', text: '⚠ stop not over all of it', color: C.loss });
             if (editable && p.levels?.stop == null) parts.push({ key: 'add-stop', text: '+ Stop', color: C.loss });
             if (editable) parts.push({ key: 'add-target', text: '+ Target', color: C.profit });
             if (editable) parts.push({ key: 'close', text: 'Close', color: C.loss, filled: true });

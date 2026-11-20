@@ -183,8 +183,10 @@ impl LiveDesk {
         match sent {
             Err(_) => Err(Refusal::conflict(format!("Hyperliquid didn't answer in {} s — the order may still have gone through: check the account before sending it again", SEND_TIMEOUT.as_secs()))),
             Ok(Err(HlError::Refused(why))) => Err(Refusal::conflict(format!("Hyperliquid refused it: {why}"))),
-            Ok(Err(e @ HlError::Http(_))) => Err(Refusal::conflict(format!("{e} — the order may still have gone through: check the account before sending it again"))),
-            Ok(Err(e)) => Err(hl_refusal(e)),
+            // Refused before it left: nothing was sent.
+            Ok(Err(e @ (HlError::Key(_) | HlError::Encode(_)))) => Err(hl_refusal(e)),
+            // A gateway error, or an answer that couldn't be read: it may have been taken.
+            Ok(Err(e)) => Err(Refusal::conflict(format!("{e} — the order may still have gone through: check the account before sending it again"))),
             Ok(Ok(statuses)) => Ok(statuses),
         }
     }
@@ -198,6 +200,54 @@ impl LiveDesk {
             Ok(Err(e)) => Err(Refusal::conflict(format!("Leverage not set to {leverage}x isolated ({e}) — nothing sent"))),
             Ok(Ok(())) => Ok(()),
         }
+    }
+
+    /// The account's open orders on `coin` (its dex's), read fresh.
+    async fn orders_on(&self, network: Network, account: &str, coin: &str) -> Result<Vec<HlOpenOrder>, Refusal> {
+        let dex = hyperliquid_client::dex_of(coin);
+        let all = timed("the open orders", self.info[&network].open_orders(account, dex)).await.map_err(Refusal::conflict)?;
+        Ok(all.into_iter().filter(|o| o.coin == coin).collect())
+    }
+
+    /// Isolated `leverage` on `coin` before an order that opens a position.
+    /// Hyperliquid keeps one leverage per coin, used by every order on it:
+    /// while orders that open rest there, a different one would change
+    /// theirs, so it is refused.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_leverage(&self, network: Network, account: &str, wallet: &Wallet, a: &NetAsset, coin: &str, label: &str, leverage: u32) -> Result<(), Refusal> {
+        let resting = self.orders_on(network, account, coin).await?.into_iter().filter(|o| !o.reduce_only).count();
+        if resting > 0 {
+            let (isolated, now) = timed("the leverage", self.info[&network].asset_leverage(account, coin)).await.map_err(Refusal::conflict)?;
+            if isolated && now == leverage {
+                return Ok(());
+            }
+            return Err(Refusal::conflict(format!(
+                "{label} has {resting} order(s) resting at {now}x{}: leverage is one per coin on Hyperliquid, so use {now}x or cancel them first",
+                if isolated { "" } else { " cross" }
+            )));
+        }
+        self.set_leverage(network, wallet, a, leverage).await
+    }
+
+    /// One stop for the whole position: `size` (all that is held) at
+    /// `price`, placed before every older stop on the coin is cancelled —
+    /// never a moment with less covered. A stop that can't be cancelled
+    /// (it fired, or is gone) is said, not failed on.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_full_stop(&self, network: Network, wallet: &Wallet, a: &NetAsset, long: bool, size: f64, price: f64, old: &[HlOpenOrder]) -> Result<Vec<String>, Refusal> {
+        self.place_guard(network, wallet, a, !long, size, price, "sl").await?;
+        let mut warnings = Vec::new();
+        let cancels: Vec<CancelWire> = old.iter().map(|o| CancelWire { a: a.asset, o: o.oid }).collect();
+        if !cancels.is_empty() {
+            match self.send(network, wallet, &CancelAction::new(cancels)).await {
+                Ok(st) => warnings.extend(st.iter().filter_map(|s| match s {
+                    OrderStatus::Error(why) => Some(format!("An older stop wasn't cancelled: {why}")),
+                    _ => None,
+                })),
+                Err(r) => warnings.push(format!("The older stops weren't cancelled: {}", r.message)),
+            }
+        }
+        Ok(warnings)
     }
 
     /// The signed-in owner's LIVE wallet on `network`, with its account.
@@ -215,7 +265,8 @@ impl LiveDesk {
 
     /// A market order or a limit, with its stop and targets. Market: an IOC
     /// at the network's mid ± 0.5 %. Isolated leverage is set first when it
-    /// opens a position.
+    /// opens a position. Levels ride only an order that opens; a market
+    /// order that adds leaves one stop over the whole position.
     pub async fn order(&self, network: Network, o: &LiveOrder) -> Result<LiveOrderAnswer, Refusal> {
         let (account, wallet) = self.signer(network).await?;
         let m = o.market;
@@ -226,10 +277,14 @@ impl LiveDesk {
         }
         let buy = is_buy(o.side);
         let held = self.held(network, &account, m.coin).await?;
+        let adds = held.is_some_and(|(szi, _)| (szi > 0.0) == buy);
         let opens = !o.reduce_only && held.is_none_or(|(szi, _)| (szi > 0.0) == buy || size > szi.abs() + 1e-12);
+        if opens && !m.tradable() {
+            return Err(close_only(m));
+        }
         let leverage = match held {
             // An add rides at the position's own leverage.
-            Some((szi, lev)) if (szi > 0.0) == buy => lev,
+            Some((_, lev)) if adds => lev,
             _ => o.leverage,
         };
         if opens && !(1..=a.leverage_cap()).contains(&leverage) {
@@ -244,14 +299,23 @@ impl LiveDesk {
         if !o.reduce_only && size * price < crate::hyperliquid::perp::MIN_NOTIONAL {
             return Err(Refusal::bad(format!("An order must be worth at least ${:.0}", crate::hyperliquid::perp::MIN_NOTIONAL)));
         }
-        if opens && held.is_none() {
-            self.set_leverage(network, &wallet, &a, leverage).await?;
-        }
-        if !o.reduce_only {
-            check_sides(o.side, price_ref(o.limit, mid), o.stop, &o.targets)?;
-        }
-        let levels = if o.reduce_only { (None, Vec::new()) } else { entry_levels(o.stop, &o.targets)? };
         let market_order = o.limit.is_none();
+        // Levels ride only an order that opens (paper ignores them on a fill
+        // that only reduces).
+        let (stop, targets) = if opens {
+            check_sides(o.side, price_ref(o.limit, mid), o.stop, &o.targets)?;
+            entry_levels(o.stop, &o.targets)?
+        } else {
+            (None, Vec::new())
+        };
+        // A resting add can't carry levels of its own: Hyperliquid would stack
+        // a second, fixed-size stop. The position's stop covers it once moved.
+        if adds && !market_order && (stop.is_some() || !targets.is_empty()) {
+            return Err(Refusal::bad("A LIVE limit that adds to a position takes no stop or target of its own: once it fills, set the position's stop again and it covers all of it"));
+        }
+        if opens && !adds && held.is_none() {
+            self.ensure_leverage(network, &account, &wallet, &a, m.coin, m.label, leverage).await?;
+        }
         let tif = if market_order { Tif::Ioc } else { Tif::Gtc };
         let entry = OrderWire { a: a.asset, b: buy, p: wire(price, "price")?, s: wire(size, "size")?, r: o.reduce_only, t: OrderTypeWire::limit(tif), c: None };
         // A limit carries its stop and target as children (`normalTpsl`),
@@ -260,7 +324,7 @@ impl LiveDesk {
         // stop and target follow, sized to what filled.
         let mut orders = vec![entry];
         if !market_order {
-            orders.extend(levels_wire(&a, buy, size, levels.0, &levels.1)?);
+            orders.extend(levels_wire(&a, buy, size, stop, &targets)?);
         }
         let grouping = if orders.len() > 1 { Grouping::NormalTpsl } else { Grouping::Na };
         let statuses = self.send(network, &wallet, &OrderAction::new(orders, grouping)).await?;
@@ -275,17 +339,9 @@ impl LiveDesk {
             }
         }
         let filled: f64 = answer.filled.iter().map(|f| f.size).sum();
-        if market_order && filled > 0.0 && (levels.0.is_some() || !levels.1.is_empty()) {
-            for o in levels_wire(&a, buy, a.size(filled), levels.0, &levels.1)? {
-                let what = if o.t.trigger.as_ref().is_some_and(|t| t.tpsl == "sl") { "Stop" } else { "Target" };
-                match self.send(network, &wallet, &OrderAction::new(vec![o], Grouping::Na)).await {
-                    Ok(st) => {
-                        if let Some(OrderStatus::Error(why)) = st.first() {
-                            answer.warnings.push(format!("{what} not placed — the position has none: {why}"));
-                        }
-                    }
-                    Err(r) => answer.warnings.push(format!("{what} not placed — the position has none: {}", r.message)),
-                }
+        if market_order && filled > 0.0 {
+            if let Err(r) = self.guard_after_fill(network, &account, &wallet, &a, m, buy, a.size(filled), adds, stop, &targets, &mut answer).await {
+                answer.warnings.push(format!("The position's stop and target weren't set: {}", r.message));
             }
         }
         if !answer.warnings.is_empty() {
@@ -293,6 +349,50 @@ impl LiveDesk {
         }
         tracing::warn!(network = net_str(network), market = m.key, buy, size, price, ?answer, "Hyperliquid LIVE order");
         Ok(answer)
+    }
+
+    /// After a market order filled `filled`: guards that no longer close the
+    /// position (it flipped) are cancelled; its stop then covers all of it —
+    /// the order's own stop, or for an add with none the stop it had,
+    /// re-placed for the new size; its target goes on for what filled.
+    #[allow(clippy::too_many_arguments)]
+    async fn guard_after_fill(&self, network: Network, account: &str, wallet: &Wallet, a: &NetAsset, m: &'static Market, buy: bool, filled: f64, adds: bool, stop: Option<f64>, targets: &[(f64, Option<f64>)], answer: &mut LiveOrderAnswer) -> Result<(), Refusal> {
+        let Some((szi, _)) = self.held(network, account, m.coin).await? else {
+            return Ok(());
+        };
+        let long = szi > 0.0;
+        let guards: Vec<HlOpenOrder> = self.orders_on(network, account, m.coin).await?.into_iter().filter(|o| o.is_trigger && o.reduce_only).collect();
+        // A guard on the side that would add to the position is a flipped one's: gone.
+        let stale: Vec<CancelWire> = guards.iter().filter(|o| o.is_buy == long).map(|o| CancelWire { a: a.asset, o: o.oid }).collect();
+        if !stale.is_empty() {
+            if let Err(r) = self.send(network, wallet, &CancelAction::new(stale)).await {
+                answer.warnings.push(format!("The old side's stops weren't cancelled: {}", r.message));
+            }
+        }
+        let stops: Vec<HlOpenOrder> = guards.into_iter().filter(|o| o.is_buy != long && o.is_stop()).collect();
+        let stop_at = stop.map(|p| a.price(p)).or(if adds { stops.first().and_then(|o| o.trigger_px) } else { None });
+        if let Some(p) = stop_at {
+            match self.set_full_stop(network, wallet, a, long, szi.abs(), p, &stops).await {
+                Ok(w) => answer.warnings.extend(w),
+                Err(r) => answer.warnings.push(format!("Stop not placed — the position has none for its new size: {}", r.message)),
+            }
+        }
+        // `buy` opened (or added to) the position this way: its targets close it.
+        let opened = if adds || (szi > 0.0) == buy { filled.min(szi.abs()) } else { 0.0 };
+        if opened > 0.0 {
+            // `levels_wire` takes the side the position is on and closes it from the other.
+            for o in levels_wire(a, long, opened, None, targets)? {
+                match self.send(network, wallet, &OrderAction::new(vec![o], Grouping::Na)).await {
+                    Ok(st) => {
+                        if let Some(OrderStatus::Error(why)) = st.first() {
+                            answer.warnings.push(format!("Target not placed: {why}"));
+                        }
+                    }
+                    Err(r) => answer.warnings.push(format!("Target not placed: {}", r.message)),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Close `size` of the position in `m` (all of it when `None`) with a
@@ -359,16 +459,37 @@ impl LiveDesk {
     }
 
     /// Cancel the open order `id` (an oid): a limit, a line order, a stop
-    /// or a target.
-    pub async fn cancel(&self, network: Network, id: &str) -> Result<(), Refusal> {
+    /// or a target. A partly filled order's stop and target children go
+    /// with it on Hyperliquid, so they are placed again for the part that
+    /// filled. What needs saying comes back as warnings.
+    pub async fn cancel(&self, network: Network, id: &str) -> Result<Vec<String>, Refusal> {
         let oid = oid_of(id)?;
         let (account, wallet) = self.signer(network).await?;
         let o = self.find_order(network, &account, oid).await?;
         let a = self.net_asset(network, &o.coin).await?;
-        match self.send(network, &wallet, &CancelAction::new(vec![CancelWire { a: a.asset, o: oid }])).await?.first() {
-            Some(OrderStatus::Error(why)) => Err(Refusal::conflict(format!("Not cancelled: {why}"))),
-            _ => Ok(()),
+        if let Some(OrderStatus::Error(why)) = self.send(network, &wallet, &CancelAction::new(vec![CancelWire { a: a.asset, o: oid }])).await?.first() {
+            return Err(Refusal::conflict(format!("Not cancelled: {why}")));
         }
+        Ok(self.guard_filled_part(network, &wallet, &a, &o).await)
+    }
+
+    /// `o` (just cancelled, or about to be placed again) filled in part: its
+    /// stop and target children, cancelled with it, go on again for the
+    /// part that filled, as reduce-only triggers.
+    async fn guard_filled_part(&self, network: Network, wallet: &Wallet, a: &NetAsset, o: &HlOpenOrder) -> Vec<String> {
+        let part = a.size(o.orig_sz - o.sz);
+        if part <= 0.0 || o.children.is_empty() {
+            return Vec::new();
+        }
+        let mut warnings = Vec::new();
+        for c in &o.children {
+            let Some(at) = c.trigger_px else { continue };
+            let tpsl = if c.is_stop() { "sl" } else { "tp" };
+            if let Err(r) = self.place_guard(network, wallet, a, c.is_buy, part, at, tpsl).await {
+                warnings.push(format!("The part that filled ({part}) has no {}: {}", if tpsl == "sl" { "stop" } else { "target" }, r.message));
+            }
+        }
+        warnings
     }
 
     /// Move the open order `id` to `price`, keeping its side, size and kind:
@@ -391,10 +512,39 @@ impl LiveDesk {
         if o.is_trigger {
             return self.replace_guard(network, &wallet, &a, &o, price, o.sz).await;
         }
-        let order = OrderWire { a: a.asset, b: o.is_buy, p: wire(price, "price")?, s: wire(o.sz, "size")?, r: o.reduce_only, t: OrderTypeWire::limit(Tif::Gtc), c: None };
-        match self.send(network, &wallet, &ModifyAction::new(vec![ModifyWire { oid, order }])).await?.first() {
-            Some(OrderStatus::Error(why)) => Err(Refusal::conflict(format!("Limit not moved: {why}"))),
-            _ => Ok(()),
+        if !o.reduce_only {
+            if let Some(m) = Market::of_coin(&o.coin).filter(|m| !m.tradable()) {
+                return Err(close_only(m));
+            }
+        }
+        if o.children.is_empty() {
+            let order = OrderWire { a: a.asset, b: o.is_buy, p: wire(price, "price")?, s: wire(o.sz, "size")?, r: o.reduce_only, t: OrderTypeWire::limit(Tif::Gtc), c: None };
+            return match self.send(network, &wallet, &ModifyAction::new(vec![ModifyWire { oid, order }])).await?.first() {
+                Some(OrderStatus::Error(why)) => Err(Refusal::conflict(format!("Limit not moved: {why}"))),
+                _ => Ok(()),
+            };
+        }
+        // A limit with its stop and target: Hyperliquid doesn't say a modify
+        // keeps them, so it is cancelled and placed again with them (what
+        // filled meanwhile gets its own, `guard_filled_part`).
+        if let Some(OrderStatus::Error(why)) = self.send(network, &wallet, &CancelAction::new(vec![CancelWire { a: a.asset, o: oid }])).await?.first() {
+            return Err(Refusal::conflict(format!("Limit not moved — it couldn't be cancelled ({why}); it may have filled")));
+        }
+        for w in self.guard_filled_part(network, &wallet, &a, &o).await {
+            tracing::error!(network = net_str(network), coin = o.coin, "Hyperliquid LIVE: {w}");
+        }
+        let side = if o.is_buy { Side::Long } else { Side::Short };
+        let stop = o.children.iter().find(|c| c.is_stop()).and_then(|c| c.trigger_px);
+        let targets: Targets = o.children.iter().filter(|c| !c.is_stop()).filter_map(|c| c.trigger_px).map(|t| (t, None)).take(1).collect();
+        check_sides(side, price, stop, &targets)?;
+        let mut orders = vec![OrderWire { a: a.asset, b: o.is_buy, p: wire(price, "price")?, s: wire(o.sz, "size")?, r: false, t: OrderTypeWire::limit(Tif::Gtc), c: None }];
+        orders.extend(levels_wire(&a, o.is_buy, o.sz, stop, &targets)?);
+        match self.send(network, &wallet, &OrderAction::new(orders, Grouping::NormalTpsl)).await {
+            Ok(st) => match st.first() {
+                Some(OrderStatus::Error(why)) => Err(Refusal::conflict(format!("The limit was cancelled but not placed again: {why} — place it again from the ticket"))),
+                _ => Ok(()),
+            },
+            Err(r) => Err(Refusal::conflict(format!("The limit was cancelled but not placed again: {} — check the account", r.message))),
         }
     }
 
@@ -415,8 +565,11 @@ impl LiveDesk {
     /// it is now, with its stop and targets as children (`normalTpsl`), live
     /// once it fills. It rests until cancelled.
     pub async fn arm_line(&self, network: Network, o: &LiveOrder) -> Result<LiveOrderAnswer, Refusal> {
-        let (account, wallet) = self.signer(network).await?;
         let m = o.market;
+        if !m.tradable() {
+            return Err(close_only(m));
+        }
+        let (account, wallet) = self.signer(network).await?;
         let a = self.net_asset(network, m.coin).await?;
         let size = a.size(o.size);
         if size <= 0.0 {
@@ -440,10 +593,14 @@ impl LiveDesk {
         }
         check_sides(o.side, line, o.stop, &o.targets)?;
         let (stop, targets) = entry_levels(o.stop, &o.targets)?;
+        let adds = held.is_some_and(|(szi, _)| (szi > 0.0) == buy);
+        if adds && (stop.is_some() || !targets.is_empty()) {
+            return Err(Refusal::bad("A LIVE line order that adds to a position takes no stop or target of its own: once it fills, set the position's stop again and it covers all of it"));
+        }
         let mid = self.net_mid(network, m.coin).await?;
         let tpsl = entry_tpsl(buy, line, mid)?;
         if held.is_none() {
-            self.set_leverage(network, &wallet, &a, leverage).await?;
+            self.ensure_leverage(network, &account, &wallet, &a, m.coin, m.label, leverage).await?;
         }
         let mut orders = vec![trigger_wire(&a, buy, size, line, tpsl, false)?];
         orders.extend(levels_wire(&a, buy, size, stop, &targets)?);
@@ -474,6 +631,10 @@ impl LiveDesk {
         let o = self.find_order(network, &account, oid).await?;
         if !o.is_trigger || o.reduce_only {
             return Err(Refusal::bad("That order isn't a line order"));
+        }
+        // Arming it again opens: not on a close-only perp (cancel it instead).
+        if let Some(m) = Market::of_coin(&o.coin).filter(|m| !m.tradable()) {
+            return Err(close_only(m));
         }
         let a = self.net_asset(network, &o.coin).await?;
         let side = if o.is_buy { Side::Long } else { Side::Short };
@@ -519,11 +680,13 @@ impl LiveDesk {
         }
     }
 
-    /// Change the LIVE position's stop and targets on Hyperliquid: a new one
-    /// is a reduce-only market trigger resting there, a moved one is that
-    /// order modified, a cleared or removed one cancelled. "All left" is
-    /// the whole position as it stands.
-    pub async fn set_levels(&self, network: Network, m: &'static Market, change: &LevelsChange) -> Result<(), Refusal> {
+    /// Change the LIVE position's stop and targets on Hyperliquid. A stop set
+    /// (or moved) is one stop over the whole position as it stands, placed
+    /// before every older stop is cancelled; a target is a reduce-only
+    /// market trigger, a moved one placed anew before the old goes; a
+    /// cleared or removed one is cancelled. Both must be on the right side
+    /// of the mid: one past it would fire at once.
+    pub async fn set_levels(&self, network: Network, m: &'static Market, change: &LevelsChange) -> Result<Vec<String>, Refusal> {
         let (account, wallet) = self.signer(network).await?;
         let a = self.net_asset(network, m.coin).await?;
         let (szi, _) = self.held(network, &account, m.coin).await?.ok_or_else(|| Refusal::not_found(format!("No LIVE {} position", m.label)))?;
@@ -533,31 +696,34 @@ impl LiveDesk {
         let dex = hyperliquid_client::dex_of(m.coin);
         let open = timed("the open orders", self.info[&network].open_orders(&account, dex)).await.map_err(Refusal::conflict)?;
         let guards: Vec<&HlOpenOrder> = open.iter().filter(|o| o.coin == m.coin && o.is_trigger && o.reduce_only).collect();
-        let stops: Vec<&&HlOpenOrder> = guards.iter().filter(|o| o.is_stop()).collect();
+        let stops: Vec<HlOpenOrder> = guards.iter().filter(|o| o.is_stop()).map(|o| (*o).clone()).collect();
+        let side = if long { Side::Long } else { Side::Short };
+        let mut warnings = Vec::new();
+        let mid = if change.stop.flatten().is_some() || change.set_target.is_some() { Some(self.net_mid(network, m.coin).await?) } else { None };
         if let Some(stop) = change.stop {
             match stop {
                 Some(p) => {
                     let p = a.price(p);
-                    if let Some(why) = crate::hyperliquid::perp::wrong_side("stop", if long { Side::Long } else { Side::Short }, self.net_mid(network, m.coin).await?, p) {
-                        return Err(Refusal::bad(format!("{why} (the mark now)")));
+                    if let Some(why) = crate::hyperliquid::perp::wrong_side("stop", side, mid.unwrap_or(p), p) {
+                        return Err(Refusal::bad(format!("{why} (the price now)")));
                     }
-                    match stops.first() {
-                        Some(o) => self.move_to(network, &o.oid.to_string(), p).await?,
-                        None => self.place_guard(network, &wallet, &a, !long, held, p, "sl").await?,
-                    }
+                    warnings.extend(self.set_full_stop(network, &wallet, &a, long, held, p, &stops).await?);
                 }
                 None => {
                     for o in &stops {
-                        self.cancel(network, &o.oid.to_string()).await?;
+                        warnings.extend(self.cancel(network, &o.oid.to_string()).await?);
                     }
                 }
             }
         }
         if let Some(id) = &change.remove_target {
-            self.cancel(network, id).await?;
+            warnings.extend(self.cancel(network, id).await?);
         }
         if let Some((id, price, size)) = &change.set_target {
             let price = a.price(*price);
+            if let Some(why) = crate::hyperliquid::perp::wrong_side("target", side, mid.unwrap_or(price), price) {
+                return Err(Refusal::bad(format!("{why} (the price now)")));
+            }
             match id {
                 Some(id) => {
                     let oid = oid_of(id)?;
@@ -578,7 +744,7 @@ impl LiveDesk {
                 }
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// One reduce-only market trigger (a stop or a target) resting on Hyperliquid.
@@ -595,6 +761,10 @@ impl LiveDesk {
     /// every position on every dex read, the app's perps or not. What it
     /// couldn't do, in words; empty when the account is flat.
     pub async fn flatten(&self, network: Network) -> Vec<String> {
+        // LIVE routes hold the gate while they answer: an order that passed
+        // the kill-switch check just before it was set lands before this
+        // reads the account. Later ones see the switch on.
+        drop(self.gate.write().await);
         let mut problems = Vec::new();
         let (account, wallet) = match self.signer(network).await {
             Ok(s) => s,
@@ -604,33 +774,10 @@ impl LiveDesk {
             Ok(d) => d,
             Err(e) => return vec![e],
         };
-        // Orders first, so no stop or line fires into the closes.
-        for &dex in &dexes {
-            let orders = match timed("the open orders", self.info[&network].open_orders(&account, dex)).await {
-                Ok(o) => o,
-                Err(e) => {
-                    problems.push(e);
-                    continue;
-                }
-            };
-            let mut cancels = Vec::new();
-            for o in &orders {
-                match self.net_asset(network, &o.coin).await {
-                    Ok(a) => cancels.push(CancelWire { a: a.asset, o: o.oid }),
-                    Err(r) => problems.push(format!("{} order {} not cancelled: {}", o.coin, o.oid, r.message)),
-                }
-            }
-            if cancels.is_empty() {
-                continue;
-            }
-            match self.send(network, &wallet, &CancelAction::new(cancels)).await {
-                Ok(statuses) => problems.extend(statuses.iter().filter_map(|st| match st {
-                    OrderStatus::Error(why) => Some(format!("an order not cancelled: {why}")),
-                    _ => None,
-                })),
-                Err(r) => problems.push(format!("orders not cancelled: {}", r.message)),
-            }
-        }
+        // Orders that can open first, so no line or limit fires into the
+        // closes; the positions; then the rest (the stops stay until their
+        // position is closed — one firing into a close is harmless).
+        problems.extend(self.cancel_where(network, &account, &wallet, &dexes, |o| !o.reduce_only).await);
         for &dex in &dexes {
             let state = match timed("the positions", self.info[&network].account_state(&account, dex)).await {
                 Ok(s) => s,
@@ -647,8 +794,62 @@ impl LiveDesk {
                 }
             }
         }
+        problems.extend(self.cancel_where(network, &account, &wallet, &dexes, |_| true).await);
         problems
     }
+
+    /// Cancel the account's open orders on `dexes` that `which` picks; what
+    /// couldn't be, in words.
+    async fn cancel_where(&self, network: Network, account: &str, wallet: &Wallet, dexes: &[Option<&'static str>], which: impl Fn(&HlOpenOrder) -> bool) -> Vec<String> {
+        let mut problems = Vec::new();
+        for &dex in dexes {
+            let orders = match timed("the open orders", self.info[&network].open_orders(account, dex)).await {
+                Ok(o) => o,
+                Err(e) => {
+                    problems.push(e);
+                    continue;
+                }
+            };
+            let mut cancels = Vec::new();
+            for o in orders.iter().filter(|o| which(o)) {
+                match self.net_asset(network, &o.coin).await {
+                    Ok(a) => cancels.push(CancelWire { a: a.asset, o: o.oid }),
+                    Err(r) => problems.push(format!("{} order {} not cancelled: {}", o.coin, o.oid, r.message)),
+                }
+            }
+            if cancels.is_empty() {
+                continue;
+            }
+            match self.send(network, wallet, &CancelAction::new(cancels)).await {
+                Ok(statuses) => problems.extend(statuses.iter().filter_map(|st| match st {
+                    OrderStatus::Error(why) => Some(format!("an order not cancelled: {why}")),
+                    _ => None,
+                })),
+                Err(r) => problems.push(format!("orders not cancelled: {}", r.message)),
+            }
+        }
+        problems
+    }
+
+    /// A perp just removed from the list (close-only): the owner's LIVE
+    /// orders on it that can open — limits and line orders — are cancelled,
+    /// as paper's are. Its stops and targets stay with the position.
+    pub async fn cancel_opening(&self, network: Network, coins: &[String]) -> Vec<String> {
+        let (account, wallet) = match self.signer(network).await {
+            Ok(s) => s,
+            Err(r) => return vec![r.message],
+        };
+        let dexes = match self.dexes_on(network).await {
+            Ok(d) => d,
+            Err(e) => return vec![e],
+        };
+        self.cancel_where(network, &account, &wallet, &dexes, |o| !o.reduce_only && coins.iter().any(|c| c == &o.coin)).await
+    }
+}
+
+/// The refusal for an order that would open or add on a close-only perp.
+fn close_only(m: &Market) -> Refusal {
+    Refusal::conflict(format!("{} is close-only: it was removed from the app's markets, so only orders that reduce a position are taken", m.label))
 }
 
 /// Targets: each a price and a size (`None`: all that is left).

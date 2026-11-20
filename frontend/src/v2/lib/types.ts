@@ -771,6 +771,8 @@ export interface PerpPosition {
   roe_pct: number | null;
   liq: number | null;
   notional: number | null;
+  /** LIVE: the stops don't cover the position as one (several, or less than held), in words. */
+  stop_note?: string;
 }
 
 /** A resting limit order. */

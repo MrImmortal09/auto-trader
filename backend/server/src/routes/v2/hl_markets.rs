@@ -178,6 +178,18 @@ pub async fn change_handler(State(state): State<AppState>, Json(b): Json<ChangeB
     if let Err(r) = state.hl_markets.change(&change).await {
         return refuse(r.status, r.message);
     }
+    // The owner's LIVE orders that could open on a perp just removed are
+    // cancelled, as paper's are at its next tick; its stops and targets stay.
+    if !change.remove.is_empty() {
+        if let Some(network) = state.hl_live.live_network().await {
+            let problems = state.hl_live.cancel_opening(network, &change.remove).await;
+            if !problems.is_empty() {
+                let message = format!("Hyperliquid markets: LIVE orders on removed perps not all cancelled — {} — cancel them on Hyperliquid", problems.join("; "));
+                tracing::error!("{message}");
+                send_log(&state.db_tx, &state.log_tx, "ERROR", json!({ "event": "HL_MARKETS", "level": "ERROR", "message": message })).await;
+            }
+        }
+    }
     let words = |what: &str, coins: &[String]| match coins.len() {
         0 => None,
         1..=6 => Some(format!("{what} {}", coins.join(", "))),

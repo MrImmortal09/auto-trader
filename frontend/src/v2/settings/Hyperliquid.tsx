@@ -107,8 +107,8 @@ function Wallet({ net, cred, canStore, live, busy, onSave, onCheck, onRemove, la
  * Settings → Hyperliquid, the owner's: Paper or LIVE, testnet or mainnet,
  * and an API wallet per network. Either switch changes only while flat;
  * LIVE needs the network's API wallet to have passed its check. LIVE is
- * the owner's own account: the Trade screen shows it, and its orders go to it,
- * and orders stay on paper.
+ * the owner's own account: the Trade screen shows it, and its orders go to
+ * it (`hyperliquid/live/trade.rs`).
  */
 export function Hyperliquid({ serverBase, id, title, large }: { serverBase: string; id?: string; title?: string; large: boolean }) {
   const live = usePoll(() => getHlLive(serverBase), 15_000, serverBase);

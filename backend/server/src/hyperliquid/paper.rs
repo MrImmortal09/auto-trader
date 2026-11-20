@@ -415,6 +415,10 @@ pub struct PositionView {
     pub roe_pct: Option<f64>,
     pub liq: Option<f64>,
     pub notional: Option<f64>,
+    /// LIVE: the stops don't cover the position as one (several, or less
+    /// than it holds), in words. Left out on paper, where one always does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_note: Option<String>,
 }
 
 /// One fill in the ledger.
@@ -963,6 +967,7 @@ impl PerpDesk {
                     roe_pct: upnl.filter(|_| p.margin > 0.0).map(|u| u / p.margin * 100.0),
                     liq: p.liq_price(m),
                     notional: mark.map(|v| p.notional(v)),
+                    stop_note: None,
                 })
             })
             .collect();
