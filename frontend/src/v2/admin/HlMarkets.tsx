@@ -114,7 +114,7 @@ export function HlMarkets({ serverBase, desktop }: { serverBase: string; desktop
           <div className="type-caption tnum text-fg-subtle">
             {px(p.price)}
             {change_ != null && <span className={`ml-1 ${TONE_TEXT[toneOf(change_)]}`}>{signedPct(change_)}</span>} · {compactUsd(p.day_volume)} a day · up to {p.leverage_cap}x
-            {p.max_leverage > p.leverage_cap ? ` (Hyperliquid ${p.max_leverage}x)` : ''} · taker {pct(p.taker_fee)}
+ · taker {pct(p.taker_fee)}
             {p.growth_mode ? ' (growth mode)' : ''}
           </div>
         </div>
@@ -188,7 +188,7 @@ export function HlMarkets({ serverBase, desktop }: { serverBase: string; desktop
       title="Hyperliquid markets"
       lead={
         <>
-          The perps the charts, search and the perps ticket offer, to you and every user’s paper desk. An added perp trades like BTC: long or short, isolated margin up to {v.max_leverage}x or its own lower limit. The pin puts it in the Trade header (at most {v.max_header}). In LIVE, each builder venue (trade.xyz, Paragon, …) keeps its own USDC balance, funded in Hyperliquid’s app. {REMOVE_WORDS}
+          The perps the charts, search and the perps ticket offer, to you and every user’s paper desk. An added perp trades like BTC: long or short, isolated margin up to its own Hyperliquid limit (40x on BTC). The pin puts it in the Trade header (at most {v.max_header}). In LIVE, each builder venue (trade.xyz, Paragon, …) keeps its own USDC balance, funded in Hyperliquid’s app. {REMOVE_WORDS}
         </>
       }
     >

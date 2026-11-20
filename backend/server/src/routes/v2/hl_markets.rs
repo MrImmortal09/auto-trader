@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::hyperliquid::markets::{self, Change, DexListing, MAX_CHANGE, MAX_HEADER};
-use crate::hyperliquid::MAX_LEVERAGE;
 use crate::routes::auth_kotak::send_log;
 use crate::AppState;
 
@@ -37,7 +36,7 @@ struct PerpRow {
     base: String,
     sz_decimals: u32,
     max_leverage: u32,
-    /// The most the app takes on it.
+    /// The most the app takes on it: Hyperliquid's own limit.
     leverage_cap: u32,
     taker_fee: f64,
     maker_fee: f64,
@@ -77,7 +76,6 @@ struct UnlistedRow {
 struct View {
     rev: u64,
     max_header: usize,
-    max_leverage: u32,
     dexes: Vec<DexRow>,
     unlisted: Vec<UnlistedRow>,
 }
@@ -109,7 +107,7 @@ fn view(listings: &[DexListing], held: &std::collections::HashSet<&'static str>)
                         base: r.coin.split_once(':').map_or(r.coin.as_str(), |(_, b)| b).to_string(),
                         sz_decimals: r.sz_decimals,
                         max_leverage: r.max_leverage,
-                        leverage_cap: r.max_leverage.min(MAX_LEVERAGE),
+                        leverage_cap: r.max_leverage,
                         taker_fee,
                         maker_fee,
                         growth_mode: r.growth_mode,
@@ -133,7 +131,7 @@ fn view(listings: &[DexListing], held: &std::collections::HashSet<&'static str>)
         .filter(|e| !listed(e.market.coin) && (e.added || held.contains(e.market.key)))
         .map(|e| UnlistedRow { coin: e.market.coin, key: e.market.key, label: e.market.label, state: if e.added { "added" } else { "close_only" }, held: held.contains(e.market.key) })
         .collect();
-    View { rev: markets::rev(), max_header: MAX_HEADER, max_leverage: MAX_LEVERAGE, dexes, unlisted }
+    View { rev: markets::rev(), max_header: MAX_HEADER, dexes, unlisted }
 }
 
 pub async fn view_handler(State(state): State<AppState>) -> Response {

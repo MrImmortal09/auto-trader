@@ -18,7 +18,7 @@ const builtin = (key: string, coin: string, dex: string | null, venue: string, n
   name,
   sz_decimals: sz,
   max_leverage: lev,
-  leverage_cap: Math.min(20, lev),
+  leverage_cap: lev,
   taker_fee: taker,
   maker_fee: taker / 3,
   tradable: true,

@@ -220,7 +220,7 @@ struct RulesRow {
     name: &'static str,
     sz_decimals: u32,
     max_leverage: u32,
-    /// The most the app takes on it: Hyperliquid's limit, at most 20x.
+    /// The most the app takes on it: Hyperliquid's own limit.
     leverage_cap: u32,
     taker_fee: f64,
     maker_fee: f64,

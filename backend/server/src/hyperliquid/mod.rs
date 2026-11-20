@@ -83,8 +83,8 @@ pub struct Market {
     pub name: &'static str,
     /// Decimals a size may carry: 5 for BTC is 0.00001 BTC.
     pub sz_decimals: u32,
-    /// Hyperliquid's own leverage limit; the app caps it lower
-    /// ([`MAX_LEVERAGE`]).
+    /// Hyperliquid's own leverage limit, which the app takes up to (the
+    /// owner's pick, 2026-11-20: no lower cap of its own).
     pub max_leverage: u32,
     /// Fees as a fraction of notional at Hyperliquid's base tier: 0.045 %
     /// taker and 0.015 % maker on core perps; a builder-deployed one's scale
@@ -93,10 +93,6 @@ pub struct Market {
     pub taker_fee: f64,
     pub maker_fee: f64,
 }
-
-/// The most leverage the app takes on any perp (the owner's cap,
-/// 2026-11-19), whatever Hyperliquid allows above it.
-pub const MAX_LEVERAGE: u32 = 20;
 
 /// What a perp's chart symbol starts with.
 pub const SYMBOL_PREFIX: &str = "HL:";
@@ -130,9 +126,9 @@ impl Market {
         markets::tradable(self.key)
     }
 
-    /// The most leverage the app takes on it.
+    /// The most leverage the app takes on it: Hyperliquid's own limit.
     pub fn leverage_cap(&self) -> u32 {
-        self.max_leverage.min(MAX_LEVERAGE)
+        self.max_leverage
     }
 
     /// Maintenance margin as a fraction of notional: half the initial
@@ -723,7 +719,7 @@ mod tests {
         assert_eq!(gold.round_price(3_733.456), 3_733.5);
         assert_eq!(eth.round_price(0.0123456), 0.01, "at most 6 - 4 = 2 decimals on ETH");
         assert_eq!(btc.round_price(0.0123456), 0.0, "at most 6 - 5 = 1 decimal on BTC");
-        assert_eq!((btc.leverage_cap(), eth.leverage_cap()), (20, 20));
+        assert_eq!((btc.leverage_cap(), eth.leverage_cap()), (40, 25), "Hyperliquid's own limits");
         assert!((btc.maintenance() - 0.0125).abs() < 1e-12 && (gold.maintenance() - 0.02).abs() < 1e-12);
         assert_eq!(gold.taker_fee, 2.0 * btc.taker_fee, "a builder-deployed perp's fees are double");
     }

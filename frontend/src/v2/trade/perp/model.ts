@@ -35,10 +35,10 @@ export function perpLabel(k: PerpKey): string {
   return perpInfo(k)?.label ?? `${k.split(':').pop() ?? k}-PERP`;
 }
 
-/** The most leverage the app takes on any perp, whatever Hyperliquid allows. */
-export const MAX_LEVERAGE = 20;
-
-export const leverageCap = (k: PerpKey) => Math.min(MAX_LEVERAGE, rulesOf(k).maxLeverage);
+/** The most leverage the app takes on `k`: Hyperliquid's own limit (40x on BTC). */
+export const leverageCap = (k: PerpKey) => rulesOf(k).maxLeverage;
+/** The ticket's leverage chips, below a perp's own limit (its "Max" chip). */
+export const LEVERAGE_PRESETS = [1, 2, 5, 10, 20];
 
 /** Maintenance margin as a fraction of notional: half the initial margin at max leverage. */
 export const maintenance = (k: PerpKey) => 1 / (2 * rulesOf(k).maxLeverage);
