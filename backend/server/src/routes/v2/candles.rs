@@ -38,13 +38,18 @@ pub(super) const STREAM_EVERY: Duration = Duration::from_millis(250);
 const TOUCH_EVERY_MS: i64 = 30_000;
 
 /// Most days one request may span: Upstox serves at most a month of minute
-/// candles per call, and a week of 1-minute bars is already ~2,600 of them.
+/// candles per call, and a week of 1-minute bars is already ~2,600 of them;
+/// daily candles, a decade (about 2,500 bars).
 pub(super) fn max_days(tf: Tf) -> i64 {
     match tf {
         Tf::M1 => 7,
         Tf::M5 | Tf::M15 => 31,
+        Tf::D1 => 3_650,
     }
 }
+
+/// The 400 for a timeframe the charts don't have.
+pub(super) const TF_HELP: &str = "tf must be 1m, 5m, 15m or 1d";
 
 pub(super) fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() }))).into_response()
@@ -159,7 +164,7 @@ pub async fn candles_handler(State(state): State<AppState>, Extension(identity):
         Err(response) => return response,
     };
     let Some(tf) = parse_tf(q.tf.as_deref()) else {
-        return bad_request("tf must be 1m, 5m or 15m");
+        return bad_request(TF_HELP);
     };
     let today = shared_domain::today_ist();
     let to = match q.to.as_deref() {
@@ -318,7 +323,7 @@ impl Stream {
 /// the answer is a 404 instead of a stream.
 pub async fn candles_stream_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Query(q): Query<StreamQuery>) -> Response {
     let Some(tf) = parse_tf(q.tf.as_deref()) else {
-        return bad_request("tf must be 1m, 5m or 15m");
+        return bad_request(TF_HELP);
     };
     // Hyperliquid perps stream on their own; one stream is one source.
     if q.symbols.split(',').any(crate::hyperliquid::is_hl_symbol) {

@@ -156,6 +156,9 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   const symbol = symbolName(sym);
   const future = futureFor(sym);
   const wholeDay = allDay(sym);
+  // Daily bars: the pivots keep today's levels only (and are read again only
+  // when 1D is entered or left, not on every timeframe switch).
+  const daily = tf === '1d';
 
   useEffect(() => {
     tfRef.current = tf;
@@ -178,6 +181,8 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
         formatExtendText: ({ data }) => {
           const now = Date.now();
           // A perp's bars run around the clock; an Indian one's only in session.
+          // An Indian day's bar closes with the session, not at midnight: no countdown.
+          if (tfRef.current === '1d' && !allDayRef.current) return '';
           return allDayRef.current || inSession(now) ? countdown(data.timestamp + TF_MS[tfRef.current], now) : '';
         },
       },
@@ -289,7 +294,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     drawings.current?.hide();
     c.removeOverlay();
     c.setSymbol({ ticker: symbol, pricePrecision: 2, volumePrecision: 0 });
-    c.setPeriod({ type: 'minute', span: TF_MS[tf] / 60_000 });
+    c.setPeriod(tf === '1d' ? { type: 'day', span: 1 } : { type: 'minute', span: TF_MS[tf] / 60_000 });
     if (future) {
       fetchBars(serverBase, future, tf)
         .then((fut) => live && setFutureBars(fut))
@@ -376,7 +381,8 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   useEffect(() => {
     const c = chart.current;
     if (!c || !bars) return;
-    if (!vwap) {
+    // A day's VWAP on a daily bar is just its typical price: none on 1D.
+    if (!vwap || tf === '1d') {
       c.removeIndicator({ name: 'v2Vwap' });
       return;
     }
@@ -388,7 +394,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
     } else {
       c.overrideIndicator({ name: 'v2Vwap', calcParams: [vwapVersion.current] });
     }
-  }, [vwap, bars, futureBars, chartId, sym.kind, wholeDay]);
+  }, [vwap, bars, futureBars, chartId, sym.kind, wholeDay, tf]);
 
   // Standard pivots, from a week of 15-minute bars so the trading day before
   // is there on a Monday or after a holiday. Fixed for the day; read again
@@ -416,7 +422,13 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       fetchDays(serverBase, symbol, '15m', 8)
         .then((bars) => {
           if (!live) return;
-          PIVOT_SERIES.set(chartId, { byDay: pivotsByDay(bars, wholeDay), allDay: wholeDay });
+          const byDay = pivotsByDay(bars, wholeDay);
+          // On daily bars, each past day's levels would be one bar wide: today's only.
+          if (daily) {
+            const today = Math.max(...byDay.keys());
+            for (const day of [...byDay.keys()]) if (day !== today) byDay.delete(day);
+          }
+          PIVOT_SERIES.set(chartId, { byDay, allDay: wholeDay });
           show();
         })
         .catch(() => {});
@@ -426,7 +438,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       live = false;
       window.clearInterval(timer);
     };
-  }, [pivots, symbol, serverBase, chartId, wholeDay]);
+  }, [pivots, symbol, serverBase, chartId, wholeDay, daily]);
 
   // Order lines and markers, kept in step with what the screen says.
   useEffect(() => {

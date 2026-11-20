@@ -7,7 +7,8 @@ import { level, shortDate, signedMoney } from '../lib/format';
 import { isPerpKey } from './perp/catalog';
 import { perpLabel } from './perp/model';
 
-export type Tf = '1m' | '5m' | '15m';
+/** A chart's timeframe. `1d`: an Indian day's session, or a perp's UTC day. */
+export type Tf = '1m' | '5m' | '15m' | '1d';
 /** Which library draws the charts: KLineChart (the default) or Vela. */
 export type ChartLib = 'kline' | 'vela';
 /** How the price series is drawn, the same on either library. */
@@ -21,9 +22,14 @@ export const CHART_LIBS: { value: ChartLib; label: string }[] = [
   { value: 'kline', label: 'KLine' },
   { value: 'vela', label: 'Vela' },
 ];
-export const TF_MS: Record<Tf, number> = { '1m': 60_000, '5m': 300_000, '15m': 900_000 };
+export const TF_MS: Record<Tf, number> = { '1m': 60_000, '5m': 300_000, '15m': 900_000, '1d': 86_400_000 };
 /** Days of bars a chart opens with, under each timeframe's server cap. */
-export const TF_DAYS: Record<Tf, number> = { '1m': 2, '5m': 5, '15m': 10 };
+export const TF_DAYS: Record<Tf, number> = { '1m': 2, '5m': 5, '15m': 10, '1d': 730 };
+/** The timeframes a chart offers, and their buttons' words. */
+export const TFS: Tf[] = ['1m', '5m', '15m', '1d'];
+export const TF_LABEL: Record<Tf, string> = { '1m': '1m', '5m': '5m', '15m': '15m', '1d': '1D' };
+/** `raw` (a saved layout's) as a timeframe, `5m` when it isn't one. */
+export const tfOrDefault = (raw: unknown): Tf => (TFS.includes(raw as Tf) ? (raw as Tf) : '5m');
 
 /** A stock's listing. The catalog is NSE-only, so `BSE` is read but the
  * server refuses to chart it (`RELIANCE@BSE`). */
@@ -477,7 +483,10 @@ export function istMs(ts: string): number {
 export function countdown(end: number, now: number): string {
   const s = Math.floor((end - now) / 1000);
   if (s < 0) return '';
-  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  const two = (n: number) => String(n).padStart(2, '0');
+  // A daily bar's: HH:MM:SS while more than an hour is left.
+  if (s >= 3600) return `${two(Math.floor(s / 3600))}:${two(Math.floor(s / 60) % 60)}:${two(s % 60)}`;
+  return `${two(Math.floor(s / 60))}:${two(s % 60)}`;
 }
 
 /** Whether `t` is inside the 09:15–15:30 IST session. */

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::broadcast;
 
-use super::candles::{bad_request, max_days, parse_date, parse_tf, DEFAULT_DAYS, MAX_STREAM_SYMBOLS, STREAM_EVERY};
+use super::candles::{bad_request, max_days, parse_date, parse_tf, DEFAULT_DAYS, MAX_STREAM_SYMBOLS, STREAM_EVERY, TF_HELP};
 use crate::candles::bars::{Bar, Tf};
 use crate::hyperliquid::{markets, Market};
 use crate::AppState;
@@ -63,7 +63,7 @@ pub async fn candles(state: &AppState, raw: &str, tf: Option<&str>, from: Option
         return bad_request(SYMBOL_HELP);
     };
     let Some(tf) = parse_tf(tf) else {
-        return bad_request("tf must be 1m, 5m or 15m");
+        return bad_request(TF_HELP);
     };
     let today = shared_domain::today_ist();
     let to = match to {
@@ -220,7 +220,7 @@ struct RulesRow {
     name: &'static str,
     sz_decimals: u32,
     max_leverage: u32,
-    /// The most the app takes on it: Hyperliquid's limit, at most 20x.
+    /// The most the app takes on it: Hyperliquid's own limit.
     leverage_cap: u32,
     taker_fee: f64,
     maker_fee: f64,

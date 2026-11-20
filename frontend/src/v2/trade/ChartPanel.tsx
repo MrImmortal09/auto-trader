@@ -19,14 +19,13 @@ import { useDrawing, useDrawPrefs, type DrawApi, type DrawTool } from './drawing
 import { expiryChip, type ExpiryRow } from './expiries';
 import { KChart, type ChartLine, type ChartMarker, type ChartState, type Placing } from './KChart';
 import type { Layers } from './lines';
-import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, sameSym, symbolLabel, symbolName, symExpiry, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
+import { CANDLE_STYLES, CHART_LIBS, expiryMonth, hasVolume, sameSym, symbolLabel, symbolName, symExpiry, TF_LABEL, TFS, underlyingOf, type CandleStyle, type ChartLib, type ChartSym, type Tf } from './model';
 import { usePerpCatalog } from './perp/catalog';
 import { PerpResults } from './perp/PerpResults';
 import { QuoteStrip } from './QuoteStrip';
 import { drawableStudies, STUDIES } from './studies';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
-const TFS: Tf[] = ['1m', '5m', '15m'];
 
 // Vela is heavy and optional: only downloaded once a chart is switched to it.
 const VChart = lazy(() => import('./VChart'));
@@ -41,10 +40,18 @@ export interface LotsPick {
   set: (lots: number) => void;
 }
 
+/** A perp's target being placed: the share of the position it sells, in
+ * whole %; 100 sells all that is left when it is reached. */
+export interface PercentPick {
+  value: number;
+  presets: number[];
+  set: (pct: number) => void;
+}
+
 /** A level being placed, as the prompt over the chart reads it: what the
- * tap places, a line under it, its lots picker and any other controls (a
- * line order's validity and Undo). */
-export type PlacingPrompt = Placing & { what: string; lots?: LotsPick; hint?: string | null; extra?: ReactNode };
+ * tap places, a line under it, its lots (or a perp's %) picker and any
+ * other controls (a line order's validity and Undo). */
+export type PlacingPrompt = Placing & { what: string; lots?: LotsPick; percent?: PercentPick; hint?: string | null; hintTone?: 'loss'; extra?: ReactNode };
 
 /** "2 lots", or at the top "all 4 lots" / "all left (2)". */
 function lotsWords(l: LotsPick): string {
@@ -64,6 +71,41 @@ function LotsStepper({ lots }: { lots: LotsPick }) {
       <button type="button" className={step} disabled={lots.value >= lots.max} onClick={() => lots.set(lots.value + 1)} aria-label="More lots">
         +
       </button>
+    </span>
+  );
+}
+
+/** The share picker in a perp target's "Tap where the target goes" prompt:
+ * the presets, or any whole % typed. */
+function PercentPicker({ pick }: { pick: PercentPick }) {
+  const [text, setText] = useState(String(pick.value));
+  const choose = (p: number) => {
+    setText(String(p));
+    pick.set(p);
+  };
+  const chip = (on: boolean) => `h-6 rounded-4 border px-1.5 type-label tnum ${on ? 'border-profit bg-profit-subtle text-profit' : 'border-line text-fg-muted hover:bg-raised hover:text-fg'}`;
+  return (
+    <span className="flex items-center gap-1" role="group" aria-label="Share of the position this target sells">
+      {pick.presets.map((p) => (
+        <button key={p} type="button" className={chip(pick.value === p)} aria-pressed={pick.value === p} onClick={() => choose(p)}>
+          {p >= 100 ? 'All' : `${p}%`}
+        </button>
+      ))}
+      <input
+        type="text"
+        inputMode="numeric"
+        aria-label="Percent of the position"
+        value={text}
+        onChange={(e) => {
+          const t = e.target.value.replace(/[^0-9]/g, '').slice(0, 3);
+          setText(t);
+          const n = Number(t);
+          if (t !== '' && n >= 1 && n <= 100) pick.set(n);
+        }}
+        onBlur={() => setText(String(pick.value))}
+        className="h-6 w-10 rounded-4 border border-line bg-inset px-1 text-right type-label tnum text-fg outline-none focus:border-accent"
+      />
+      <span className="type-label text-fg-muted">%</span>
     </span>
   );
 }
@@ -448,7 +490,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
             <Popover open={menu === 'tf'} onClose={close} align="right" backdrop>
               {TFS.map((t) => (
                 <button key={t} type="button" onClick={() => (onTf(t), close())} className={`flex h-10 w-full items-center rounded-6 px-3 type-label ${t === tf ? 'bg-accent-subtle text-accent' : 'text-fg-muted hover:bg-raised hover:text-fg'}`}>
-                  {t}
+                  {TF_LABEL[t]}
                 </button>
               ))}
             </Popover>
@@ -457,7 +499,7 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
           <div role="tablist" aria-label="Timeframe" className="flex gap-0.5 rounded-6 border border-line bg-inset p-0.5">
             {TFS.map((t) => (
               <button key={t} type="button" role="tab" aria-selected={t === tf} onClick={() => onTf(t)} className={`h-6 rounded-4 px-2.5 type-label transition-colors duration-120 ${t === tf ? 'bg-panel text-accent shadow-sm' : 'text-fg-muted hover:text-fg'}`}>
-                {t}
+                {TF_LABEL[t]}
               </button>
             ))}
           </div>
@@ -636,9 +678,10 @@ export function ChartPanel({ chartId, serverBase, sym, tf, onSym, onTf, layers, 
                 <div className="pointer-events-auto flex max-w-[calc(100%-16px)] flex-wrap items-center justify-center gap-x-3 gap-y-1 rounded-8 border border-line bg-panel px-3 py-1.5 shadow-md">
                   <span className="flex flex-col">
                     <span className="type-label text-fg">Tap where the {placing.what} goes</span>
-                    {placing.hint && <span className="type-caption text-fg-subtle">{placing.hint}</span>}
+                    {placing.hint && <span className={`type-caption ${placing.hintTone === 'loss' ? 'text-loss' : 'text-fg-subtle'}`}>{placing.hint}</span>}
                   </span>
                   {placing.lots && <LotsStepper lots={placing.lots} />}
+                  {placing.percent && <PercentPicker pick={placing.percent} />}
                   {placing.extra}
                   <button type="button" onClick={onCancelPlacing} className="type-label text-fg-muted hover:text-fg">
                     Cancel

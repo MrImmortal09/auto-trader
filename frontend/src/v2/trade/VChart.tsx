@@ -9,10 +9,10 @@ import { editable } from './chartKeymap';
 import { C, FONT, PIVOT_ORANGE, type MarkerData } from './chartSetup';
 import { keepList, pruneExpired, VELA_DRAWINGS, type DrawApi } from './drawings';
 import type { ChartLine, ChartProps } from './KChart';
-import { allDay, barAt, daySummary, futureFor, symbolName, TF_MS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
+import { allDay, barAt, daySummary, futureFor, symbolName, TF_MS, TFS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
 import { pivotLines, pivotsByDay } from './pivots';
 import { DrawHistory } from './undoHistory';
-import { CandleProvider, PROVIDER, velaSymbol, type Feed } from './velaProvider';
+import { CandleProvider, PROVIDER, TF_OF, velaSymbol, type Feed } from './velaProvider';
 
 /** The design tokens on Vela's theme: white, the subtle ink for the axes,
  * the candle pair, as the KLineChart page draws; its menus and dialogs take them too. */
@@ -56,7 +56,8 @@ function lookOf(d: SerializedDrawing | undefined): string {
 }
 
 /** Vela names a timeframe `5` or `5m`. */
-const sameTf = (t: string, tf: Tf) => t === tf || t === tf.slice(0, -1);
+// Only a timeframe the app has matches: Vela's `60` or `W` is never ours.
+const sameTf = (t: string, tf: Tf) => TF_OF[t] === tf;
 /** A Vela symbol, with or without its provider prefix, is `symbol`. */
 const sameSymbol = (s: string, symbol: string) => s === velaSymbol(symbol) || `${PROVIDER}:${s}` === velaSymbol(symbol);
 
@@ -236,7 +237,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
       providers: { [PROVIDER]: () => p },
       // The axis and readouts in IST, whatever the browser's zone.
       timezone: 'Asia/Kolkata',
-      timeframes: ['1m', '5m', '15m'],
+      timeframes: TFS,
       // What the user adds is kept by us, per instrument; Vela keeps nothing.
       persist: false,
       // Its range chips switch to hourly, daily or weekly bars, which the candle service doesn't serve.
@@ -829,7 +830,8 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
     if (!c || !loaded || !bars) return;
     const ex = extras.current;
     // An index's from its future, in IST days; a perp's own, in UTC days.
-    const days = vwap ? vwapDays(sym.kind === 'index' ? vwapOnIndex(futureBars, bars) : vwapOf(bars, wholeDay), sym.kind !== 'index' && wholeDay).filter((d) => d.points.length >= 2) : [];
+    // A day's VWAP on a daily bar is just its typical price: none on 1D.
+    const days = vwap && tf !== '1d' ? vwapDays(sym.kind === 'index' ? vwapOnIndex(futureBars, bars) : vwapOf(bars, wholeDay), sym.kind !== 'index' && wholeDay).filter((d) => d.points.length >= 2) : [];
     const wanted = new Set(days.map((d) => d.day));
     quietly(applying, () => {
       for (const [day, vid] of ex.vwap) {
@@ -855,7 +857,7 @@ export default function VChart({ chartId, serverBase, sym, tf, lines, markers, v
         c.drawings.lock(d.id, true);
       }
     });
-  }, [vwap, bars, futureBars, loaded, sym.kind, wholeDay]);
+  }, [vwap, bars, futureBars, loaded, sym.kind, wholeDay, tf]);
 
   // Standard pivots for today, from a week of 15-minute bars; read again every
   // half hour in case the page stays open past midnight.
