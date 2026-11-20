@@ -730,6 +730,42 @@ export interface HlAdminMarkets {
   unlisted: { coin: string; key: string; label: string; state: 'added' | 'close_only'; held: boolean }[];
 }
 
+/** `GET /api/v2/hl/today`: a perps desk's today, from IST midnight. `net` =
+ * `booked` + `open`; `booked` = `realized` − `fees` − `funding`. */
+export interface PerpToday {
+  mode: 'paper' | 'live';
+  network?: 'testnet' | 'mainnet';
+  day: string;
+  net: number;
+  booked: number;
+  open: number;
+  realized: number;
+  fees: number;
+  /** Paid (negative: received). LIVE: every hour paid today; paper: on what closed today. */
+  funding: number;
+  trades: number;
+  equity: number;
+  free: number;
+  positions: PerpPosition[];
+  closed: PerpClosedToday[];
+}
+
+export interface PerpClosedToday {
+  market: string;
+  label: string;
+  /** The side of the position it closed. */
+  side: PerpSide;
+  size: number;
+  price: number;
+  realized: number;
+  fee: number;
+  funding: number;
+  net: number;
+  /** IST `HH:MM:SS`. */
+  time: string;
+  reason: string;
+}
+
 /** A Hyperliquid perp position or order's way: bought (long) or sold (short). */
 export type PerpSide = 'long' | 'short';
 
@@ -749,8 +785,8 @@ export interface PerpLevels {
 /** An open perp position on isolated margin, with its mark and P&L. */
 export interface PerpPosition {
   id: string;
-  /** `BTC`, `ETH`, `GOLD`. */
-  market: 'BTC' | 'ETH' | 'GOLD';
+  /** The perp's key: `BTC`, `GOLD`, `xyz:NVDA`. */
+  market: string;
   side: PerpSide;
   /** In the coin. */
   size: number;
@@ -778,7 +814,8 @@ export interface PerpPosition {
 /** A resting limit order. */
 export interface PerpOrder {
   id: string;
-  market: 'BTC' | 'ETH' | 'GOLD';
+  /** The perp's key: `BTC`, `GOLD`, `xyz:NVDA`. */
+  market: string;
   side: PerpSide;
   size: number;
   price: number;
@@ -792,7 +829,8 @@ export interface PerpOrder {
  * it when `rising`), with the stop and targets its position takes. */
 export interface PerpLine {
   id: string;
-  market: 'BTC' | 'ETH' | 'GOLD';
+  /** The perp's key: `BTC`, `GOLD`, `xyz:NVDA`. */
+  market: string;
   side: PerpSide;
   size: number;
   leverage: number;
@@ -849,6 +887,13 @@ export interface PerpAccount {
   venues?: { dex: string; label: string; account_value: number; withdrawable: number; margin_used: number }[];
   /** LIVE: when it was read from Hyperliquid (IST `YYYY-MM-DD HH:MM:SS`); paper is always current. */
   as_of?: string;
+  /** LIVE: Hyperliquid's account mode — `default` (spot and each dex a balance of its own) or `unifiedAccount` (spot's USDC is every perp's margin). */
+  account_mode?: string;
+  /** LIVE: the account's spot USDC, all of it and what isn't held for orders. */
+  spot_usdc?: number;
+  spot_usdc_free?: number;
+  /** LIVE: the USDC a new position in the ticket's perp can use now, as Hyperliquid works it out. */
+  available?: { market: string; buy: number; sell: number };
 }
 
 /** A stored Hyperliquid API wallet, as Settings shows it (never its key). */

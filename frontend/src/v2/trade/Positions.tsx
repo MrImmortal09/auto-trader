@@ -14,7 +14,7 @@ import { Modal } from '../ui/Modal';
 import { Segment } from '../ui/Segment';
 import { targetQty, targetRoom, type LevelKind, type LevelRef } from './lines';
 import { approxMoney, levelPnl } from './model';
-import { AccountColumn } from './panel/TradingPanel';
+import { AccountColumn, PerpColumn } from './panel/TradingPanel';
 import { activityEvents, type EngineError } from './panel/activity';
 import { ActivityList, HistoryList, PaperActivityList } from './panel/lists';
 import { PerpTab } from './perp/PerpTab';
@@ -121,7 +121,7 @@ type SheetTab = 'positions' | 'history' | 'activity' | 'perps';
  * Positions (each trade, its stop and target, −1 lot and Exit), History
  * (today's closed trades) and Activity (fills and engine errors).
  */
-export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, indexNow, deltaOf, since, canSet, onRemove, onAdd, onClose, paper, perps }: {
+export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, indexNow, deltaOf, since, canSet, onRemove, onAdd, onClose, paper, perps, serverBase }: {
   scalps: ExecutePosition[];
   h: PositionHandlers;
   mode: string;
@@ -143,14 +143,31 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
   paper?: PaperAccount;
   /** Hyperliquid perps on paper (the `hyperliquid` switch): a Perps tab. */
   perps?: { desk: Perps; onOpen: (key: PerpKey) => void };
+  /** For the account's Hyperliquid side (`perps`). */
+  serverBase?: string;
 }) {
   const [tab, setTab] = useState<SheetTab>('positions');
+  // The account's market: F&O whenever the sheet opens (the owner's pick).
+  const [venue, setVenue] = useState<'fno' | 'hl'>('fno');
   const active = scalps.filter((p) => !p.placing);
   const closed = history.filter((c) => c.channel === 'Scalps');
   return (
     <Modal open onClose={onClose} label="Trading">
       <div className="flex flex-col gap-4 overflow-y-auto px-4 pt-3 pb-4">
-        <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical={false} />
+        {perps && serverBase != null && (
+          <Segment
+            label="Market"
+            size="lg"
+            stretch
+            value={venue}
+            onChange={setVenue}
+            options={[
+              { value: 'fno', label: 'F&O' },
+              { value: 'hl', label: 'Hyperliquid' },
+            ]}
+          />
+        )}
+        {perps && serverBase != null && venue === 'hl' ? <PerpColumn serverBase={serverBase} /> : <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical={false} />}
         {/* Four tabs with the perps: the row scrolls rather than squeeze. */}
         <div className="-mx-1 shrink-0 overflow-x-auto px-1">
           <Segment

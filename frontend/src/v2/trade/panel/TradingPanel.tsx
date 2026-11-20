@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, ty
 import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp } from 'lucide-react';
 import type { ExecutePosition } from '../../../types';
 import { contractLabel, expiryLabel } from '../../../lib/execute';
-import { getOrders, getPositionsRaw, type KotakOrderRow } from '../../lib/api';
+import { getOrders, getPerpToday, getPositionsRaw, type KotakOrderRow } from '../../lib/api';
 import { money, plural, price, signedMoney, signedPct, toneOf } from '../../lib/format';
 import { usePoll } from '../../lib/usePoll';
 import { useTickFlash } from '../../lib/useTickFlash';
@@ -20,6 +20,8 @@ import { MIN_CHART_HEIGHT, MIN_PANEL_HEIGHT } from './height';
 import { DEFAULT_DESK_WIDTH, MAX_DESK_WIDTH, MIN_DESK_WIDTH, MIN_PANEL_BODY, useWidth } from '../paneSizes';
 import { ActivityList, HistoryList, PaperActivityList } from './lists';
 import { PerpTab } from '../perp/PerpTab';
+import { signedUsd, sizeText, usd } from '../perp/model';
+import { Segment } from '../../ui/Segment';
 import type { Perps } from '../perp/usePerps';
 import type { PerpKey } from '../model';
 
@@ -183,6 +185,58 @@ export function AccountColumn({ mode, desk, positions, paper, vertical, onHide }
 }
 
 /**
+ * The account column's Hyperliquid side: the perps' equity, today from IST
+ * midnight (what closed, net of every charge — fees and funding — beside
+ * the charges themselves) and what is open; the owner's Hyperliquid
+ * account while LIVE, else the paper desk.
+ */
+export function PerpColumn({ serverBase, onHide }: { serverBase: string; onHide?: () => void }) {
+  const today = usePoll(() => getPerpToday(serverBase), 2_000, serverBase);
+  const t = today.data;
+  const live = t?.mode === 'live';
+  return (
+    <div className="flex flex-col">
+      <div className="flex items-center gap-2 border-b border-line px-4 py-2.5">
+        <span className="type-body-strong text-fg">Hyperliquid</span>
+        <Chip kind={live ? 'live' : 'outline'}>{live ? `LIVE · ${t?.network ?? ''}` : 'Paper'}</Chip>
+        {onHide && (
+          <button type="button" onClick={onHide} aria-label="Hide the desk" title="Hide the desk" className="ml-auto grid size-6 shrink-0 place-items-center rounded-6 text-fg-muted hover:bg-raised hover:text-fg">
+            <ChevronLeft size={14} />
+          </button>
+        )}
+      </div>
+      {!t ? (
+        <p className={`px-4 py-3 type-caption ${today.error ? 'text-loss' : 'text-fg-subtle'}`}>{today.error ?? 'Loading…'}</p>
+      ) : (
+        <>
+          <Block label="Equity (USDC)">
+            <span className="num-large text-fg">{usd(t.equity)}</span>
+            <span className="type-caption text-fg-subtle tnum">free {usd(t.free)}</span>
+          </Block>
+          <Block label="Today" right={<span className={`num-medium ${TONE_TEXT[toneOf(t.booked)]}`}>{signedUsd(t.booked)}</span>}>
+            <span className="type-body text-fg">{t.closed.length === 0 ? 'Nothing closed today.' : `${plural(t.closed.length, 'close')} · ${signedUsd(t.realized)} before charges`}</span>
+            <span className="type-caption text-fg-subtle tnum">
+              Charges {usd(t.fees + t.funding)}: fees {usd(t.fees)} · funding {t.funding >= 0 ? `${usd(t.funding)} paid` : `${usd(-t.funding)} received`}
+            </span>
+          </Block>
+          <Block label={`Open · ${plural(t.positions.length, 'position')}`} right={<span className={`num-medium ${TONE_TEXT[toneOf(t.open)]}`}>{signedUsd(t.open)}</span>}>
+            {t.positions.map((p) => (
+              <span key={p.id} className="flex items-baseline gap-2 type-caption">
+                <span className="text-fg">{p.label}</span>
+                <span className="text-fg-muted tnum">
+                  {p.side === 'long' ? 'Long' : 'Short'} · {sizeText(p.market, p.size)}
+                </span>
+              </span>
+            ))}
+          </Block>
+          <Block label="Net today" right={<span className={`num-medium ${TONE_TEXT[toneOf(t.net)]}`}>{signedUsd(t.net)}</span>} />
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
  * The trading panel under the Trade charts: the account column, and the
  * tabs — Positions (every open trade with its stop and target, its limit
  * sell, Limit, −1 lot and Close), Waiting (first buys still being placed)
@@ -230,6 +284,8 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
   perps?: { desk: Perps; onOpen: (key: PerpKey) => void };
 }) {
   const [tab, setTab] = useState<TabId>('positions');
+  // The account column's market: F&O whenever the screen opens (the owner's pick).
+  const [deskVenue, setDeskVenue] = useState<'fno' | 'hl'>('fno');
   // The height under a drag, kept here until the pointer lifts.
   const [dragged, setDragged] = useState<number | null>(null);
   const drag = useRef<{ y: number; h: number; max: number } | null>(null);
@@ -595,7 +651,26 @@ export function TradingPanel({ serverBase, mode, desk, scalps, errors, fills, hi
       ) : (
         <>
           <aside style={{ width: Math.min(deskDrag ?? deskWidth, deskMax) }} className="shrink-0 overflow-y-auto">
-            <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical onHide={() => onDeskHidden(true)} />
+            {perps && (
+              <div className="border-b border-line px-3 py-2">
+                <Segment
+                  label="Market"
+                  size="xs"
+                  stretch
+                  value={deskVenue}
+                  onChange={setDeskVenue}
+                  options={[
+                    { value: 'fno', label: 'F&O' },
+                    { value: 'hl', label: 'Hyperliquid' },
+                  ]}
+                />
+              </div>
+            )}
+            {perps && deskVenue === 'hl' ? (
+              <PerpColumn serverBase={serverBase} onHide={() => onDeskHidden(true)} />
+            ) : (
+              <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical onHide={() => onDeskHidden(true)} />
+            )}
           </aside>
           <ResizeHandle
             label={`Resize the ${deskName}`}

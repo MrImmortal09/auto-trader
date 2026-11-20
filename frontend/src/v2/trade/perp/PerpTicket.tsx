@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Check, Minus, Plus, X } from 'lucide-react';
 import type { HlMarket, PerpAccount, PerpSide } from '../../lib/types';
+import { perpInfo } from './catalog';
 import { signedPct, toneOf } from '../../lib/format';
 import { Button } from '../../ui/Button';
 import { Modal } from '../../ui/Modal';
@@ -68,6 +69,38 @@ function Field({ label, value, onChange, unit, placeholder, large, action }: { l
         </span>
       </span>
     </label>
+  );
+}
+
+/**
+ * LIVE: the USDC a new position in `k` can use now (Hyperliquid's own
+ * figure, for the side picked), and where the account's USDC sits — spot
+ * USDC is every perp's margin in a unified account, and must be moved to
+ * the perp's balance in a standard one.
+ */
+function LiveFunds({ account, k, side }: { account: PerpAccount; k: PerpKey; side: PerpSide }) {
+  const avail = account.available?.market === k ? (side === 'long' ? account.available.buy : account.available.sell) : null;
+  const spot = account.spot_usdc_free ?? 0;
+  const unified = account.account_mode === 'unifiedAccount' || account.account_mode === 'portfolioMargin';
+  const venue = perpInfo(k)?.venue ?? 'its';
+  return (
+    <div className="flex flex-col gap-0.5 type-caption tnum">
+      <div className="flex justify-between gap-3">
+        <span className="text-fg-muted">Available to {side === 'long' ? 'buy' : 'sell'} {perpLabel(k)}</span>
+        <span className={avail != null && avail > 0 ? 'text-fg' : 'text-loss'}>{avail == null ? '—' : usd(avail)}</span>
+      </div>
+      {account.spot_usdc != null && (
+        <div className="flex justify-between gap-3">
+          <span className="text-fg-muted">Spot USDC</span>
+          <span className="text-fg">{usd(account.spot_usdc)}</span>
+        </div>
+      )}
+      {unified ? (
+        <p className="text-fg-subtle">Unified account: your spot USDC is the margin for every perp.</p>
+      ) : spot > 0 && (avail ?? 0) < 1 ? (
+        <p className="text-loss">Your {usd(spot)} USDC is in Spot. In Hyperliquid's app, move it to Perps{venue !== 'Hyperliquid' ? ` and then to ${venue}'s balance` : ''} to trade {perpLabel(k)}.</p>
+      ) : null}
+    </div>
   );
 }
 
@@ -514,6 +547,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           ? `Type ${sizeIn === 'usd' ? 'the dollars of margin' : 'a size'}${kind === 'market' ? '' : isLine ? ', then place the line' : ' and a price'}. At most ${cap}x; a ${rules.unit} size carries ${rules.szDecimals} decimals.`
           : `${usd(notional)} · ${held && !adding ? `closes ${sizeText(k, Math.min(size!, held.size))}${margin! > 0 ? `, then ` : ''}` : ''}${margin! > 0 || !held || adding ? `margin ${usd(margin!)}` : ''} · fee ≈ ${usd(fee!)}${liq != null ? ` · liquidation ≈ ${perpPrice(roundPrice(k, liq))}` : ''}${kind === 'line' ? ` · when the mark ${mid != null && price! > mid ? 'rises' : 'falls'} to ${perpPrice(price!)}` : ''}`}
       </p>
+      {live && account && <LiveFunds account={account} k={k} side={side} />}
       {closeOnly && <p className="type-caption text-fg">{perpLabel(k)} is close-only: it was removed from the app's markets. Only orders that reduce your position are taken.</p>}
       {!rules.known && <p className="type-caption text-fg-subtle">{perpLabel(k)} isn't on the app's list of perps.</p>}
       {live && (

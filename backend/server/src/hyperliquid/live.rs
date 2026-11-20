@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 
-use super::paper::{AccountView, FillRow, PositionView, Refusal, Venue};
+use super::paper::{today_start, AccountView, Available, ClosedToday, FillRow, PerpToday, PositionView, Refusal, Venue};
 use super::perp::{PerpLevels, PerpLine, PerpOrder, PerpPosition, PerpTarget, Side};
 use super::{markets, Market};
 
@@ -256,7 +256,23 @@ struct LiveCache {
     as_of: Option<String>,
     orders: Option<(Instant, Vec<HlOpenOrder>)>,
     fills: Option<(Instant, Vec<HlFill>)>,
+    /// Spot balances: (coin, total, held).
+    spot: Option<(Instant, Vec<(String, f64, f64)>)>,
+    /// The account mode (`default`, `unifiedAccount`, …).
+    mode: Option<(Instant, String)>,
+    /// What a new position in each coin asked about can use: (buy, sell).
+    available: HashMap<String, (Instant, (f64, f64))>,
+    /// Funding since the day's IST midnight (that midnight, Unix ms):
+    /// (Unix ms, coin, USDC — negative paid).
+    funding: Option<(Instant, i64, Vec<(i64, String, f64)>)>,
 }
+
+/// How long the spot balances, the account mode and what is available to
+/// trade are reused. Each is a nicety beside the account: a read that fails
+/// keeps the last, or shows none.
+const SPOT_TTL: Duration = Duration::from_secs(5);
+const MODE_TTL: Duration = Duration::from_secs(10 * 60);
+const AVAILABLE_TTL: Duration = Duration::from_secs(3);
 
 pub struct LiveDesk {
     pool: SqlitePool,
@@ -583,7 +599,7 @@ impl LiveDesk {
     /// few seconds per part), in the paper desk's shape. Each read gives up
     /// after [`ACCOUNT_READ_TIMEOUT`]; a failure is answered again at once
     /// until [`FAILURE_TTL`], so the requests queued behind it don't wait.
-    pub async fn account(&self, network: Network) -> Result<AccountView, Refusal> {
+    pub async fn account(&self, network: Network, market: Option<&'static Market>) -> Result<AccountView, Refusal> {
         let account = self.creds.read().await.get(&network).map(|c| c.account.clone()).ok_or_else(|| Refusal::conflict(format!("No {} API wallet", net_str(network))))?;
         let info = &self.info[&network];
         let mut all = self.cache.lock().await;
@@ -610,7 +626,116 @@ impl LiveDesk {
         let fills = cache.fills.as_ref().map(|(_, f)| f.as_slice()).unwrap_or_default();
         let mut view = live_account_view(network, &states, orders, fills);
         view.as_of = cache.as_of.clone();
+        // Beside the account: its spot USDC, its mode, and what the perp
+        // asked about can take — none of them fails the view.
+        if cache.spot.as_ref().is_none_or(|(at, _)| at.elapsed() > SPOT_TTL) {
+            match timed("the spot balances", info.spot_balances(&account)).await {
+                Ok(b) => cache.spot = Some((Instant::now(), b)),
+                Err(e) => tracing::warn!("Hyperliquid LIVE: {e}"),
+            }
+        }
+        if cache.mode.as_ref().is_none_or(|(at, _)| at.elapsed() > MODE_TTL) {
+            match timed("the account mode", info.abstraction(&account)).await {
+                Ok(m) => cache.mode = Some((Instant::now(), m)),
+                Err(e) => tracing::warn!("Hyperliquid LIVE: {e}"),
+            }
+        }
+        if let Some(m) = market {
+            let fresh = cache.available.get(m.coin).is_some_and(|(at, _)| at.elapsed() < AVAILABLE_TTL);
+            if !fresh {
+                match timed("what is available to trade", info.available_to_trade(&account, m.coin)).await {
+                    Ok(a) => {
+                        cache.available.insert(m.coin.to_string(), (Instant::now(), a));
+                    }
+                    Err(e) => tracing::warn!("Hyperliquid LIVE: {e}"),
+                }
+            }
+            view.available = cache.available.get(m.coin).map(|(_, (buy, sell))| Available { market: m.key.to_string(), buy: *buy, sell: *sell });
+        }
+        view.account_mode = cache.mode.as_ref().map(|(_, m)| m.clone());
+        if let Some((_, balances)) = &cache.spot {
+            let usdc = balances.iter().find(|(coin, ..)| coin == "USDC").map_or((0.0, 0.0), |(_, total, hold)| (*total, *hold));
+            view.spot_usdc = Some(usdc.0);
+            view.spot_usdc_free = Some((usdc.0 - usdc.1).max(0.0));
+            view.venues.push(Venue { dex: "spot", label: "Spot USDC".into(), account_value: usdc.0, withdrawable: (usdc.0 - usdc.1).max(0.0), margin_used: usdc.1 });
+        }
         Ok(view)
+    }
+
+    /// The owner's LIVE perps today on `network`, from IST midnight:
+    /// Hyperliquid's fills since then (P&L closed and fees) and every hour's
+    /// funding, beside the account as it stands.
+    pub async fn today(&self, network: Network) -> Result<PerpToday, Refusal> {
+        let view = self.account(network, None).await?;
+        let (day, _, from_ms) = today_start();
+        let account = self.creds.read().await.get(&network).map(|c| c.account.clone()).ok_or_else(|| Refusal::conflict(format!("No {} API wallet", net_str(network))))?;
+        let info = &self.info[&network];
+        let (fills, funding) = {
+            let mut all = self.cache.lock().await;
+            let cache = all.entry(network).or_default();
+            let stale = cache.funding.as_ref().is_none_or(|(at, since, _)| at.elapsed() > FILLS_TTL || *since != from_ms);
+            if stale {
+                match timed("today's funding", info.funding_since(&account, from_ms)).await {
+                    Ok(f) => cache.funding = Some((Instant::now(), from_ms, f)),
+                    Err(e) => tracing::warn!("Hyperliquid LIVE: {e}"),
+                }
+            }
+            let fills: Vec<HlFill> = cache.fills.as_ref().map(|(_, f)| f.iter().filter(|f| f.time >= from_ms).cloned().collect()).unwrap_or_default();
+            let funding: Vec<(i64, String, f64)> = cache.funding.as_ref().filter(|(_, since, _)| *since == from_ms).map(|(_, _, f)| f.clone()).unwrap_or_default();
+            (fills, funding)
+        };
+        Ok(live_today(network, day, &view, &fills, &funding, from_ms))
+    }
+}
+
+/// [`LiveDesk::today`]'s figures from the account `view`, today's `fills`
+/// and `funding` (USDC per hour, negative paid) since `from_ms`.
+fn live_today(network: Network, day: String, view: &AccountView, fills: &[HlFill], funding: &[(i64, String, f64)], from_ms: i64) -> PerpToday {
+    let today: Vec<&HlFill> = fills.iter().filter(|f| f.time >= from_ms).collect();
+    let realized: f64 = today.iter().map(|f| f.closed_pnl).sum();
+    let fees: f64 = today.iter().map(|f| f.fee).sum();
+    let paid: f64 = -funding.iter().filter(|(t, ..)| *t >= from_ms).map(|(_, _, usdc)| usdc).sum::<f64>();
+    let mut oids: Vec<u64> = today.iter().map(|f| f.oid).collect();
+    oids.sort_unstable();
+    oids.dedup();
+    let mut closed: Vec<ClosedToday> = today
+        .iter()
+        .filter(|f| f.dir.starts_with("Close") || f.closed_pnl != 0.0 || f.dir.contains('>'))
+        .map(|f| {
+            let m = Market::of_coin(&f.coin);
+            ClosedToday {
+                market: m.map_or_else(|| f.coin.clone(), |m| m.key.to_string()),
+                label: m.map_or_else(|| f.coin.clone(), |m| m.label.to_string()),
+                // A sell closes a long, a buy a short.
+                side: if f.is_buy { Side::Short } else { Side::Long },
+                size: f.sz,
+                price: f.px,
+                realized: f.closed_pnl,
+                fee: f.fee,
+                funding: 0.0,
+                net: f.closed_pnl - f.fee,
+                time: ist(f.time).get(11..19).unwrap_or_default().to_string(),
+                reason: f.dir.clone(),
+            }
+        })
+        .collect();
+    closed.sort_by(|a, b| b.time.cmp(&a.time));
+    let booked = realized - fees - paid;
+    PerpToday {
+        mode: "live",
+        network: Some(net_str(network)),
+        day,
+        net: booked + view.upnl,
+        booked,
+        open: view.upnl,
+        realized,
+        fees,
+        funding: paid,
+        trades: oids.len(),
+        equity: view.equity,
+        free: view.cash,
+        positions: view.positions.clone(),
+        closed,
     }
 }
 
@@ -854,6 +979,10 @@ pub fn live_account_view(network: Network, states: &[(Option<&'static str>, Acco
             .map(|(dex, s)| Venue { dex: dex.unwrap_or("core"), label: venue_label(*dex), account_value: s.account_value, withdrawable: s.withdrawable, margin_used: s.margin_used })
             .collect(),
         as_of: None,
+        account_mode: None,
+        spot_usdc: None,
+        spot_usdc_free: None,
+        available: None,
     }
 }
 
@@ -953,6 +1082,26 @@ mod tests {
         // A role Hyperliquid adds later: named, not taken for a main key.
         let err = account_for(me, agent, &UserRole::Other("newKind".into()), "mainnet").unwrap_err();
         assert!(err.message.contains("'newKind'") && !err.message.contains("own key"), "{}", err.message);
+    }
+
+    #[test]
+    fn todays_live_figures_add_up_from_fills_and_funding() {
+        let fill = |time: i64, coin: &str, is_buy: bool, closed_pnl: f64, fee: f64, oid: u64, dir: &str| HlFill { coin: coin.into(), px: 100.0, sz: 1.0, is_buy, time, closed_pnl, fee, oid, tid: oid, dir: dir.into() };
+        let fills = [
+            fill(500, "BTC", true, 0.0, 0.5, 1, "Open Long"),
+            fill(900, "BTC", false, 30.0, 0.5, 2, "Close Long"),
+            fill(50, "BTC", false, 99.0, 9.0, 3, "Close Long"), // before today
+        ];
+        let funding = [(600, "BTC".to_string(), -0.25), (700, "BTC".to_string(), 0.05), (40, "BTC".to_string(), -5.0)];
+        let mut view = live_account_view(Network::Testnet, &[(None, state(1_000.0, vec![]))], &[], &[]);
+        view.upnl = 12.0;
+        let t = live_today(Network::Testnet, "2026-11-20".into(), &view, &fills, &funding, 100);
+        assert_eq!((t.realized, t.fees, t.trades), (30.0, 1.0, 2));
+        assert!((t.funding - 0.2).abs() < 1e-12, "paid 0.25, received 0.05");
+        assert!((t.booked - (30.0 - 1.0 - 0.2)).abs() < 1e-12);
+        assert!((t.net - (t.booked + 12.0)).abs() < 1e-12);
+        assert_eq!(t.closed.len(), 1);
+        assert_eq!((t.closed[0].side, t.closed[0].net), (Side::Long, 29.5));
     }
 
     #[test]

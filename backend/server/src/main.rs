@@ -1360,6 +1360,7 @@ async fn main() {
         .route("/api/v2/hl/catalog",                get(routes::v2::hl::catalog_handler))
         .route("/api/v2/hl/admin/markets",          get(routes::v2::hl_markets::view_handler).put(routes::v2::hl_markets::change_handler))
         .route("/api/v2/hl/account",                get(routes::v2::hl_desk::account_handler))
+        .route("/api/v2/hl/today",                  get(routes::v2::hl_desk::today_handler))
         .route("/api/v2/hl/orders",                 post(routes::v2::hl_desk::order_handler))
         .route("/api/v2/hl/orders/:id",             axum::routing::patch(routes::v2::hl_desk::move_order_handler).delete(routes::v2::hl_desk::cancel_order_handler))
         .route("/api/v2/hl/positions/:market",      axum::routing::patch(routes::v2::hl_desk::levels_handler))

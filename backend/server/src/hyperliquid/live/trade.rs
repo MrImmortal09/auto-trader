@@ -171,6 +171,8 @@ impl LiveDesk {
             c.orders = None;
             c.fills = None;
             c.failed = None;
+            c.spot = None;
+            c.available.clear();
         }
     }
 

@@ -138,15 +138,17 @@ function levelLines(
   return out;
 }
 
-export function usePerps({ serverBase, enabled, onShow }: {
+export function usePerps({ serverBase, enabled, onShow, market }: {
   serverBase: string;
   enabled: boolean;
+  /** The ticket's perp: LIVE, the account says what a new position in it can use. */
+  market?: PerpKey | null;
   /** Something is about to be placed on `key`'s chart: make sure one shows it. */
   onShow?: (key: PerpKey) => void;
 }): Perps {
   const guard = useGuard();
   const toast = useToast();
-  const poll = usePoll(() => getPerpAccount(serverBase), 1_000, serverBase, enabled);
+  const poll = usePoll(() => getPerpAccount(serverBase, market), 1_000, serverBase, enabled);
   const account = enabled ? poll.data : null;
   // Every line moves and cancels, on paper and LIVE alike (LIVE: on
   // Hyperliquid, by its order id).

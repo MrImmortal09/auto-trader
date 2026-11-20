@@ -340,7 +340,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       }),
     [save, desktop],
   );
-  const perpDesk = usePerps({ serverBase, enabled: hlOn === true && signedIn, onShow: showPerp });
+  const perpDesk = usePerps({ serverBase, enabled: hlOn === true && signedIn, onShow: showPerp, market: saved.perp });
   // The perps' prices every 2 s: the header's, and the ones charted, on the
   // ticket or in the caller's book (`keys`), which the server follows while
   // asked. A change of them is asked at once, not at the next poll.
@@ -1385,6 +1385,7 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
 
   const sheetEl = sheet && (
     <PositionSheet
+      serverBase={serverBase}
       scalps={scalps}
       h={handlers}
       mode={frame?.mode ?? 'PAPER'}

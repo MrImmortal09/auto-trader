@@ -6,6 +6,7 @@
 //! switch is on, LIVE orders that would open are refused.
 //!
 //! - `GET    /api/v2/hl/account`
+//! - `GET    /api/v2/hl/today` — today from IST midnight: P&L, fees, funding, closes
 //! - `POST   /api/v2/hl/orders` — a market or limit order
 //! - `PATCH  /api/v2/hl/orders/:id` `{price}` — move a resting limit
 //! - `DELETE /api/v2/hl/orders/:id`
@@ -17,7 +18,7 @@
 //! - `POST   /api/v2/hl/reset`
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
@@ -232,13 +233,31 @@ macro_rules! desk_or_return {
     }};
 }
 
-pub async fn account_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
+#[derive(Debug, Default, Deserialize)]
+pub struct AccountQuery {
+    /// LIVE: a perp's key, for what a new position in it can use now.
+    #[serde(default)]
+    market: Option<String>,
+}
+
+pub async fn account_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Query(q): Query<AccountQuery>) -> Response {
     let id = caller_or_return!(state, identity);
     // The owner, LIVE: their account as Hyperliquid holds it.
     if let Some(net) = live_for(&state, &identity).await {
-        return answer(state.hl_live.account(net).await);
+        let m = q.market.as_deref().and_then(|k| Market::of_key(k.trim()));
+        return answer(state.hl_live.account(net, m).await);
     }
     answer(state.perps.view(id).await)
+}
+
+/// `GET /api/v2/hl/today` — the caller's perps today, from IST midnight: the
+/// owner's Hyperliquid account while LIVE, else their paper desk.
+pub async fn today_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
+    let id = caller_or_return!(state, identity);
+    if let Some(net) = live_for(&state, &identity).await {
+        return answer(state.hl_live.today(net).await);
+    }
+    answer(state.perps.today(id).await)
 }
 
 pub async fn order_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Json(b): Json<OrderBody>) -> Response {
