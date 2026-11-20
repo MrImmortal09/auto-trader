@@ -427,6 +427,7 @@ export function usePerps({ serverBase, enabled, onShow, market }: {
         draggable: false,
         parts: (at) => {
           const s = share(at);
+          if (s.problem === 'over') return [{ key: 'label', text: `Target · ${pct}% is more than is left`, color: C.loss, filled: true }];
           if (s.why) return [{ key: 'label', text: `Target · ${pct}% too small here${s.minPct != null ? ` — at least ${s.minPct}%` : ''}`, color: C.loss, filled: true }];
           return [{ key: 'label', text: `Target · ${sells(s)} ${signedUsd(pnlAt(p.side, s.sells, p.entry, at))}`, color: C.profit }];
         },

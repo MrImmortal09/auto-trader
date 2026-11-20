@@ -483,7 +483,10 @@ export function istMs(ts: string): number {
 export function countdown(end: number, now: number): string {
   const s = Math.floor((end - now) / 1000);
   if (s < 0) return '';
-  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  const two = (n: number) => String(n).padStart(2, '0');
+  // A daily bar's: HH:MM:SS while more than an hour is left.
+  if (s >= 3600) return `${two(Math.floor(s / 3600))}:${two(Math.floor(s / 60) % 60)}:${two(s % 60)}`;
+  return `${two(Math.floor(s / 60))}:${two(s % 60)}`;
 }
 
 /** Whether `t` is inside the 09:15–15:30 IST session. */

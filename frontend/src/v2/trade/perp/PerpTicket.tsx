@@ -516,13 +516,14 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
               disabled={adding}
               value={levText ?? String(usedLev)}
               onFocus={(e) => (setLevText(String(lev)), e.currentTarget.select())}
-              onChange={(e) => {
-                const t = e.target.value.replace(/[^0-9]/g, '').slice(0, 3);
-                setLevText(t);
-                const n = Number(t);
-                if (t !== '' && n >= 1 && n <= cap) setLeverage(n);
+              onChange={(e) => setLevText(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))}
+              // Taken once typing is done (blur, or Enter), up to the limit:
+              // a keystroke on the way to another number never applies.
+              onBlur={() => {
+                const n = Number(levText);
+                if (levText && n >= 1) setLeverage(Math.min(cap, n));
+                setLevText(null);
               }}
-              onBlur={() => setLevText(null)}
               onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
               className={`w-8 bg-transparent text-right num-medium outline-none ${levText != null && !(Number(levText) >= 1 && Number(levText) <= cap) ? 'text-loss' : 'text-fg'}`}
             />

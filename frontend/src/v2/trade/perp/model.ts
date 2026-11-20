@@ -125,6 +125,8 @@ export interface TargetShare {
   sells: number;
   /** Why it can't be placed, if it can't. */
   why: string | null;
+  /** Which way it is wrong: worth too little, or more than the other targets leave. */
+  problem: 'small' | 'over' | null;
   /** The smallest whole % that works at `price`, when `pct` is too small. */
   minPct: number | null;
 }
@@ -139,25 +141,25 @@ export interface TargetShare {
  */
 export function targetShare(k: PerpKey, side: PerpSide, held: number, others: number, pct: number, price: number): TargetShare {
   const left = Math.max(0, held - others);
-  if (pct >= 100) return { size: null, sells: left, why: null, minPct: null };
+  if (pct >= 100) return { size: null, sells: left, why: null, problem: null, minPct: null };
   const sizeAt = (p: number) => roundSize(k, (held * p) / 100);
   const worst = side === 'long' ? price * (1 - TRIGGER_SLIP) : price;
   const fits = (s: number) => s > 0 && s <= left + 1e-12 && s * worst + 1e-9 >= MIN_ORDER_USD;
   const size = sizeAt(pct);
   if (size <= 0) {
     const minPct = smallest(pct, sizeAt, fits);
-    return { size, sells: 0, why: `${pct}% of ${sizeText(k, held)} rounds to nothing. ${minPct != null ? `Pick at least ${minPct}%` : 'Pick 100%'}`, minPct };
+    return { size, sells: 0, why: `${pct}% of ${sizeText(k, held)} rounds to nothing. ${minPct != null ? `Pick at least ${minPct}%` : 'Pick 100%'}`, problem: 'small', minPct };
   }
   if (size > left + 1e-12) {
     const room = Math.floor((left / held) * 100);
-    return { size, sells: size, why: `Only ${sizeText(k, left)} (${room}%) isn't on another target`, minPct: null };
+    return { size, sells: size, why: `Only ${sizeText(k, left)} (${room}%) isn't on another target`, problem: 'over', minPct: null };
   }
   if (!fits(size)) {
     const minPct = smallest(pct, sizeAt, fits);
     const at = side === 'long' ? ' at its worst fill, 10% under the target' : '';
-    return { size, sells: size, why: `${sizeText(k, size)} is ${usd(size * worst)}${at}: Hyperliquid takes nothing under ${usd(MIN_ORDER_USD)} but a close of all of it. ${minPct != null ? `Pick at least ${minPct}%` : 'Pick 100%'}`, minPct };
+    return { size, sells: size, why: `${sizeText(k, size)} is ${usd(size * worst)}${at}: Hyperliquid takes nothing under ${usd(MIN_ORDER_USD)} but a close of all of it. ${minPct != null ? `Pick at least ${minPct}%` : 'Pick 100%'}`, problem: 'small', minPct };
   }
-  return { size, sells: size, why: null, minPct: null };
+  return { size, sells: size, why: null, problem: null, minPct: null };
 }
 
 /** The smallest whole % above `pct`, under 100, whose size `fits`. */

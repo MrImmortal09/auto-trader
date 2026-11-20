@@ -12,7 +12,7 @@ import type { ChartLine, ChartProps } from './KChart';
 import { allDay, barAt, daySummary, futureFor, symbolName, TF_MS, TFS, vwapDays, vwapOf, vwapOnIndex, type Bar, type CandleStyle, type Tf } from './model';
 import { pivotLines, pivotsByDay } from './pivots';
 import { DrawHistory } from './undoHistory';
-import { CandleProvider, PROVIDER, tfOf, velaSymbol, type Feed } from './velaProvider';
+import { CandleProvider, PROVIDER, TF_OF, velaSymbol, type Feed } from './velaProvider';
 
 /** The design tokens on Vela's theme: white, the subtle ink for the axes,
  * the candle pair, as the KLineChart page draws; its menus and dialogs take them too. */
@@ -56,7 +56,8 @@ function lookOf(d: SerializedDrawing | undefined): string {
 }
 
 /** Vela names a timeframe `5` or `5m`. */
-const sameTf = (t: string, tf: Tf) => tfOf(t) === tf;
+// Only a timeframe the app has matches: Vela's `60` or `W` is never ours.
+const sameTf = (t: string, tf: Tf) => TF_OF[t] === tf;
 /** A Vela symbol, with or without its provider prefix, is `symbol`. */
 const sameSymbol = (s: string, symbol: string) => s === velaSymbol(symbol) || `${PROVIDER}:${s}` === velaSymbol(symbol);
 

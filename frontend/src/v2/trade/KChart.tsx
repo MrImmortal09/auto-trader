@@ -156,6 +156,9 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
   const symbol = symbolName(sym);
   const future = futureFor(sym);
   const wholeDay = allDay(sym);
+  // Daily bars: the pivots keep today's levels only (and are read again only
+  // when 1D is entered or left, not on every timeframe switch).
+  const daily = tf === '1d';
 
   useEffect(() => {
     tfRef.current = tf;
@@ -421,7 +424,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
           if (!live) return;
           const byDay = pivotsByDay(bars, wholeDay);
           // On daily bars, each past day's levels would be one bar wide: today's only.
-          if (tf === '1d') {
+          if (daily) {
             const today = Math.max(...byDay.keys());
             for (const day of [...byDay.keys()]) if (day !== today) byDay.delete(day);
           }
@@ -435,7 +438,7 @@ export function KChart({ chartId, serverBase, sym, tf, lines, markers, vwap, piv
       live = false;
       window.clearInterval(timer);
     };
-  }, [pivots, symbol, serverBase, chartId, wholeDay, tf]);
+  }, [pivots, symbol, serverBase, chartId, wholeDay, daily]);
 
   // Order lines and markers, kept in step with what the screen says.
   useEffect(() => {

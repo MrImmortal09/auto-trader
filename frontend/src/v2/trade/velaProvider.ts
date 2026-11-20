@@ -22,7 +22,8 @@ export const apiSymbol = (ticker: string) => ticker.replace(/_/g, ':').replace(/
 
 export const toOhlcv = (b: Bar): OHLCV => ({ time: b.t, open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v ?? undefined });
 
-const TF_OF: Record<string, Tf> = { '1': '1m', '1m': '1m', '5': '5m', '5m': '5m', '15': '15m', '15m': '15m', D: '1d', '1D': '1d', '1d': '1d' };
+/** Vela's names for the timeframes the candle service has; nothing else. */
+export const TF_OF: Record<string, Tf> = { '1': '1m', '1m': '1m', '5': '5m', '5m': '5m', '15': '15m', '15m': '15m', D: '1d', '1D': '1d', '1d': '1d' };
 /** The candle service's timeframe for a Vela one (`'5'`, `'5m'`, `'D'`). */
 export const tfOf = (timeframe: string): Tf => TF_OF[timeframe] ?? '5m';
 
