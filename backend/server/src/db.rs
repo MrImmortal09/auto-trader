@@ -522,6 +522,23 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
         )",
     ).execute(&pool).await.unwrap();
 
+    // A LIVE line order's stop and target, kept until it fills
+    // (`hyperliquid::live`): Hyperliquid can't attach them to a trigger order,
+    // so the server places them, sized to the fill, once it has. A new
+    // table, so existing databases keep working.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hl_line_guards (
+            network TEXT NOT NULL,
+            oid INTEGER NOT NULL,
+            coin TEXT NOT NULL,
+            buy INTEGER NOT NULL,
+            stop REAL,
+            target REAL,
+            armed_at TEXT NOT NULL,
+            PRIMARY KEY (network, oid)
+        )",
+    ).execute(&pool).await.unwrap();
+
     // The Hyperliquid perps the app charts and trades (`hyperliquid::markets`):
     // every perp the admin has added, with Hyperliquid's rules for it as last
     // read. A removed one keeps its row (`added = 0`): positions still held in

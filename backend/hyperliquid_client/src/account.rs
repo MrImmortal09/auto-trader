@@ -280,6 +280,13 @@ impl InfoClient {
             .collect()
     }
 
+    /// What became of `user`'s order `oid`: Hyperliquid's word for its state
+    /// (`open`, `triggered`, `filled`, `canceled`, `rejected`, …) and its
+    /// original size; `None` when Hyperliquid doesn't know the order.
+    pub async fn order_status(&self, user: &str, oid: u64) -> Result<Option<(String, f64)>, HlError> {
+        read_order_status(&self.post(json!({ "type": "orderStatus", "user": user, "oid": oid })).await?)
+    }
+
     /// The API wallets `user` has approved.
     pub async fn agents(&self, user: &str) -> Result<Vec<Agent>, HlError> {
         let v: Value = self.post(json!({ "type": "extraAgents", "user": user })).await?;
@@ -321,6 +328,19 @@ impl InfoClient {
     /// the account it trades for), a vault, a sub-account, or nothing.
     pub async fn user_role(&self, address: &str) -> Result<UserRole, HlError> {
         read_role(&self.post(json!({ "type": "userRole", "user": address })).await?)
+    }
+}
+
+fn read_order_status(v: &Value) -> Result<Option<(String, f64)>, HlError> {
+    match v.get("status").and_then(Value::as_str) {
+        Some("unknownOid") => Ok(None),
+        Some("order") => {
+            let o = v.get("order").ok_or_else(|| HlError::Decode(format!("orderStatus without its order: {v}")))?;
+            let status = o.get("status").and_then(Value::as_str).ok_or_else(|| HlError::Decode(format!("orderStatus without a status: {v}")))?;
+            let orig = o.pointer("/order/origSz").and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()).ok_or_else(|| HlError::Decode(format!("orderStatus without origSz: {v}")))?;
+            Ok(Some((status.to_string(), orig)))
+        }
+        _ => Err(HlError::Decode(format!("orderStatus: {v}"))),
     }
 }
 
@@ -453,5 +473,13 @@ mod tests {
         assert!(orders[0].is_trigger && orders[0].is_buy && !orders[0].reduce_only && orders[0].trigger_px == Some(1810.0));
         assert!(orders[0].children[0].is_stop() && orders[0].children[0].reduce_only);
         assert_eq!((orders[1].coin.as_str(), orders[1].is_trigger, orders[1].trigger_px), ("xyz:GOLD", false, None));
+    }
+
+    #[test]
+    fn an_order_status_reads_its_state_and_size() {
+        let v = json!({ "status": "order", "order": { "order": { "coin": "ETH", "oid": 1, "sz": "0.0", "origSz": "0.0076" }, "status": "filled", "statusTimestamp": 1724361546645_i64 } });
+        assert_eq!(read_order_status(&v).unwrap(), Some(("filled".to_string(), 0.0076)));
+        assert_eq!(read_order_status(&json!({ "status": "unknownOid" })).unwrap(), None);
+        assert!(read_order_status(&json!({ "status": "order" })).is_err());
     }
 }

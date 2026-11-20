@@ -312,6 +312,29 @@ pub struct LiveDesk {
     /// Held exclusively by the mode switch and the API wallets' changes, and
     /// shared by the owner's paper orders ([`LiveDesk::paper_gate`]).
     gate: Arc<RwLock<()>>,
+    /// Armed LIVE line orders' stops and targets, kept (and saved) until
+    /// they fill: see [`LineGuard`].
+    line_guards: Mutex<Vec<LineGuard>>,
+    /// Why a filled line order's stop or target wasn't placed, per network
+    /// and coin: shown on the position until its stop is set.
+    line_notes: Mutex<HashMap<(Network, String), String>>,
+}
+
+/// A LIVE line order's stop and target, kept here (and in `hl_line_guards`)
+/// until it fills. Hyperliquid can't attach them to a trigger order — its
+/// children hang only on a market or limit order — so the line rests alone
+/// and `LiveDesk::watch_lines` places them, sized to the fill, once it has.
+#[derive(Debug, Clone)]
+pub(super) struct LineGuard {
+    pub network: Network,
+    pub oid: u64,
+    /// Hyperliquid's coin (`BTC`, `xyz:NVDA`).
+    pub coin: String,
+    pub buy: bool,
+    pub stop: Option<f64>,
+    pub target: Option<f64>,
+    /// When it was first seen fired without a fill under its id.
+    pub fired_at: Option<Instant>,
 }
 
 impl LiveDesk {
@@ -335,6 +358,12 @@ impl LiveDesk {
                 creds.insert(n, Credential { account, agent, key_box, checked_at, check_ok, check_note });
             }
         }
+        let guards = sqlx::query_as::<_, (String, i64, String, bool, Option<f64>, Option<f64>)>("SELECT network, oid, coin, buy, stop, target FROM hl_line_guards")
+            .fetch_all(&pool)
+            .await?
+            .into_iter()
+            .filter_map(|(network, oid, coin, buy, stop, target)| Some(LineGuard { network: Network::parse(&network)?, oid: u64::try_from(oid).ok()?, coin, buy, stop, target, fired_at: None }))
+            .collect();
         let nets = [Network::Testnet, Network::Mainnet];
         Ok(LiveDesk {
             pool,
@@ -348,7 +377,61 @@ impl LiveDesk {
             dexes: Mutex::new(HashMap::new()),
             assets: Mutex::new(HashMap::new()),
             gate: Arc::new(RwLock::new(())),
+            line_guards: Mutex::new(guards),
+            line_notes: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Keep (and save) `g`, in place of any for the same order.
+    pub(super) async fn keep_line_guard(&self, g: LineGuard) {
+        let saved = sqlx::query("INSERT OR REPLACE INTO hl_line_guards (network, oid, coin, buy, stop, target, armed_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(net_str(g.network))
+            .bind(g.oid as i64)
+            .bind(&g.coin)
+            .bind(g.buy)
+            .bind(g.stop)
+            .bind(g.target)
+            .bind(shared_domain::now_ist().format("%Y-%m-%d %H:%M:%S").to_string())
+            .execute(&self.pool)
+            .await;
+        if let Err(e) = saved {
+            // Kept in memory still: it is lost only if the server restarts first.
+            tracing::error!(network = net_str(g.network), oid = g.oid, "Hyperliquid LIVE line order's stop/target not saved: {e}");
+        }
+        let mut all = self.line_guards.lock().await;
+        all.retain(|x| !(x.network == g.network && x.oid == g.oid));
+        all.push(g);
+    }
+
+    /// Drop order `oid`'s kept stop and target.
+    pub(super) async fn forget_line_guard(&self, network: Network, oid: u64) {
+        self.line_guards.lock().await.retain(|g| !(g.network == network && g.oid == oid));
+        if let Err(e) = sqlx::query("DELETE FROM hl_line_guards WHERE network = ? AND oid = ?").bind(net_str(network)).bind(oid as i64).execute(&self.pool).await {
+            tracing::error!(network = net_str(network), oid, "Hyperliquid LIVE line guard not deleted: {e}");
+        }
+    }
+
+    /// Drop every kept stop and target on `network` (the kill switch).
+    pub(super) async fn forget_line_guards(&self, network: Network) {
+        self.line_guards.lock().await.retain(|g| g.network != network);
+        if let Err(e) = sqlx::query("DELETE FROM hl_line_guards WHERE network = ?").bind(net_str(network)).execute(&self.pool).await {
+            tracing::error!(network = net_str(network), "Hyperliquid LIVE line guards not deleted: {e}");
+        }
+    }
+
+    /// Order `oid`'s kept stop and target, if any.
+    pub(super) async fn line_guard(&self, network: Network, oid: u64) -> Option<LineGuard> {
+        self.line_guards.lock().await.iter().find(|g| g.network == network && g.oid == oid).cloned()
+    }
+
+    /// Say (or, with `None`, stop saying) on `coin`'s position why a filled
+    /// line order's stop or target isn't there.
+    pub(super) async fn line_note(&self, network: Network, coin: &str, note: Option<String>) {
+        let mut notes = self.line_notes.lock().await;
+        match note {
+            Some(n) => notes.insert((network, coin.to_string()), n),
+            None => notes.remove(&(network, coin.to_string())),
+        };
     }
 
     pub async fn settings(&self) -> LiveSettings {
@@ -686,7 +769,35 @@ impl LiveDesk {
                 view.cash = (usdc.0 - usdc.1).max(0.0);
             }
         }
+        drop(all);
+        self.with_line_guards(network, &mut view).await;
         Ok(view)
+    }
+
+    /// The kept stops and targets onto `view`: each armed line order's (they
+    /// rest here until it fills), and on a position with no stop, why a
+    /// filled line's didn't go on.
+    async fn with_line_guards(&self, network: Network, view: &mut AccountView) {
+        {
+            let guards = self.line_guards.lock().await;
+            for l in view.lines.iter_mut() {
+                let Some(g) = guards.iter().find(|g| g.network == network && g.oid.to_string() == l.id) else { continue };
+                l.levels = PerpLevels {
+                    stop: g.stop,
+                    targets: g.target.map(|price| PerpTarget { id: format!("{}:target", g.oid), price, size: None }).into_iter().collect(),
+                };
+            }
+        }
+        let mut notes = self.line_notes.lock().await;
+        // A note outlives nothing it was about: no position, no note.
+        let held: Vec<String> = view.positions.iter().filter_map(|p| Market::of_key(&p.position.market)).map(|m| m.coin.to_string()).collect();
+        notes.retain(|(net, coin), _| *net != network || held.contains(coin));
+        for p in view.positions.iter_mut().filter(|p| p.position.levels.stop.is_none()) {
+            let Some(m) = Market::of_key(&p.position.market) else { continue };
+            if let Some(note) = notes.get(&(network, m.coin.to_string())) {
+                p.stop_note = Some(note.clone());
+            }
+        }
     }
 
     /// The owner's LIVE perps today on `network`, from IST midnight:

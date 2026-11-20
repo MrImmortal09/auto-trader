@@ -593,6 +593,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
             ? 'LIVE on mainnet: orders go to your Hyperliquid account — real money. Each order that opens asks first; stops and targets rest on Hyperliquid.'
             : 'LIVE on testnet: orders go to your Hyperliquid testnet account (test USDC). Stops and targets rest on Hyperliquid.'}
           {account?.network === 'testnet' && ' Charts and these estimates are mainnet’s; testnet fills at its own prices.'}
+          {isLine && ' A line order rests on Hyperliquid alone: its stop and target go on once it fills, placed by this server (within a few seconds; if the server is down then, as soon as it is back).'}
         </p>
       )}
       {live && perps.error && <p className="type-caption text-loss">Couldn't refresh the LIVE account ({perps.error}): what is shown is from {account?.as_of ? `${account.as_of.slice(11)} IST` : 'earlier'}.</p>}
