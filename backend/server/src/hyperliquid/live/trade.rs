@@ -11,7 +11,7 @@
 //! - A line order is a trigger order that opens a position once the mark
 //!   crosses it, until cancelled (no expiry in LIVE).
 //! - Isolated margin at the ticket's leverage, set before an order opens a
-//!   position; never more than the app's 20x.
+//!   position; up to the perp's own limit on Hyperliquid.
 //!
 //! Hyperliquid holds the account: nothing about a LIVE order is kept here.
 //! After every action the account is read again ([`LiveDesk::account`]).
@@ -28,7 +28,7 @@ use serde::Serialize;
 use super::{net_str, timed, LiveDesk};
 use crate::hyperliquid::paper::{LevelsChange, Refusal};
 use crate::hyperliquid::perp::{Side, TRIGGER_SLIP};
-use crate::hyperliquid::{round_price, round_size, Market, MAX_LEVERAGE};
+use crate::hyperliquid::{round_price, round_size, Market};
 
 /// How far from the mid a market order or close may fill: 0.5 %.
 pub const SLIPPAGE: f64 = 0.005;
@@ -55,9 +55,9 @@ impl NetAsset {
     pub fn price(&self, price: f64) -> f64 {
         round_price(price, self.sz_decimals)
     }
-    /// The most leverage taken on it: the network's limit, at most 20x.
+    /// The most leverage taken on it: the network's own limit.
     pub fn leverage_cap(&self) -> u32 {
-        self.max_leverage.min(MAX_LEVERAGE)
+        self.max_leverage
     }
 }
 
@@ -966,7 +966,7 @@ mod tests {
         let nvda = NetAsset { asset: 110_005, sz_decimals: 3, max_leverage: 10 };
         assert_eq!(ioc_price(&nvda, true, 145.47), 146.2, "five figures, at most 3 decimals");
         assert_eq!(nvda.leverage_cap(), 10);
-        assert_eq!(btc().leverage_cap(), 20);
+        assert_eq!(btc().leverage_cap(), 40);
     }
 
     #[test]

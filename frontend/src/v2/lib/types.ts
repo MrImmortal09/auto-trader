@@ -661,7 +661,7 @@ export interface HlPerpRules {
   name: string;
   sz_decimals: number;
   max_leverage: number;
-  /** The most the app takes on it (Hyperliquid's limit, at most 20x). */
+  /** The most the app takes on it: Hyperliquid's own limit. */
   leverage_cap: number;
   taker_fee: number;
   maker_fee: number;
@@ -724,7 +724,6 @@ export interface HlAdminDex {
 export interface HlAdminMarkets {
   rev: number;
   max_header: number;
-  max_leverage: number;
   dexes: HlAdminDex[];
   /** Perps the app keeps that Hyperliquid no longer lists. */
   unlisted: { coin: string; key: string; label: string; state: 'added' | 'close_only'; held: boolean }[];

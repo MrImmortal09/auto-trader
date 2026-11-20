@@ -11,7 +11,7 @@ import { useToast } from '../../ui/toast';
 import { C } from '../chartSetup';
 import type { PerpKey } from '../model';
 import { setPerpDraft } from './draft';
-import { estLiq, leverageCap, perpLabel, perpPrice, pnlAt, roundPrice, roundSize, rulesOf, signedUsd, sizeText, usd, VALIDITIES } from './model';
+import { estLiq, LEVERAGE_PRESETS, leverageCap, perpLabel, perpPrice, pnlAt, roundPrice, roundSize, rulesOf, signedUsd, sizeText, usd, VALIDITIES } from './model';
 import type { Perps } from './usePerps';
 
 /** What the size field is typed in: dollars of margin (the capital put up;
@@ -130,6 +130,8 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   const [stopText, setStopText] = useState('');
   const [targetText, setTargetText] = useState('');
   const [leverage, setLeverage] = useState(5);
+  // The leverage as typed, while its field has focus.
+  const [levText, setLevText] = useState<string | null>(null);
   const [validity, setValidity] = useState<number | null>(60);
   const [reduceOnly, setReduceOnly] = useState(false);
   const [sending, setSending] = useState(false);
@@ -500,17 +502,51 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
               : ''}
         </p>
       )}
-      <div className="flex items-center justify-between gap-3">
-        <span className="type-label text-fg-muted">Leverage{adding ? ' (the position’s)' : held ? ' (for what opens)' : ''}</span>
-        <div role="group" aria-label="Leverage" className="flex items-center rounded-6 border border-line bg-inset">
-          <button type="button" aria-label="Less leverage" disabled={adding || lev <= 1} onClick={() => setLeverage(lev - 1)} className="grid size-8 place-items-center text-fg disabled:opacity-40">
-            <Minus size={14} />
-          </button>
-          <span className="w-12 text-center num-medium text-fg">{usedLev}x</span>
-          <button type="button" aria-label="More leverage" disabled={adding || lev >= cap} onClick={() => setLeverage(lev + 1)} className="grid size-8 place-items-center text-fg disabled:opacity-40">
-            <Plus size={14} />
-          </button>
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between gap-3">
+          <span className="type-label text-fg-muted">Leverage{adding ? ' (the position’s)' : held ? ' (for what opens)' : ''}</span>
+          <div role="group" aria-label="Leverage" className="flex items-center rounded-6 border border-line bg-inset">
+            <button type="button" aria-label="Less leverage" disabled={adding || lev <= 1} onClick={() => (setLevText(null), setLeverage(lev - 1))} className="grid size-8 place-items-center text-fg disabled:opacity-40">
+              <Minus size={14} />
+            </button>
+            <input
+              type="text"
+              inputMode="numeric"
+              aria-label={`Leverage, 1 to ${cap}x`}
+              disabled={adding}
+              value={levText ?? String(usedLev)}
+              onFocus={(e) => (setLevText(String(lev)), e.currentTarget.select())}
+              onChange={(e) => {
+                const t = e.target.value.replace(/[^0-9]/g, '').slice(0, 3);
+                setLevText(t);
+                const n = Number(t);
+                if (t !== '' && n >= 1 && n <= cap) setLeverage(n);
+              }}
+              onBlur={() => setLevText(null)}
+              onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+              className={`w-8 bg-transparent text-right num-medium outline-none ${levText != null && !(Number(levText) >= 1 && Number(levText) <= cap) ? 'text-loss' : 'text-fg'}`}
+            />
+            <span className="w-4 num-medium text-fg">x</span>
+            <button type="button" aria-label="More leverage" disabled={adding || lev >= cap} onClick={() => (setLevText(null), setLeverage(lev + 1))} className="grid size-8 place-items-center text-fg disabled:opacity-40">
+              <Plus size={14} />
+            </button>
+          </div>
         </div>
+        {!adding && (
+          <div role="group" aria-label="Leverage presets" className="flex flex-wrap justify-end gap-1.5">
+            {[...LEVERAGE_PRESETS.filter((p) => p < cap), cap].map((p) => (
+              <button
+                key={p}
+                type="button"
+                aria-pressed={lev === p}
+                onClick={() => (setLevText(null), setLeverage(p))}
+                className={`rounded-4 border px-2 type-label tnum transition-colors duration-120 ${large ? 'h-9' : 'h-7'} ${lev === p ? 'border-accent bg-accent-subtle text-accent' : 'border-line text-fg-muted hover:bg-raised hover:text-fg'}`}
+              >
+                {p === cap ? `Max ${cap}x` : `${p}x`}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       {kind === 'line' && !live && (
         <label className="flex items-center justify-between gap-3">
