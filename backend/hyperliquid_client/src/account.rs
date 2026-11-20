@@ -262,22 +262,23 @@ impl InfoClient {
     pub async fn user_fills(&self, user: &str) -> Result<Vec<HlFill>, HlError> {
         let raw: Vec<RawFill> = serde_json::from_value(self.post(json!({ "type": "userFills", "user": user })).await?)
             .map_err(|e| HlError::Decode(format!("userFills: {e}")))?;
-        raw.into_iter()
-            .map(|f| {
-                Ok(HlFill {
-                    px: num(&f.px)?,
-                    sz: num(&f.sz)?,
-                    is_buy: f.side == "B",
-                    time: f.time,
-                    closed_pnl: num(&f.closed_pnl)?,
-                    fee: num(&f.fee)?,
-                    oid: f.oid,
-                    tid: f.tid,
-                    dir: f.dir,
-                    coin: f.coin,
-                })
-            })
-            .collect()
+        read_fills(raw)
+    }
+
+    /// `user`'s fills since `start_ms` (Unix ms; the oldest 2,000 of them).
+    /// Hyperliquid charges a read by the fills it answers, so a short window
+    /// costs less than [`InfoClient::user_fills`].
+    pub async fn user_fills_since(&self, user: &str, start_ms: i64) -> Result<Vec<HlFill>, HlError> {
+        let raw: Vec<RawFill> = serde_json::from_value(self.post(json!({ "type": "userFillsByTime", "user": user, "startTime": start_ms })).await?)
+            .map_err(|e| HlError::Decode(format!("userFillsByTime: {e}")))?;
+        read_fills(raw)
+    }
+
+    /// What became of `user`'s order `oid`: Hyperliquid's word for its state
+    /// (`open`, `triggered`, `filled`, `canceled`, `rejected`, …) and its
+    /// original size; `None` when Hyperliquid doesn't know the order.
+    pub async fn order_status(&self, user: &str, oid: u64) -> Result<Option<(String, f64)>, HlError> {
+        read_order_status(&self.post(json!({ "type": "orderStatus", "user": user, "oid": oid })).await?)
     }
 
     /// The API wallets `user` has approved.
@@ -321,6 +322,38 @@ impl InfoClient {
     /// the account it trades for), a vault, a sub-account, or nothing.
     pub async fn user_role(&self, address: &str) -> Result<UserRole, HlError> {
         read_role(&self.post(json!({ "type": "userRole", "user": address })).await?)
+    }
+}
+
+fn read_fills(raw: Vec<RawFill>) -> Result<Vec<HlFill>, HlError> {
+    raw.into_iter()
+        .map(|f| {
+            Ok(HlFill {
+                px: num(&f.px)?,
+                sz: num(&f.sz)?,
+                is_buy: f.side == "B",
+                time: f.time,
+                closed_pnl: num(&f.closed_pnl)?,
+                fee: num(&f.fee)?,
+                oid: f.oid,
+                tid: f.tid,
+                dir: f.dir,
+                coin: f.coin,
+            })
+        })
+        .collect()
+}
+
+fn read_order_status(v: &Value) -> Result<Option<(String, f64)>, HlError> {
+    match v.get("status").and_then(Value::as_str) {
+        Some("unknownOid") => Ok(None),
+        Some("order") => {
+            let o = v.get("order").ok_or_else(|| HlError::Decode(format!("orderStatus without its order: {v}")))?;
+            let status = o.get("status").and_then(Value::as_str).ok_or_else(|| HlError::Decode(format!("orderStatus without a status: {v}")))?;
+            let orig = o.pointer("/order/origSz").and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()).ok_or_else(|| HlError::Decode(format!("orderStatus without origSz: {v}")))?;
+            Ok(Some((status.to_string(), orig)))
+        }
+        _ => Err(HlError::Decode(format!("orderStatus: {v}"))),
     }
 }
 
@@ -453,5 +486,13 @@ mod tests {
         assert!(orders[0].is_trigger && orders[0].is_buy && !orders[0].reduce_only && orders[0].trigger_px == Some(1810.0));
         assert!(orders[0].children[0].is_stop() && orders[0].children[0].reduce_only);
         assert_eq!((orders[1].coin.as_str(), orders[1].is_trigger, orders[1].trigger_px), ("xyz:GOLD", false, None));
+    }
+
+    #[test]
+    fn an_order_status_reads_its_state_and_size() {
+        let v = json!({ "status": "order", "order": { "order": { "coin": "ETH", "oid": 1, "sz": "0.0", "origSz": "0.0076" }, "status": "filled", "statusTimestamp": 1724361546645_i64 } });
+        assert_eq!(read_order_status(&v).unwrap(), Some(("filled".to_string(), 0.0076)));
+        assert_eq!(read_order_status(&json!({ "status": "unknownOid" })).unwrap(), None);
+        assert!(read_order_status(&json!({ "status": "order" })).is_err());
     }
 }

@@ -25,7 +25,7 @@ use hyperliquid_client::signing::{float_to_wire, CancelAction, CancelWire, Group
 use hyperliquid_client::{asset_id, HlError, Network};
 use serde::Serialize;
 
-use super::{net_str, timed, LiveDesk};
+use super::{net_str, timed, LineGuard, LineWatch, LiveDesk};
 use crate::hyperliquid::paper::{LevelsChange, Refusal};
 use crate::hyperliquid::perp::{Side, TRIGGER_SLIP};
 use crate::hyperliquid::{round_price, round_size, Market};
@@ -238,7 +238,7 @@ impl LiveDesk {
     /// never a moment with less covered. A stop that can't be cancelled
     /// (it fired, or is gone) is said, not failed on.
     #[allow(clippy::too_many_arguments)]
-    async fn set_full_stop(&self, network: Network, wallet: &Wallet, a: &NetAsset, long: bool, size: f64, price: f64, old: &[HlOpenOrder]) -> Result<Vec<String>, Refusal> {
+    async fn set_full_stop(&self, network: Network, wallet: &Wallet, a: &NetAsset, long: bool, size: f64, price: f64, old: &[HlOpenOrder]) -> Result<Vec<String>, Missed> {
         self.place_guard(network, wallet, a, !long, size, price, "sl").await?;
         let mut warnings = Vec::new();
         let cancels: Vec<CancelWire> = old.iter().map(|o| CancelWire { a: a.asset, o: o.oid }).collect();
@@ -378,7 +378,7 @@ impl LiveDesk {
         if let Some(p) = stop_at {
             match self.set_full_stop(network, wallet, a, long, szi.abs(), p, &stops).await {
                 Ok(w) => answer.warnings.extend(w),
-                Err(r) => answer.warnings.push(format!("Stop not placed — the position has none for its new size: {}", r.message)),
+                Err(r) => answer.warnings.push(format!("Stop not placed — the position has none for its new size: {}", r.text())),
             }
         }
         // `buy` opened (or added to) the position this way: its targets close it.
@@ -474,6 +474,8 @@ impl LiveDesk {
         if let Some(OrderStatus::Error(why)) = self.send(network, &wallet, &CancelAction::new(vec![CancelWire { a: a.asset, o: oid }])).await?.first() {
             return Err(Refusal::conflict(format!("Not cancelled: {why}")));
         }
+        // A line order cancelled before it fired: nothing to guard.
+        self.forget_line_guard(network, oid).await;
         Ok(self.guard_filled_part(network, &wallet, &a, &o).await)
     }
 
@@ -490,7 +492,7 @@ impl LiveDesk {
             let Some(at) = c.trigger_px else { continue };
             let tpsl = if c.is_stop() { "sl" } else { "tp" };
             if let Err(r) = self.place_guard(network, wallet, a, c.is_buy, part, at, tpsl).await {
-                warnings.push(format!("The part that filled ({part}) has no {}: {}", if tpsl == "sl" { "stop" } else { "target" }, r.message));
+                warnings.push(format!("The part that filled ({part}) has no {}: {}", if tpsl == "sl" { "stop" } else { "target" }, r.text()));
             }
         }
         warnings
@@ -566,8 +568,10 @@ impl LiveDesk {
 
     /// Arm a line order on Hyperliquid: a market trigger that opens (or adds
     /// to) a position once the mark crosses `o.limit` (the line) from where
-    /// it is now, with its stop and targets as children (`normalTpsl`), live
-    /// once it fills. It rests until cancelled.
+    /// it is now. It rests until cancelled. Its stop and target can't ride
+    /// with it — Hyperliquid refuses children on a trigger order ("Main order
+    /// cannot be trigger order") — so they are kept here and placed on
+    /// Hyperliquid, sized to the fill, once it fills ([`LiveDesk::watch_lines`]).
     pub async fn arm_line(&self, network: Network, o: &LiveOrder) -> Result<LiveOrderAnswer, Refusal> {
         let m = o.market;
         if !m.tradable() {
@@ -606,29 +610,39 @@ impl LiveDesk {
         if held.is_none() {
             self.ensure_leverage(network, &account, &wallet, &a, m.coin, m.label, leverage).await?;
         }
-        let mut orders = vec![trigger_wire(&a, buy, size, line, tpsl, false)?];
-        orders.extend(levels_wire(&a, buy, size, stop, &targets)?);
-        let grouping = if orders.len() > 1 { Grouping::NormalTpsl } else { Grouping::Na };
-        let statuses = self.send(network, &wallet, &OrderAction::new(orders, grouping)).await?;
+        let order = trigger_wire(&a, buy, size, line, tpsl, false)?;
+        let statuses = self.send(network, &wallet, &OrderAction::new(vec![order], Grouping::Na)).await?;
         let mut answer = LiveOrderAnswer::default();
-        for (i, st) in statuses.iter().enumerate() {
-            match (i, st) {
-                (0, OrderStatus::Resting { oid }) => answer.resting = Some(*oid),
-                (0, OrderStatus::Filled { size, avg_px, .. }) => answer.filled.push(LiveFill { market: m.key.to_string(), action: if buy { "BUY" } else { "SELL" }, size: *size, price: *avg_px }),
-                (0, OrderStatus::Error(why)) => return Err(Refusal::conflict(format!("{} line order not armed: {why}", m.label))),
-                (_, OrderStatus::Error(why)) => answer.warnings.push(why.clone()),
-                _ => {}
+        let guarded = stop.is_some() || !targets.is_empty();
+        let guard = |oid: u64| LineGuard { network, oid, coin: m.coin.to_string(), buy, stop, target: targets.first().map(|t| t.0), watch: LineWatch::default() };
+        match statuses.first() {
+            Some(OrderStatus::Resting { oid }) => {
+                answer.resting = Some(*oid);
+                if guarded {
+                    self.keep_line_guard(guard(*oid)).await;
+                }
             }
+            Some(OrderStatus::Filled { oid, size, avg_px }) => {
+                answer.filled.push(LiveFill { market: m.key.to_string(), action: if buy { "BUY" } else { "SELL" }, size: *size, price: *avg_px });
+                if guarded {
+                    // Crossed as it was armed: its stop and target go on now.
+                    answer.warnings.extend(self.guard_filled_line(guard(*oid), *size, &account, &wallet).await);
+                }
+            }
+            Some(OrderStatus::Error(why)) => return Err(Refusal::conflict(format!("{} line order not armed: {why}", m.label))),
+            _ => {}
         }
         tracing::warn!(network = net_str(network), market = m.key, buy, size, line, tpsl, ?answer, "Hyperliquid LIVE line order");
         Ok(answer)
     }
 
-    /// Move an armed line order and/or change its stop and target. On
-    /// Hyperliquid a trigger and the children waiting on it can't be moved
-    /// in place, so it is cancelled and armed again with the change — from
-    /// where the mark is now, so the trigger's direction follows. If the
-    /// cancel fails (it fired, or is gone) nothing is armed again.
+    /// Move an armed line order and/or change its stop and target. Its stop
+    /// and target are kept here until it fills (see [`LiveDesk::arm_line`]),
+    /// so changing only them touches nothing on Hyperliquid. A moved line
+    /// can't be moved in place there: it is cancelled and armed again — from
+    /// where the mark is now, so the trigger's direction follows — and its
+    /// stop and target go with it. If the cancel fails (it fired, or is
+    /// gone) nothing is armed again.
     pub async fn update_line(&self, network: Network, id: &str, price: Option<f64>, change: &LevelsChange) -> Result<(), Refusal> {
         let oid = oid_of(id)?;
         let (account, wallet) = self.signer(network).await?;
@@ -647,9 +661,10 @@ impl LiveDesk {
             Some(_) => return Err(Refusal::bad("The line's price must be a positive number")),
             None => o.trigger_px.unwrap_or(o.limit_px),
         };
-        // Its stop and target as they are, then as changed.
-        let mut stop = o.children.iter().find(|c| c.is_stop()).and_then(|c| c.trigger_px);
-        let mut target = o.children.iter().find(|c| !c.is_stop()).and_then(|c| c.trigger_px);
+        // Its stop and target as kept, then as changed.
+        let kept = self.line_guard(network, oid).await;
+        let mut stop = kept.as_ref().and_then(|g| g.stop);
+        let mut target = kept.as_ref().and_then(|g| g.target);
         if let Some(s) = change.stop {
             stop = s.map(|p| a.price(p));
         }
@@ -661,16 +676,39 @@ impl LiveDesk {
         }
         let targets: Vec<(f64, Option<f64>)> = target.map(|t| (t, None)).into_iter().collect();
         check_sides(side, line, stop, &targets)?;
+        let guarded = stop.is_some() || target.is_some();
+        if guarded && self.held(network, &account, &o.coin).await?.is_some_and(|(szi, _)| (szi > 0.0) == o.is_buy) {
+            return Err(Refusal::bad("A LIVE line order that adds to a position takes no stop or target of its own: once it fills, set the position's stop again and it covers all of it"));
+        }
+        let guard = |oid: u64| LineGuard { network, oid, coin: o.coin.clone(), buy: o.is_buy, stop, target, watch: LineWatch::default() };
+        let line_now = o.trigger_px.unwrap_or(o.limit_px);
+        if line == line_now {
+            // Only its stop and target: nothing on Hyperliquid changes.
+            if guarded {
+                self.keep_line_guard(guard(oid)).await;
+            } else {
+                self.forget_line_guard(network, oid).await;
+            }
+            return Ok(());
+        }
         let mid = self.net_mid(network, &o.coin).await?;
         let tpsl = entry_tpsl(o.is_buy, line, mid)?;
         // Cancel first: never two entries armed at once.
         if let Some(OrderStatus::Error(why)) = self.send(network, &wallet, &CancelAction::new(vec![CancelWire { a: a.asset, o: oid }])).await?.first() {
             return Err(Refusal::conflict(format!("Line order not changed — it couldn't be cancelled ({why}); it may have fired")));
         }
-        let mut orders = vec![trigger_wire(&a, o.is_buy, o.sz, line, tpsl, false)?];
-        orders.extend(levels_wire(&a, o.is_buy, o.sz, stop, &targets)?);
-        let grouping = if orders.len() > 1 { Grouping::NormalTpsl } else { Grouping::Na };
-        let rearmed = self.send(network, &wallet, &OrderAction::new(orders, grouping)).await;
+        let order = trigger_wire(&a, o.is_buy, o.sz, line, tpsl, false)?;
+        let rearmed = self.send(network, &wallet, &OrderAction::new(vec![order], Grouping::Na)).await;
+        // The old order is gone: its kept levels go with the new one, if any.
+        self.forget_line_guard(network, oid).await;
+        match rearmed.as_ref().map(|st| st.first().cloned()) {
+            Ok(Some(OrderStatus::Resting { oid: new })) if guarded => self.keep_line_guard(guard(new)).await,
+            // Crossed as it was armed: its stop and target go on now.
+            Ok(Some(OrderStatus::Filled { oid: new, size, .. })) if guarded => {
+                self.guard_filled_line(guard(new), size, &account, &wallet).await;
+            }
+            _ => {}
+        }
         match rearmed.as_ref().map(|st| st.first().cloned()) {
             Ok(Some(OrderStatus::Error(why))) => {
                 tracing::error!(network = net_str(network), coin = o.coin, "Hyperliquid LIVE line order cancelled but not armed again: {why}");
@@ -682,6 +720,286 @@ impl LiveDesk {
             }
             Ok(_) => Ok(()),
         }
+    }
+
+    /// Each armed LIVE line order whose stop or target is kept here, one a
+    /// second in turn (Hyperliquid's request limit is per IP, so the watch
+    /// costs the same however many are armed): still armed, it waits;
+    /// filled, its stop and target go on Hyperliquid sized to the fill
+    /// ([`LiveDesk::place_line_guards`], tried again every few seconds
+    /// until they are on); gone without a fill (cancelled, refused), they
+    /// are dropped. Runs for the server's life.
+    pub async fn watch_lines(self: std::sync::Arc<Self>) {
+        let mut every = tokio::time::interval(LINE_WATCH_EVERY);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut turn = 0;
+        loop {
+            every.tick().await;
+            let Some(g) = self.next_line_guard(&mut turn).await else { continue };
+            if let Err(r) = self.check_line(&g).await {
+                tracing::warn!(network = net_str(g.network), oid = g.oid, coin = g.coin, "Hyperliquid LIVE line order not checked, trying again: {}", r.message);
+            }
+        }
+    }
+
+    /// [`LiveDesk::watch_lines`] for one line order.
+    async fn check_line(&self, g: &LineGuard) -> Result<(), Refusal> {
+        // No API wallet on its network (removed): nothing can be placed.
+        let Ok((account, wallet)) = self.signer(g.network).await else { return Ok(()) };
+        if g.watch.filled.is_none() && !self.line_filled(g, &account).await? {
+            return Ok(());
+        }
+        self.try_line_guards(g.network, g.oid, &account, &wallet).await;
+        Ok(())
+    }
+
+    /// Whether armed line order `g` has filled, from Hyperliquid: once it
+    /// has, what filled is kept on it. One Hyperliquid doesn't know, or that
+    /// ended with nothing filled, is dropped once that has held for
+    /// [`LINE_FILL_WAIT`].
+    async fn line_filled(&self, g: &LineGuard, account: &str) -> Result<bool, Refusal> {
+        let info = &self.info[&g.network];
+        let Some((status, orig)) = timed("a line order's state", info.order_status(account, g.oid)).await.map_err(Refusal::conflict)? else {
+            if self.doubted(g).await {
+                tracing::warn!(network = net_str(g.network), oid = g.oid, coin = g.coin, "Hyperliquid doesn't know this line order: its stop and target are dropped");
+                self.forget_line_guard(g.network, g.oid).await;
+            }
+            return Ok(false);
+        };
+        if status == "open" {
+            self.undoubt(g).await;
+            return Ok(false);
+        }
+        let since = shared_domain::now_ist().timestamp_millis() - LINE_FILLS_LOOKBACK_MS;
+        let fills = timed("the fills", info.user_fills_since(account, since)).await.map_err(Refusal::conflict)?;
+        let mut filled: f64 = fills.iter().filter(|f| f.oid == g.oid).map(|f| f.sz).sum();
+        let fired = matches!(status.as_str(), "triggered" | "filled");
+        if filled <= 0.0 {
+            if !fired {
+                if self.doubted(g).await {
+                    tracing::warn!(network = net_str(g.network), oid = g.oid, coin = g.coin, status, "Hyperliquid LIVE line order ended with nothing filled: its stop and target are dropped");
+                    self.forget_line_guard(g.network, g.oid).await;
+                }
+                return Ok(false);
+            }
+            // Fired, its fill not listed under its id (yet): a few seconds,
+            // then by what it was for — the position caps it.
+            let first = self.touch_line_guard(g.network, g.oid, |x| *x.watch.fired_at.get_or_insert_with(Instant::now)).await;
+            if first.is_none_or(|at| at.elapsed() < LINE_FILL_WAIT) {
+                return Ok(false);
+            }
+            filled = orig;
+        }
+        let kept = self
+            .touch_line_guard(g.network, g.oid, |x| {
+                x.watch.filled = Some(filled);
+                x.watch.doubt_since = None;
+            })
+            .await;
+        Ok(kept.is_some())
+    }
+
+    /// Whether Hyperliquid's answer that `g` is done with has held long
+    /// enough to act on ([`LINE_FILL_WAIT`]): a read just after a change may
+    /// not show it yet.
+    async fn doubted(&self, g: &LineGuard) -> bool {
+        let since = self.touch_line_guard(g.network, g.oid, |x| *x.watch.doubt_since.get_or_insert_with(Instant::now)).await;
+        since.is_none_or(|at| at.elapsed() >= LINE_FILL_WAIT)
+    }
+
+    async fn undoubt(&self, g: &LineGuard) {
+        self.touch_line_guard(g.network, g.oid, |x| x.watch.doubt_since = None).await;
+    }
+
+    /// A line order that filled `filled` as it was armed (or moved): its
+    /// stop and target are kept like any other's and tried now; the watch
+    /// tries again if they don't go on. What went wrong, in words.
+    async fn guard_filled_line(&self, mut g: LineGuard, filled: f64, account: &str, wallet: &Wallet) -> Vec<String> {
+        g.watch.filled = Some(filled);
+        let (network, oid) = (g.network, g.oid);
+        self.keep_line_guard(g).await;
+        self.try_line_guards(network, oid, account, wallet).await
+    }
+
+    /// One try at filled line order `oid`'s stop and target, unless one is
+    /// already under way: a read that fails counts as a failed try.
+    async fn try_line_guards(&self, network: Network, oid: u64, account: &str, wallet: &Wallet) -> Vec<String> {
+        let g = self
+            .touch_line_guard(network, oid, |x| {
+                let free = !x.watch.busy;
+                x.watch.busy = true;
+                free.then(|| x.clone())
+            })
+            .await
+            .flatten();
+        let Some(g) = g else { return Vec::new() };
+        let tried = self.place_line_guards(&g, account, wallet).await;
+        let now = Instant::now();
+        self.touch_line_guard(network, oid, |x| {
+            x.watch.busy = false;
+            x.watch.next_at = Some(now + LINE_RETRY_EVERY);
+            if tried.is_err() {
+                x.watch.failing_since.get_or_insert(now);
+            }
+        })
+        .await;
+        match tried {
+            Ok(w) => w,
+            Err(r) => {
+                let why = format!("its stop and target couldn't be placed yet, trying again: {}", r.message);
+                self.after_line_guards(network, &g.coin, vec![why.clone()]).await;
+                vec![why]
+            }
+        }
+    }
+
+    /// One try at putting filled line order `g`'s stop and target on
+    /// Hyperliquid, for the position it opened. Each goes on once and is
+    /// cleared from the guard; one that doesn't is tried again
+    /// [`LINE_RETRY_EVERY`] (a retry first trusts a stop already covering
+    /// the position, or a target already at its price: the last try's may
+    /// have gone through unanswered). A stop Hyperliquid refuses, or one
+    /// still not on after [`LINE_STOP_PATIENCE`], closes the position the
+    /// way Close does (the owner's pick, 2026-11-21): a filled line is never
+    /// left open without the stop it was armed with. What went wrong this
+    /// try, in words.
+    async fn place_line_guards(&self, g: &LineGuard, account: &str, wallet: &Wallet) -> Result<Vec<String>, Refusal> {
+        let net = g.network;
+        let Some(m) = Market::of_coin(&g.coin) else {
+            tracing::error!(network = net_str(net), coin = g.coin, "Hyperliquid LIVE line order filled on a perp no longer listed: its stop and target weren't placed");
+            self.forget_line_guard(net, g.oid).await;
+            return Ok(Vec::new());
+        };
+        let a = self.net_asset(net, &g.coin).await?;
+        let szi = match self.held(net, account, &g.coin).await? {
+            Some((szi, _)) if (szi > 0.0) == g.buy => szi,
+            other => {
+                if !self.doubted(g).await {
+                    return Ok(Vec::new());
+                }
+                self.forget_line_guard(net, g.oid).await;
+                let Some(_) = other else {
+                    tracing::warn!(network = net_str(net), coin = g.coin, "Hyperliquid LIVE line order filled, but no position is open now: its stop and target dropped");
+                    return Ok(Vec::new());
+                };
+                let why = format!("The line order filled, but the {} position is the other way now: its stop and target weren't placed", m.label);
+                self.after_line_guards(net, &g.coin, vec![why.clone()]).await;
+                return Ok(vec![why]);
+            }
+        };
+        self.undoubt(g).await;
+        let long = szi > 0.0;
+        let size = szi.abs();
+        let filled = a.size(g.watch.filled.unwrap_or(size).min(size));
+        let open = self.orders_on(net, account, &g.coin).await?;
+        let guards: Vec<&HlOpenOrder> = open.iter().filter(|o| o.is_trigger && o.reduce_only).collect();
+        let mut warnings = Vec::new();
+        if !g.watch.tried {
+            // A guard on the side that would add to the position is a flipped one's: gone.
+            let stale: Vec<CancelWire> = guards.iter().filter(|o| o.is_buy == long).map(|o| CancelWire { a: a.asset, o: o.oid }).collect();
+            if !stale.is_empty() {
+                if let Err(r) = self.send(net, wallet, &CancelAction::new(stale)).await {
+                    warnings.push(format!("The old side's stops weren't cancelled: {}", r.message));
+                }
+            }
+        }
+        let stops: Vec<HlOpenOrder> = guards.iter().filter(|o| o.is_buy != long && o.is_stop()).map(|o| (*o).clone()).collect();
+        let near = |px: Option<f64>, p: f64| px.is_some_and(|x| (x - p).abs() <= p * 1e-9);
+        let covered = stops.iter().any(|o| o.is_position_tpsl) || stops.iter().map(|o| o.sz).sum::<f64>() + 1e-12 >= size;
+        let mut stop = g.stop.filter(|_| !(g.watch.tried && covered));
+        let mut target = g.target.filter(|t| !(g.watch.tried && guards.iter().any(|o| o.is_buy != long && !o.is_stop() && near(o.trigger_px, a.price(*t)))));
+        let now = Instant::now();
+        let overdue = |since: Option<Instant>| since.is_some_and(|at| now.duration_since(at) >= LINE_STOP_PATIENCE);
+        let mut failing_since = g.watch.failing_since;
+        let mut close = stop.is_some() && (g.watch.closing_since.is_some() || overdue(failing_since));
+        if let Some(p) = stop.filter(|_| !close) {
+            match self.set_full_stop(net, wallet, &a, long, size, a.price(p), &stops).await {
+                Ok(w) => {
+                    warnings.extend(w);
+                    stop = None;
+                }
+                Err(Missed::Refused(why)) => {
+                    warnings.push(format!("Hyperliquid refused the stop at {p} ({why})"));
+                    close = true;
+                }
+                Err(Missed::Unsure(why)) => {
+                    failing_since.get_or_insert(now);
+                    close = overdue(failing_since);
+                    warnings.push(format!("The stop at {p} isn't on {} ({why})", if close { "after 30 s of tries" } else { "yet, trying again" }));
+                }
+            }
+        }
+        if close {
+            let since = g.watch.closing_since.unwrap_or(now);
+            match self.close_coin(net, account, wallet, &g.coin, m.key, m.label, None).await {
+                Ok(done) => {
+                    tracing::error!(network = net_str(net), coin = g.coin, ?done, ?warnings, "Hyperliquid LIVE line order filled but its stop couldn't be placed: the position was closed");
+                    self.forget_line_guard(net, g.oid).await;
+                    self.line_note(net, &g.coin, None).await;
+                    warnings.push(format!("{} was closed: its stop couldn't be placed", m.label));
+                    return Ok(warnings);
+                }
+                Err(r) if now.duration_since(since) >= LINE_STOP_PATIENCE => {
+                    warnings.push(format!("Its stop couldn't be placed and the position couldn't be closed ({}) — close it on Hyperliquid", r.message));
+                    self.forget_line_guard(net, g.oid).await;
+                    self.after_line_guards(net, &g.coin, warnings.clone()).await;
+                    return Ok(warnings);
+                }
+                Err(r) => warnings.push(format!("Its stop couldn't be placed, so the position is being closed: not yet ({}), trying again", r.message)),
+            }
+            self.touch_line_guard(net, g.oid, |x| {
+                x.watch.tried = true;
+                x.watch.failing_since = failing_since;
+                x.watch.closing_since = Some(since);
+            })
+            .await;
+            self.after_line_guards(net, &g.coin, warnings.clone()).await;
+            return Ok(warnings);
+        }
+        if let Some(t) = target {
+            match self.place_guard(net, wallet, &a, !long, filled, a.price(t), "tp").await {
+                Ok(()) => target = None,
+                Err(Missed::Refused(why)) => {
+                    warnings.push(why);
+                    target = None;
+                }
+                Err(Missed::Unsure(why)) => {
+                    failing_since.get_or_insert(now);
+                    if overdue(failing_since) {
+                        warnings.push(format!("{why} — given up after 30 s of tries"));
+                        target = None;
+                    } else {
+                        warnings.push(format!("{why} — trying again"));
+                    }
+                }
+            }
+        }
+        if stop.is_none() && target.is_none() {
+            tracing::warn!(network = net_str(net), coin = g.coin, filled, stop = ?g.stop, target = ?g.target, ?warnings, "Hyperliquid LIVE line order filled: its stop and target placed");
+            self.forget_line_guard(net, g.oid).await;
+        } else {
+            if (stop, target) != (g.stop, g.target) {
+                self.line_guard_left(net, g.oid, stop, target).await;
+            }
+            self.touch_line_guard(net, g.oid, |x| {
+                x.watch.tried = true;
+                x.watch.failing_since = failing_since;
+            })
+            .await;
+        }
+        self.after_line_guards(net, &g.coin, warnings.clone()).await;
+        Ok(warnings)
+    }
+
+    /// What placing a filled line order's stop and target said: loud, and
+    /// on the position, if any of it went wrong.
+    async fn after_line_guards(&self, network: Network, coin: &str, warnings: Vec<String>) {
+        if warnings.is_empty() {
+            self.line_note(network, coin, None).await;
+            return;
+        }
+        tracing::error!(network = net_str(network), coin, ?warnings, "Hyperliquid LIVE line order filled: its stop or target wasn't placed");
+        self.line_note(network, coin, Some(format!("The line order's stop or target wasn't placed: {}", warnings.join("; ")))).await;
     }
 
     /// Change the LIVE position's stop and targets on Hyperliquid. A stop set
@@ -755,11 +1073,15 @@ impl LiveDesk {
 
     /// One reduce-only market trigger (a stop or a target) resting on Hyperliquid.
     #[allow(clippy::too_many_arguments)]
-    async fn place_guard(&self, network: Network, wallet: &Wallet, a: &NetAsset, buy: bool, size: f64, trigger: f64, tpsl: &'static str) -> Result<(), Refusal> {
-        let order = trigger_wire(a, buy, size, trigger, tpsl, true)?;
-        match self.send(network, wallet, &OrderAction::new(vec![order], Grouping::Na)).await?.first() {
-            Some(OrderStatus::Error(why)) => Err(Refusal::conflict(format!("{} not placed: {why}", if tpsl == "sl" { "Stop" } else { "Target" }))),
-            _ => Ok(()),
+    async fn place_guard(&self, network: Network, wallet: &Wallet, a: &NetAsset, buy: bool, size: f64, trigger: f64, tpsl: &'static str) -> Result<(), Missed> {
+        let what = if tpsl == "sl" { "Stop" } else { "Target" };
+        let order = trigger_wire(a, buy, size, trigger, tpsl, true).map_err(|r| Missed::Refused(format!("{what} not placed: {}", r.message)))?;
+        match self.send(network, wallet, &OrderAction::new(vec![order], Grouping::Na)).await {
+            Err(r) => Err(Missed::Unsure(format!("{what} not placed: {}", r.message))),
+            Ok(st) => match st.first() {
+                Some(OrderStatus::Error(why)) => Err(Missed::Refused(format!("{what} not placed: {why}"))),
+                _ => Ok(()),
+            },
         }
     }
 
@@ -771,6 +1093,8 @@ impl LiveDesk {
         // the kill-switch check just before it was set lands before this
         // reads the account. Later ones see the switch on.
         drop(self.gate.write().await);
+        // No line's stop or target goes on while (or after) this flattens.
+        self.forget_line_guards(network).await;
         let mut problems = Vec::new();
         let (account, wallet) = match self.signer(network).await {
             Ok(s) => s,
@@ -858,6 +1182,29 @@ fn close_only(m: &Market) -> Refusal {
     Refusal::conflict(format!("{} is close-only: it was removed from the app's markets, so only orders that reduce a position are taken", m.label))
 }
 
+/// Why a stop or target isn't on Hyperliquid.
+#[derive(Debug)]
+pub(super) enum Missed {
+    /// Hyperliquid answered no (or it couldn't be put in an order at all).
+    Refused(String),
+    /// It couldn't be sent, or its answer wasn't read: it may be on.
+    Unsure(String),
+}
+
+impl Missed {
+    fn text(&self) -> &str {
+        match self {
+            Missed::Refused(why) | Missed::Unsure(why) => why,
+        }
+    }
+}
+
+impl From<Missed> for Refusal {
+    fn from(m: Missed) -> Refusal {
+        Refusal::conflict(m.text())
+    }
+}
+
 /// Targets: each a price and a size (`None`: all that is left).
 type Targets = Vec<(f64, Option<f64>)>;
 
@@ -873,6 +1220,23 @@ fn partial_target_ok(side: Side, size: f64, held: f64, price: f64) -> Result<(),
         None => Ok(()),
     }
 }
+
+/// How often the watch looks at one armed line order with a stop or target
+/// (they take turns).
+const LINE_WATCH_EVERY: Duration = Duration::from_secs(1);
+/// How long a fired line order's fill may take to be listed under its id
+/// before its stop and target go on by its size (capped by the position);
+/// and how long an answer that a line is done with must hold before its
+/// stop and target are dropped.
+const LINE_FILL_WAIT: Duration = Duration::from_secs(5);
+/// How far back a fired line order's fill is looked for (older: by its size).
+const LINE_FILLS_LOOKBACK_MS: i64 = 24 * 3_600_000;
+/// How often a filled line order's stop and target are tried again.
+const LINE_RETRY_EVERY: Duration = Duration::from_secs(5);
+/// How long a filled line order's stop may fail to go on before its
+/// position is closed — and how long the close may then fail before it is
+/// left, loudly, to the owner.
+const LINE_STOP_PATIENCE: Duration = Duration::from_secs(30);
 
 /// The stop and target an entry carries on Hyperliquid: children are as
 /// big as the entry, so at most one stop and one target, for all of it.

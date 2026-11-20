@@ -1226,6 +1226,8 @@ async fn main() {
             .await
             .expect("load the Hyperliquid LIVE settings"),
     );
+    // Armed LIVE line orders' stops and targets go on Hyperliquid once they fill.
+    tokio::spawn(Arc::clone(&hl_live).watch_lines());
 
     // 10. Router
     let state = AppState {
