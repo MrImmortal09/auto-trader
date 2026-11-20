@@ -143,25 +143,38 @@ impl Market {
 
     /// `size` on the market's size grid, rounded down (never more than asked).
     pub fn round_size(&self, size: f64) -> f64 {
-        let f = 10f64.powi(self.sz_decimals as i32);
-        ((size * f) + 1e-9).floor() / f
+        round_size(size, self.sz_decimals)
     }
 
     /// `price` as Hyperliquid takes a perp price: at most five significant
     /// figures and `6 - sz_decimals` decimals (an integer always passes),
     /// rounded to the nearest.
     pub fn round_price(&self, price: f64) -> f64 {
-        if !(price.is_finite() && price > 0.0) {
-            return price;
-        }
-        let max_decimals = 6 - self.sz_decimals as i32;
-        let magnitude = price.log10().floor() as i32 + 1;
-        let decimals = (5 - magnitude).clamp(0, max_decimals.max(0));
-        let f = 10f64.powi(decimals);
-        let rounded = (price * f).round() / f;
-        // An integer price is always valid, however many figures it has.
-        if decimals == 0 { price.round() } else { rounded }
+        round_price(price, self.sz_decimals)
     }
+}
+
+/// `size` on a grid of `sz_decimals` decimals, rounded down (never more
+/// than asked).
+pub fn round_size(size: f64, sz_decimals: u32) -> f64 {
+    let f = 10f64.powi(sz_decimals as i32);
+    ((size * f) + 1e-9).floor() / f
+}
+
+/// `price` as Hyperliquid takes a perp price on a perp of `sz_decimals`: at
+/// most five significant figures and `6 - sz_decimals` decimals (an integer
+/// always passes), rounded to the nearest.
+pub fn round_price(price: f64, sz_decimals: u32) -> f64 {
+    if !(price.is_finite() && price > 0.0) {
+        return price;
+    }
+    let max_decimals = 6 - sz_decimals as i32;
+    let magnitude = price.log10().floor() as i32 + 1;
+    let decimals = (5 - magnitude).clamp(0, max_decimals.max(0));
+    let f = 10f64.powi(decimals);
+    let rounded = (price * f).round() / f;
+    // An integer price is always valid, however many figures it has.
+    if decimals == 0 { price.round() } else { rounded }
 }
 
 /// Whether `raw` is a perp's chart symbol (or meant to be one: `HL:` and

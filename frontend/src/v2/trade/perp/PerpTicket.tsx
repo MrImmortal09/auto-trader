@@ -3,6 +3,7 @@ import { Check, Minus, Plus, X } from 'lucide-react';
 import type { HlMarket, PerpAccount, PerpSide } from '../../lib/types';
 import { signedPct, toneOf } from '../../lib/format';
 import { Button } from '../../ui/Button';
+import { Modal } from '../../ui/Modal';
 import { Segment } from '../../ui/Segment';
 import { Toggle } from '../../ui/Toggle';
 import { useToast } from '../../ui/toast';
@@ -132,13 +133,16 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   const stop = typed(stopText);
   const target = typed(targetText);
   const reduce = kind !== 'line' && reduceOnly;
-  // LIVE is read-only in this release: orders stay on paper.
+  // LIVE: orders go to the owner's Hyperliquid account. On mainnet each one
+  // that opens asks first (the owner's pick); testnet is one click.
   const live = account?.mode === 'live';
+  const mainnet = live && account?.network === 'mainnet';
+  const [confirm, setConfirm] = useState<{ title: string; lines: string[]; go: () => void } | null>(null);
   // A close-only perp (removed from the list, still held) takes only an
   // order that reduces the position: the other way, no more than is held.
   const closeOnly = rules.known && !rules.tradable;
   const reduces = held != null && held.side !== side && size != null && size <= held.size + 1e-12 && kind !== 'line';
-  const ready = !live && rules.known && (!closeOnly || reduces) && size != null && size > 0 && price != null && !sending;
+  const ready = rules.known && (!closeOnly || reduces) && size != null && size > 0 && price != null && !sending;
   const size_ = large ? 'lg' : 'md';
   const segSize = large ? 'lg' : 'sm';
 
@@ -148,15 +152,18 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   // placed) — and only for an order that opens one (not reduce-only, not an
   // add: a held position shows its own); and a line order's line, stop and
   // target until it is armed.
-  const draftLiq = !live && !reduce && liq != null && price != null && (kind === 'market' ? size != null && size > 0 : true) ? liq : null;
+  // LIVE: a resting order that adds to the position can't carry its own
+  // stop and target (Hyperliquid would stack a second, fixed-size stop).
+  const restingAdd = live && adding && kind !== 'market';
+  const draftLiq = !reduce && liq != null && price != null && (kind === 'market' ? size != null && size > 0 : true) ? liq : null;
   const draftMargin = margin != null && margin > 0 ? margin : null;
   const isLine = kind === 'line';
   const draftStop = isLine ? stop : null;
   const draftTarget = isLine ? target : null;
   useEffect(() => {
-    const show = price != null && !live && (draftLiq != null || isLine);
+    const show = price != null && (draftLiq != null || isLine);
     setPerpDraft(show ? { key: k, side, entry: price, leverage: usedLev, liq: draftLiq, margin: draftMargin, line: isLine, size, stop: draftStop, target: draftTarget } : null);
-  }, [k, side, price, usedLev, draftLiq, draftMargin, isLine, size, draftStop, draftTarget, live]);
+  }, [k, side, price, usedLev, draftLiq, draftMargin, isLine, size, draftStop, draftTarget]);
   useEffect(() => () => setPerpDraft(null), []);
 
   function chooseSizeIn(next: SizeIn) {
@@ -180,9 +187,9 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
   // line and stop as its fields show them, corrected by hand between taps
   // or not, so what arms is what the ticket and the chart show.
   const fieldLine = typed(priceText) == null ? null : roundPrice(k, typed(priceText)!);
-  const latest = useRef({ side, usedLev, validity, amount, sizeIn, line: fieldLine, stop });
+  const latest = useRef({ side, usedLev, validity, amount, sizeIn, line: fieldLine, stop, live, mainnet });
   useEffect(() => {
-    latest.current = { side, usedLev, validity, amount, sizeIn, line: fieldLine, stop };
+    latest.current = { side, usedLev, validity, amount, sizeIn, line: fieldLine, stop, live, mainnet };
   });
   const step = perps.placing?.kind === 'pick' && perps.placing.key === k ? (perps.placing.options?.step ?? null) : null;
 
@@ -210,8 +217,9 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
     return t.sizeIn === 'coin' ? roundSize(k, t.amount) : roundSize(k, (t.amount * t.usedLev) / line);
   };
 
-  /** Arm the line order at `line` with `stopAt` and `targetAt` (either may be null). */
-  async function armLine(line: number, stopAt: number | null, targetAt: number | null) {
+  /** Arm the line order at `line` with `stopAt` and `targetAt` (either may
+   * be null) — on mainnet once the owner confirms it. */
+  function armLine(line: number, stopAt: number | null, targetAt: number | null) {
     const t = latest.current;
     const coins = coinsOn(line);
     if (coins == null || coins <= 0) {
@@ -219,6 +227,23 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
       toast({ tone: 'loss', title: 'Line order not armed', body: t.amount == null ? 'Type the amount first.' : `The amount is too small: at this line it comes to less than one size step (${step_}).` });
       return;
     }
+    const go = () => void sendLine(line, stopAt, targetAt, coins);
+    if (!t.mainnet) return go();
+    const liq = estLiq(k, t.side, line, t.usedLev);
+    setConfirm({
+      title: `Arm a real ${t.side === 'long' ? 'buy' : 'sell'} on a line?`,
+      lines: [
+        `${sizeText(k, coins)} ${perpLabel(k)} at ${t.usedLev}x isolated, a market order once the mark ${line > (mid ?? line) ? 'rises' : 'falls'} to ${perpPrice(line)}`,
+        `Stop ${stopAt != null ? perpPrice(stopAt) : 'none'} · target ${targetAt != null ? perpPrice(targetAt) : 'none'}`,
+        `Margin ≈ ${usd((coins * line) / t.usedLev)}${liq != null ? ` · liquidation ≈ ${perpPrice(roundPrice(k, liq))}` : ''}`,
+        'It rests on Hyperliquid until you cancel it.',
+      ],
+      go,
+    });
+  }
+
+  async function sendLine(line: number, stopAt: number | null, targetAt: number | null, coins: number) {
+    const t = latest.current;
     setSending(true);
     const ok = await perps.actions.line({
       market: k,
@@ -226,7 +251,8 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
       size: coins,
       leverage: t.usedLev,
       price: line,
-      valid_minutes: t.validity,
+      // A LIVE line order rests on Hyperliquid until cancelled.
+      valid_minutes: t.live ? null : t.validity,
       stop: stopAt ?? undefined,
       targets: targetAt != null ? [{ price: targetAt, size: null }] : undefined,
     });
@@ -261,7 +287,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
         if (!onSide(latest.current.side, 'target', line, at)) return wrongSide('target', line);
         setTargetText(String(at));
         // The line and stop as the fields have them now.
-        void armLine(line, latest.current.stop, at);
+        armLine(line, latest.current.stop, at);
       },
       { step: 'target', color: C.profit, label: tapLabel('Target (optional)', tapped) },
     );
@@ -303,18 +329,35 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
     const line = typed(priceText);
     if (line == null) return;
     perps.cancelPlacing();
-    void armLine(roundPrice(k, line), stop, target);
+    armLine(roundPrice(k, line), stop, target);
   }
 
-  async function send() {
+  /** Send the ticket's order — on mainnet once the owner confirms it. */
+  function send() {
     if (!ready || size == null) return;
+    if (!mainnet) return void sendNow();
+    const way = side === 'long' ? 'buy' : 'sell';
+    const what = isLine ? 'line order' : kind === 'limit' ? 'limit order' : 'market order';
+    setConfirm({
+      title: `Send a real ${way} ${what}?`,
+      lines: [
+        `${sizeText(k, size)} ${perpLabel(k)}${kind === 'market' ? ` at the market (≈ ${perpPrice(price!)}, at most 0.5 % past it)` : ` at ${perpPrice(price!)}`}${reduce ? ', reduce only' : ` at ${usedLev}x isolated`}`,
+        ...(reduce ? [] : [`Stop ${stop != null ? perpPrice(stop) : 'none'} · target ${target != null ? perpPrice(target) : 'none'}`]),
+        ...(margin != null && margin > 0 ? [`Margin ≈ ${usd(margin)}${liq != null ? ` · liquidation ≈ ${perpPrice(roundPrice(k, liq))}` : ''}`] : []),
+      ],
+      go: () => void sendNow(),
+    });
+  }
+
+  async function sendNow() {
+    if (size == null) return;
     setSending(true);
     const targets = target != null ? [{ price: target, size: null }] : undefined;
-    const levels = reduce ? {} : { stop: stop ?? undefined, targets };
+    const levels = reduce || restingAdd ? {} : { stop: stop ?? undefined, targets };
     const way = side === 'long' ? 'buy' : 'sell';
     const ok =
       kind === 'line'
-        ? await perps.actions.line({ market: k, side: way, size, leverage: usedLev, price: price!, valid_minutes: validity, ...levels })
+        ? await perps.actions.line({ market: k, side: way, size, leverage: usedLev, price: price!, valid_minutes: live ? null : validity, ...levels })
         : await perps.actions.order({ market: k, side: way, size, leverage: usedLev, type: kind, price: kind === 'limit' ? price! : undefined, reduce_only: reduce || undefined, ...levels });
     setSending(false);
     if (ok) {
@@ -436,7 +479,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           </button>
         </div>
       </div>
-      {kind === 'line' && (
+      {kind === 'line' && !live && (
         <label className="flex items-center justify-between gap-3">
           <span className="type-label text-fg-muted">Valid for</span>
           <select
@@ -452,12 +495,13 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           </select>
         </label>
       )}
-      {!reduce && (
+      {!reduce && !restingAdd && (
         <>
           <Field label="Stop (optional)" value={stopText} onChange={setStopText} unit="$" large={large} action={pickButton('Stop', setStopText)} />
           <Field label="Target (optional)" value={targetText} onChange={setTargetText} unit="$" large={large} action={pickButton('Target', setTargetText)} />
         </>
       )}
+      {restingAdd && <p className="type-caption text-fg-subtle">A LIVE {isLine ? 'line order' : 'limit'} that adds to the position takes no stop of its own: once it fills, set the position's stop again and it covers all of it.</p>}
       {kind !== 'line' && (
         <div className="flex items-center justify-between gap-3">
           <span className="type-label text-fg-muted">Reduce only</span>
@@ -474,8 +518,10 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
       {!rules.known && <p className="type-caption text-fg-subtle">{perpLabel(k)} isn't on the app's list of perps.</p>}
       {live && (
         <p className="type-caption text-fg">
-          LIVE on {account?.network}: your Hyperliquid account is shown read-only. LIVE orders come in the next release; switch Hyperliquid to Paper in Settings to trade on paper.
-          {account?.network === 'testnet' && ' Charts, prices and these estimates are mainnet’s; testnet’s own prices differ.'}
+          {mainnet
+            ? 'LIVE on mainnet: orders go to your Hyperliquid account — real money. Each order that opens asks first; stops and targets rest on Hyperliquid.'
+            : 'LIVE on testnet: orders go to your Hyperliquid testnet account (test USDC). Stops and targets rest on Hyperliquid.'}
+          {account?.network === 'testnet' && ' Charts and these estimates are mainnet’s; testnet fills at its own prices.'}
         </p>
       )}
       {live && perps.error && <p className="type-caption text-loss">Couldn't refresh the LIVE account ({perps.error}): what is shown is from {account?.as_of ? `${account.as_of.slice(11)} IST` : 'earlier'}.</p>}
@@ -487,7 +533,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           </p>
           <div className="flex gap-2">
             {step !== 'line' && (
-              <Button size={size_} kind={side === 'long' ? 'profit' : 'loss'} pointerOnly disabled={sending || live} onClick={armNow} className="flex-1">
+              <Button size={size_} kind={side === 'long' ? 'profit' : 'loss'} pointerOnly disabled={sending} onClick={armNow} className="flex-1">
                 {sending ? 'Sending…' : 'Arm now'}
               </Button>
             )}
@@ -497,7 +543,7 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           </div>
         </div>
       ) : isLine && price == null ? (
-        <Button size={size_} kind={side === 'long' ? 'profit' : 'loss'} pointerOnly disabled={live || !rules.known || closeOnly || sending} onClick={startLine}>
+        <Button size={size_} kind={side === 'long' ? 'profit' : 'loss'} pointerOnly disabled={!rules.known || closeOnly || sending} onClick={startLine}>
           {`${side === 'long' ? 'Buy' : 'Sell'} on a line: tap the chart`}
         </Button>
       ) : (
@@ -505,6 +551,34 @@ export function PerpTicket({ k, market, account, perps, large, onClose }: {
           {sending ? 'Sending…' : `${isLine ? 'Arm: ' : ''}${side === 'long' ? 'Buy / long' : 'Sell / short'}${size ? ` ${sizeText(k, size)}` : ''}${kind === 'limit' && price ? ` @ ${perpPrice(price)}` : ''}`}
         </Button>
       )}
+
+      <Modal open={confirm != null} onClose={() => setConfirm(null)} label="Confirm the real order" width="lg:max-w-[440px]">
+        <div className="flex flex-col gap-3 p-6">
+          <h2 className="type-title text-fg">{confirm?.title}</h2>
+          <ul className="flex flex-col gap-1 type-body text-fg-muted tnum">
+            {confirm?.lines.map((l) => (
+              <li key={l}>{l}</li>
+            ))}
+          </ul>
+          <p className="type-caption text-fg-subtle">Hyperliquid mainnet · your own account · real money.</p>
+          <div className="mt-2 flex justify-end gap-2">
+            <Button size="md" kind="neutral" onClick={() => setConfirm(null)} data-autofocus>
+              Cancel
+            </Button>
+            <Button
+              size="md"
+              kind="live"
+              onClick={() => {
+                const go = confirm?.go;
+                setConfirm(null);
+                go?.();
+              }}
+            >
+              Send it
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       {account && (
         <section className="flex flex-col gap-1 border-t border-line pt-3">
