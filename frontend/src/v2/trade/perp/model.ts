@@ -109,3 +109,59 @@ export const sideWord = (s: PerpSide) => (s === 'long' ? 'Long' : 'Short');
 export function unreadNote(t: PerpToday): string | null {
   return t.unread?.includes('funding') ? "Today's funding couldn't be read from Hyperliquid — the charges and P&L leave it out." : null;
 }
+
+/** The least order Hyperliquid takes, in USD: only one closing all of a position may be smaller. */
+export const MIN_ORDER_USD = 10;
+/** A target fires as a market order: a long's may fill as far as 10 % under its price. */
+export const TRIGGER_SLIP = 0.1;
+/** The share a new target sells when its prompt opens (the owner's pick). */
+export const TARGET_PCT_DEFAULT = 25;
+
+/** What a target for `pct` % of a `side` position of `held` sells at `price`. */
+export interface TargetShare {
+  /** What is sent: `null` sells all that is left when it is reached. */
+  size: number | null;
+  /** What it sells as things stand. */
+  sells: number;
+  /** Why it can't be placed, if it can't. */
+  why: string | null;
+  /** The smallest whole % that works at `price`, when `pct` is too small. */
+  minPct: number | null;
+}
+
+/**
+ * A target selling `pct` % of a `side` position of `held` on `k`, at
+ * `price`, as the server checks it: the size on the perp's grid, rounded
+ * down (never more than asked); one for part of it worth at least
+ * {@link MIN_ORDER_USD} where it may fill (a long's {@link TRIGGER_SLIP}
+ * under its price); with `others` (paper: what the other sized targets
+ * sell) no more than is held. 100 % is "all left", always taken.
+ */
+export function targetShare(k: PerpKey, side: PerpSide, held: number, others: number, pct: number, price: number): TargetShare {
+  const left = Math.max(0, held - others);
+  if (pct >= 100) return { size: null, sells: left, why: null, minPct: null };
+  const sizeAt = (p: number) => roundSize(k, (held * p) / 100);
+  const worst = side === 'long' ? price * (1 - TRIGGER_SLIP) : price;
+  const fits = (s: number) => s > 0 && s <= left + 1e-12 && s * worst + 1e-9 >= MIN_ORDER_USD;
+  const size = sizeAt(pct);
+  if (size <= 0) {
+    const minPct = smallest(pct, sizeAt, fits);
+    return { size, sells: 0, why: `${pct}% of ${sizeText(k, held)} rounds to nothing. ${minPct != null ? `Pick at least ${minPct}%` : 'Pick 100%'}`, minPct };
+  }
+  if (size > left + 1e-12) {
+    const room = Math.floor((left / held) * 100);
+    return { size, sells: size, why: `Only ${sizeText(k, left)} (${room}%) isn't on another target`, minPct: null };
+  }
+  if (!fits(size)) {
+    const minPct = smallest(pct, sizeAt, fits);
+    const at = side === 'long' ? ' at its worst fill, 10% under the target' : '';
+    return { size, sells: size, why: `${sizeText(k, size)} is ${usd(size * worst)}${at}: Hyperliquid takes nothing under ${usd(MIN_ORDER_USD)} but a close of all of it. ${minPct != null ? `Pick at least ${minPct}%` : 'Pick 100%'}`, minPct };
+  }
+  return { size, sells: size, why: null, minPct: null };
+}
+
+/** The smallest whole % above `pct`, under 100, whose size `fits`. */
+function smallest(pct: number, sizeAt: (p: number) => number, fits: (s: number) => boolean): number | null {
+  for (let p = Math.floor(pct) + 1; p < 100; p++) if (fits(sizeAt(p))) return p;
+  return null;
+}
