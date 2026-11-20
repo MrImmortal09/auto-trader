@@ -6,6 +6,7 @@ import { Chip } from '../../ui/Chip';
 import { Segment } from '../../ui/Segment';
 import { perpLabel, perpPrice, roundPrice, roundSize, sideWord, signedUsd, sizeText, usd } from './model';
 import type { Perps } from './usePerps';
+import type { PerpKey } from '../model';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 
@@ -22,7 +23,7 @@ export function PerpTab({ account, perps, onOpen, compact = false }: {
   account: PerpAccount | null;
   perps: Perps;
   /** Show a perp's chart and ticket. */
-  onOpen: (key: 'BTC' | 'ETH' | 'GOLD') => void;
+  onOpen: (key: PerpKey) => void;
   /** Phone: each position a card, 44 pt buttons. */
   compact?: boolean;
 }) {

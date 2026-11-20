@@ -177,7 +177,7 @@ export default function App() {
 
   const content =
     screen === 'desk' ? (
-      <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} role={role} />
+      <Desk serverBase={serverBase} desktop={desktop} stopped={stopped} role={role} perpsOn={perpsOn} />
     ) : screen === 'trade' ? (
       <Suspense fallback={<p className="p-6 type-body text-fg-subtle">Loading charts…</p>}>
         <Trade key={tradeSeq} serverBase={serverBase} desktop={desktop} />

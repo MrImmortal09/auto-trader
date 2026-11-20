@@ -171,6 +171,10 @@ impl LiveDesk {
             c.orders = None;
             c.fills = None;
             c.failed = None;
+            c.spot = None;
+            c.available.clear();
+            // What an order changes is read again at once.
+            c.tried.retain(|k, _| !(k == "spot" || k.starts_with("available:")));
         }
     }
 

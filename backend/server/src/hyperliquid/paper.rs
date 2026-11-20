@@ -468,6 +468,92 @@ pub struct AccountView {
     /// which is always current.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
+    /// LIVE: Hyperliquid's account mode — `default` (spot and each dex a
+    /// balance of its own: spot USDC must be moved to perps to trade) or
+    /// `unifiedAccount` (one USDC balance, spot's, for every perp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_mode: Option<String>,
+    /// LIVE: the account's spot USDC, all of it and what isn't held for orders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spot_usdc: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spot_usdc_free: Option<f64>,
+    /// LIVE: the USDC a new position in the asked perp can use now, buying
+    /// and selling, as Hyperliquid works it out (`?market=`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available: Option<Available>,
+}
+
+/// A perps desk's today, from IST midnight (the owner's pick, 2026-11-20:
+/// the same today as the F&O desk), as the Desk shows it: `net` = `booked`
+/// + `open`, and `booked` = `realized` − `fees` − `funding`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PerpToday {
+    /// `paper` or `live`.
+    pub mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<&'static str>,
+    /// The IST day, `YYYY-MM-DD`.
+    pub day: String,
+    pub net: f64,
+    pub booked: f64,
+    /// The open positions' P&L at their marks.
+    pub open: f64,
+    /// P&L closed today, before charges.
+    pub realized: f64,
+    /// Trading fees on every fill today.
+    pub fees: f64,
+    /// Funding paid (negative: received). LIVE: every hour paid today;
+    /// paper: on what closed today (paper's hourly funding is booked when
+    /// its position closes).
+    pub funding: f64,
+    /// Orders that filled today.
+    pub trades: usize,
+    pub equity: f64,
+    /// Free USDC.
+    pub free: f64,
+    pub positions: Vec<PositionView>,
+    /// What closed today, newest first.
+    pub closed: Vec<ClosedToday>,
+    /// LIVE: parts Hyperliquid didn't answer (`funding`): the figures leave
+    /// them out, and the Desk says so.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<&'static str>,
+}
+
+/// One fill that closed (part of) a position today.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClosedToday {
+    pub market: String,
+    pub label: String,
+    /// The side of the position it closed.
+    pub side: Side,
+    pub size: f64,
+    pub price: f64,
+    pub realized: f64,
+    pub fee: f64,
+    pub funding: f64,
+    /// `realized − fee − funding`.
+    pub net: f64,
+    /// IST `HH:MM:SS`.
+    pub time: String,
+    pub reason: String,
+}
+
+/// Today in IST: the day, its 00:00 as an IST timestamp string, and as Unix ms.
+pub fn today_start() -> (String, String, i64) {
+    use chrono::TimeZone;
+    let day = shared_domain::today_ist();
+    let ms = shared_domain::ist_offset().from_local_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight")).single().map_or(0, |t| t.timestamp_millis());
+    (day.format("%Y-%m-%d").to_string(), format!("{} 00:00:00", day.format("%Y-%m-%d")), ms)
+}
+
+/// What a new position in `market` can put up now, in USDC.
+#[derive(Debug, Clone, Serialize)]
+pub struct Available {
+    pub market: String,
+    pub buy: f64,
+    pub sell: f64,
 }
 
 /// One Hyperliquid balance: the core perps' or a builder dex's.
@@ -989,6 +1075,69 @@ impl PerpDesk {
             network: None,
             venues: Vec::new(),
             as_of: None,
+            account_mode: None,
+            spot_usdc: None,
+            spot_usdc_free: None,
+            available: None,
+        })
+    }
+
+    /// `user_id`'s paper perps today (from IST midnight), from the ledger.
+    pub async fn today(&self, user_id: i64) -> Result<PerpToday, Refusal> {
+        let view = self.view(user_id).await?;
+        let (day, from, _) = today_start();
+        let rows = sqlx::query_as::<_, FillRow>(
+            "SELECT id, position_id, market, action, size, price, fee, realized, funding, reason, timestamp
+             FROM perp_fills WHERE user_id = ? AND epoch = ? AND timestamp >= ? ORDER BY id DESC",
+        )
+        .bind(user_id)
+        .bind(view.epoch)
+        .bind(&from)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Refusal::server("read today's fills", e))?;
+        let realized: f64 = rows.iter().map(|r| r.realized).sum();
+        let fees: f64 = rows.iter().map(|r| r.fee).sum();
+        let funding: f64 = rows.iter().map(|r| r.funding).sum();
+        // An order's fills share its time, perp and side (a flip makes two).
+        let mut orders: Vec<(&str, &str, &str)> = rows.iter().map(|r| (r.timestamp.as_str(), r.market.as_str(), r.action.as_str())).collect();
+        orders.sort_unstable();
+        orders.dedup();
+        let closed = rows
+            .iter()
+            // A fill that closed: it realized P&L or funding, or is an exit.
+            .filter(|r| r.realized != 0.0 || r.funding != 0.0 || matches!(r.reason.as_str(), "CLOSE" | "STOP" | "TARGET" | "LIQUIDATION"))
+            .map(|r| ClosedToday {
+                market: r.market.clone(),
+                label: Market::of_key(&r.market).map_or_else(|| r.market.clone(), |m| m.label.to_string()),
+                side: if r.action == "SELL" { Side::Long } else { Side::Short },
+                size: r.size,
+                price: r.price,
+                realized: r.realized,
+                fee: r.fee,
+                funding: r.funding,
+                net: r.realized - r.fee - r.funding,
+                time: r.timestamp.get(11..19).unwrap_or_default().to_string(),
+                reason: r.reason.clone(),
+            })
+            .collect();
+        let booked = realized - fees - funding;
+        Ok(PerpToday {
+            mode: "paper",
+            network: None,
+            day,
+            net: booked + view.upnl,
+            booked,
+            open: view.upnl,
+            realized,
+            fees,
+            funding,
+            trades: orders.len(),
+            equity: view.equity,
+            free: view.cash,
+            positions: view.positions,
+            closed,
+            unread: Vec::new(),
         })
     }
 

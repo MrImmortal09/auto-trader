@@ -23,6 +23,7 @@ import type {
   HlCatalogAnswer,
   HlMarketsAnswer,
   PerpAccount,
+  PerpToday,
   GroupId,
   HistoryAnswer,
   IndicatorAnswer,
@@ -480,7 +481,11 @@ export const putHlAdminMarkets = (base: string, change: HlMarketsChange) => send
 
 // ── Hyperliquid perps on paper: the caller's own account ───────────────── //
 
-export const getPerpAccount = (base: string) => getJson<PerpAccount>(base, '/api/v2/hl/account');
+/** The caller's perps today, from IST midnight (LIVE: the owner's Hyperliquid account). */
+export const getPerpToday = (base: string) => getJson<PerpToday>(base, '/api/v2/hl/today');
+/** The caller's perps account; LIVE, with what a new position in `market` can use now. */
+export const getPerpAccount = (base: string, market?: string | null) =>
+  getJson<PerpAccount>(base, `/api/v2/hl/account${market ? `?market=${encodeURIComponent(market)}` : ''}`);
 export interface PerpTargetBody {
   price: number;
   /** Left out or null: all that is left. */

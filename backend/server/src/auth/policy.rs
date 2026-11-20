@@ -77,6 +77,7 @@ const RULES: &[Rule] = &[
     // owner's and every user's), keyed by user id in the routes. Named one
     // by one: any other `/api/v2/hl/` route (LIVE's, say) stays the admin's.
     rule(On::Read, "/api/v2/hl/account", Access::SignedIn),
+    rule(On::Read, "/api/v2/hl/today", Access::SignedIn),
     rule(On::Write, "/api/v2/hl/orders", Access::SignedIn),
     rule(On::Write, "/api/v2/hl/orders/*", Access::SignedIn),
     rule(On::Write, "/api/v2/hl/positions/*", Access::SignedIn),
@@ -240,6 +241,7 @@ mod tests {
         (PUT, "/api/v2/hl/admin/markets", Access::Admin),
         (PATCH, "/api/v2/hl/positions/xyz:NVDA", Access::SignedIn),
         (GET, "/api/v2/hl/account", Access::SignedIn),
+        (GET, "/api/v2/hl/today", Access::SignedIn),
         (POST, "/api/v2/hl/orders", Access::SignedIn),
         (DELETE, "/api/v2/hl/orders/abc", Access::SignedIn),
         (PATCH, "/api/v2/hl/positions/BTC", Access::SignedIn),
