@@ -522,6 +522,11 @@ impl Running {
     pub async fn history(&self, upstox_key: Option<&str>, tf: Tf, from: NaiveDate, to: NaiveDate) -> Result<Vec<Bar>, String> {
         let client = self.upstox.as_ref().ok_or("Upstox is not configured (UPSTOX_ANALYTICS_TOKEN)")?;
         let key = upstox_key.ok_or("Upstox does not list this contract")?;
+        if tf == Tf::D1 {
+            // A day's candle is stamped at its midnight, not in the session.
+            let days = client.daily_candles(key, from, to).await.map_err(|e| e.to_string())?;
+            return Ok(days.into_iter().map(|c| Bar { t: bars::ist_day_start(c.start_ms), o: c.open, h: c.high, l: c.low, c: c.close, v: Some(c.volume) }).collect());
+        }
         let candles = client.historical_candles(key, tf.minutes(), from, to).await.map_err(|e| e.to_string())?;
         Ok(candles
             .into_iter()
