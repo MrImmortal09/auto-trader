@@ -515,6 +515,10 @@ pub struct PerpToday {
     pub positions: Vec<PositionView>,
     /// What closed today, newest first.
     pub closed: Vec<ClosedToday>,
+    /// LIVE: parts Hyperliquid didn't answer (`funding`): the figures leave
+    /// them out, and the Desk says so.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<&'static str>,
 }
 
 /// One fill that closed (part of) a position today.
@@ -1133,6 +1137,7 @@ impl PerpDesk {
             free: view.cash,
             positions: view.positions,
             closed,
+            unread: Vec::new(),
         })
     }
 

@@ -4,7 +4,7 @@ import { plural, toneOf } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { PerpToday } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
-import { perpPrice, roundPrice, sideWord, signedUsd, sizeText, usd } from '../trade/perp/model';
+import { perpPrice, roundPrice, sideWord, signedUsd, sizeText, unreadNote, usd } from '../trade/perp/model';
 import { Stat } from '../ui/Stat';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
@@ -49,6 +49,7 @@ export function DeskPerps({ serverBase, desktop, header }: { serverBase: string;
         <Stat label="Trades today" value={t.trades} size={desktop ? undefined : 'medium'} />
         <Stat label={walletLabel(t)} value={usd(t.equity)} size={desktop ? undefined : 'medium'} sub={`free ${usd(t.free)}`} />
       </div>
+      {unreadNote(t) && <p className="w-full type-caption text-loss">{unreadNote(t)}</p>}
     </div>
   );
 

@@ -748,6 +748,8 @@ export interface PerpToday {
   free: number;
   positions: PerpPosition[];
   closed: PerpClosedToday[];
+  /** LIVE: parts Hyperliquid didn't answer (`funding`), left out of the figures. */
+  unread?: string[];
 }
 
 export interface PerpClosedToday {

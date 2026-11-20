@@ -2,7 +2,7 @@
 // list, `catalog.ts`) and the arithmetic the ticket, the panel and the chart
 // lines share.
 
-import type { PerpSide } from '../../lib/types';
+import type { PerpSide, PerpToday } from '../../lib/types';
 import type { PerpKey } from '../model';
 import { perpInfo } from './catalog';
 
@@ -104,3 +104,8 @@ export const VALIDITIES: { value: number | null; label: string }[] = [
 
 /** "Long" or "Short". */
 export const sideWord = (s: PerpSide) => (s === 'long' ? 'Long' : 'Short');
+
+/** What today's figures leave out because Hyperliquid didn't answer it. */
+export function unreadNote(t: PerpToday): string | null {
+  return t.unread?.includes('funding') ? "Today's funding couldn't be read from Hyperliquid — the charges and P&L leave it out." : null;
+}

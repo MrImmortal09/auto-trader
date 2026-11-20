@@ -97,7 +97,7 @@ function LiveFunds({ account, k, side }: { account: PerpAccount; k: PerpKey; sid
       )}
       {unified ? (
         <p className="text-fg-subtle">Unified account: your spot USDC is the margin for every perp.</p>
-      ) : spot > 0 && (avail ?? 0) < 1 ? (
+      ) : spot > 0 && avail != null && avail < 1 ? (
         <p className="text-loss">Your {usd(spot)} USDC is in Spot. In Hyperliquid's app, move it to Perps{venue !== 'Hyperliquid' ? ` and then to ${venue}'s balance` : ''} to trade {perpLabel(k)}.</p>
       ) : null}
     </div>

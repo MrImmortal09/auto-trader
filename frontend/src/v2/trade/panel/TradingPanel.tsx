@@ -20,7 +20,7 @@ import { MIN_CHART_HEIGHT, MIN_PANEL_HEIGHT } from './height';
 import { DEFAULT_DESK_WIDTH, MAX_DESK_WIDTH, MIN_DESK_WIDTH, MIN_PANEL_BODY, useWidth } from '../paneSizes';
 import { ActivityList, HistoryList, PaperActivityList } from './lists';
 import { PerpTab } from '../perp/PerpTab';
-import { signedUsd, sizeText, usd } from '../perp/model';
+import { signedUsd, sizeText, unreadNote, usd } from '../perp/model';
 import { Segment } from '../../ui/Segment';
 import type { Perps } from '../perp/usePerps';
 import type { PerpKey } from '../model';
@@ -218,6 +218,7 @@ export function PerpColumn({ serverBase, onHide }: { serverBase: string; onHide?
             <span className="type-caption text-fg-subtle tnum">
               Charges {usd(t.fees + t.funding)}: fees {usd(t.fees)} · funding {t.funding >= 0 ? `${usd(t.funding)} paid` : `${usd(-t.funding)} received`}
             </span>
+            {unreadNote(t) && <span className="type-caption text-loss">{unreadNote(t)}</span>}
           </Block>
           <Block label={`Open · ${plural(t.positions.length, 'position')}`} right={<span className={`num-medium ${TONE_TEXT[toneOf(t.open)]}`}>{signedUsd(t.open)}</span>}>
             {t.positions.map((p) => (
