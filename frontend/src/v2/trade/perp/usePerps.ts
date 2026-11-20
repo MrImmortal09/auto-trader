@@ -29,7 +29,7 @@ import type { PlacingPrompt } from '../ChartPanel';
 import type { ChartLine } from '../KChart';
 import type { PerpKey } from '../model';
 import { usePerpDraft, type PerpDraft } from './draft';
-import { estLiq, perpLabel, perpPrice, pnlAt, roundPrice, sideWord, signedUsd, sizeText } from './model';
+import { estLiq, perpLabel, perpPrice, pnlAt, roundPrice, sideWord, signedUsd, sizeText, TARGET_PCT_DEFAULT, targetShare } from './model';
 
 /** A step of the ticket's "Buy on a line": the line, then its stop, then
  * its target, each one tap on the chart. */
@@ -49,7 +49,9 @@ export interface PickOptions {
  * of a "Buy on a line"); `onPick` answering `true` keeps the chart taking
  * clicks (it has asked for the next step, or refused this one). */
 export type PerpPlacing =
-  | { key: PerpKey; kind: 'stop' | 'target' }
+  | { key: PerpKey; kind: 'stop' }
+  /** `pct`: the share of the position the target sells (100: all left). */
+  | { key: PerpKey; kind: 'target'; pct: number }
   | { key: PerpKey; kind: 'pick'; what: string; onPick: (price: number) => boolean | void; options?: PickOptions };
 
 export interface PerpActions {
@@ -227,7 +229,7 @@ export function usePerps({ serverBase, enabled, onShow, market }: {
         },
         onPart: (part) => {
           if (part === 'add-stop') setPlacing({ key, kind: 'stop' });
-          if (part === 'add-target') setPlacing({ key, kind: 'target' });
+          if (part === 'add-target') setPlacing({ key, kind: 'target', pct: TARGET_PCT_DEFAULT });
           if (part === 'close') void actions.close(key);
         },
       },
@@ -378,21 +380,66 @@ export function usePerps({ serverBase, enabled, onShow, market }: {
     }
     const p = account?.positions.find((x) => x.market === key);
     if (!p) return null;
-    const kind = placing.kind;
-    const color = kind === 'stop' ? C.loss : C.profit;
+    if (placing.kind === 'target') return targetPrompt(p, placing.pct);
     return {
-      key: `perp:${key}:${kind}`,
-      what: kind,
+      key: `perp:${key}:stop`,
+      what: 'stop',
       data: {
-        color,
+        color: C.loss,
         dashed: true,
         draggable: false,
-        parts: (at) => [{ key: 'label', text: `${kind === 'stop' ? 'Stop' : 'Target · all left'} ${signedUsd(pnlAt(p.side, p.size, p.entry, at))}`, color }],
+        parts: (at) => [{ key: 'label', text: `Stop ${signedUsd(pnlAt(p.side, p.size, p.entry, at))}`, color: C.loss }],
+        axisText: (at) => perpPrice(at),
+      },
+      onPlace: (at) => {
+        void actions.setLevels(key, { stop: roundPrice(key, at) });
+        return true;
+      },
+    };
+  }
+
+  /**
+   * "+ Target" on `p`: the share it sells is picked in the prompt (25 % to
+   * start), and the tap places it only if that share is a size Hyperliquid
+   * takes there (`targetShare`); otherwise it says why and waits for
+   * another. Paper's sized targets add up to no more than is held; LIVE's
+   * are reduce-only triggers, each capped by the position on Hyperliquid.
+   */
+  function targetPrompt(p: PerpPosition, pct: number): PlacingPrompt {
+    const key = p.market;
+    const others = account?.mode === 'live' ? 0 : (p.levels?.targets ?? []).reduce((n, t) => n + (t.size ?? 0), 0);
+    const share = (at: number) => targetShare(key, p.side, p.size, others, pct, roundPrice(key, at));
+    const now = share(p.mark ?? p.entry);
+    const sells = (s: { size: number | null; sells: number }) => (s.size == null ? `all left (${sizeText(key, s.sells)})` : sizeText(key, s.sells));
+    // A share that fits at no price (it rounds to nothing, or is more than
+    // the other targets leave) says so at once; one too small at a price,
+    // on the line there.
+    const stuck = now.size != null && (now.size <= 0 || now.size > p.size - others + 1e-12);
+    return {
+      key: `perp:${key}:target`,
+      what: 'target',
+      hint: stuck ? now.why : `${pct >= 100 ? 'All' : `${pct}%`} of ${sizeText(key, p.size)} · sells ${sells(now)}`,
+      hintTone: stuck ? 'loss' : undefined,
+      percent: { value: pct, presets: [25, 50, 75, 100], set: (v) => setPlacing({ key, kind: 'target', pct: v }) },
+      data: {
+        color: C.profit,
+        dashed: true,
+        draggable: false,
+        parts: (at) => {
+          const s = share(at);
+          if (s.why) return [{ key: 'label', text: `Target · ${pct}% too small here${s.minPct != null ? ` — at least ${s.minPct}%` : ''}`, color: C.loss, filled: true }];
+          return [{ key: 'label', text: `Target · ${sells(s)} ${signedUsd(pnlAt(p.side, s.sells, p.entry, at))}`, color: C.profit }];
+        },
         axisText: (at) => perpPrice(at),
       },
       onPlace: (at) => {
         const price = roundPrice(key, at);
-        void actions.setLevels(key, kind === 'stop' ? { stop: price } : { set_target: { price, size: null } });
+        const s = share(price);
+        if (s.why) {
+          toast({ tone: 'loss', title: 'Target not placed', body: s.why });
+          return false;
+        }
+        void actions.setLevels(key, { set_target: { price, size: s.size } });
         return true;
       },
     };
@@ -405,7 +452,7 @@ export function usePerps({ serverBase, enabled, onShow, market }: {
     placing,
     place: (key, kind) => {
       onShow?.(key);
-      setPlacing({ key, kind });
+      setPlacing(kind === 'stop' ? { key, kind } : { key, kind, pct: TARGET_PCT_DEFAULT });
     },
     pick: (key, what, onPick, options) => {
       onShow?.(key);

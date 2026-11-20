@@ -26,7 +26,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
-use super::perp::{apply_fill, exit_at, funding_payment, wrong_side, Book, Exit, FillReq, Leg, PerpLevels, PerpLine, PerpOrder, PerpPosition, PerpTarget, Side, MIN_NOTIONAL};
+use super::perp::{apply_fill, exit_at, funding_payment, partial_target_refusal, wrong_side, Book, Exit, FillReq, Leg, PerpLevels, PerpLine, PerpOrder, PerpPosition, PerpTarget, Side, MIN_NOTIONAL};
 use super::{HlMarketData, Market};
 
 /// What every paper wallet starts with, and starts over with.
@@ -163,6 +163,9 @@ pub fn checked_levels(m: &Market, side: Side, reference: f64, stop: Option<f64>,
                 if s <= 0.0 {
                     return Err(Refusal::bad("A target's size must be more than nothing"));
                 }
+                if let Some(why) = partial_target_refusal(side, s, p) {
+                    return Err(Refusal::bad(why));
+                }
                 Some(s)
             }
         };
@@ -210,10 +213,11 @@ pub struct LevelsChange {
     pub remove_target: Option<String>,
 }
 
-/// Apply `change` to `levels` for a holding of `held` (sized targets add up
-/// to no more than it) on `m`. Prices go on the grid; a level past the
-/// price is taken as asked (it fires on the next tick: a quick exit).
-fn change_levels(m: &Market, levels: &mut PerpLevels, change: &LevelsChange, held: f64) -> Result<(), Refusal> {
+/// Apply `change` to `levels` for a `side` holding of `held` (sized targets
+/// add up to no more than it; one selling part of it is worth Hyperliquid's
+/// minimum) on `m`. Prices go on the grid; a level past the price is taken
+/// as asked (it fires on the next tick: a quick exit).
+fn change_levels(m: &Market, side: Side, levels: &mut PerpLevels, change: &LevelsChange, held: f64) -> Result<(), Refusal> {
     let mut next = levels.clone();
     if let Some(stop) = change.stop {
         next.stop = match stop {
@@ -244,19 +248,27 @@ fn change_levels(m: &Market, levels: &mut PerpLevels, change: &LevelsChange, hel
             }
             other => *other,
         };
-        match id {
+        let set = match id {
             Some(id) => {
                 let t = next.targets.iter_mut().find(|t| &t.id == id).ok_or_else(|| Refusal::not_found("No such target"))?;
                 t.price = price;
                 if let Some(size) = size {
                     t.size = size;
                 }
+                t.clone()
             }
             None => {
                 if next.targets.len() >= MAX_TARGETS {
                     return Err(Refusal::conflict(format!("At most {MAX_TARGETS} targets")));
                 }
                 next.targets.push(PerpTarget { id: new_id(), price, size: size.flatten() });
+                next.targets.last().expect("just pushed").clone()
+            }
+        };
+        // Part of the holding (all of it closes it, and is exempt).
+        if let Some(s) = set.size.filter(|s| *s + 1e-9 < held) {
+            if let Some(why) = partial_target_refusal(side, s, set.price) {
+                return Err(Refusal::bad(why));
             }
         }
     }
@@ -873,8 +885,8 @@ impl PerpDesk {
         let now = now_ts();
         self.with_account(user_id, |acc| {
             let p = acc.book.position_mut(m.key).ok_or_else(|| Refusal::not_found(format!("No {} position", m.label)))?;
-            let held = p.size;
-            change_levels(m, &mut p.levels, &change, held)?;
+            let (held, side) = (p.size, p.side);
+            change_levels(m, side, &mut p.levels, &change, held)?;
             let levels = p.levels.clone();
             acc.note(&now, "levels", Some(m.key), levels_words(m, &levels));
             Ok((levels, Vec::new()))
@@ -962,7 +974,7 @@ impl PerpDesk {
                 next.price = p;
                 next.rising = p > mark;
             }
-            change_levels(m, &mut next.levels, &change, next.size)?;
+            change_levels(m, next.side, &mut next.levels, &change, next.size)?;
             if let Some(stop) = next.levels.stop {
                 if let Some(why) = wrong_side("stop", next.side, next.price, stop) {
                     return Err(Refusal::conflict(why));
@@ -1403,13 +1415,36 @@ mod tests {
         assert_eq!((l.stop, l.targets[0].size), (Some(59_000.0), Some(0.12345)));
         let mut levels = l.clone();
         // A second sized target past the holding is refused; "all left" fits.
-        assert!(change_levels(btc(), &mut levels, &LevelsChange { set_target: Some((None, 62_000.0, Some(Some(0.9)))), ..Default::default() }, 1.0).is_err());
-        change_levels(btc(), &mut levels, &LevelsChange { set_target: Some((None, 62_000.0, Some(None))), ..Default::default() }, 1.0).unwrap();
+        assert!(change_levels(btc(), Side::Long, &mut levels, &LevelsChange { set_target: Some((None, 62_000.0, Some(Some(0.9)))), ..Default::default() }, 1.0).is_err());
+        change_levels(btc(), Side::Long, &mut levels, &LevelsChange { set_target: Some((None, 62_000.0, Some(None))), ..Default::default() }, 1.0).unwrap();
         assert_eq!(levels.targets.len(), 2);
         // A stop dragged past the price is taken (it fires next tick).
-        change_levels(btc(), &mut levels, &LevelsChange { stop: Some(Some(70_000.0)), ..Default::default() }, 1.0).unwrap();
+        change_levels(btc(), Side::Long, &mut levels, &LevelsChange { stop: Some(Some(70_000.0)), ..Default::default() }, 1.0).unwrap();
         assert_eq!(levels.stop, Some(70_000.0));
-        change_levels(btc(), &mut levels, &LevelsChange { stop: Some(None), ..Default::default() }, 1.0).unwrap();
+        change_levels(btc(), Side::Long, &mut levels, &LevelsChange { stop: Some(None), ..Default::default() }, 1.0).unwrap();
         assert_eq!(levels.stop, None);
+    }
+
+    #[test]
+    fn a_target_for_part_of_the_position_is_worth_hyperliquids_minimum_where_it_may_fill() {
+        // 0.0002 BTC at 62,000 is $12.40, but a long's target may fill 10 %
+        // under it: $11.16. 0.00017 is $10.54 there, $9.49 at the worst.
+        let mut levels = PerpLevels::default();
+        let add = |size: f64| LevelsChange { set_target: Some((None, 62_000.0, Some(Some(size)))), ..Default::default() };
+        let held = 0.001;
+        assert!(change_levels(btc(), Side::Long, &mut levels, &add(0.00017), held).is_err());
+        change_levels(btc(), Side::Long, &mut levels, &add(0.0002), held).unwrap();
+        // A short's target buys: 10 % over it is worth more, so its price counts.
+        assert!(partial_target_refusal(Side::Short, 0.00017, 62_000.0).is_none());
+        // All of it closes the position: exempt, sized or not.
+        let mut whole = PerpLevels::default();
+        change_levels(btc(), Side::Long, &mut whole, &add(held), held).unwrap();
+        let mut tiny = PerpLevels::default();
+        change_levels(btc(), Side::Long, &mut tiny, &LevelsChange { set_target: Some((None, 62_000.0, Some(None))), ..Default::default() }, 0.0001).unwrap();
+        // Moved to where it's worth too little: refused, and left where it was.
+        let id = levels.targets[0].id.clone();
+        assert!(change_levels(btc(), Side::Long, &mut levels, &LevelsChange { set_target: Some((Some(id), 50_000.0, None)), ..Default::default() }, held).is_err());
+        assert_eq!(levels.targets[0].price, 62_000.0);
+        assert!(checked_levels(btc(), Side::Long, 60_000.0, None, &[(62_000.0, Some(0.00017))]).is_err(), "an entry's sized target too");
     }
 }

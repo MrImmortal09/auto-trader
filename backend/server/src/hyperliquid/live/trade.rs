@@ -27,7 +27,7 @@ use serde::Serialize;
 
 use super::{net_str, timed, LiveDesk};
 use crate::hyperliquid::paper::{LevelsChange, Refusal};
-use crate::hyperliquid::perp::Side;
+use crate::hyperliquid::perp::{Side, TRIGGER_SLIP};
 use crate::hyperliquid::{round_price, round_size, Market, MAX_LEVERAGE};
 
 /// How far from the mid a market order or close may fill: 0.5 %.
@@ -737,6 +737,7 @@ impl LiveDesk {
                         Some(None) => held,
                         Some(Some(s)) => a.size(*s).min(held),
                     };
+                    partial_target_ok(side, size, held, price)?;
                     self.replace_guard(network, &wallet, &a, o, price, size).await?;
                 }
                 None => {
@@ -744,6 +745,7 @@ impl LiveDesk {
                     if size <= 0.0 {
                         return Err(Refusal::bad("A target's size must be more than nothing"));
                     }
+                    partial_target_ok(side, size, held, price)?;
                     self.place_guard(network, &wallet, &a, !long, size, price, "tp").await?;
                 }
             }
@@ -859,6 +861,19 @@ fn close_only(m: &Market) -> Refusal {
 /// Targets: each a price and a size (`None`: all that is left).
 type Targets = Vec<(f64, Option<f64>)>;
 
+/// A target for `size` of a `side` position of `held` at `price`: one for
+/// part of it must be worth Hyperliquid's minimum where it may fill, or
+/// Hyperliquid refuses it (all of it is exempt).
+fn partial_target_ok(side: Side, size: f64, held: f64, price: f64) -> Result<(), Refusal> {
+    if size + 1e-12 >= held {
+        return Ok(());
+    }
+    match crate::hyperliquid::perp::partial_target_refusal(side, size, price) {
+        Some(why) => Err(Refusal::bad(why)),
+        None => Ok(()),
+    }
+}
+
 /// The stop and target an entry carries on Hyperliquid: children are as
 /// big as the entry, so at most one stop and one target, for all of it.
 /// More targets, or a sized one, go on once the position is open.
@@ -924,7 +939,7 @@ fn levels_wire(a: &NetAsset, buy: bool, size: f64, stop: Option<f64>, targets: &
 /// A market trigger: once the mark reaches `trigger`, a market order of
 /// `size`. Its limit price is the trigger ± 10 %, the worst it may fill at.
 pub fn trigger_wire(a: &NetAsset, buy: bool, size: f64, trigger: f64, tpsl: &'static str, reduce_only: bool) -> Result<OrderWire, Refusal> {
-    let worst = a.price(if buy { trigger * 1.1 } else { trigger * 0.9 });
+    let worst = a.price(if buy { trigger * (1.0 + TRIGGER_SLIP) } else { trigger * (1.0 - TRIGGER_SLIP) });
     Ok(OrderWire {
         a: a.asset,
         b: buy,

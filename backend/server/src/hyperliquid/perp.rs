@@ -16,8 +16,28 @@ use super::Market;
 
 /// A size this small is nothing (sizes carry at most five decimals).
 const DUST: f64 = 1e-9;
-/// The smallest order Hyperliquid takes, in USD of notional.
+/// The smallest order Hyperliquid takes, in USD of notional. Only a
+/// reduce-only order that closes all of a position may be smaller.
 pub const MIN_NOTIONAL: f64 = 10.0;
+/// A target fires as a market order: a sale may fill as far as 10 % under
+/// its price, a buy 10 % over it (the limit LIVE sends with the trigger).
+pub const TRIGGER_SLIP: f64 = 0.1;
+
+/// Why a target selling part of a `side` position (`size` of it) at
+/// `price` can't be placed: worth under [`MIN_NOTIONAL`] where it may fill —
+/// a long's target as far as [`TRIGGER_SLIP`] under its price — which
+/// Hyperliquid refuses (only an order closing all of it is exempt).
+pub fn partial_target_refusal(side: Side, size: f64, price: f64) -> Option<String> {
+    let worst = match side {
+        Side::Long => price * (1.0 - TRIGGER_SLIP),
+        Side::Short => price,
+    };
+    let worth = size * worst;
+    (worth + 1e-9 < MIN_NOTIONAL).then(|| {
+        let at = if side == Side::Long { " at its worst fill, 10 % under the target" } else { "" };
+        format!("A target selling part of the position must be worth at least ${MIN_NOTIONAL:.0}{at}: {size} is ${worth:.2}. Sell a larger share, or all of it")
+    })
+}
 
 /// Long (bought) or short (sold); for an order, which way it trades: a
 /// buy is `Long`, a sell `Short`.
