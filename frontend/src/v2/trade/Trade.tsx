@@ -427,7 +427,14 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const chosenExpiry = saved.expiry[ladderIndex] ?? null;
   const ladderExpiry = chosenExpiry && (!listedExpiries || listedExpiries.some((e) => e.date === chosenExpiry)) ? chosenExpiry : null;
   const ladderKey = `${ladderIndex}:${ladderExpiry ?? ''}`;
-  const centre = centreAt?.key === ladderKey ? centreAt.strike : null;
+  // Phone: a ladder is on screen only under Scalper or in the Chain sheet.
+  // With neither, nothing rests on the strike one was scrolled to, so the
+  // prices go back to ATM's window — once a buy line being placed is armed or
+  // dropped: the server arms it only while its contract's price is live.
+  const ladderShown = desktop || chainOpen || (saved.phoneScalper && perpSel == null);
+  if (centreAt && !ladderShown && !draft) setCentreAt(null);
+  // The Call / Put sheet lists the strikes around ATM, wherever a ladder rests.
+  const centre = buyPick == null && centreAt?.key === ladderKey ? centreAt.strike : null;
   const { frame, stale, now } = useExecuteStream(serverBase, ladderIndex, ladderExpiry, centre, streamToken());
   // Whose figures the screen shows: the owner's desk for the admin, a user's
   // own paper portfolio otherwise.
@@ -876,6 +883,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       setSlot(0, { sym: ownChartOf(board.index) });
     }
     if (!desktop) showChart(true);
+    // The lines are tapped on the chart: the chain sheet would cover it.
+    setChainOpen(false);
     setPlacingAt(null);
     setDraft({ slot, sym, label, index: board.index, strike, side, expiry: board.expiry, lots, lotSize: board.lot_size, entry: null, stop: null, targets: [], pick: lots, sending: false });
   }
@@ -1101,6 +1110,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     const at = shownSlots.findIndex((s) => underlyingOf(s.sym) === board.index);
     setSlot(at >= 0 ? at : 0, { sym });
     if (!desktop) showChart(true);
+    // Tapped in the chain sheet: the chart it asked for is under the sheet.
+    setChainOpen(false);
   }
 
   /** An underlying's own chart: the index, or the stock's cash price. */
@@ -1501,6 +1512,10 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
             mode={frame?.mode ?? 'PAPER'}
             onBuy={async (sym, label, strike, side) => {
               if (lineMode) {
+                // The sheet priced this contract from ATM's window: the stream
+                // stays on it while the line is placed, not back on a strike
+                // the ladder under a full-screen chart was scrolled to.
+                setCentreAt(null);
                 startDraft(sym, label, strike, side);
                 return true;
               }

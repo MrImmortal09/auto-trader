@@ -2,11 +2,10 @@
 // the words for a level, and VWAP.
 
 import type { ChartLevel, ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
-import { INDEX_ORDER } from '../../lib/execute';
+import { fmtAgeLimit, INDEX_ORDER } from '../../lib/execute';
 import { level, shortDate, signedMoney } from '../lib/format';
 import { isPerpKey } from './perp/catalog';
 import { perpLabel } from './perp/model';
-import { fmtAgeLimit } from '../../lib/execute';
 
 /** A chart's timeframe. `1d`: an Indian day's session, or a perp's UTC day. */
 export type Tf = '1m' | '5m' | '15m' | '1d';
@@ -214,8 +213,6 @@ export function stockBuyBlocked(kind: 'index' | 'stock', paper: boolean, stockPa
   return stockPaper === true ? null : STOCK_PAPER_OFF;
 }
 
-/** The price is the quote hub's (Kotak's REST quote every ~2 s), not the
- * feed's: the strike is past the feed budget. No buy route accepts it. */
 /** Why one side of a row can't be bought now, or null. */
 export function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: number, ladder: 'index' | 'stock'): string | null {
   if (blocked) return blocked;
@@ -229,6 +226,8 @@ export function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, max
   return null;
 }
 
+/** The price is the quote hub's (Kotak's REST quote every ~2 s), not the
+ * feed's: the strike is past the feed budget. No buy route accepts it. */
 export function quotePolled(q: ExecuteQuote & { polled?: boolean }): boolean {
   return q.polled === true;
 }

@@ -15,9 +15,10 @@ const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg'
 export type OptionSide = 'CE' | 'PE';
 
 /**
- * Phone, over the chart's bottom-left: the board's expiry and ATM strike,
- * with Call and Put. Each opens the buy sheet for that side — nothing is sent
- * from here. Bottom-right, clear of the price axis: full screen.
+ * Phone, over the chart's bottom-left: the board's underlying (the chart can
+ * show another), expiry and ATM strike, with Call and Put. Each opens the buy
+ * sheet for that side — nothing is sent from here. Bottom-right, clear of the
+ * price axis: full screen.
  */
 export function ChartQuickBuy({ board, fullscreen, showButtons, onPick, onFullscreen }: {
   board: ExecuteBoard | null;
@@ -34,7 +35,7 @@ export function ChartQuickBuy({ board, fullscreen, showButtons, onPick, onFullsc
       {ready && (
         <div className="pointer-events-none absolute bottom-9 left-2 z-10 flex flex-col items-start gap-1.5">
           <span className="rounded-6 bg-canvas/85 px-1.5 py-0.5 type-caption text-fg-muted tnum">
-            {expiryLabel(board.expiry)} · {level(atm)}
+            {board.index} · {expiryLabel(board.expiry)} · {level(atm)}
           </span>
           <div className="pointer-events-auto flex gap-2">
             <button
