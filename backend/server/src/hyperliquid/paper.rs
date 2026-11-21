@@ -60,7 +60,7 @@ impl Refusal {
     pub fn not_found(message: impl Into<String>) -> Self {
         Refusal { status: StatusCode::NOT_FOUND, message: message.into() }
     }
-    fn server(what: &str, e: impl std::fmt::Display) -> Self {
+    pub(crate) fn server(what: &str, e: impl std::fmt::Display) -> Self {
         tracing::error!("perp desk: {what}: {e}");
         Refusal { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("could not {what}") }
     }

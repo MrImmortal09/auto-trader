@@ -26,6 +26,7 @@ pub mod admin;
 pub use admin::{list_users_handler, create_user_handler, patch_user_handler, delete_user_handler};
 pub mod public_view;
 pub mod admin_data;
+pub mod admin_hl;
 pub mod admin_paper;
 pub mod admin_report;
 pub mod admin_sessions;

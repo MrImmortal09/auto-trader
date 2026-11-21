@@ -386,6 +386,10 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     // Whether the number's closed trades are shown, with no sign-in, on the
     // view-only page (`routes::public_view`). The admin's switch, off by default.
     ensure_column(&pool, "ALTER TABLE users ADD COLUMN public INTEGER NOT NULL DEFAULT 0").await;
+    // Whether the person may trade Hyperliquid LIVE with their own API
+    // wallet (`hyperliquid::live`). The admin's switch, off by default; the
+    // admin's own row is always on.
+    ensure_column(&pool, "ALTER TABLE users ADD COLUMN hl_live INTEGER NOT NULL DEFAULT 0").await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS otp_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -536,6 +540,39 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             target REAL,
             armed_at TEXT NOT NULL,
             PRIMARY KEY (network, oid)
+        )",
+    ).execute(&pool).await.unwrap();
+    // Whose line it is (rows from before every person had their own LIVE
+    // account are the admin's: see below).
+    ensure_column(&pool, "ALTER TABLE hl_line_guards ADD COLUMN user_id INTEGER").await;
+
+    // Hyperliquid LIVE per person (since 2026-11-21): each one's Paper/LIVE
+    // and testnet/mainnet switches and own kill switch, and an API wallet per
+    // network. New tables: `hl_live_settings` and `hl_credentials` (the
+    // owner's, from before) stay, kept in step with the admin's rows here so
+    // an older binary still reads them right, and read back into these at
+    // every start (`hyperliquid::live::LiveDesks::load`).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hl_live_accounts (
+            user_id INTEGER PRIMARY KEY,
+            mode TEXT NOT NULL,
+            network TEXT NOT NULL,
+            kill INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )",
+    ).execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hl_api_wallets (
+            user_id INTEGER NOT NULL,
+            network TEXT NOT NULL,
+            account TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            key_box TEXT NOT NULL,
+            checked_at TEXT,
+            check_ok INTEGER NOT NULL DEFAULT 0,
+            check_note TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, network)
         )",
     ).execute(&pool).await.unwrap();
 
@@ -1541,6 +1578,8 @@ pub struct UserRow {
     pub last_login_at: Option<String>,
     /// Shown on the view-only page (`routes::public_view`).
     pub public: i64,
+    /// May trade Hyperliquid LIVE with their own API wallet.
+    pub hl_live: i64,
 }
 
 impl UserRow {
@@ -1555,7 +1594,7 @@ impl UserRow {
     }
 }
 
-const USER_COLUMNS: &str = "id, phone, name, role, enabled, created_at, last_login_at, public";
+const USER_COLUMNS: &str = "id, phone, name, role, enabled, created_at, last_login_at, public, hl_live";
 
 /// Make the owner's phone (`ADMIN_PHONE`) the one admin — run at every
 /// start. Its row is put back as an enabled admin whatever it says now, and

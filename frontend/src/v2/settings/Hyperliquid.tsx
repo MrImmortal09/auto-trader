@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { checkHlCredentials, getHlLive, putHlCredentials, putHlLiveSettings, removeHlCredentials, type Sent } from '../lib/api';
+import { useIdentity } from '../auth/identity';
+import { checkHlCredentials, engageHlKill, getHlLive, putHlCredentials, putHlLiveSettings, removeHlCredentials, resetHlKill, type Sent } from '../lib/api';
 import type { HlCredentialView } from '../lib/types';
 import { usePoll } from '../lib/usePoll';
 import { useGuard } from '../shell/useGuard';
@@ -104,23 +105,28 @@ function Wallet({ net, cred, canStore, live, busy, onSave, onCheck, onRemove, la
 }
 
 /**
- * Settings → Hyperliquid, the owner's: Paper or LIVE, testnet or mainnet,
- * and an API wallet per network. Either switch changes only while flat;
- * LIVE needs the network's API wallet to have passed its check. LIVE is
- * the owner's own account: the Trade screen shows it, and its orders go to
- * it (`hyperliquid/live/trade.rs`).
+ * Settings → Hyperliquid, each person's own: Paper or LIVE, testnet or
+ * mainnet, and an API wallet per network. Either switch changes only while
+ * flat; LIVE needs the network's API wallet to have passed its check. LIVE
+ * is their own Hyperliquid account: the Trade screen shows it, and its
+ * orders go to it (`hyperliquid/live/trade.rs`). A user may set it up only
+ * once the admin has switched LIVE on for them, and has a kill switch of
+ * their own (the admin's is the app's, in Trading).
  */
 export function Hyperliquid({ serverBase, id, title, large }: { serverBase: string; id?: string; title?: string; large: boolean }) {
   const live = usePoll(() => getHlLive(serverBase), 15_000, serverBase);
+  const { role } = useIdentity();
   const guard = useGuard();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
+  const [confirmKill, setConfirmKill] = useState(false);
   const v = live.data;
 
   async function run(act: () => Promise<Sent>, fail: string, done?: string): Promise<boolean> {
     setBusy(true);
-    const sent = await guard('Changing Hyperliquid needs the admin.', act, fail);
+    // Each person's own desk: the admin's and every user's alike.
+    const sent = await guard('Changing Hyperliquid needs you to sign in.', act, fail, 'signed');
     setBusy(false);
     await live.refresh();
     if (sent?.ok && done) toast({ tone: 'neutral', title: done, body: '' });
@@ -136,8 +142,19 @@ export function Hyperliquid({ serverBase, id, title, large }: { serverBase: stri
   }
   const segSize = large ? 'lg' : 'sm';
   const cred = v.credentials[v.network];
+  const lead = 'Perps on Hyperliquid. Paper trades on the live market with 10,000 USDC; LIVE is your own Hyperliquid account.';
+  // A user the admin hasn't let trade LIVE, and who isn't LIVE: paper only.
+  if (!v.allowed && v.mode !== 'live') {
+    return (
+      <Section id={id} title={title} lead={lead}>
+        <Row title="LIVE" caption="LIVE isn't switched on for you. The admin turns it on; until then you trade perps on paper, which needs nothing set up here." />
+      </Section>
+    );
+  }
+  const ownKill = role !== 'admin';
   return (
-    <Section id={id} title={title} lead="BTC, ETH and gold perps on Hyperliquid. Paper trades on the live market with 10,000 USDC; LIVE is your own Hyperliquid account.">
+    <Section id={id} title={title} lead={lead}>
+      {!v.allowed && <Row title="LIVE switched off" caption="The admin has switched LIVE off for you: your Hyperliquid account takes no new order that opens. Close and cancel what is there, then switch to Paper." />}
       <Row title="Mode" caption={v.mode === 'live' ? `LIVE on ${v.network}: the Trade screen shows your Hyperliquid account, and its orders go to it${v.network === 'mainnet' ? ' — real money, each opening order confirmed first' : ''}. Stops and targets rest on Hyperliquid.` : 'Paper: orders fill on the live market against your paper wallet.'}>
         <Segment
           label="Hyperliquid mode"
@@ -178,12 +195,57 @@ export function Hyperliquid({ serverBase, id, title, large }: { serverBase: stri
           onRemove={() => void run(() => removeHlCredentials(serverBase, net), 'API wallet not removed', `${net} API wallet removed`)}
         />
       ))}
-      <Row title="Gold’s balance" caption="Gold trades on trade.xyz’s dex, which keeps its own USDC balance apart from BTC and ETH. Move USDC to it in Hyperliquid’s app; the API wallet can’t move money." />
+      <Row title="Builder dexes’ balances" caption="Gold and other builder-dex perps (trade.xyz’s and the like) keep their own USDC balance apart from BTC and ETH. Move USDC to them in Hyperliquid’s app; the API wallet can’t move money." />
+      {ownKill && (
+        <Row
+          title="Kill switch"
+          caption={
+            v.kill
+              ? `On: no new LIVE order until you reset it.${v.kill_note ? ` ${v.kill_note}.` : ''}`
+              : 'Cancels every order on your Hyperliquid account and closes every position (while LIVE), and refuses new LIVE orders until you reset it. Your account only.'
+          }
+        >
+          {v.kill ? (
+            <Button size={large ? 'lg' : 'md'} kind="neutral" disabled={busy} onClick={() => void run(() => resetHlKill(serverBase), 'Kill switch not reset', 'Kill switch reset')}>
+              Reset
+            </Button>
+          ) : (
+            <Button size={large ? 'lg' : 'md'} kind="loss" disabled={busy} onClick={() => setConfirmKill(true)}>
+              Kill switch
+            </Button>
+          )}
+        </Row>
+      )}
+      <Modal open={confirmKill} onClose={() => setConfirmKill(false)} label="Hyperliquid kill switch" width="lg:max-w-[440px]" locked={busy}>
+        <div className="flex flex-col gap-3 p-6">
+          <h2 className="type-title text-fg">Close everything on Hyperliquid?</h2>
+          <p className="type-body text-fg-muted">
+            {v.mode === 'live'
+              ? `Every order on your Hyperliquid ${v.network} account is cancelled and every position closed at the market, and no new LIVE order is taken until you reset the switch.`
+              : 'You are on Paper: nothing is closed, but no LIVE order is taken until you reset the switch.'}
+          </p>
+          <div className="mt-2 flex justify-end gap-2">
+            <Button size="md" kind="neutral" onClick={() => setConfirmKill(false)} disabled={busy} data-autofocus>
+              Cancel
+            </Button>
+            <Button
+              size="md"
+              kind="loss"
+              disabled={busy}
+              onClick={async () => {
+                if (await run(() => engageHlKill(serverBase), 'Kill switch not engaged', 'Kill switch on')) setConfirmKill(false);
+              }}
+            >
+              Close everything
+            </Button>
+          </div>
+        </div>
+      </Modal>
       <Modal open={confirmLive} onClose={() => setConfirmLive(false)} label="Go LIVE on Hyperliquid" width="lg:max-w-[440px]" locked={busy}>
         <div className="flex flex-col gap-3 p-6">
           <h2 className="type-title text-fg">Go LIVE on Hyperliquid {v.network}?</h2>
           <p className="type-body text-fg-muted">
-            The Trade screen shows your Hyperliquid account {cred ? `(${cred.account})` : ''} instead of the paper wallet. {v.network === 'mainnet' ? 'This is real money.' : 'Testnet uses free test USDC; the charts stay on mainnet prices.'} Its orders go to Hyperliquid, and the kill switch closes it too. The API wallet is checked again now, and the account must hold and rest nothing on Hyperliquid, so LIVE can be left again.
+            The Trade screen shows your Hyperliquid account {cred ? `(${cred.account})` : ''} instead of the paper wallet. {v.network === 'mainnet' ? 'This is real money.' : 'Testnet uses free test USDC; the charts stay on mainnet prices.'} Its orders go to Hyperliquid, and {ownKill ? 'your kill switch closes it' : 'the kill switch closes it too'}. The API wallet is checked again now, and the account must hold and rest nothing on Hyperliquid, so LIVE can be left again.
           </p>
           <div className="mt-2 flex justify-end gap-2">
             <Button size="md" kind="neutral" onClick={() => setConfirmLive(false)} disabled={busy} data-autofocus>

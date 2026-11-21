@@ -1,9 +1,10 @@
-//! Hyperliquid perps for whoever is signed in — the owner and every user
-//! alike on paper, each on their own USDC wallet (`hyperliquid::paper`), and
-//! the owner's on Hyperliquid itself while their Hyperliquid is LIVE
-//! (`hyperliquid::live`; LIVE ids are Hyperliquid's oids). All behind the
-//! `hyperliquid` switch: while it is off they answer 404. While the kill
-//! switch is on, LIVE orders that would open are refused.
+//! Hyperliquid perps for whoever is signed in — each on paper with their own
+//! USDC wallet (`hyperliquid::paper`), or on their own Hyperliquid account
+//! while their Hyperliquid is LIVE (`hyperliquid::live`; LIVE ids are
+//! Hyperliquid's oids). All behind the `hyperliquid` switch: while it is off
+//! they answer 404. A LIVE order that would open is refused while the
+//! admin's kill switch or the person's own is on, or while the admin has
+//! switched LIVE off for them (close-only until they go back to Paper).
 //!
 //! - `GET    /api/v2/hl/account`
 //! - `GET    /api/v2/hl/today` — today from IST midnight: P&L, fees, funding, closes
@@ -27,8 +28,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use tokio::sync::OwnedRwLockReadGuard;
 
+use std::sync::Arc;
+
 use crate::auth::Identity;
-use crate::hyperliquid::live::{LiveOrder, LiveOrderAnswer};
+use crate::hyperliquid::live::{LiveDesk, LiveOrder, LiveOrderAnswer};
 use crate::hyperliquid::paper::{Kind, LevelsChange, OrderReq, Refusal};
 use crate::hyperliquid::perp::Side;
 use crate::hyperliquid::Market;
@@ -52,44 +55,40 @@ async fn caller(state: &AppState, identity: &Identity) -> Result<i64, Response> 
     identity.user_id().ok_or_else(|| refuse(StatusCode::UNAUTHORIZED, "Sign in to trade perps on paper"))
 }
 
-/// The owner's network while their Hyperliquid is LIVE (users are always on paper).
-async fn live_for(state: &AppState, identity: &Identity) -> Option<hyperliquid_client::Network> {
-    match identity {
-        Identity::Admin { .. } => state.hl_live.live_network().await,
-        _ => None,
-    }
+/// `user_id`'s LIVE desk and network while their Hyperliquid is LIVE.
+async fn live_for(state: &AppState, user_id: i64) -> Result<Option<(Arc<LiveDesk>, hyperliquid_client::Network)>, Response> {
+    let desk = state.hl_live.desk(user_id).await.map_err(IntoResponse::into_response)?;
+    Ok(desk.live_network().await.map(|n| (desk, n)))
 }
 
-/// Where a change goes: the caller's paper account, or (the owner, LIVE)
-/// Hyperliquid on that network.
-#[derive(Debug, Clone, Copy)]
+/// Where a change goes: the caller's paper account, or (LIVE) their
+/// Hyperliquid account on that network.
 enum Desk {
     Paper(i64),
-    Live(hyperliquid_client::Network),
+    Live(Arc<LiveDesk>, hyperliquid_client::Network),
 }
 
-/// The desk a change goes to. The owner's hold the LIVE switch's gate from
-/// this read until answered, so the mode can't change in between
+/// The desk a change goes to, with the caller's LIVE switch's gate held
+/// from this read until answered, so the mode can't change in between
 /// (`LiveDesk::paper_gate`).
-async fn desk_for(state: &AppState, identity: &Identity, user_id: i64) -> (Desk, Option<OwnedRwLockReadGuard<()>>) {
-    let gate = match identity {
-        Identity::Admin { .. } => Some(state.hl_live.paper_gate().await),
-        _ => None,
-    };
-    match live_for(state, identity).await {
-        Some(net) => (Desk::Live(net), gate),
+async fn desk_for(state: &AppState, user_id: i64) -> Result<(Desk, OwnedRwLockReadGuard<()>), Response> {
+    let desk = state.hl_live.desk(user_id).await.map_err(IntoResponse::into_response)?;
+    let gate = desk.paper_gate().await;
+    Ok(match desk.live_network().await {
+        Some(net) => (Desk::Live(desk, net), gate),
         None => (Desk::Paper(user_id), gate),
-    }
+    })
 }
 
-/// A LIVE order that would open is refused while the kill switch is on;
-/// closes and cancels still go through.
-async fn kill_switch_off(state: &AppState) -> Result<(), Response> {
+/// A LIVE order that would open is refused while the admin's kill switch
+/// is on (everyone's: the owner's pick, 2026-11-21), while the person's own
+/// is, or while the admin has switched LIVE off for them; closes and
+/// cancels still go through.
+async fn may_open(state: &AppState, desk: &LiveDesk) -> Result<(), Response> {
     if state.trading_cfg.read().await.kill_switch_active {
-        Err(refuse(StatusCode::CONFLICT, "The kill switch is on: no new LIVE orders until it is reset"))
-    } else {
-        Ok(())
+        return Err(refuse(StatusCode::CONFLICT, "The kill switch is on: no new LIVE orders until it is reset"));
     }
+    desk.may_open().map_err(IntoResponse::into_response)
 }
 
 /// The perp `key` names (any case): one on the app's list, added or
@@ -229,8 +228,21 @@ macro_rules! caller_or_return {
 macro_rules! desk_or_return {
     ($state:expr, $identity:expr) => {{
         let id = caller_or_return!($state, $identity);
-        desk_for(&$state, &$identity, id).await
+        match desk_for(&$state, id).await {
+            Ok(d) => d,
+            Err(e) => return e,
+        }
     }};
+}
+
+/// `user_id`'s LIVE desk and network while LIVE, or the route answers.
+macro_rules! live_or_return {
+    ($state:expr, $id:expr) => {
+        match live_for(&$state, $id).await {
+            Ok(l) => l,
+            Err(e) => return e,
+        }
+    };
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -242,20 +254,20 @@ pub struct AccountQuery {
 
 pub async fn account_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Query(q): Query<AccountQuery>) -> Response {
     let id = caller_or_return!(state, identity);
-    // The owner, LIVE: their account as Hyperliquid holds it.
-    if let Some(net) = live_for(&state, &identity).await {
+    // LIVE: their account as Hyperliquid holds it.
+    if let Some((desk, net)) = live_or_return!(state, id) {
         let m = q.market.as_deref().and_then(|k| Market::of_key(k.trim()));
-        return answer(state.hl_live.account(net, m).await);
+        return answer(desk.account(net, m).await);
     }
     answer(state.perps.view(id).await)
 }
 
-/// `GET /api/v2/hl/today` — the caller's perps today, from IST midnight: the
-/// owner's Hyperliquid account while LIVE, else their paper desk.
+/// `GET /api/v2/hl/today` — the caller's perps today, from IST midnight:
+/// their Hyperliquid account while LIVE, else their paper desk.
 pub async fn today_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
     let id = caller_or_return!(state, identity);
-    if let Some(net) = live_for(&state, &identity).await {
-        return answer(state.hl_live.today(net).await);
+    if let Some((desk, net)) = live_or_return!(state, id) {
+        return answer(desk.today(net).await);
     }
     answer(state.perps.today(id).await)
 }
@@ -275,9 +287,9 @@ pub async fn order_handler(State(state): State<AppState>, Extension(identity): E
     let targets: Vec<(f64, Option<f64>)> = b.targets.iter().map(|t| (t.price, t.size)).collect();
     match desk {
         Desk::Paper(id) => answer(state.perps.order(id, OrderReq { market: m, side, size: b.size, leverage: b.leverage, kind, reduce_only: b.reduce_only, stop: b.stop, targets }).await),
-        Desk::Live(net) => {
+        Desk::Live(desk, net) => {
             if !b.reduce_only {
-                if let Err(e) = kill_switch_off(&state).await {
+                if let Err(e) = may_open(&state, &desk).await {
                     return e;
                 }
             }
@@ -285,7 +297,7 @@ pub async fn order_handler(State(state): State<AppState>, Extension(identity): E
                 Kind::Market => None,
                 Kind::Limit(p) => Some(p),
             };
-            answer(state.hl_live.order(net, &LiveOrder { market: m, side, size: b.size, leverage: b.leverage, limit, reduce_only: b.reduce_only, stop: b.stop, targets }).await)
+            answer(desk.order(net, &LiveOrder { market: m, side, size: b.size, leverage: b.leverage, limit, reduce_only: b.reduce_only, stop: b.stop, targets }).await)
         }
     }
 }
@@ -293,12 +305,12 @@ pub async fn order_handler(State(state): State<AppState>, Extension(identity): E
 pub async fn move_order_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(order_id): Path<String>, Json(b): Json<MoveBody>) -> Response {
     match desk_or_return!(state, identity) {
         (Desk::Paper(id), _gate) => answer(state.perps.move_order(id, &order_id, b.price).await),
-        (Desk::Live(net), _gate) => {
+        (Desk::Live(desk, net), _gate) => {
             // A moved limit can fill, a moved line is armed again: neither while the kill switch is on.
-            if let Err(e) = kill_switch_off(&state).await {
+            if let Err(e) = may_open(&state, &desk).await {
                 return e;
             }
-            answer(state.hl_live.move_to(net, &order_id, b.price).await.map(|()| LiveOrderAnswer::default()))
+            answer(desk.move_to(net, &order_id, b.price).await.map(|()| LiveOrderAnswer::default()))
         }
     }
 }
@@ -306,7 +318,7 @@ pub async fn move_order_handler(State(state): State<AppState>, Extension(identit
 pub async fn cancel_order_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(order_id): Path<String>) -> Response {
     let r = match desk_or_return!(state, identity) {
         (Desk::Paper(id), _gate) => state.perps.cancel_order(id, &order_id).await.map(|()| Vec::new()),
-        (Desk::Live(net), _gate) => state.hl_live.cancel(net, &order_id).await,
+        (Desk::Live(desk, net), _gate) => desk.cancel(net, &order_id).await,
     };
     answer(r.map(|warnings| json!({ "status": "cancelled", "warnings": warnings })))
 }
@@ -320,7 +332,7 @@ pub async fn close_handler(State(state): State<AppState>, Extension(identity): E
     let size = body.and_then(|Json(b)| b.size);
     match desk {
         Desk::Paper(id) => answer(state.perps.close(id, m, size).await.map(|legs| json!({ "filled": legs }))),
-        Desk::Live(net) => answer(state.hl_live.close(net, m, size).await),
+        Desk::Live(desk, net) => answer(desk.close(net, m, size).await),
     }
 }
 
@@ -335,7 +347,7 @@ pub async fn levels_handler(State(state): State<AppState>, Extension(identity): 
     }
     match desk {
         Desk::Paper(id) => answer(state.perps.set_levels(id, m, b.change()).await),
-        Desk::Live(net) => answer(state.hl_live.set_levels(net, m, &b.change()).await.map(|warnings| json!({ "status": "set", "warnings": warnings }))),
+        Desk::Live(desk, net) => answer(desk.set_levels(net, m, &b.change()).await.map(|warnings| json!({ "status": "set", "warnings": warnings }))),
     }
 }
 
@@ -348,15 +360,15 @@ pub async fn line_handler(State(state): State<AppState>, Extension(identity): Ex
     let targets: Vec<(f64, Option<f64>)> = b.targets.iter().map(|t| (t.price, t.size)).collect();
     match desk {
         Desk::Paper(id) => answer(state.perps.arm_line(id, m, side, b.size, b.leverage, b.price, b.valid_minutes, b.stop, targets).await),
-        Desk::Live(net) => {
-            if let Err(e) = kill_switch_off(&state).await {
+        Desk::Live(desk, net) => {
+            if let Err(e) = may_open(&state, &desk).await {
                 return e;
             }
             // A LIVE line order rests on Hyperliquid until cancelled (the owner's pick).
             if b.valid_minutes.is_some() {
                 return refuse(StatusCode::BAD_REQUEST, "A LIVE line order lasts until cancelled: leave valid_minutes out");
             }
-            answer(state.hl_live.arm_line(net, &LiveOrder { market: m, side, size: b.size, leverage: b.leverage, limit: Some(b.price), reduce_only: false, stop: b.stop, targets }).await)
+            answer(desk.arm_line(net, &LiveOrder { market: m, side, size: b.size, leverage: b.leverage, limit: Some(b.price), reduce_only: false, stop: b.stop, targets }).await)
         }
     }
 }
@@ -364,12 +376,12 @@ pub async fn line_handler(State(state): State<AppState>, Extension(identity): Ex
 pub async fn update_line_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(line_id): Path<String>, Json(b): Json<LevelsBody>) -> Response {
     match desk_or_return!(state, identity) {
         (Desk::Paper(id), _gate) => answer(state.perps.update_line(id, &line_id, b.price, b.change()).await),
-        (Desk::Live(net), _gate) => {
+        (Desk::Live(desk, net), _gate) => {
             // A changed line order is armed again: not while the kill switch is on.
-            if let Err(e) = kill_switch_off(&state).await {
+            if let Err(e) = may_open(&state, &desk).await {
                 return e;
             }
-            answer(state.hl_live.update_line(net, &line_id, b.price, &b.change()).await.map(|()| json!({ "status": "changed" })))
+            answer(desk.update_line(net, &line_id, b.price, &b.change()).await.map(|()| json!({ "status": "changed" })))
         }
     }
 }
@@ -377,7 +389,7 @@ pub async fn update_line_handler(State(state): State<AppState>, Extension(identi
 pub async fn cancel_line_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(line_id): Path<String>) -> Response {
     let r = match desk_or_return!(state, identity) {
         (Desk::Paper(id), _gate) => state.perps.cancel_line(id, &line_id).await.map(|()| Vec::new()),
-        (Desk::Live(net), _gate) => state.hl_live.cancel(net, &line_id).await,
+        (Desk::Live(desk, net), _gate) => desk.cancel(net, &line_id).await,
     };
     answer(r.map(|warnings| json!({ "status": "cancelled", "warnings": warnings })))
 }
@@ -385,7 +397,7 @@ pub async fn cancel_line_handler(State(state): State<AppState>, Extension(identi
 pub async fn reset_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
     match desk_or_return!(state, identity) {
         (Desk::Paper(id), _gate) => answer(state.perps.reset(id).await.map(|()| json!({ "status": "reset" }))),
-        (Desk::Live(_), _gate) => refuse(StatusCode::CONFLICT, "A LIVE account isn't reset: Hyperliquid holds it"),
+        (Desk::Live(..), _gate) => refuse(StatusCode::CONFLICT, "A LIVE account isn't reset: Hyperliquid holds it"),
     }
 }
 

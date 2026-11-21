@@ -26,6 +26,8 @@ use hyperliquid_client::{asset_id, HlError, Network};
 use serde::Serialize;
 
 use super::{net_str, timed, LineGuard, LineWatch, LiveDesk};
+#[cfg(doc)]
+use super::LiveDesks;
 use crate::hyperliquid::paper::{LevelsChange, Refusal};
 use crate::hyperliquid::perp::{Side, TRIGGER_SLIP};
 use crate::hyperliquid::{round_price, round_size, Market};
@@ -571,7 +573,7 @@ impl LiveDesk {
     /// it is now. It rests until cancelled. Its stop and target can't ride
     /// with it — Hyperliquid refuses children on a trigger order ("Main order
     /// cannot be trigger order") — so they are kept here and placed on
-    /// Hyperliquid, sized to the fill, once it fills ([`LiveDesk::watch_lines`]).
+    /// Hyperliquid, sized to the fill, once it fills ([`LiveDesks::watch_lines`]).
     pub async fn arm_line(&self, network: Network, o: &LiveOrder) -> Result<LiveOrderAnswer, Refusal> {
         let m = o.market;
         if !m.tradable() {
@@ -722,28 +724,12 @@ impl LiveDesk {
         }
     }
 
-    /// Each armed LIVE line order whose stop or target is kept here, one a
-    /// second in turn (Hyperliquid's request limit is per IP, so the watch
-    /// costs the same however many are armed): still armed, it waits;
-    /// filled, its stop and target go on Hyperliquid sized to the fill
-    /// ([`LiveDesk::place_line_guards`], tried again every few seconds
-    /// until they are on); gone without a fill (cancelled, refused), they
-    /// are dropped. Runs for the server's life.
-    pub async fn watch_lines(self: std::sync::Arc<Self>) {
-        let mut every = tokio::time::interval(LINE_WATCH_EVERY);
-        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut turn = 0;
-        loop {
-            every.tick().await;
-            let Some(g) = self.next_line_guard(&mut turn).await else { continue };
-            if let Err(r) = self.check_line(&g).await {
-                tracing::warn!(network = net_str(g.network), oid = g.oid, coin = g.coin, "Hyperliquid LIVE line order not checked, trying again: {}", r.message);
-            }
-        }
-    }
-
-    /// [`LiveDesk::watch_lines`] for one line order.
-    async fn check_line(&self, g: &LineGuard) -> Result<(), Refusal> {
+    /// [`LiveDesks::watch_lines`] for one of this desk's line orders: still
+    /// armed, it waits; filled, its stop and target go on Hyperliquid sized
+    /// to the fill ([`LiveDesk::place_line_guards`], tried again every few
+    /// seconds until they are on); gone without a fill (cancelled,
+    /// refused), they are dropped.
+    pub(super) async fn check_line(&self, g: &LineGuard) -> Result<(), Refusal> {
         // No API wallet on its network (removed): nothing can be placed.
         let Ok((account, wallet)) = self.signer(g.network).await else { return Ok(()) };
         if g.watch.filled.is_none() && !self.line_filled(g, &account).await? {
@@ -1161,6 +1147,23 @@ impl LiveDesk {
         problems
     }
 
+    /// The admin switched LIVE off for this person: every order of theirs
+    /// that could open a position (limits and line orders) is cancelled,
+    /// once the orders already under way have landed; stops and targets
+    /// stay. What couldn't be cancelled, in words.
+    pub async fn cancel_every_opening(&self, network: Network) -> Vec<String> {
+        drop(self.gate.write().await);
+        let (account, wallet) = match self.signer(network).await {
+            Ok(s) => s,
+            Err(r) => return vec![r.message],
+        };
+        let dexes = match self.dexes_on(network).await {
+            Ok(d) => d,
+            Err(e) => return vec![e],
+        };
+        self.cancel_where(network, &account, &wallet, &dexes, |o| !o.reduce_only).await
+    }
+
     /// A perp just removed from the list (close-only): the owner's LIVE
     /// orders on it that can open — limits and line orders — are cancelled,
     /// as paper's are. Its stops and targets stay with the position.
@@ -1223,7 +1226,7 @@ fn partial_target_ok(side: Side, size: f64, held: f64, price: f64) -> Result<(),
 
 /// How often the watch looks at one armed line order with a stop or target
 /// (they take turns).
-const LINE_WATCH_EVERY: Duration = Duration::from_secs(1);
+pub(super) const LINE_WATCH_EVERY: Duration = Duration::from_secs(1);
 /// How long a fired line order's fill may take to be listed under its id
 /// before its stop and target go on by its size (capped by the position);
 /// and how long an answer that a line is done with must hold before its

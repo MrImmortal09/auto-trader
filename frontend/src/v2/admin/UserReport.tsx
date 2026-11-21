@@ -15,6 +15,7 @@ import { Chip, ToneChip } from '../ui/Chip';
 import { Segment } from '../ui/Segment';
 import { Stat } from '../ui/Stat';
 import { PaperLine } from './PaperActivity';
+import { UserHlLive } from './UserHlLive';
 
 const TONE_TEXT = { profit: 'text-profit', loss: 'text-loss', neutral: 'text-fg' } as const;
 // A white well; its border is `border-line` (accent on focus), or `border-loss` while the dates are the
@@ -688,7 +689,10 @@ export function UserReport({ serverBase, userId, desktop, onBack }: { serverBase
   );
   const r = report.data;
   const top = useRef<HTMLDivElement>(null);
-  useEffect(() => top.current?.scrollIntoView({ block: 'start' }), [userId]);
+  // A block body: newer Chrome's scrollIntoView returns a promise, which React would take for the effect's clean-up.
+  useEffect(() => {
+    top.current?.scrollIntoView({ block: 'start' });
+  }, [userId]);
 
   function pickDate(which: 'from' | 'to', value: string) {
     setCustom({ ...span, [which]: value || (which === 'to' ? today : null) });
@@ -717,6 +721,7 @@ export function UserReport({ serverBase, userId, desktop, onBack }: { serverBase
           <PaperLine p={user.paper} />
         </div>
       )}
+      <UserHlLive serverBase={serverBase} userId={userId} />
     </div>
   );
 

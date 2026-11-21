@@ -1,6 +1,6 @@
-//! Hyperliquid LIVE's settings, the owner's alone (`hyperliquid::live`).
-//! Behind the `hyperliquid` switch; none of these is named in the auth
-//! policy, so all are the admin's.
+//! Hyperliquid LIVE's settings, each signed-in person's own
+//! (`hyperliquid::live`): a user may save an API wallet and go LIVE once the
+//! admin has switched LIVE on for them. Behind the `hyperliquid` switch.
 //!
 //! - `GET    /api/v2/hl/live` — the switches and the API wallets (never a key)
 //! - `PUT    /api/v2/hl/live/settings` `{mode?, network?}`
@@ -8,6 +8,9 @@
 //!   `account` may be empty: Hyperliquid says whose API wallet the key is
 //! - `POST   /api/v2/hl/live/check` `{network}`
 //! - `DELETE /api/v2/hl/live/credentials/:network`
+//! - `POST   /api/v2/hl/live/kill` — their own kill switch: every Hyperliquid
+//!   order cancelled and position closed (while LIVE), new LIVE orders refused
+//! - `DELETE /api/v2/hl/live/kill` — reset it
 
 use axum::{
     extract::{Path, State},
@@ -19,8 +22,10 @@ use hyperliquid_client::Network;
 use serde::Deserialize;
 use serde_json::json;
 
+use std::sync::Arc;
+
 use crate::auth::Identity;
-use crate::hyperliquid::live::HlMode;
+use crate::hyperliquid::live::{HlMode, LiveDesk};
 use crate::routes::auth_kotak::send_log;
 use crate::AppState;
 
@@ -40,11 +45,25 @@ fn network(raw: &str) -> Result<Network, Response> {
     Network::parse(raw).ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "network must be testnet or mainnet"))
 }
 
-pub async fn view_handler(State(state): State<AppState>) -> Response {
-    if let Err(e) = switched_on(&state).await {
-        return e;
-    }
-    Json(state.hl_live.view().await).into_response()
+/// The caller's own LIVE desk, with the switch on.
+async fn mine(state: &AppState, identity: &Identity) -> Result<Arc<LiveDesk>, Response> {
+    switched_on(state).await?;
+    let id = identity.user_id().ok_or_else(|| refuse(StatusCode::UNAUTHORIZED, "sign in"))?;
+    state.hl_live.desk(id).await.map_err(|r| refuse(r.status, r.message))
+}
+
+macro_rules! mine_or_return {
+    ($state:expr, $identity:expr) => {
+        match mine(&$state, &$identity).await {
+            Ok(d) => d,
+            Err(e) => return e,
+        }
+    };
+}
+
+pub async fn view_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
+    let desk = mine_or_return!(state, identity);
+    Json(desk.view().await).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,9 +76,7 @@ pub struct SettingsBody {
 }
 
 pub async fn settings_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Json(b): Json<SettingsBody>) -> Response {
-    if let Err(e) = switched_on(&state).await {
-        return e;
-    }
+    let desk = mine_or_return!(state, identity);
     let mode = match b.mode.as_deref() {
         None => None,
         Some("paper") => Some(HlMode::Paper),
@@ -71,16 +88,16 @@ pub async fn settings_handler(State(state): State<AppState>, Extension(identity)
         Some(Ok(n)) => Some(n),
         Some(Err(e)) => return e,
     };
-    let Some(owner) = identity.user_id() else {
-        return refuse(StatusCode::UNAUTHORIZED, "sign in");
-    };
     // Read once the switch is held: no paper order lands in between.
-    match state.hl_live.set(mode, net, state.perps.flat(owner)).await {
+    match desk.set(mode, net, state.perps.flat(desk.user_id)).await {
         Ok(view) => {
+            // The engine log is the admin's: a user's switch is told there
+            // too, by id, as the admin's own is.
+            let who = if desk.admin { String::new() } else { format!(" for user {}", desk.user_id) };
             send_log(&state.db_tx, &state.log_tx, "WARN", json!({
                 "event": "HL_MODE",
                 "level": "WARN",
-                "message": format!("Hyperliquid: {} on {}", if view.mode == HlMode::Live { "LIVE" } else { "Paper" }, view.network),
+                "message": format!("Hyperliquid: {} on {}{who}", if view.mode == HlMode::Live { "LIVE" } else { "Paper" }, view.network),
             }))
             .await;
             Json(view).into_response()
@@ -104,15 +121,13 @@ impl std::fmt::Debug for CredentialBody {
     }
 }
 
-pub async fn credentials_handler(State(state): State<AppState>, Json(b): Json<CredentialBody>) -> Response {
-    if let Err(e) = switched_on(&state).await {
-        return e;
-    }
+pub async fn credentials_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Json(b): Json<CredentialBody>) -> Response {
+    let desk = mine_or_return!(state, identity);
     let net = match network(&b.network) {
         Ok(n) => n,
         Err(e) => return e,
     };
-    match state.hl_live.save_credential(net, &b.account, &b.key).await {
+    match desk.save_credential(net, &b.account, &b.key).await {
         Ok(view) => Json(view).into_response(),
         Err(r) => refuse(r.status, r.message),
     }
@@ -124,30 +139,50 @@ pub struct CheckBody {
     network: String,
 }
 
-pub async fn check_handler(State(state): State<AppState>, Json(b): Json<CheckBody>) -> Response {
-    if let Err(e) = switched_on(&state).await {
-        return e;
-    }
+pub async fn check_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Json(b): Json<CheckBody>) -> Response {
+    let desk = mine_or_return!(state, identity);
     let net = match network(&b.network) {
         Ok(n) => n,
         Err(e) => return e,
     };
-    match state.hl_live.check(net).await {
+    match desk.check(net).await {
         Ok(view) => Json(view).into_response(),
         Err(r) => refuse(r.status, r.message),
     }
 }
 
-pub async fn remove_handler(State(state): State<AppState>, Path(raw): Path<String>) -> Response {
-    if let Err(e) = switched_on(&state).await {
-        return e;
-    }
+pub async fn remove_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>, Path(raw): Path<String>) -> Response {
+    let desk = mine_or_return!(state, identity);
     let net = match network(&raw) {
         Ok(n) => n,
         Err(e) => return e,
     };
-    match state.hl_live.remove_credential(net).await {
+    match desk.remove_credential(net).await {
         Ok(view) => Json(view).into_response(),
+        Err(r) => refuse(r.status, r.message),
+    }
+}
+
+/// `POST /api/v2/hl/live/kill` — the caller's own Hyperliquid kill switch.
+pub async fn kill_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
+    let desk = mine_or_return!(state, identity);
+    if let Err(r) = desk.engage_kill().await {
+        return refuse(r.status, r.message);
+    }
+    send_log(&state.db_tx, &state.log_tx, "WARN", json!({
+        "event": "HL_KILL_SWITCH",
+        "level": "WARN",
+        "message": format!("Hyperliquid kill switch on{}", if desk.admin { String::new() } else { format!(" for user {}", desk.user_id) }),
+    }))
+    .await;
+    Json(desk.view().await).into_response()
+}
+
+/// `DELETE /api/v2/hl/live/kill` — reset it.
+pub async fn reset_kill_handler(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
+    let desk = mine_or_return!(state, identity);
+    match desk.reset_kill().await {
+        Ok(()) => Json(desk.view().await).into_response(),
         Err(r) => refuse(r.status, r.message),
     }
 }

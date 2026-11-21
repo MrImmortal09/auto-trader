@@ -11,6 +11,7 @@ import { Chip } from '../ui/Chip';
 import { Modal } from '../ui/Modal';
 import { useToast } from '../ui/toast';
 import { ServerDialog } from './dialogs';
+import { Hyperliquid } from './Hyperliquid';
 import { TradeNotes } from './OtherSections';
 import { Row, Section, StateDot } from './parts';
 
@@ -32,7 +33,7 @@ export function UserSettings({ serverBase, desktop }: { serverBase: string; desk
         <span className="flex items-center gap-2">
           {displayName(user)}
           {/* Admin is blue: marigold would say "real money" about a role. */}
-          <Chip kind={user.role === 'admin' ? 'accent' : 'neutral'}>{user.role === 'admin' ? 'Admin' : 'Paper trader'}</Chip>
+          <Chip kind={user.role === 'admin' ? 'accent' : 'neutral'}>{user.role === 'admin' ? 'Admin' : 'Trader'}</Chip>
         </span>
       }
       caption={`+91 ${formatPhone(user.phone)} · signed in with a WhatsApp code`}
@@ -64,6 +65,8 @@ export function UserSettings({ serverBase, desktop }: { serverBase: string; desk
             </Button>
           </Row>
         </Section>
+        {/* Their own Hyperliquid desk: Paper or LIVE with their own API wallet, once the admin lets them. */}
+        {role === 'user' && flags.data?.hyperliquid === true && <Hyperliquid serverBase={serverBase} title="Hyperliquid" large={large} />}
         <TradeNotes title="Trade" flags={flags.data} />
       </div>
       {serverOpen && <ServerDialog current={serverBase} onClose={() => setServerOpen(false)} />}
