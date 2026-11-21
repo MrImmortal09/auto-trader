@@ -198,8 +198,22 @@ pub async fn patch_user_handler(
         tracing::info!(user_id = id, public, "User's view-only page switched");
     }
     if let Some(on) = patch.hl_live {
-        state.hl_live.set_allowed(id, on).await;
         tracing::warn!(user_id = id, on, "User's Hyperliquid LIVE switched");
+        // Close-only from now; off while they are LIVE, their opening
+        // orders are cancelled on Hyperliquid in the background, and what
+        // is left is said loudly.
+        if let Some((desk, network)) = state.hl_live.set_allowed(id, on).await {
+            let st = state.clone();
+            tokio::spawn(async move {
+                let problems = desk.cancel_every_opening(network).await;
+                if problems.is_empty() {
+                    return;
+                }
+                let message = format!("Hyperliquid LIVE switched off for user {id}, but not all their opening orders were cancelled — {} — cancel them on Hyperliquid", problems.join("; "));
+                tracing::error!("{message}");
+                crate::routes::auth_kotak::send_log(&st.db_tx, &st.log_tx, "ERROR", json!({ "event": "HL_LIVE_USER", "level": "ERROR", "message": message })).await;
+            });
+        }
     }
     match db::load_user(&state.db_pool, id).await {
         Ok(Some(row)) => Json(UserOut::from(row)).into_response(),

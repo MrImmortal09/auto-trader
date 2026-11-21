@@ -549,11 +549,9 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
     // Hyperliquid LIVE per person (since 2026-11-21): each one's Paper/LIVE
     // and testnet/mainnet switches and own kill switch, and an API wallet per
     // network. New tables: `hl_live_settings` and `hl_credentials` (the
-    // owner's, from before) are left as they were, so an older binary still
-    // reads them, and the owner's rows are copied over once, when these are
-    // made.
-    let fresh = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'hl_live_accounts'")
-        .fetch_one(&pool).await.unwrap() == 0;
+    // owner's, from before) stay, kept in step with the admin's rows here so
+    // an older binary still reads them right, and read back into these at
+    // every start (`hyperliquid::live::LiveDesks::load`).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS hl_live_accounts (
             user_id INTEGER PRIMARY KEY,
@@ -577,19 +575,6 @@ pub async fn init_db(db_url: &str) -> SqlitePool {
             PRIMARY KEY (user_id, network)
         )",
     ).execute(&pool).await.unwrap();
-    let admin: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").fetch_optional(&pool).await.unwrap();
-    if let Some(admin) = admin {
-        if fresh {
-            sqlx::query("INSERT OR IGNORE INTO hl_live_accounts (user_id, mode, network, kill, updated_at) SELECT ?, mode, network, 0, updated_at FROM hl_live_settings WHERE id = 1")
-                .bind(admin).execute(&pool).await.unwrap();
-            sqlx::query(
-                "INSERT OR IGNORE INTO hl_api_wallets (user_id, network, account, agent, key_box, checked_at, check_ok, check_note, updated_at)
-                 SELECT ?, network, account, agent, key_box, checked_at, check_ok, check_note, updated_at FROM hl_credentials",
-            )
-            .bind(admin).execute(&pool).await.unwrap();
-        }
-        sqlx::query("UPDATE hl_line_guards SET user_id = ? WHERE user_id IS NULL").bind(admin).execute(&pool).await.unwrap();
-    }
 
     // The Hyperliquid perps the app charts and trades (`hyperliquid::markets`):
     // every perp the admin has added, with Hyperliquid's rules for it as last

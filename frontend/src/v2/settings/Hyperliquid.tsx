@@ -125,7 +125,8 @@ export function Hyperliquid({ serverBase, id, title, large }: { serverBase: stri
 
   async function run(act: () => Promise<Sent>, fail: string, done?: string): Promise<boolean> {
     setBusy(true);
-    const sent = await guard('Changing Hyperliquid needs you to sign in.', act, fail);
+    // Each person's own desk: the admin's and every user's alike.
+    const sent = await guard('Changing Hyperliquid needs you to sign in.', act, fail, 'signed');
     setBusy(false);
     await live.refresh();
     if (sent?.ok && done) toast({ tone: 'neutral', title: done, body: '' });

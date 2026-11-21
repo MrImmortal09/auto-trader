@@ -1147,6 +1147,23 @@ impl LiveDesk {
         problems
     }
 
+    /// The admin switched LIVE off for this person: every order of theirs
+    /// that could open a position (limits and line orders) is cancelled,
+    /// once the orders already under way have landed; stops and targets
+    /// stay. What couldn't be cancelled, in words.
+    pub async fn cancel_every_opening(&self, network: Network) -> Vec<String> {
+        drop(self.gate.write().await);
+        let (account, wallet) = match self.signer(network).await {
+            Ok(s) => s,
+            Err(r) => return vec![r.message],
+        };
+        let dexes = match self.dexes_on(network).await {
+            Ok(d) => d,
+            Err(e) => return vec![e],
+        };
+        self.cancel_where(network, &account, &wallet, &dexes, |o| !o.reduce_only).await
+    }
+
     /// A perp just removed from the list (close-only): the owner's LIVE
     /// orders on it that can open — limits and line orders — are cancelled,
     /// as paper's are. Its stops and targets stay with the position.

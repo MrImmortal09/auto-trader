@@ -61,11 +61,13 @@ pub use trade::{LiveOrder, LiveOrderAnswer};
 /// How long each part of the LIVE account is reused before it is read again.
 /// An open Trade screen costs about 60 a minute per dex the account has
 /// something on (its state every 2 s), 120 more for its open orders (every
-/// 10 s), 4 per dex it has nothing on (every 30 s) and 20 to 40 for fills,
-/// of the 1,200 request weight Hyperliquid allows an IP a minute: about 400
-/// with money on the core perps and one builder dex. The server's one IP
-/// serves every person's account, so with several read in the last minute
-/// each part is reused that many times as long ([`LiveDesks`]): about 400 a
+/// 10 s), 4 per dex it has nothing on (every 30 s), 20 to 40 for fills, 24
+/// for the spot balances (every 5 s) and 400 for what a new position in the
+/// ticket's perp can use (`activeAssetData`, weight 20, every 3 s), of the
+/// 1,200 request weight Hyperliquid allows an IP a minute: about 800 with
+/// money on the core perps and one builder dex. The server's one IP serves
+/// every person's account, so with several read in the last minute every
+/// part is reused that many times as long ([`LiveDesks`]): about 800 a
 /// minute in all, however many are open. The line watch
 /// (`trade.rs`) adds about 120 whatever the screen does: one order's state a
 /// second, the armed lines taking turns, however many there are; and, for a
@@ -392,6 +394,8 @@ pub(super) struct LineWatch {
     pub next_at: Option<Instant>,
     /// A try at its stop and target is under way.
     pub busy: bool,
+    /// The watch is checking it now (in a task of its own).
+    pub watched: bool,
 }
 
 /// What every person's desk shares: the Hyperliquid clients, the nonce
@@ -432,6 +436,10 @@ impl LiveDesks {
             assets: Arc::new(Mutex::new(HashMap::new())),
             readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
+        let admin: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").fetch_optional(&pool).await?;
+        if let Some(admin) = admin {
+            from_legacy(&pool, admin).await?;
+        }
         let people: Vec<i64> = sqlx::query_scalar(
             "SELECT user_id FROM hl_live_accounts UNION SELECT user_id FROM hl_api_wallets UNION SELECT user_id FROM hl_line_guards WHERE user_id IS NOT NULL",
         )
@@ -465,22 +473,27 @@ impl LiveDesks {
         all
     }
 
-    /// The admin's desk, if there is an admin.
+    /// The admin's desk, from memory (the kill switch reads it, so no
+    /// database read can make it skip Hyperliquid): an admin who is LIVE
+    /// always has one, made at start from their stored row.
     pub async fn admin_desk(&self) -> Option<Arc<LiveDesk>> {
-        let id: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").fetch_optional(&self.shared.pool).await.ok().flatten();
-        match id {
-            Some(id) => self.desk(id).await.ok(),
-            None => None,
-        }
+        self.desks.read().await.values().find(|d| d.admin).cloned()
     }
 
-    /// The admin switched LIVE on or off for `user_id` (already saved).
-    pub async fn set_allowed(&self, user_id: i64, allowed: bool) {
-        if let Ok(d) = self.desk(user_id).await {
-            if !d.admin {
-                d.allowed.store(allowed, Ordering::SeqCst);
-            }
+    /// The admin switched LIVE on or off for `user_id` (already saved): the
+    /// desk takes it at once. Off while they are LIVE, their desk is
+    /// close-only, and what comes back is it with its network: their orders
+    /// that could still open a position there — resting limits and armed
+    /// line orders — are to be cancelled ([`LiveDesk::cancel_every_opening`]),
+    /// as a removed perp's are; their stops and targets stay.
+    pub async fn set_allowed(&self, user_id: i64, allowed: bool) -> Option<(Arc<LiveDesk>, Network)> {
+        let d = self.desk(user_id).await.ok()?;
+        if d.admin {
+            return None;
         }
+        d.allowed.store(allowed, Ordering::SeqCst);
+        let network = d.live_network().await.filter(|_| !allowed)?;
+        Some((d, network))
     }
 
     /// Whether `user_id` is LIVE now (removing them is refused then).
@@ -519,13 +532,38 @@ impl LiveDesks {
                 all.extend(guards.into_iter().map(|g| (Arc::clone(&d), g)));
             }
             let now = Instant::now();
-            let due: Vec<bool> = all.iter().map(|(_, g)| !g.watch.busy && g.watch.next_at.is_none_or(|at| at <= now)).collect();
+            let due: Vec<bool> = all.iter().map(|(_, g)| !g.watch.busy && !g.watch.watched && g.watch.next_at.is_none_or(|at| at <= now)).collect();
             let Some(i) = next_turn(&due, &mut turn) else { continue };
-            let (desk, g) = &all[i];
-            if let Err(r) = desk.check_line(g).await {
-                tracing::warn!(user_id = desk.user_id, network = net_str(g.network), oid = g.oid, coin = g.coin, "Hyperliquid LIVE line order not checked, trying again: {}", r.message);
+            let (desk, g) = all.swap_remove(i);
+            // Each check in a task of its own: one person's slow close
+            // (its retries can take most of a minute) holds up nobody
+            // else's stop. Still one started a second.
+            if desk.touch_line_guard(g.network, g.oid, |x| x.watch.watched = true).await.is_none() {
+                continue;
             }
+            tokio::spawn(async move {
+                let _done = Watched { desk: Arc::clone(&desk), network: g.network, oid: g.oid };
+                if let Err(r) = desk.check_line(&g).await {
+                    tracing::warn!(user_id = desk.user_id, network = net_str(g.network), oid = g.oid, coin = g.coin, "Hyperliquid LIVE line order not checked, trying again: {}", r.message);
+                }
+            });
         }
+    }
+}
+
+/// Clears a guard's `watched` once its check is over, however it ended.
+struct Watched {
+    desk: Arc<LiveDesk>,
+    network: Network,
+    oid: u64,
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        let (desk, network, oid) = (Arc::clone(&self.desk), self.network, self.oid);
+        tokio::spawn(async move {
+            desk.touch_line_guard(network, oid, |x| x.watch.watched = false).await;
+        });
     }
 }
 
@@ -536,6 +574,37 @@ fn next_turn(due: &[bool], turn: &mut usize) -> Option<usize> {
     let i = (0..n).map(|k| (*turn + k) % n).find(|&i| due[i])?;
     *turn = i + 1;
     Some(i)
+}
+
+/// The admin's LIVE rows, from the owner's tables of before
+/// (`hl_live_settings`, `hl_credentials`): every change the admin makes is
+/// written to both at once ([`LiveDesk::save_settings`] and the API wallet
+/// changes), so a difference at start is one made by an older binary run
+/// in between (a rollback) — the owner going LIVE or changing a wallet
+/// there — and it is taken. The first start after the upgrade copies the
+/// owner's rows the same way. Line guards from before are the admin's too.
+async fn from_legacy(pool: &SqlitePool, admin: i64) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO hl_live_accounts (user_id, mode, network, kill, updated_at)
+         SELECT ?, mode, network, 0, updated_at FROM hl_live_settings WHERE id = 1
+         ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode, network = excluded.network, updated_at = excluded.updated_at",
+    )
+    .bind(admin)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM hl_api_wallets WHERE user_id = ? AND network NOT IN (SELECT network FROM hl_credentials)").bind(admin).execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO hl_api_wallets (user_id, network, account, agent, key_box, checked_at, check_ok, check_note, updated_at)
+         SELECT ?, network, account, agent, key_box, checked_at, check_ok, check_note, updated_at FROM hl_credentials WHERE true
+         ON CONFLICT(user_id, network) DO UPDATE SET account = excluded.account, agent = excluded.agent, key_box = excluded.key_box,
+           checked_at = excluded.checked_at, check_ok = excluded.check_ok, check_note = excluded.check_note, updated_at = excluded.updated_at",
+    )
+    .bind(admin)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE hl_line_guards SET user_id = ? WHERE user_id IS NULL").bind(admin).execute(&mut *tx).await?;
+    tx.commit().await
 }
 
 /// How many accounts on `network` were read in the last minute (at least
@@ -784,34 +853,36 @@ impl LiveDesk {
 
     async fn save_settings(&self, s: LiveSettings) -> Result<(), Refusal> {
         let now = shared_domain::current_ist_timestamp_string();
-        sqlx::query(
-            "INSERT INTO hl_live_accounts (user_id, mode, network, kill, updated_at) VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode, network = excluded.network, updated_at = excluded.updated_at",
-        )
-        .bind(self.user_id)
-        .bind(s.mode.as_str())
-        .bind(net_str(s.network))
-        .bind(self.kill.load(Ordering::SeqCst))
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Refusal::conflict(format!("could not save the Hyperliquid settings: {e}")))?;
-        if self.admin {
-            // The admin's, in the table an older binary reads too: rolled
-            // back, it must never see LIVE where the owner has left it.
-            let legacy = sqlx::query(
-                "INSERT INTO hl_live_settings (id, mode, network, updated_at) VALUES (1, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET mode = excluded.mode, network = excluded.network, updated_at = excluded.updated_at",
+        let saved = async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                "INSERT INTO hl_live_accounts (user_id, mode, network, kill, updated_at) VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode, network = excluded.network, updated_at = excluded.updated_at",
             )
+            .bind(self.user_id)
             .bind(s.mode.as_str())
             .bind(net_str(s.network))
+            .bind(self.kill.load(Ordering::SeqCst))
             .bind(&now)
-            .execute(&self.pool)
-            .await;
-            if let Err(e) = legacy {
-                tracing::error!("Hyperliquid: the admin's mode wasn't copied to hl_live_settings: {e}");
+            .execute(&mut *tx)
+            .await?;
+            if self.admin {
+                // The admin's, in the table an older binary reads too
+                // (see [`from_legacy`]): rolled back, it must never see
+                // LIVE where the owner has left it.
+                sqlx::query(
+                    "INSERT INTO hl_live_settings (id, mode, network, updated_at) VALUES (1, ?, ?, ?)
+                     ON CONFLICT(id) DO UPDATE SET mode = excluded.mode, network = excluded.network, updated_at = excluded.updated_at",
+                )
+                .bind(s.mode.as_str())
+                .bind(net_str(s.network))
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
             }
-        }
+            tx.commit().await
+        };
+        saved.await.map_err(|e| Refusal::conflict(format!("could not save the Hyperliquid settings: {e}")))?;
         *self.settings.write().await = s;
         Ok(())
     }
@@ -938,20 +1009,39 @@ impl LiveDesk {
         }
         let key_box = seal(&box_key, key.trim())?;
         let now = shared_domain::current_ist_timestamp_string();
-        sqlx::query(
-            "INSERT INTO hl_api_wallets (user_id, network, account, agent, key_box, checked_at, check_ok, check_note, updated_at) VALUES (?, ?, ?, ?, ?, NULL, 0, NULL, ?)
-             ON CONFLICT(user_id, network) DO UPDATE SET account = excluded.account, agent = excluded.agent, key_box = excluded.key_box,
-               checked_at = NULL, check_ok = 0, check_note = NULL, updated_at = excluded.updated_at",
-        )
-        .bind(self.user_id)
-        .bind(net_str(network))
-        .bind(&account)
-        .bind(wallet.address())
-        .bind(&key_box)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Refusal::conflict(format!("could not store the API wallet: {e}")))?;
+        let saved = async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                "INSERT INTO hl_api_wallets (user_id, network, account, agent, key_box, checked_at, check_ok, check_note, updated_at) VALUES (?, ?, ?, ?, ?, NULL, 0, NULL, ?)
+                 ON CONFLICT(user_id, network) DO UPDATE SET account = excluded.account, agent = excluded.agent, key_box = excluded.key_box,
+                   checked_at = NULL, check_ok = 0, check_note = NULL, updated_at = excluded.updated_at",
+            )
+            .bind(self.user_id)
+            .bind(net_str(network))
+            .bind(&account)
+            .bind(wallet.address())
+            .bind(&key_box)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            if self.admin {
+                // In step with the owner's table of before ([`from_legacy`]).
+                sqlx::query(
+                    "INSERT INTO hl_credentials (network, account, agent, key_box, checked_at, check_ok, check_note, updated_at) VALUES (?, ?, ?, ?, NULL, 0, NULL, ?)
+                     ON CONFLICT(network) DO UPDATE SET account = excluded.account, agent = excluded.agent, key_box = excluded.key_box,
+                       checked_at = NULL, check_ok = 0, check_note = NULL, updated_at = excluded.updated_at",
+                )
+                .bind(net_str(network))
+                .bind(&account)
+                .bind(wallet.address())
+                .bind(&key_box)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await
+        };
+        saved.await.map_err(|e| Refusal::conflict(format!("could not store the API wallet: {e}")))?;
         self.creds.write().await.insert(network, Credential { account, agent: wallet.address().to_string(), key_box, checked_at: None, check_ok: false, check_note: None });
         // Another account's: nothing read for the last one is shown for it.
         self.cache.lock().await.remove(&network);
@@ -967,12 +1057,15 @@ impl LiveDesk {
         if s.mode == HlMode::Live && s.network == network {
             return Err(Refusal::conflict("Switch Hyperliquid to Paper before removing the LIVE API wallet"));
         }
-        sqlx::query("DELETE FROM hl_api_wallets WHERE user_id = ? AND network = ?")
-            .bind(self.user_id)
-            .bind(net_str(network))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Refusal::conflict(format!("could not remove the API wallet: {e}")))?;
+        let removed = async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM hl_api_wallets WHERE user_id = ? AND network = ?").bind(self.user_id).bind(net_str(network)).execute(&mut *tx).await?;
+            if self.admin {
+                sqlx::query("DELETE FROM hl_credentials WHERE network = ?").bind(net_str(network)).execute(&mut *tx).await?;
+            }
+            tx.commit().await
+        };
+        removed.await.map_err(|e| Refusal::conflict(format!("could not remove the API wallet: {e}")))?;
         self.creds.write().await.remove(&network);
         self.cache.lock().await.remove(&network);
         Ok(self.view().await)
@@ -1006,15 +1099,28 @@ impl LiveDesk {
             Ok((account, wallet)) => self.probe(network, &account, &wallet).await,
         };
         let now = shared_domain::current_ist_timestamp_string();
-        sqlx::query("UPDATE hl_api_wallets SET checked_at = ?, check_ok = ?, check_note = ? WHERE user_id = ? AND network = ?")
-            .bind(&now)
-            .bind(ok)
-            .bind(&note)
-            .bind(self.user_id)
-            .bind(net_str(network))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Refusal::conflict(format!("could not save the check: {e}")))?;
+        let saved = async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("UPDATE hl_api_wallets SET checked_at = ?, check_ok = ?, check_note = ? WHERE user_id = ? AND network = ?")
+                .bind(&now)
+                .bind(ok)
+                .bind(&note)
+                .bind(self.user_id)
+                .bind(net_str(network))
+                .execute(&mut *tx)
+                .await?;
+            if self.admin {
+                sqlx::query("UPDATE hl_credentials SET checked_at = ?, check_ok = ?, check_note = ? WHERE network = ?")
+                    .bind(&now)
+                    .bind(ok)
+                    .bind(&note)
+                    .bind(net_str(network))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await
+        };
+        saved.await.map_err(|e| Refusal::conflict(format!("could not save the check: {e}")))?;
         if let Some(c) = self.creds.write().await.get_mut(&network) {
             c.checked_at = Some(now);
             c.check_ok = ok;
@@ -1091,20 +1197,20 @@ impl LiveDesk {
         view.as_of = cache.as_of.clone();
         // Beside the account: its spot USDC, its mode, and what the perp
         // asked about can take — none of them fails the view.
-        if cache.due("spot", SPOT_TTL) {
+        if cache.due("spot", SPOT_TTL * share) {
             match timed("the spot balances", info.spot_balances(&account)).await {
                 Ok(b) => cache.spot = Some((Instant::now(), b)),
                 Err(e) => tracing::warn!("Hyperliquid LIVE: {e}"),
             }
         }
-        if cache.due("mode", MODE_TTL) {
+        if cache.due("mode", MODE_TTL * share) {
             match timed("the account mode", info.abstraction(&account)).await {
                 Ok(m) => cache.mode = Some((Instant::now(), m)),
                 Err(e) => tracing::warn!("Hyperliquid LIVE: {e}"),
             }
         }
         if let Some(m) = market {
-            if cache.due(&format!("available:{}", m.coin), AVAILABLE_TTL) {
+            if cache.due(&format!("available:{}", m.coin), AVAILABLE_TTL * share) {
                 match timed("what is available to trade", info.available_to_trade(&account, m.coin)).await {
                     Ok(a) => {
                         cache.available.insert(m.coin.to_string(), (Instant::now(), a));
@@ -1599,33 +1705,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_owners_live_settings_and_api_wallets_from_before_become_the_admins_once() {
+    async fn the_owners_live_rows_from_before_are_the_admins_and_stay_in_step_for_a_rollback() {
         let db = TempDb::new("hl-live-desks-migrate");
         let pool = init_db(&db.url()).await;
         let admin = person(&pool, "7000000001", "admin", false).await;
+        let legacy = |sql: &'static str| {
+            let pool = pool.clone();
+            async move { sqlx::query(sql).execute(&pool).await.unwrap() }
+        };
         // A database from before every person had their own LIVE desk.
-        for sql in [
-            "DROP TABLE hl_live_accounts",
-            "DROP TABLE hl_api_wallets",
-            "INSERT INTO hl_live_settings (id, mode, network, updated_at) VALUES (1, 'live', 'mainnet', 'then')",
-            "INSERT INTO hl_credentials (network, account, agent, key_box, checked_at, check_ok, check_note, updated_at) VALUES ('mainnet', '0xaaaa', '0xbbbb', 'boxed', 'then', 1, 'ok', 'then')",
-            "INSERT INTO hl_line_guards (network, oid, coin, buy, stop, target, armed_at) VALUES ('mainnet', 5, 'BTC', 1, 60000, NULL, 'then')",
-        ] {
-            sqlx::query(sql).execute(&pool).await.unwrap();
-        }
-        drop(pool);
-        let pool = init_db(&db.url()).await;
+        legacy("INSERT INTO hl_live_settings (id, mode, network, updated_at) VALUES (1, 'live', 'mainnet', 'then')").await;
+        legacy("INSERT INTO hl_credentials (network, account, agent, key_box, checked_at, check_ok, check_note, updated_at) VALUES ('mainnet', '0xaaaa', '0xbbbb', 'boxed', 'then', 1, 'ok', 'then')").await;
+        legacy("INSERT INTO hl_credentials (network, account, agent, key_box, checked_at, check_ok, check_note, updated_at) VALUES ('testnet', '0xcccc', '0xdddd', 'boxed', 'then', 1, 'ok', 'then')").await;
+        legacy("INSERT INTO hl_line_guards (network, oid, coin, buy, stop, target, armed_at) VALUES ('mainnet', 5, 'BTC', 1, 60000, NULL, 'then')").await;
         let desks = LiveDesks::load(pool.clone(), None).await.unwrap();
         let d = desks.desk(admin).await.unwrap();
         assert_eq!(d.settings().await, LiveSettings { mode: HlMode::Live, network: Network::Mainnet });
         assert_eq!(d.view().await.credentials.mainnet.map(|c| c.account), Some("0xaaaa".into()));
         assert_eq!(d.line_guards.lock().await.iter().map(|g| g.oid).collect::<Vec<_>>(), vec![5]);
-        // Once: a wallet the admin removes doesn't come back at the next start.
-        sqlx::query("DELETE FROM hl_api_wallets").execute(&pool).await.unwrap();
+        assert!(Arc::ptr_eq(&desks.admin_desk().await.unwrap(), &d), "the kill switch finds it in memory");
+        // The admin's changes go to the old tables too, so a rolled-back
+        // binary sees them, and the next start doesn't undo them.
+        d.remove_credential(Network::Testnet).await.unwrap();
+        let old: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hl_credentials WHERE network = 'testnet'").fetch_one(&pool).await.unwrap();
+        assert_eq!(old, 0);
         drop(desks);
-        let pool = init_db(&db.url()).await;
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hl_api_wallets").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 0);
+        let desks = LiveDesks::load(pool.clone(), None).await.unwrap();
+        assert!(desks.desk(admin).await.unwrap().view().await.credentials.testnet.is_none(), "a removed wallet doesn't come back");
+        // A rolled-back binary changed the owner's rows: the next start takes them.
+        drop(desks);
+        legacy("UPDATE hl_live_settings SET mode = 'paper', network = 'testnet'").await;
+        legacy("UPDATE hl_credentials SET account = '0xeeee' WHERE network = 'mainnet'").await;
+        let desks = LiveDesks::load(pool.clone(), None).await.unwrap();
+        let d = desks.desk(admin).await.unwrap();
+        assert_eq!(d.settings().await, LiveSettings { mode: HlMode::Paper, network: Network::Testnet });
+        assert_eq!(d.view().await.credentials.mainnet.map(|c| c.account), Some("0xeeee".into()));
     }
 
     #[test]
