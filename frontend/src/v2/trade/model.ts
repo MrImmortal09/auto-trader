@@ -6,6 +6,7 @@ import { INDEX_ORDER } from '../../lib/execute';
 import { level, shortDate, signedMoney } from '../lib/format';
 import { isPerpKey } from './perp/catalog';
 import { perpLabel } from './perp/model';
+import { fmtAgeLimit } from '../../lib/execute';
 
 /** A chart's timeframe. `1d`: an Indian day's session, or a perp's UTC day. */
 export type Tf = '1m' | '5m' | '15m' | '1d';
@@ -215,6 +216,19 @@ export function stockBuyBlocked(kind: 'index' | 'stock', paper: boolean, stockPa
 
 /** The price is the quote hub's (Kotak's REST quote every ~2 s), not the
  * feed's: the strike is past the feed budget. No buy route accepts it. */
+/** Why one side of a row can't be bought now, or null. */
+export function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: number, ladder: 'index' | 'stock'): string | null {
+  if (blocked) return blocked;
+  if (!q || q.ltp == null) return 'No price for this contract yet';
+  // The hub's REST quote stands in for a strike past the feed budget: good to
+  // look at, but no buy route accepts a price the feed never carried. An
+  // index ladder keeps its wording from before stocks joined, so index
+  // trading reads exactly as it did; a stock's row says it the short way.
+  if (quotePolled(q)) return ladder === 'stock' ? 'No live tick for this strike' : 'Polled price — this strike is past the feed budget, so it can’t be bought yet';
+  if (q.age_ms != null && q.age_ms > maxAgeMs) return `This contract's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}`;
+  return null;
+}
+
 export function quotePolled(q: ExecuteQuote & { polled?: boolean }): boolean {
   return q.polled === true;
 }
