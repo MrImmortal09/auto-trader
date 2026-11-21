@@ -1,26 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { Check } from 'lucide-react';
 import type { ExecuteBoard, ExecutePosition, ExecuteQuote } from '../../types';
-import { buyMaxAgeMs, expiryLabel, fmtAgeLimit } from '../../lib/execute';
+import { buyMaxAgeMs, expiryLabel } from '../../lib/execute';
 import { level, price, signedMoney } from '../lib/format';
 import type { ChainAnswer } from '../lib/types';
 import { useTickFlash } from '../lib/useTickFlash';
 import { Button } from '../ui/Button';
 import { LotsStepper } from '../ui/LotsStepper';
-import { boardKind, fmtAge, polledMarker, quotePolled } from './model';
+import { boardKind, fmtAge, polledMarker, quoteBlocked, quotePolled } from './model';
 
-/** Why one side of a row can't be bought now, or null. */
-function quoteBlocked(q: ExecuteQuote | null, blocked: string | null, maxAgeMs: number, ladder: 'index' | 'stock'): string | null {
-  if (blocked) return blocked;
-  if (!q || q.ltp == null) return 'No price for this contract yet';
-  // The hub's REST quote stands in for a strike past the feed budget: good to
-  // look at, but no buy route accepts a price the feed never carried. An
-  // index ladder keeps its wording from before stocks joined, so index
-  // trading reads exactly as it did; a stock's row says it the short way.
-  if (quotePolled(q)) return ladder === 'stock' ? 'No live tick for this strike' : 'Polled price — this strike is past the feed budget, so it can’t be bought yet';
-  if (q.age_ms != null && q.age_ms > maxAgeMs) return `This contract's price hasn't updated in ${fmtAgeLimit(maxAgeMs)}`;
-  return null;
-}
 
 /** "Buy on a line": the ladder's Buy places a line order on the index chart
  * instead of buying at market. */

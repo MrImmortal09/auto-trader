@@ -77,6 +77,8 @@ import { SplitHandle } from './SplitHandle';
 import { TradingPanel } from './panel/TradingPanel';
 import { knownStudies } from './studies';
 import { PositionSheet, ScalpBar, type PaperAccount, type PositionHandlers } from './Positions';
+import { BuySheet, ChartQuickBuy, PhoneTradeBar, type OptionSide } from './PhoneTrade';
+import { Modal } from '../ui/Modal';
 
 interface Slot {
   sym: ChartSym;
@@ -128,6 +130,9 @@ interface Saved {
   deskHidden: boolean;
   /** The ladder's Buy places a line order on the index chart ("Buy on a line"). */
   lineBuy: boolean;
+  /** Phone: "Scalper" — the strike ladder under the chart. Off, the chart
+   * takes the screen and Call / Put on it open the buy sheet. */
+  phoneScalper: boolean;
   /** How long a buy line stays armed, in minutes; `null` till close. */
   lineValidity: number | null;
   /** The Hyperliquid perp whose ticket is in the ladder's place, behind the
@@ -139,7 +144,7 @@ const STORE_KEY = TRADE_KEY;
 /** The screen's name before it became Trade; read once, for its saved layout. */
 const OLD_STORE_KEY = 'v2.scalp';
 const indexSlot = (index: string): Slot => ({ sym: { kind: 'index', index }, tf: '5m', layers: DEFAULT_LAYERS, style: 'candles' });
-const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', stock: null, header: 'indices', headerList: null, lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false, lineBuy: false, lineValidity: 30, perp: null };
+const DEFAULTS: Saved = { layout: 2, slots: [indexSlot('NIFTY'), indexSlot('BANKNIFTY'), indexSlot('SENSEX')], index: 'NIFTY', stock: null, header: 'indices', headerList: null, lots: {}, chartHidden: false, phoneChartHeight: null, expiry: {}, chartLib: 'kline', panelOpen: true, panelHeight: DEFAULT_PANEL_HEIGHT, barHidden: false, ladderHidden: false, ladderWidth: DEFAULT_LADDER_WIDTH, chartShares: {}, deskWidth: DEFAULT_DESK_WIDTH, deskHidden: false, lineBuy: false, phoneScalper: false, lineValidity: 30, perp: null };
 
 /** An option or a dated future that has expired goes back to its
  * underlying's own chart (the server refuses an expired future's name; a
@@ -202,6 +207,7 @@ function loadSaved(): Saved {
     deskWidth: savedWidth(saved.deskWidth, MIN_DESK_WIDTH, MAX_DESK_WIDTH, DEFAULT_DESK_WIDTH),
     deskHidden: saved.deskHidden === true,
     lineBuy: saved.lineBuy === true,
+    phoneScalper: saved.phoneScalper === true,
     lineValidity: validityOf(saved.lineValidity),
     perp: isPerpKey(saved.perp) ? saved.perp : null,
   };
@@ -273,6 +279,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const [draft, setDraft] = useState<LineDraft | null>(null);
   const [lostDraft, setLostDraft] = useState<LineDraft | null>(null);
   const [sheet, setSheet] = useState(false);
+  // Phone: the Call / Put sheet (its side and strike), and the chain sheet.
+  const [buyPick, setBuyPick] = useState<{ side: OptionSide; strike: number } | null>(null);
+  const [chainOpen, setChainOpen] = useState(false);
   // The scalp whose limit close is being asked for (the Limit button).
   const [limitFor, setLimitFor] = useState<string | null>(null);
   // The strike the ladder scrolled to, for the ladder it was scrolled on.
@@ -418,7 +427,14 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const chosenExpiry = saved.expiry[ladderIndex] ?? null;
   const ladderExpiry = chosenExpiry && (!listedExpiries || listedExpiries.some((e) => e.date === chosenExpiry)) ? chosenExpiry : null;
   const ladderKey = `${ladderIndex}:${ladderExpiry ?? ''}`;
-  const centre = centreAt?.key === ladderKey ? centreAt.strike : null;
+  // Phone: a ladder is on screen only under Scalper or in the Chain sheet.
+  // With neither, nothing rests on the strike one was scrolled to, so the
+  // prices go back to ATM's window — once a buy line being placed is armed or
+  // dropped: the server arms it only while its contract's price is live.
+  const ladderShown = desktop || chainOpen || (saved.phoneScalper && perpSel == null);
+  if (centreAt && !ladderShown && !draft) setCentreAt(null);
+  // The Call / Put sheet lists the strikes around ATM, wherever a ladder rests.
+  const centre = buyPick == null && centreAt?.key === ladderKey ? centreAt.strike : null;
   const { frame, stale, now } = useExecuteStream(serverBase, ladderIndex, ladderExpiry, centre, streamToken());
   // Whose figures the screen shows: the owner's desk for the admin, a user's
   // own paper portfolio otherwise.
@@ -572,19 +588,21 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     }
   }
 
-  async function buy(sym: string, label: string) {
+  /** A market buy of `lots` of `sym`; true once the server took it. */
+  async function buy(sym: string, label: string): Promise<boolean> {
     const qty = lots * (board?.lot_size ?? 0);
     const order = () => (paper ? paperBuy(serverBase, sym, lots) : executeBuy(serverBase, sym, lots));
     const sent = await busy(sym, () => guard('Sign in to place paper orders.', order, `${label} not bought`, scope));
-    if (!sent?.ok) return;
+    if (!sent?.ok) return false;
     if (paper) {
       // Filled already. Keyed as the status bar's fill toast is, so that one isn't shown again.
       const f = sent.body as PaperFill;
       toast({ tone: 'profit', title: `Bought ${f.qty} ${f.contract}`, body: `Filled at ${price(f.price)} · wallet ${money(f.balance)}`, key: `fill-${f.trade_id}` });
-      return;
+      return true;
     }
     const added = (sent.body as { action?: string } | null)?.action === 'added';
     toast({ tone: 'neutral', title: `${added ? 'Adding' : 'Buying'} ${qty} ${label}`, body: 'Market order sent — the fill shows here when it is done.' });
+    return true;
   }
 
   // A paper sell fills at once and its toast, with the P&L, comes from the status bar.
@@ -865,6 +883,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
       setSlot(0, { sym: ownChartOf(board.index) });
     }
     if (!desktop) showChart(true);
+    // The lines are tapped on the chart: the chain sheet would cover it.
+    setChainOpen(false);
     setPlacingAt(null);
     setDraft({ slot, sym, label, index: board.index, strike, side, expiry: board.expiry, lots, lotSize: board.lot_size, entry: null, stop: null, targets: [], pick: lots, sending: false });
   }
@@ -1090,6 +1110,8 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     const at = shownSlots.findIndex((s) => underlyingOf(s.sym) === board.index);
     setSlot(at >= 0 ? at : 0, { sym });
     if (!desktop) showChart(true);
+    // Tapped in the chain sheet: the chart it asked for is under the sheet.
+    setChainOpen(false);
   }
 
   /** An underlying's own chart: the index, or the stock's cash price. */
@@ -1216,6 +1238,25 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
   const shares = shownSlots.length < 2 ? [1] : (sharesDrag ?? saved.chartShares[sharesKey] ?? equalShares(shownSlots.length));
   // A perp's stop, target or picked price goes on the first chart showing it.
   const perpSlot = perpDesk.placing ? shownSlots.findIndex((sl) => sl.sym.kind === 'perp' && sl.sym.key === perpDesk.placing!.key) : -1;
+  // Phone without Scalper: the chart takes the screen (the ladder is a sheet
+  // behind Chain). A perp's ticket still needs the room under the chart.
+  const phoneChartFills = !desktop && !saved.phoneScalper && perpSel == null;
+  // Call / Put on the phone chart: the buy sheet, at the board's ATM.
+  const pickOption = (side: OptionSide) => {
+    if (board?.atm != null) setBuyPick({ side, strike: board.atm });
+  };
+  const phoneBar = (
+    <PhoneTradeBar
+      scalps={activeScalps}
+      onOpen={() => setSheet(true)}
+      onChain={() => setChainOpen(true)}
+      chainReady={board != null}
+      scalper={saved.phoneScalper}
+      onScalper={(on) => save((s) => ({ ...s, phoneScalper: on }))}
+      paper={account}
+    />
+  );
+
   const charts = shownSlots.map((slot, i) => {
     const isFullscreen = activeFullscreenSlot === i;
     const cx = {
@@ -1234,15 +1275,18 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
     return (
       <div
         key={i}
-        style={isFullscreen ? undefined : desktop ? { flex: `${shares[i] ?? 1} 1 0%` } : { height: chartHeight }}
+        style={isFullscreen ? undefined : desktop ? { flex: `${shares[i] ?? 1} 1 0%` } : phoneChartFills ? undefined : { height: chartHeight }}
         className={
           isFullscreen
             ? 'fixed inset-0 z-40 flex flex-col bg-canvas pt-safe pb-safe'
             : desktop
               ? 'flex min-h-0 min-w-0 flex-col'
-              : 'flex shrink-0'
+              : phoneChartFills
+                ? 'flex min-h-0 flex-1'
+                : 'flex shrink-0'
         }
       >
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         <ChartPanel
           chartId={`trade-${i}`}
           serverBase={serverBase}
@@ -1297,15 +1341,17 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
           lib={saved.chartLib}
           onLib={desktop ? undefined : setLib}
           compact={!desktop}
-          onHide={desktop ? undefined : () => showChart(false)}
+          onHide={desktop || phoneChartFills ? undefined : () => showChart(false)}
           fullscreen={isFullscreen}
           onFullscreen={(on) => toggleFullscreen(i, on)}
           stocksOn={stocksOn === true}
           perpsOn={hlOn === true}
         />
-        {isFullscreen && activeScalps.length > 0 && (
-          <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />
+        {!desktop && i === 0 && slot.sym.kind !== 'perp' && (
+          <ChartQuickBuy board={board} fullscreen={isFullscreen} showButtons={isFullscreen || !saved.phoneScalper} onPick={pickOption} onFullscreen={(on) => toggleFullscreen(i, on)} />
         )}
+        </div>
+        {isFullscreen && (desktop ? activeScalps.length > 0 && <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} /> : phoneBar)}
       </div>
     );
   });
@@ -1426,7 +1472,9 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
         {/* The chart and the ladder share this box: the chart is never so tall
             that the ladder loses its lots row and its first strikes. */}
         <div ref={splitBox} className="flex min-h-0 flex-1 flex-col">
-          {chartHidden ? (
+          {phoneChartFills ? (
+            charts[0]
+          ) : chartHidden ? (
             <div className="shrink-0 px-2 pb-3">
               <button type="button" onClick={() => showChart(true)} className="flex h-10 w-full items-center gap-2 rounded-12 border border-line bg-panel px-3 text-left">
                 <ChartCandlestick size={16} className="text-fg-muted" />
@@ -1443,11 +1491,44 @@ export function Trade({ serverBase, desktop }: { serverBase: string; desktop: bo
               <SplitHandle height={chartHeight} min={splitMin} max={splitMax} dragging={splitDragging} handle={splitHandle} />
             </>
           )}
-          <div className="flex min-h-0 flex-1 flex-col">{ticket || ladder}</div>
+          {!phoneChartFills && <div className="flex min-h-0 flex-1 flex-col">{ticket || ladder}</div>}
         </div>
-        <ScalpBar scalps={activeScalps} h={handlers} onOpen={() => setSheet(true)} paper={account} />
+        {phoneBar}
         {sheetEl}
         {limitEl}
+        {buyPick && board && (
+          <BuySheet
+            board={board}
+            side={buyPick.side}
+            strike={buyPick.strike}
+            onStrike={(strike) => setBuyPick((b) => (b ? { ...b, strike } : b))}
+            lots={lots}
+            onLots={(n) => save((s) => ({ ...s, lots: { ...s.lots, [ladderIndex]: n } }))}
+            held={held}
+            blocked={blocked}
+            readOnly={readOnly}
+            lineMode={lineMode}
+            sending={sending}
+            mode={frame?.mode ?? 'PAPER'}
+            onBuy={async (sym, label, strike, side) => {
+              if (lineMode) {
+                // The sheet priced this contract from ATM's window: the stream
+                // stays on it while the line is placed, not back on a strike
+                // the ladder under a full-screen chart was scrolled to.
+                setCentreAt(null);
+                startDraft(sym, label, strike, side);
+                return true;
+              }
+              return buy(sym, label);
+            }}
+            onClose={() => setBuyPick(null)}
+          />
+        )}
+        {chainOpen && board && (
+          <Modal open onClose={() => setChainOpen(false)} label={`${board.index} option chain`}>
+            <div className="flex h-[78dvh] min-h-0 flex-col pt-2">{ladder}</div>
+          </Modal>
+        )}
       </div>
     );
   }

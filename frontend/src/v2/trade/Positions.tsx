@@ -168,6 +168,13 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
           />
         )}
         {perps && serverBase != null && venue === 'hl' ? <PerpColumn serverBase={serverBase} /> : <AccountColumn mode={mode} desk={desk} positions={active} paper={paper} vertical={false} />}
+        {/* The phone's bar under the chart has no room for it: Exit all (the
+            F&O scalps) lives here. */}
+        {!(perps && serverBase != null && venue === 'hl') && active.length > 0 && (
+          <HoldButton size="lg" disabled={h.exitAllBusy} onFire={h.onExitAll} className="w-full">
+            {h.exitAllBusy ? 'Exiting…' : 'Hold to exit all'}
+          </HoldButton>
+        )}
         {/* Four tabs with the perps: the row scrolls rather than squeeze. */}
         <div className="-mx-1 shrink-0 overflow-x-auto px-1">
           <Segment
