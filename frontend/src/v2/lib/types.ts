@@ -239,6 +239,8 @@ export interface AdminUser {
   last_login_at: string | null;
   /** Anyone may see this number's closed trades on the view-only page. */
   public: boolean;
+  /** May trade Hyperliquid LIVE with their own API wallet (always, for the admin). */
+  hl_live: boolean;
   /** A user's paper figures; null for the admin. */
   paper: AdminPaper | null;
 }
@@ -909,15 +911,32 @@ export interface HlCredentialView {
   note: string | null;
 }
 
-/** `GET /api/v2/hl/live`: the owner's Hyperliquid switches and API wallets. */
+/** `GET /api/v2/hl/live`: the signed-in person's Hyperliquid switches and API wallets. */
 export interface HlLiveView {
   mode: 'paper' | 'live';
   network: 'testnet' | 'mainnet';
+  /** May go LIVE: the admin always; a user once the admin has switched it on. */
+  allowed: boolean;
+  /** Their own kill switch is on: no LIVE order that opens until it is reset. */
+  kill: boolean;
+  /** What the kill switch's last flattening came to. */
+  kill_note: string | null;
   credentials: { testnet: HlCredentialView | null; mainnet: HlCredentialView | null };
   /** AUTH_SECRET is set on the server, so a key can be stored. */
   can_store_keys: boolean;
   /** LIVE orders are sent (not yet in this release). */
   orders_enabled: boolean;
+}
+
+/** `GET /api/admin/users/:id/hl`: a user's Hyperliquid LIVE desk, read-only. */
+export interface AdminUserHl {
+  live: HlLiveView;
+  /** While LIVE: their account on Hyperliquid. */
+  account: PerpAccount | null;
+  /** While LIVE: their day from IST midnight. */
+  today: PerpToday | null;
+  /** Why the account or the day couldn't be read. */
+  error: string | null;
 }
 
 export interface HlMarketsAnswer {

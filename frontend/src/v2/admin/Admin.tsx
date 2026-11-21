@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { CalendarPlus, ChartLine, Eye, Trash2, UserPlus } from 'lucide-react';
+import { CalendarPlus, ChartLine, Eye, Trash2, UserPlus, Zap } from 'lucide-react';
 import { formatPhone, normalizePhone } from '../auth/phone';
-import { createUser, deleteSpecialSession, deleteUser, listSpecialSessions, listUsers, patchUser, putSpecialSession } from '../lib/api';
+import { createUser, deleteSpecialSession, deleteUser, getFlags, listSpecialSessions, listUsers, patchUser, putSpecialSession } from '../lib/api';
 import { dayLabel, hhmm, plural, shortDate, todayIst } from '../lib/format';
 import { usePoll } from '../lib/usePoll';
 import type { AdminUser, SpecialSession } from '../lib/types';
@@ -42,6 +42,9 @@ function reportFromUrl(): number | null {
 export function Admin({ serverBase, desktop }: { serverBase: string; desktop: boolean }) {
   const [viewing, setViewing] = useState<number | null>(reportFromUrl);
   const users = usePoll(() => listUsers(serverBase), 15_000, serverBase, viewing == null);
+  const flags = usePoll(() => getFlags(serverBase), 30_000, serverBase);
+  // Hyperliquid LIVE per user, only while Hyperliquid is switched on.
+  const hlOn = flags.data?.hyperliquid === true;
   const specialSessions = usePoll(() => listSpecialSessions(serverBase), 15_000, serverBase, viewing == null);
   const guard = useGuard();
   const toast = useToast();
@@ -157,6 +160,11 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
   const setEnabled = (u: AdminUser, enabled: boolean) =>
     act(u.id, () => guard('Changing a user needs the admin sign-in.', () => patchUser(serverBase, u.id, { enabled }), `Couldn't ${enabled ? 'enable' : 'disable'} ${formatPhone(u.phone)}`, 'admin'));
 
+  const setHlLive = (u: AdminUser, on: boolean) =>
+    act(u.id, () =>
+      guard('Changing a user needs the admin sign-in.', () => patchUser(serverBase, u.id, { hl_live: on }), `Couldn't switch Hyperliquid LIVE ${on ? 'on' : 'off'} for ${formatPhone(u.phone)}`, 'admin'),
+    );
+
   const setPublic = (u: AdminUser, on: boolean) =>
     act(u.id, () =>
       guard('Changing a user needs the admin sign-in.', () => patchUser(serverBase, u.id, { public: on }), `Couldn't ${on ? 'share' : 'hide'} the trades of ${formatPhone(u.phone)}`, 'admin'),
@@ -195,6 +203,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
                 {isAdmin && <Chip kind="accent">Admin</Chip>}
                 {!u.enabled && <Chip kind="loss">Disabled</Chip>}
                 {u.public && <Chip kind="outline">Public</Chip>}
+                {hlOn && !isAdmin && u.hl_live && <Chip kind="live">HL LIVE</Chip>}
               </span>
             }
             caption={
@@ -221,6 +230,24 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
             >
               {large ? null : u.public ? 'Public' : 'Private'}
             </Button>
+            {hlOn && !isAdmin && (
+              <Button
+                size={size}
+                kind={u.hl_live ? 'live' : 'ghost'}
+                icon={<Zap size={14} />}
+                disabled={!!busy[u.id]}
+                aria-pressed={u.hl_live}
+                aria-label={`${u.hl_live ? 'Stop' : 'Let'} ${who} ${u.hl_live ? 'trading' : 'trade'} Hyperliquid LIVE`}
+                title={
+                  u.hl_live
+                    ? `${who} may trade Hyperliquid LIVE with their own API wallet. Click to stop: their LIVE desk turns close-only, and they go back to Paper once flat.`
+                    : `Let ${who} save their own Hyperliquid API wallet and trade LIVE with it`
+                }
+                onClick={() => void setHlLive(u, !u.hl_live)}
+              >
+                {large ? null : u.hl_live ? 'HL LIVE' : 'HL paper'}
+              </Button>
+            )}
             <Toggle checked={u.enabled} disabled={isAdmin || !!busy[u.id]} label={`${u.enabled ? 'Disable' : 'Enable'} ${formatPhone(u.phone)}`} onChange={(on) => void setEnabled(u, on)} />
             {!isAdmin && (
               <Button
@@ -380,7 +407,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
         </Section>
         <Section
           title="Users"
-          lead="Who may sign in with a phone number, as a paper trader. The admin is the server's own number (ADMIN_PHONE) and nobody else. A disabled number is signed out at once. Open a user for their P&L report: every trade, day by day."
+          lead={`Who may sign in with a phone number, as a paper trader. The admin is the server's own number (ADMIN_PHONE) and nobody else. A disabled number is signed out at once. Open a user for their P&L report: every trade, day by day.${hlOn ? ' HL LIVE lets a user trade Hyperliquid with their own API wallet; switched off, their LIVE desk turns close-only.' : ''}`}
         >
           {rows}
           {addForm}
@@ -415,7 +442,7 @@ export function Admin({ serverBase, desktop }: { serverBase: string; desktop: bo
           <div className="flex flex-col gap-4 p-6">
             <h2 className="type-title text-fg">Remove {removing.name?.trim() || formatPhone(removing.phone)}?</h2>
             <p className="type-body text-fg-muted">
-              +91 {formatPhone(removing.phone)} is taken off the allow-list and signed out at once, and their paper portfolio and its trades are deleted. Add the number again to let them back in, starting fresh.
+              +91 {formatPhone(removing.phone)} is taken off the allow-list and signed out at once, and their paper portfolio and its trades are deleted, with any Hyperliquid API wallet they saved. Add the number again to let them back in, starting fresh.
             </p>
             <div className="flex justify-end gap-2">
               <Button size="md" onClick={() => setRemoving(null)}>

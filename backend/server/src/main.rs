@@ -218,7 +218,8 @@ pub(crate) struct AppState {
     pub perps: Arc<hyperliquid::paper::PerpDesk>,
     /// Hyperliquid LIVE, the owner's: its switches, its API wallets (sealed
     /// under AUTH_SECRET) and its account read from Hyperliquid.
-    pub hl_live: Arc<hyperliquid::live::LiveDesk>,
+    /// Every person's Hyperliquid LIVE desk.
+    pub hl_live: Arc<hyperliquid::live::LiveDesks>,
     /// The admin's list of Hyperliquid perps: adding and removing them
     /// (`hyperliquid::markets`).
     pub hl_markets: Arc<hyperliquid::markets::MarketAdmin>,
@@ -1222,7 +1223,7 @@ async fn main() {
     );
     tokio::spawn(hyperliquid::paper::run(Arc::clone(&perps)));
     let hl_live = Arc::new(
-        hyperliquid::live::LiveDesk::load(pool.clone(), resolve_auth_secret().as_deref())
+        hyperliquid::live::LiveDesks::load(pool.clone(), resolve_auth_secret().as_deref())
             .await
             .expect("load the Hyperliquid LIVE settings"),
     );
@@ -1352,6 +1353,7 @@ async fn main() {
         .route("/api/admin/trades",                 get(routes::admin_paper::trades_handler))
         .route("/api/admin/positions",              get(routes::admin_paper::positions_handler))
         .route("/api/admin/users/:id/report",       get(routes::admin_report::report_handler))
+        .route("/api/admin/users/:id/hl",           get(routes::admin_hl::user_hl_handler))
         .route("/api/admin/latency",                get(feed_latency::latency_handler))
         .route("/api/admin/order-timings",          get(order_timing::timings_handler))
         .route("/api/admin/special-sessions",       get(routes::admin_sessions::get_sessions_handler))
@@ -1375,6 +1377,7 @@ async fn main() {
         .route("/api/v2/hl/live/credentials",       axum::routing::put(routes::v2::hl_live::credentials_handler))
         .route("/api/v2/hl/live/credentials/:network", axum::routing::delete(routes::v2::hl_live::remove_handler))
         .route("/api/v2/hl/live/check",             post(routes::v2::hl_live::check_handler))
+        .route("/api/v2/hl/live/kill",              post(routes::v2::hl_live::kill_handler).delete(routes::v2::hl_live::reset_kill_handler))
         .route("/api/v2/flags",                     get(routes::v2::get_flags_handler)
                                                    .put(routes::v2::put_flags_handler))
         .route("/api/v2/positions/:id",             axum::routing::patch(routes::v2::patch_position_levels_handler))

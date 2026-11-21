@@ -29,6 +29,9 @@ pub struct UserOut {
     /// Whether anyone may see this number's closed trades on the view-only
     /// page, with no sign-in.
     pub public: bool,
+    /// May trade Hyperliquid LIVE with their own API wallet (the admin's
+    /// switch for a user; the admin always may).
+    pub hl_live: bool,
     /// A user's paper wallet, positions and P&L — in the list only, and
     /// never for the admin, who trades on the owner's desk.
     pub paper: Option<PaperSummary>,
@@ -45,6 +48,7 @@ impl From<UserRow> for UserOut {
             created_at: r.created_at,
             last_login_at: r.last_login_at,
             public: r.public != 0,
+            hl_live: r.hl_live != 0 || Role::parse(&r.role) == Role::Admin,
             paper: None,
         }
     }
@@ -126,7 +130,7 @@ pub async fn create_user_handler(
     tracing::info!(user_id = id, role = role.as_str(), by = identity.kind(), "User added to the allow-list");
     (
         StatusCode::CREATED,
-        Json(UserOut { id, phone, name, role: role.as_str(), enabled: true, created_at: now, last_login_at: None, public: false, paper: None }),
+        Json(UserOut { id, phone, name, role: role.as_str(), enabled: true, created_at: now, last_login_at: None, public: false, hl_live: false, paper: None }),
     )
         .into_response()
 }
@@ -143,6 +147,11 @@ pub struct UserPatch {
     /// trades, by the owner's choice.
     #[serde(default)]
     pub public: Option<bool>,
+    /// Let them trade Hyperliquid LIVE with their own API wallet, or stop
+    /// them: off, their LIVE desk takes no order that opens (close-only)
+    /// and can't be switched to LIVE. Not the admin's own row: always on.
+    #[serde(default)]
+    pub hl_live: Option<bool>,
 }
 
 /// Whether `record` is the owner's own seeded row.
@@ -150,7 +159,7 @@ fn is_seeded_admin(record: &UserRecord) -> bool {
     admin_phone().is_some_and(|p| p == record.phone)
 }
 
-/// `PATCH /api/admin/users/:id {name?, enabled?, public?}`.
+/// `PATCH /api/admin/users/:id {name?, enabled?, public?, hl_live?}`.
 pub async fn patch_user_handler(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -162,15 +171,19 @@ pub async fn patch_user_handler(
     if patch.enabled == Some(false) && is_seeded_admin(&current) {
         return refuse(StatusCode::CONFLICT, "The admin account can't be disabled");
     }
+    if patch.hl_live.is_some() && current.role == Role::Admin {
+        return refuse(StatusCode::CONFLICT, "The admin may always trade Hyperliquid LIVE");
+    }
     let name = match patch.name {
         Some(n) => clean_name(Some(n)),
         None => current.name.clone(),
     };
     let enabled = patch.enabled.unwrap_or(current.enabled);
-    if let Err(e) = sqlx::query("UPDATE users SET name = ?, enabled = ?, public = COALESCE(?, public) WHERE id = ?")
+    if let Err(e) = sqlx::query("UPDATE users SET name = ?, enabled = ?, public = COALESCE(?, public), hl_live = COALESCE(?, hl_live) WHERE id = ?")
         .bind(&name)
         .bind(enabled as i64)
         .bind(patch.public.map(i64::from))
+        .bind(patch.hl_live.map(i64::from))
         .bind(id)
         .execute(&state.db_pool)
         .await
@@ -183,6 +196,10 @@ pub async fn patch_user_handler(
     }
     if let Some(public) = patch.public {
         tracing::info!(user_id = id, public, "User's view-only page switched");
+    }
+    if let Some(on) = patch.hl_live {
+        state.hl_live.set_allowed(id, on).await;
+        tracing::warn!(user_id = id, on, "User's Hyperliquid LIVE switched");
     }
     match db::load_user(&state.db_pool, id).await {
         Ok(Some(row)) => Json(UserOut::from(row)).into_response(),
@@ -198,6 +215,10 @@ pub async fn delete_user_handler(State(state): State<AppState>, Path(id): Path<i
     };
     if is_seeded_admin(&current) {
         return refuse(StatusCode::CONFLICT, "The admin account can't be removed");
+    }
+    // Their Hyperliquid account is theirs to leave flat: not while LIVE.
+    if state.hl_live.is_live(id).await {
+        return refuse(StatusCode::CONFLICT, "This user is LIVE on Hyperliquid — switch LIVE off for them, and remove them once they are back on Paper");
     }
     // Held until the rows are gone, so they can't open a position meanwhile.
     let Some(flat) = state.paper.hold_flat(id).await else {
@@ -231,6 +252,10 @@ pub async fn delete_user_handler(State(state): State<AppState>, Path(id): Path<i
         return server_error("remove the user", e);
     }
     drop(flat);
+    // Their sealed API wallets and LIVE settings go too.
+    if let Err(e) = state.hl_live.forget_person(id).await {
+        tracing::error!(user_id = id, "Removed user's Hyperliquid LIVE rows not deleted: {e}");
+    }
     state.paper.forget(id);
     state.auth.users.remove(id);
     tracing::info!(user_id = id, "User removed from the allow-list");

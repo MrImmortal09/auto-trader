@@ -105,15 +105,21 @@ pub async fn post_kill_switch_handler(State(state): State<AppState>) -> impl Int
     drop(positions);
     persist_positions_snapshot(&state, &snapshot).await;
 
-    // Hyperliquid, while LIVE (the owner's pick, 2026-11-19): every open
-    // order cancelled and every position closed, in the background so the
-    // Kotak side answers at once; what is left open is logged loudly. New
-    // LIVE perp orders are refused while the switch is on.
-    let hyperliquid = state.hl_live.live_network().await;
-    if let Some(network) = hyperliquid {
+    // Hyperliquid, while the owner is LIVE (the owner's pick, 2026-11-19):
+    // every open order cancelled and every position closed, in the
+    // background so the Kotak side answers at once; what is left open is
+    // logged loudly. New LIVE perp orders are refused while the switch is
+    // on — everyone's, but only the owner's account is closed (the owner's
+    // pick, 2026-11-21: each user has a kill switch of their own).
+    let owner = state.hl_live.admin_desk().await;
+    let hyperliquid = match &owner {
+        Some(d) => d.live_network().await.map(|n| (std::sync::Arc::clone(d), n)),
+        None => None,
+    };
+    if let Some((desk, network)) = hyperliquid.clone() {
         let st = state.clone();
         tokio::spawn(async move {
-            let problems = st.hl_live.flatten(network).await;
+            let problems = desk.flatten(network).await;
             let (level, message) = if problems.is_empty() {
                 ("WARN", format!("Kill switch: Hyperliquid {} — every order cancelled and every position closed", network.as_str()))
             } else {
@@ -166,7 +172,7 @@ pub async fn post_kill_switch_handler(State(state): State<AppState>) -> impl Int
             "mode": mode,
             "liquidated_positions": open_liquidated,
             "abandoned_entries": waiting_abandoned,
-            "hyperliquid": hyperliquid.map(|n| format!("closing everything on {}", n.as_str())),
+            "hyperliquid": hyperliquid.map(|(_, n)| format!("closing everything on {}", n.as_str())),
         })),
     )
 }

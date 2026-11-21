@@ -73,9 +73,10 @@ const RULES: &[Rule] = &[
     // and the pickers offer. Adding and removing them (`hl/admin/markets`)
     // stays the admin's.
     rule(On::Read, "/api/v2/hl/catalog", Access::SignedIn),
-    // Hyperliquid perps on paper: each signed-in person's own account (the
-    // owner's and every user's), keyed by user id in the routes. Named one
-    // by one: any other `/api/v2/hl/` route (LIVE's, say) stays the admin's.
+    // Hyperliquid perps, on paper or LIVE: each signed-in person's own
+    // account (the owner's and every user's), keyed by user id in the
+    // routes; LIVE only for those the admin has let (the desk refuses the
+    // rest). Named one by one: any other `/api/v2/hl/` route stays the admin's.
     rule(On::Read, "/api/v2/hl/account", Access::SignedIn),
     rule(On::Read, "/api/v2/hl/today", Access::SignedIn),
     rule(On::Write, "/api/v2/hl/orders", Access::SignedIn),
@@ -84,6 +85,12 @@ const RULES: &[Rule] = &[
     rule(On::Write, "/api/v2/hl/lines", Access::SignedIn),
     rule(On::Write, "/api/v2/hl/lines/*", Access::SignedIn),
     rule(On::Write, "/api/v2/hl/reset", Access::SignedIn),
+    rule(On::Read, "/api/v2/hl/live", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/live/settings", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/live/credentials", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/live/credentials/*", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/live/check", Access::SignedIn),
+    rule(On::Write, "/api/v2/hl/live/kill", Access::SignedIn),
     // The instrument search and its quotes (behind the `search` flag). The
     // status page is the owner's: it carries the hub's error text, call
     // times and the catalog's paths — diagnostics, not market data.
@@ -255,11 +262,15 @@ mod tests {
         (GET, "/api/v2/hl/network", Access::Admin),
         (PUT, "/api/v2/hl/network", Access::Admin),
         (POST, "/api/v2/hl/live/orders", Access::Admin),
-        (GET, "/api/v2/hl/live", Access::Admin),
-        (PUT, "/api/v2/hl/live/settings", Access::Admin),
-        (PUT, "/api/v2/hl/live/credentials", Access::Admin),
-        (DELETE, "/api/v2/hl/live/credentials/testnet", Access::Admin),
-        (POST, "/api/v2/hl/live/check", Access::Admin),
+        (GET, "/api/v2/hl/live", Access::SignedIn),
+        (PUT, "/api/v2/hl/live/settings", Access::SignedIn),
+        (PUT, "/api/v2/hl/live/credentials", Access::SignedIn),
+        (DELETE, "/api/v2/hl/live/credentials/testnet", Access::SignedIn),
+        (POST, "/api/v2/hl/live/check", Access::SignedIn),
+        (POST, "/api/v2/hl/live/kill", Access::SignedIn),
+        (DELETE, "/api/v2/hl/live/kill", Access::SignedIn),
+        (GET, "/api/v2/hl/live/kill", Access::Admin),
+        (GET, "/api/admin/users/7/hl", Access::Admin),
         (PATCH, "/api/v2/positions/abc-123", Access::Admin),
         (POST, "/api/v2/positions/abc-123/limit-close", Access::Admin),
         (DELETE, "/api/v2/positions/abc-123/limit-close", Access::Admin),

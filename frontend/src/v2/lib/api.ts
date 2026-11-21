@@ -13,6 +13,7 @@ import type {
   OrderTimingAnswer,
   AdminTradesAnswer,
   AdminUser,
+  AdminUserHl,
   ChainAnswer,
   ExpiriesAnswer,
   DeskAnswer,
@@ -318,7 +319,7 @@ export function getUserReport(base: string, user: number, from: string | null, t
 }
 // The Admin page's allow-list.
 export const createUser = (base: string, phone: string, name: string | null) => send(base, '/api/admin/users', 'POST', { phone, name });
-export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean; public?: boolean }) =>
+export const patchUser = (base: string, id: number, patch: { name?: string; enabled?: boolean; public?: boolean; hl_live?: boolean }) =>
   send(base, `/api/admin/users/${id}`, 'PATCH', patch);
 export const deleteUser = (base: string, id: number) => send(base, `/api/admin/users/${id}`, 'DELETE');
 
@@ -535,7 +536,7 @@ export const perpCancelLine = (base: string, id: string) => send(base, `/api/v2/
 /** Back to 10,000 USDC; refused while anything is open, resting or armed. */
 export const perpReset = (base: string) => send(base, '/api/v2/hl/reset', 'POST');
 
-// ── Hyperliquid LIVE: the owner's switches and API wallets ─────────────── //
+// ── Hyperliquid LIVE: each person's switches and API wallets ───────────── //
 
 export const getHlLive = (base: string) => getJson<HlLiveView>(base, '/api/v2/hl/live');
 /** Paper ↔ LIVE and testnet ↔ mainnet; refused unless flat. */
@@ -544,6 +545,11 @@ export const putHlLiveSettings = (base: string, change: { mode?: 'paper' | 'live
 export const putHlCredentials = (base: string, body: { network: 'testnet' | 'mainnet'; account: string; key: string }) => send(base, '/api/v2/hl/live/credentials', 'PUT', body);
 export const checkHlCredentials = (base: string, network: 'testnet' | 'mainnet') => send(base, '/api/v2/hl/live/check', 'POST', { network });
 export const removeHlCredentials = (base: string, network: 'testnet' | 'mainnet') => send(base, `/api/v2/hl/live/credentials/${network}`, 'DELETE');
+/** Their own kill switch: every Hyperliquid order cancelled and position closed (while LIVE), new LIVE orders refused. */
+export const engageHlKill = (base: string) => send(base, '/api/v2/hl/live/kill', 'POST');
+export const resetHlKill = (base: string) => send(base, '/api/v2/hl/live/kill', 'DELETE');
+/** A user's Hyperliquid LIVE desk, for the admin, read-only. */
+export const getAdminUserHl = (base: string, id: number) => getJson<AdminUserHl>(base, `/api/admin/users/${id}/hl`);
 /** Log in to Kotak with the server's saved credentials — v1's Auto Connect. */
 export const kotakAutoLogin = (base: string) => send(base, '/api/auth/kotak/auto-login', 'POST');
 export const kotakDisconnect = (base: string) => send(base, '/api/auth/kotak/disconnect', 'DELETE');
