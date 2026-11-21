@@ -298,9 +298,10 @@ export function PositionSheet({ scalps, h, mode, desk, history, fills, errors, i
                       <Button pointerOnly size="lg" kind="loss-outline" disabled={locked || p.qty < p.lot_size} onClick={() => h.onLessLot(p)}>
                         −1 lot ({p.lot_size})
                       </Button>
-                      <Button pointerOnly size="lg" kind="loss" disabled={locked} onClick={() => h.onExit(p)}>
-                        Exit {p.qty}
-                      </Button>
+                      {/* The whole holding: a 1 s hold, as Exit all — not a stray tap. */}
+                      <HoldButton size="lg" kind="loss" disabled={locked} onFire={() => h.onExit(p)}>
+                        Hold to exit {p.qty}
+                      </HoldButton>
                     </div>
                   </>
                 )}

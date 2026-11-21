@@ -31,6 +31,13 @@ export function HoldButton({ onFire, holdMs = 1000, kind = 'loss', size = 'sm', 
     setHolding(false);
   }
 
+  // Disabled mid-hold (the row locked: an exit already in flight, a sell
+  // being sent): the hold lapses instead of firing into it.
+  const disabledNow = useRef(disabled);
+  useEffect(() => {
+    disabledNow.current = disabled;
+  }, [disabled]);
+
   function start() {
     if (disabled) return;
     cancel();
@@ -38,6 +45,7 @@ export function HoldButton({ onFire, holdMs = 1000, kind = 'loss', size = 'sm', 
     timer.current = window.setTimeout(() => {
       timer.current = null;
       setHolding(false);
+      if (disabledNow.current) return;
       onFire();
     }, holdMs);
   }
@@ -57,7 +65,7 @@ export function HoldButton({ onFire, holdMs = 1000, kind = 'loss', size = 'sm', 
       onContextMenu={(e) => e.preventDefault()}
       className={`relative touch-none overflow-hidden ${className}`}
     >
-      {holding && (
+      {holding && !disabled && (
         <span
           aria-hidden
           className="hold-sweep absolute inset-0 bg-fg/30"

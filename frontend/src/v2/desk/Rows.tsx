@@ -4,6 +4,7 @@ import { hhmm, level, money, price, signedMoney, signedPct, toneOf } from '../li
 import { buyLabel, callContract, grossOf, reasonLabel, sourceOfChannel } from '../lib/labels';
 import type { Call, ClosedCall, DeskPosition } from '../lib/types';
 import { Button } from '../ui/Button';
+import { HoldButton } from '../ui/HoldButton';
 import { SourceChip, ToneChip } from '../ui/Chip';
 import { LotsStepper } from '../ui/LotsStepper';
 import { PositionRail } from './PositionRail';
@@ -103,6 +104,8 @@ export function OpenRow({ p, desktop, sending, levelsOn, onLessLot, onExit }: {
       </div>
     );
   }
+  // Phone: the whole holding goes only after a 1 s hold, as Exit all does —
+  // a thumb scrolling the cards must not sell everything.
   return (
     <div className={CARD}>
       <div className="flex items-start justify-between gap-3">
@@ -112,7 +115,9 @@ export function OpenRow({ p, desktop, sending, levelsOn, onLessLot, onExit }: {
       <PositionRail spec={railFor(p, levelsOn)} surface="panel" />
       <div className="grid grid-cols-2 gap-2">
         {lessLot}
-        {exit}
+        <HoldButton kind="loss" size="lg" disabled={locked} onFire={onExit} className="w-full">
+          Hold to exit
+        </HoldButton>
       </div>
     </div>
   );
