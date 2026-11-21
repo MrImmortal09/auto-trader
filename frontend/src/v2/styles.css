@@ -262,3 +262,22 @@
   --vela-shadow-dialog: var(--shadow-lg) !important;
   --vela-backdrop: var(--color-scrim) !important;
 }
+
+/* Phones and tablets (under the 1024 px desktop breakpoint): the type scale one
+   step smaller. Unlayered, so it wins over the utilities above at these widths;
+   desktop keeps the scale above. */
+@media (max-width: 1023px) {
+  .num-hero   { font-size: 28px; line-height: 32px; letter-spacing: -0.5px; }
+  .num-large  { font-size: 19px; line-height: 23px; letter-spacing: -0.2px; }
+  .num-medium { font-size: 14px; line-height: 18px; }
+  .num-small  { font-size: 11px; line-height: 14px; }
+  .type-title       { font-size: 15px; line-height: 20px; }
+  .type-body-strong { font-size: 13px; line-height: 18px; }
+  .type-body        { font-size: 13px; line-height: 18px; }
+  .type-label       { font-size: 11px; line-height: 14px; }
+  .type-caption     { font-size: 10px; line-height: 13px; }
+  .type-eyebrow     { font-size: 10px; line-height: 13px; }
+  .type-button      { font-size: 12px; line-height: 16px; }
+  .type-button-lg   { font-size: 14px; line-height: 18px; }
+  .type-mono        { font-size: 11px; line-height: 14px; }
+}

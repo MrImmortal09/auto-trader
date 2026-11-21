@@ -22,7 +22,7 @@ export function Segment<T extends string>({
   disabled?: boolean;
   label: string;
 }) {
-  const item = size === 'lg' ? 'h-10 px-4 rounded-8 type-body-strong' : size === 'xs' ? 'h-6 px-2.5 rounded-4 type-label' : 'h-7 px-3 rounded-6 type-label';
+  const item = size === 'lg' ? 'h-9 px-3.5 rounded-8 type-body-strong lg:h-10 lg:px-4' : size === 'xs' ? 'h-6 px-2.5 rounded-4 type-label' : 'h-7 px-3 rounded-6 type-label';
   const track = size === 'lg' ? 'gap-1 p-1 rounded-12' : size === 'xs' ? 'gap-0.5 p-0.5 rounded-6' : 'gap-1 p-1 rounded-8';
   return (
     <div role="tablist" aria-label={label} className={`inline-flex border border-line bg-inset ${track} ${stretch ? 'flex w-full' : ''}`}>

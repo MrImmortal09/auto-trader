@@ -21,7 +21,7 @@ export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 
     const next = Math.min(max, Math.max(1, lots + by));
     if (next !== lots) onChange(next);
   };
-  const button = `grid place-items-center text-fg transition-colors duration-120 hover:bg-raised-strong disabled:opacity-40 disabled:hover:bg-transparent ${lg ? 'size-11 rounded-8' : 'size-7 rounded-6'}`;
+  const button = `grid place-items-center text-fg transition-colors duration-120 hover:bg-raised-strong disabled:opacity-40 disabled:hover:bg-transparent ${lg ? 'size-10 rounded-8 lg:size-11' : 'size-7 rounded-6'}`;
   return (
     <div className="flex items-center gap-2">
       {label && <span className="type-label text-fg-muted">Lots</span>}
@@ -30,7 +30,7 @@ export function LotsStepper({ lots, lotSize, onChange, disabled = false, size = 
           <Minus size={lg ? 18 : 14} />
         </button>
         {/* Inter's digits are wider than the old face's: 32 / 44 px holds two. */}
-        <span className={`text-center text-fg ${lg ? 'w-11 num-large' : 'w-8 num-medium'}`} aria-live="polite">
+        <span className={`text-center text-fg ${lg ? 'w-10 num-large lg:w-11' : 'w-8 num-medium'}`} aria-live="polite">
           {lots}
         </span>
         <button type="button" aria-label="One lot more" className={button} disabled={disabled || lots >= max} onClick={() => step(1)}>

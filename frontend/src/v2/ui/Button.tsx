@@ -27,8 +27,8 @@ const SIZE: Record<ButtonSize, string> = {
   // Desktop rows and bars.
   sm: 'h-7 px-2.5 rounded-6 type-button gap-1.5',
   md: 'h-8 px-3 rounded-6 type-button gap-1.5',
-  // Phone: a 44 pt touch target.
-  lg: 'h-11 px-4 rounded-8 type-button-lg gap-2',
+  // Phone: 40 px, a 44 px touch target from desktop width up.
+  lg: 'h-10 px-3.5 rounded-8 type-button-lg gap-2 lg:h-11 lg:px-4',
 };
 
 export function Button({

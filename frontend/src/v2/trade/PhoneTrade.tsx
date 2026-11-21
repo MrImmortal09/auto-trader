@@ -40,14 +40,14 @@ export function ChartQuickBuy({ board, fullscreen, showButtons, onPick, onFullsc
             <button
               type="button"
               onClick={() => onPick('CE')}
-              className="h-11 min-w-[76px] rounded-8 bg-profit-subtle px-4 type-button-lg text-profit shadow-sm active:brightness-95"
+              className="h-10 min-w-[68px] rounded-8 bg-profit-subtle px-3.5 type-button-lg text-profit shadow-sm active:brightness-95"
             >
               Call
             </button>
             <button
               type="button"
               onClick={() => onPick('PE')}
-              className="h-11 min-w-[76px] rounded-8 bg-loss-subtle px-4 type-button-lg text-loss shadow-sm active:brightness-95"
+              className="h-10 min-w-[68px] rounded-8 bg-loss-subtle px-3.5 type-button-lg text-loss shadow-sm active:brightness-95"
             >
               Put
             </button>
@@ -59,9 +59,9 @@ export function ChartQuickBuy({ board, fullscreen, showButtons, onPick, onFullsc
         aria-label={fullscreen ? 'Exit full screen' : 'Full screen'}
         title={fullscreen ? 'Exit full screen' : 'Full screen'}
         onClick={() => onFullscreen(!fullscreen)}
-        className="absolute right-[72px] bottom-9 z-10 grid size-11 place-items-center rounded-full border border-line bg-panel text-fg-muted shadow-sm active:bg-raised"
+        className="absolute right-[72px] bottom-9 z-10 grid size-10 place-items-center rounded-full border border-line bg-panel text-fg-muted shadow-sm active:bg-raised"
       >
-        {fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+        {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
       </button>
     </>
   );
@@ -212,12 +212,12 @@ export function PhoneTradeBar({ scalps, onOpen, onChain, chainReady, scalper, on
         type="button"
         onClick={onChain}
         disabled={!chainReady}
-        className="flex h-11 shrink-0 items-center gap-1.5 rounded-full border border-line px-4 type-button text-fg disabled:opacity-40"
+        className="flex h-10 shrink-0 items-center gap-1.5 rounded-full border border-line px-3.5 type-button text-fg disabled:opacity-40"
       >
         <Link2 size={16} />
         Chain
       </button>
-      <label className="flex h-11 shrink-0 items-center gap-2 rounded-full border border-line pr-2 pl-4 type-button text-fg">
+      <label className="flex h-10 shrink-0 items-center gap-2 rounded-full border border-line pr-2 pl-3.5 type-button text-fg">
         Scalper
         <Toggle checked={scalper} onChange={onScalper} label="Scalper: show the strike ladder under the chart" />
       </label>
